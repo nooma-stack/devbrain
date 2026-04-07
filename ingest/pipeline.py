@@ -12,12 +12,13 @@ from adapters.base import UniversalSession
 from adapters.claude_code import ClaudeCodeAdapter
 from adapters.codex import CodexAdapter
 from adapters.gemini import GeminiAdapter
+from adapters.markdown_memory import MarkdownMemoryAdapter
 from adapters.openclaw import OpenClawAdapter
 from chunker import chunk_text
 from db import get_project_id, insert_chunk, insert_raw_session, session_exists, update_session_summary
 from embeddings import embed, embed_batch
 
-ADAPTERS = [ClaudeCodeAdapter(), OpenClawAdapter(), CodexAdapter(), GeminiAdapter()]
+ADAPTERS = [ClaudeCodeAdapter(), OpenClawAdapter(), CodexAdapter(), GeminiAdapter(), MarkdownMemoryAdapter()]
 
 
 def file_hash(path: Path) -> str:
@@ -64,7 +65,8 @@ def _process_session(session: UniversalSession, source_path: Path, source_hash: 
         project_id = get_project_id(session.project_slug)
 
     # Convert to text for storage and chunking
-    raw_text = session.to_text()
+    # Strip NUL bytes — PostgreSQL TEXT columns reject them
+    raw_text = session.to_text().replace("\x00", "")
 
     print(f"  Storing raw session ({session.message_count} messages, {len(raw_text)} chars)...")
 

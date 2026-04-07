@@ -26,6 +26,7 @@ WATCH_DIRS = [
     Path.home() / ".openclaw" / "agents",
     Path.home() / ".codex" / "sessions",
     Path.home() / ".gemini" / "tmp",
+    Path.home() / "Developer" / "lighthouse" / "brightbot" / "memory",
 ]
 
 
@@ -40,7 +41,11 @@ def scan_all():
             continue
 
         print(f"\nScanning {watch_dir}...")
-        for path in sorted(list(watch_dir.rglob("*.jsonl")) + list(watch_dir.rglob("session-*.json"))):
+        for path in sorted(
+            list(watch_dir.rglob("*.jsonl"))
+            + list(watch_dir.rglob("session-*.json"))
+            + list(watch_dir.rglob("*.md"))
+        ):
             # Skip tiny files (< 1KB likely empty/corrupt)
             if path.stat().st_size < 1024:
                 continue
@@ -75,7 +80,7 @@ class SessionFileHandler(FileSystemEventHandler):
         self._handle(Path(event.src_path))
 
     def _handle(self, path: Path):
-        if path.suffix not in (".jsonl", ".json"):
+        if path.suffix not in (".jsonl", ".json", ".md"):
             return
         if path.suffix == ".json" and not path.name.startswith("session-"):
             return
