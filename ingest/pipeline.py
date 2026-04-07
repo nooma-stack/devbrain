@@ -10,12 +10,14 @@ from pathlib import Path
 
 from adapters.base import UniversalSession
 from adapters.claude_code import ClaudeCodeAdapter
+from adapters.codex import CodexAdapter
+from adapters.gemini import GeminiAdapter
 from adapters.openclaw import OpenClawAdapter
 from chunker import chunk_text
 from db import get_project_id, insert_chunk, insert_raw_session, session_exists, update_session_summary
 from embeddings import embed, embed_batch
 
-ADAPTERS = [ClaudeCodeAdapter(), OpenClawAdapter()]
+ADAPTERS = [ClaudeCodeAdapter(), OpenClawAdapter(), CodexAdapter(), GeminiAdapter()]
 
 
 def file_hash(path: Path) -> str:
