@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3 -u
 """DevBrain ingest — one-shot and watch modes.
 
 Usage:

@@ -12,7 +12,7 @@ from adapters.base import UniversalSession
 from adapters.claude_code import ClaudeCodeAdapter
 from adapters.openclaw import OpenClawAdapter
 from chunker import chunk_text
-from db import get_project_id, insert_chunk, insert_raw_session, session_exists
+from db import get_project_id, insert_chunk, insert_raw_session, session_exists, update_session_summary
 from embeddings import embed, embed_batch
 
 ADAPTERS = [ClaudeCodeAdapter(), OpenClawAdapter()]
@@ -126,4 +126,33 @@ def _process_session(session: UniversalSession, source_path: Path, source_hash: 
             total_stored += 1
 
     print(f"  Stored {total_stored} embedded chunks")
+
+    # Auto-summarize using local LLM
+    _summarize_session(session_db_id, raw_text, project_id)
+
     return True
+
+
+def _summarize_session(session_db_id: str, raw_text: str, project_id: str | None) -> None:
+    """Generate and store a summary using local Ollama model."""
+    try:
+        from summarize import summarize_text
+        print("  Summarizing...")
+        summary = summarize_text(raw_text)
+        if summary:
+            update_session_summary(session_db_id, summary)
+            # Also store summary as its own searchable chunk
+            summary_embedding = embed(summary)
+            insert_chunk(
+                project_id=project_id,
+                source_type="session_summary",
+                source_id=session_db_id,
+                source_line_start=None,
+                source_line_end=None,
+                content=summary,
+                embedding=summary_embedding,
+                token_count=len(summary) // 4,
+            )
+            print(f"  Summary stored ({len(summary)} chars)")
+    except Exception as e:
+        print(f"  Summarization failed (non-blocking): {e}")

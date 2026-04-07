@@ -6,20 +6,30 @@ import { resolve } from 'path'
 const configPath = resolve(import.meta.dirname, '../../config/devbrain.yaml')
 const config = parse(readFileSync(configPath, 'utf-8'))
 
-const pool = new pg.Pool({
-  host: config.database.host,
-  port: config.database.port,
-  user: config.database.user,
-  password: config.database.password,
-  database: config.database.database,
-  max: 10,
-})
+// Lazy pool initialization — don't connect until first query
+let _pool: pg.Pool | null = null
 
-export { pool, config }
+function getPool(): pg.Pool {
+  if (!_pool) {
+    _pool = new pg.Pool({
+      host: config.database.host,
+      port: config.database.port,
+      user: config.database.user,
+      password: config.database.password,
+      database: config.database.database,
+      max: 5,
+      connectionTimeoutMillis: 5000,
+      idleTimeoutMillis: 30000,
+    })
+  }
+  return _pool
+}
+
+export { config }
 
 export async function query<T extends pg.QueryResultRow = Record<string, unknown>>(
   text: string,
   params?: unknown[],
 ): Promise<pg.QueryResult<T>> {
-  return pool.query<T>(text, params)
+  return getPool().query<T>(text, params)
 }

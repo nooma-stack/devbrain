@@ -96,3 +96,12 @@ def insert_chunk(
         row = cur.fetchone()
         conn.commit()
         return str(row[0]) if row else ""
+
+
+def update_session_summary(session_id: str, summary: str) -> None:
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE devbrain.raw_sessions SET summary = %s WHERE id = %s",
+            (summary, session_id),
+        )
+        conn.commit()
