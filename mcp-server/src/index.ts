@@ -391,6 +391,153 @@ server.tool(
   },
 )
 
+// ─── Tool: factory_plan ──────────────────────────────────────────────────────
+
+server.tool(
+  'factory_plan',
+  'Submit a feature to the dev factory for autonomous implementation. Creates a job that will be planned, implemented, reviewed, QA tested, and staged for your approval.',
+  {
+    project: z.string().describe('Project slug'),
+    title: z.string().describe('Feature title'),
+    spec: z.string().describe('Feature requirements and description'),
+    priority: z.number().optional().default(0).describe('Priority (higher = more urgent)'),
+    assigned_cli: z.string().optional().describe('CLI to use: claude, codex, gemini (default: claude)'),
+  },
+  async ({ project, title, spec, priority, assigned_cli }) => {
+    const projectId = await resolveProjectId(project)
+    if (!projectId) {
+      return { content: [{ type: 'text', text: `Project "${project}" not found.` }] }
+    }
+
+    const result = await query<{ id: string }>(
+      `INSERT INTO devbrain.factory_jobs
+          (project_id, title, spec, status, priority, current_phase, assigned_cli)
+       VALUES ($1, $2, $3, 'queued', $4, 'queued', $5)
+       RETURNING id`,
+      [projectId, title, spec, priority, assigned_cli ?? 'claude'],
+    )
+
+    const jobId = result.rows[0].id
+    return {
+      content: [{
+        type: 'text',
+        text: `Factory job created: ${jobId}\nTitle: ${title}\nStatus: queued\nCLI: ${assigned_cli ?? 'claude'}\n\nThe job will be processed by the factory pipeline. Use factory_status to check progress.`,
+      }],
+    }
+  },
+)
+
+// ─── Tool: factory_status ────────────────────────────────────────────────────
+
+server.tool(
+  'factory_status',
+  'Check dev factory job status. Shows active jobs, their current phase, and any issues.',
+  {
+    job_id: z.string().optional().describe('Specific job ID, or omit for all active jobs'),
+    project: z.string().optional().describe('Filter by project slug'),
+  },
+  async ({ job_id, project }) => {
+    let sql: string
+    const params: unknown[] = []
+
+    if (job_id) {
+      sql = `
+        SELECT j.id, p.slug, j.title, j.status, j.current_phase,
+               j.branch_name, j.error_count, j.max_retries,
+               j.assigned_cli, j.created_at, j.updated_at
+        FROM devbrain.factory_jobs j
+        JOIN devbrain.projects p ON j.project_id = p.id
+        WHERE j.id = $1`
+      params.push(job_id)
+    } else {
+      const slug = project ?? DEFAULT_PROJECT
+      sql = `
+        SELECT j.id, p.slug, j.title, j.status, j.current_phase,
+               j.branch_name, j.error_count, j.max_retries,
+               j.assigned_cli, j.created_at, j.updated_at
+        FROM devbrain.factory_jobs j
+        JOIN devbrain.projects p ON j.project_id = p.id
+        WHERE j.status NOT IN ('approved', 'rejected', 'deployed', 'failed')
+        ${slug ? 'AND p.slug = $1' : ''}
+        ORDER BY j.priority DESC, j.created_at ASC`
+      if (slug) params.push(slug)
+    }
+
+    const result = await query(sql, params)
+
+    if (result.rows.length === 0) {
+      return { content: [{ type: 'text', text: job_id ? `Job ${job_id} not found.` : 'No active factory jobs.' }] }
+    }
+
+    // If single job, also get artifacts
+    let artifacts: unknown[] = []
+    if (job_id && result.rows.length === 1) {
+      const artResult = await query(
+        `SELECT phase, artifact_type, findings_count, blocking_count, model_used, created_at
+         FROM devbrain.factory_artifacts WHERE job_id = $1 ORDER BY created_at ASC`,
+        [job_id],
+      )
+      artifacts = artResult.rows
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({ jobs: result.rows, artifacts }, null, 2),
+      }],
+    }
+  },
+)
+
+// ─── Tool: factory_approve ───────────────────────────────────────────────────
+
+server.tool(
+  'factory_approve',
+  'Approve or reject a dev factory job that is ready for review. Shows the plan, review findings, and QA results.',
+  {
+    job_id: z.string().describe('Job ID to approve/reject'),
+    action: z.enum(['approve', 'reject', 'request_changes']).describe('Action to take'),
+    notes: z.string().optional().describe('Optional notes for the decision'),
+  },
+  async ({ job_id, action, notes }) => {
+    const job = await query(
+      'SELECT status, title FROM devbrain.factory_jobs WHERE id = $1',
+      [job_id],
+    )
+
+    if (job.rows.length === 0) {
+      return { content: [{ type: 'text', text: `Job ${job_id} not found.` }] }
+    }
+
+    const status = job.rows[0].status as string
+    const title = job.rows[0].title as string
+
+    if (action === 'approve') {
+      if (status !== 'ready_for_approval') {
+        return { content: [{ type: 'text', text: `Job is not ready for approval (status: ${status}).` }] }
+      }
+      await query(
+        "UPDATE devbrain.factory_jobs SET status = 'approved', current_phase = 'approved', updated_at = now() WHERE id = $1",
+        [job_id],
+      )
+      return { content: [{ type: 'text', text: `Job "${title}" APPROVED. Branch is ready to push.` }] }
+    } else if (action === 'reject') {
+      await query(
+        "UPDATE devbrain.factory_jobs SET status = 'rejected', current_phase = 'rejected', updated_at = now() WHERE id = $1",
+        [job_id],
+      )
+      return { content: [{ type: 'text', text: `Job "${title}" REJECTED.${notes ? ' Reason: ' + notes : ''}` }] }
+    } else {
+      // request_changes — back to fix loop
+      await query(
+        "UPDATE devbrain.factory_jobs SET status = 'fix_loop', current_phase = 'fix_loop', error_count = error_count + 1, updated_at = now() WHERE id = $1",
+        [job_id],
+      )
+      return { content: [{ type: 'text', text: `Job "${title}" sent back for changes.${notes ? ' Notes: ' + notes : ''}` }] }
+    }
+  },
+)
+
 // ─── Start server ────────────────────────────────────────────────────────────
 
 async function main() {
