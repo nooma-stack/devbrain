@@ -1,0 +1,83 @@
+# DevBrain Configuration
+# ======================
+
+database:
+  host: localhost
+  port: 5433
+  user: devbrain
+  password: devbrain-local
+  database: devbrain
+
+embedding:
+  provider: ollama
+  url: http://localhost:11434
+  model: mxbai-embed-large
+  dims: 1024
+
+summarization:
+  provider: ollama
+  url: http://localhost:11434
+  model: qwen2.5:7b
+
+chunking:
+  max_tokens: 400
+  overlap_tokens: 80
+
+ingest:
+  adapters:
+    claude_code:
+      enabled: true
+      watch_paths:
+        - "~/.claude/projects"
+      file_pattern: "*.jsonl"
+      project_detection: path
+
+    openclaw:
+      enabled: true
+      watch_paths:
+        - "~/.openclaw/agents/*/sessions"
+      file_pattern: "*.jsonl"
+      project_detection: content
+
+    codex:
+      enabled: false  # Enable when adapter is built
+      watch_paths:
+        - "~/.codex"
+      file_pattern: "*.json"
+      project_detection: path
+
+  codebase_indexer:
+    trigger: git_hook  # or "periodic"
+    periodic_interval_minutes: 30
+    file_types:
+      - py
+      - ts
+      - tsx
+      - js
+      - sql
+    ignore_patterns:
+      - node_modules
+      - .venv
+      - __pycache__
+      - dist
+      - build
+      - .next
+
+factory:
+  max_concurrent_jobs: 2
+  max_fix_loop_retries: 3
+  default_review_passes:
+    - architecture
+    - security_hipaa
+  cli_preferences:
+    plan: claude       # Best for reasoning/planning
+    implement: codex   # Best for code generation
+    review: claude     # Best for analysis
+    qa: local          # Run locally, no LLM needed
+
+notifications:
+  desktop:
+    enabled: true
+    method: osascript  # macOS native
+  mobile:
+    enabled: false     # Phase 2: Telegram

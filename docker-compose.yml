@@ -1,0 +1,41 @@
+# DevBrain — Universal Persistent Memory & Dev Factory
+# ====================================================
+#
+# Local-first, model-agnostic, app-agnostic development infrastructure.
+#
+# Usage:
+#   docker compose up -d devbrain-db    # Database only (for development)
+#   docker compose up -d                # Full stack
+#   docker compose down                 # Stop all
+#   docker compose logs -f devbrain-mcp # Tail MCP server logs
+#
+# Ports:
+#   5433 — PostgreSQL (avoids conflict with brightbot-db on 5432)
+#
+# Note: Ollama runs natively on macOS (not in Docker) for Metal GPU acceleration.
+# The containerized version would use CPU only, which is much slower.
+
+services:
+  # =============================================================================
+  # Database — PostgreSQL 17 + pgvector
+  # =============================================================================
+  devbrain-db:
+    image: pgvector/pgvector:pg17
+    container_name: devbrain-db
+    restart: unless-stopped
+    volumes:
+      - devbrain-pgdata:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    environment:
+      POSTGRES_USER: devbrain
+      POSTGRES_PASSWORD: devbrain-local
+      POSTGRES_DB: devbrain
+    ports:
+      - "5433:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U devbrain"]
+      interval: 5s
+      retries: 5
+
+volumes:
+  devbrain-pgdata:

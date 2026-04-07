@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+*.log
+mcp-server/node_modules/
+mcp-server/dist/
+ingest/__pycache__/
+ingest/.venv/
