@@ -193,6 +193,7 @@ Store any important decisions or patterns you discover in DevBrain."""
 
     def _run_review(self, job: FactoryJob) -> FactoryJob:
         """Review phase: architecture + security/HIPAA review."""
+        job = self.db.transition(job.id, JobStatus.REVIEWING)
         project_root = self._get_project_root(job)
 
         # Get the diff for review
@@ -290,6 +291,7 @@ Store any security issues found in DevBrain with type="issue" and category="secu
 
     def _run_qa(self, job: FactoryJob) -> FactoryJob:
         """QA phase: run full test suite, lint, type checks."""
+        job = self.db.transition(job.id, JobStatus.QA)
         project_root = self._get_project_root(job)
 
         # Get project test/lint commands
