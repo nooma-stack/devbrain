@@ -32,19 +32,19 @@ CLI_CONFIGS = {
         "command": "claude",
         "flag": "-p",  # prompt flag
         "extra_args": ["--output-format", "text", "--max-turns", "50"],
-        "timeout": 600,  # 10 min
+        "timeout": None,  # No timeout — let the CLI run to completion
     },
     "codex": {
         "command": "codex",
         "flag": "--prompt",
         "extra_args": ["--auto"],
-        "timeout": 600,
+        "timeout": None,
     },
     "gemini": {
         "command": "gemini",
         "flag": "-p",
         "extra_args": [],
-        "timeout": 600,
+        "timeout": None,
     },
 }
 
@@ -75,7 +75,6 @@ def run_cli(
     cli_name: str,
     prompt: str,
     cwd: str | None = None,
-    timeout: int | None = None,
     env_override: dict | None = None,
 ) -> CLIResult:
     """Run a CLI tool with a prompt and return the result.
@@ -98,9 +97,8 @@ def run_cli(
         )
 
     cmd = [config["command"], config["flag"], prompt] + config["extra_args"]
-    effective_timeout = timeout or config["timeout"]
 
-    logger.info("Running %s (timeout=%ds, cwd=%s)", cli_name, effective_timeout, cwd)
+    logger.info("Running %s (no timeout, cwd=%s)", cli_name, cwd)
 
     import os
     env = os.environ.copy()
@@ -113,7 +111,6 @@ def run_cli(
             cwd=cwd,
             capture_output=True,
             text=True,
-            timeout=effective_timeout,
             env=env,
         )
         success = result.returncode == 0
@@ -126,13 +123,6 @@ def run_cli(
             stdout=result.stdout,
             stderr=result.stderr,
             success=success,
-        )
-    except subprocess.TimeoutExpired:
-        logger.error("%s timed out after %ds", cli_name, effective_timeout)
-        return CLIResult(
-            cli=cli_name, exit_code=-1,
-            stdout="", stderr=f"Timeout after {effective_timeout}s",
-            success=False,
         )
     except Exception as e:
         logger.error("%s failed: %s", cli_name, e)

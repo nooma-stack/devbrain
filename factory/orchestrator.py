@@ -102,7 +102,7 @@ Output the plan as a structured document. Be specific about file paths and funct
 Store the plan in DevBrain using the store tool with type="decision"."""
 
         logger.info("Planning with %s...", cli)
-        result = run_cli(cli, prompt, cwd=project_root, timeout=300)
+        result = run_cli(cli, prompt, cwd=project_root)
 
         self.db.store_artifact(
             job_id=job.id,
@@ -159,7 +159,7 @@ Instructions:
 Store any important decisions or patterns you discover in DevBrain."""
 
         logger.info("Implementing with %s...", cli)
-        result = run_cli(cli, prompt, cwd=project_root, timeout=600)
+        result = run_cli(cli, prompt, cwd=project_root)
 
         self.db.store_artifact(
             job_id=job.id,
@@ -230,7 +230,7 @@ Output findings as a list with severity levels:
 Store any important patterns or issues found in DevBrain."""
 
         logger.info("Architecture review with %s...", arch_cli)
-        arch_result = run_cli(arch_cli, arch_prompt, cwd=project_root, timeout=300)
+        arch_result = run_cli(arch_cli, arch_prompt, cwd=project_root)
 
         blocking_count = arch_result.stdout.lower().count("blocking")
         self.db.store_artifact(
@@ -268,7 +268,7 @@ Output findings with severity:
 Store any security issues found in DevBrain with type="issue" and category="security"."""
 
         logger.info("Security review with %s...", sec_cli)
-        sec_result = run_cli(sec_cli, sec_prompt, cwd=project_root, timeout=300)
+        sec_result = run_cli(sec_cli, sec_prompt, cwd=project_root)
 
         sec_blocking = sec_result.stdout.lower().count("blocking")
         self.db.store_artifact(
@@ -382,7 +382,7 @@ Instructions:
 5. Do NOT push to remote"""
 
         logger.info("Fix loop attempt %d with %s...", job.error_count + 1, cli)
-        result = run_cli(cli, fix_prompt, cwd=project_root, timeout=600)
+        result = run_cli(cli, fix_prompt, cwd=project_root)
 
         self.db.store_artifact(
             job_id=job.id,
