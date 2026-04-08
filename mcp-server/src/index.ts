@@ -2,10 +2,15 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
+import { spawn } from 'child_process'
+import { resolve } from 'path'
 import { z } from 'zod'
 import { query } from './db.js'
 import { embed, toSqlVector } from './embeddings.js'
 import { summarizeSession } from './summarize.js'
+
+// Factory orchestrator runner path
+const FACTORY_RUNNER = resolve(import.meta.dirname, '../../factory/run.py')
 
 const server = new McpServer({
   name: 'devbrain',
@@ -418,10 +423,28 @@ server.tool(
     )
 
     const jobId = result.rows[0].id
+
+    // Spawn the factory orchestrator as a detached background process.
+    // It runs the full pipeline: planning → implementing → reviewing → QA → approval.
+    // Detached + unref() ensures it outlives the MCP tool call.
+    try {
+      const factoryPython = resolve(import.meta.dirname, '../../.venv/bin/python')
+      const child = spawn(factoryPython, [FACTORY_RUNNER, jobId], {
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        cwd: resolve(import.meta.dirname, '../..'),
+      })
+      child.unref()
+      console.error(`[factory] Spawned orchestrator for job ${jobId.slice(0, 8)} (pid ${child.pid})`)
+    } catch (err) {
+      console.error(`[factory] Failed to spawn orchestrator: ${err}`)
+      // Job is still created in DB — can be run manually via: python3 factory/run.py <job_id>
+    }
+
     return {
       content: [{
         type: 'text',
-        text: `Factory job created: ${jobId}\nTitle: ${title}\nStatus: queued\nCLI: ${assigned_cli ?? 'claude'}\n\nThe job will be processed by the factory pipeline. Use factory_status to check progress.`,
+        text: `Factory job created: ${jobId}\nTitle: ${title}\nStatus: queued\nCLI: ${assigned_cli ?? 'claude'}\n\nThe factory orchestrator has been launched. Use factory_status to check progress.`,
       }],
     }
   },
