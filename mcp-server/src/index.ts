@@ -416,8 +416,8 @@ server.tool(
 
     const result = await query<{ id: string }>(
       `INSERT INTO devbrain.factory_jobs
-          (project_id, title, spec, status, priority, current_phase, assigned_cli)
-       VALUES ($1, $2, $3, 'queued', $4, 'queued', $5)
+          (project_id, title, spec, status, priority, current_phase, assigned_cli, max_retries)
+       VALUES ($1, $2, $3, 'queued', $4, 'queued', $5, 5)
        RETURNING id`,
       [projectId, title, spec, priority, assigned_cli ?? 'claude'],
     )

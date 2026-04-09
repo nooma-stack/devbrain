@@ -65,7 +65,7 @@ ingest:
 
 factory:
   max_concurrent_jobs: 2
-  max_fix_loop_retries: 3
+  max_fix_loop_retries: 5
   default_review_passes:
     - architecture
     - security_hipaa
