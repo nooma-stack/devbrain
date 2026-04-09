@@ -3,6 +3,10 @@
 Spawns AI CLI tools (claude, codex, gemini) as subprocesses, each running
 under its own subscription. The factory orchestrator calls these to
 execute planning, implementation, and review phases.
+
+Per-phase CLI assignments are configured in config/devbrain.yaml under
+factory.cli_preferences. Jobs can override with assigned_cli (applies to
+all phases for that job).
 """
 
 from __future__ import annotations
@@ -14,7 +18,15 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+import yaml
+
 logger = logging.getLogger(__name__)
+
+# Load factory CLI preferences from config
+_CONFIG_PATH = Path(__file__).parent.parent / "config" / "devbrain.yaml"
+with open(_CONFIG_PATH) as _f:
+    _config = yaml.safe_load(_f)
+_CLI_PREFERENCES = _config.get("factory", {}).get("cli_preferences", {})
 
 
 @dataclass
@@ -31,7 +43,7 @@ CLI_CONFIGS = {
     "claude": {
         "command": "claude",
         "flag": "-p",  # prompt flag
-        "extra_args": ["--output-format", "text", "--max-turns", "50"],
+        "extra_args": ["--output-format", "text", "--max-turns", "50", "--dangerously-skip-permissions"],
         "timeout": None,  # No timeout — let the CLI run to completion
     },
     "codex": {
@@ -48,13 +60,13 @@ CLI_CONFIGS = {
     },
 }
 
-# Default CLI assignments per phase
+# CLI assignments per phase — loaded from config/devbrain.yaml, falling back to claude
 DEFAULT_CLI_ASSIGNMENTS = {
-    "planning": "claude",       # Best for reasoning/planning
-    "implementing": "claude",   # Configurable per job
-    "review_arch": "claude",    # Architecture review
-    "review_security": "claude",  # Security/HIPAA review
-    "fix": "claude",            # Fix loop
+    "planning": _CLI_PREFERENCES.get("planning", "claude"),
+    "implementing": _CLI_PREFERENCES.get("implementing", "claude"),
+    "review_arch": _CLI_PREFERENCES.get("review_arch", "claude"),
+    "review_security": _CLI_PREFERENCES.get("review_security", "claude"),
+    "fix": _CLI_PREFERENCES.get("fix", "claude"),
 }
 
 

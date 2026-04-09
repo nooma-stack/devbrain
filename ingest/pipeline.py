@@ -161,18 +161,24 @@ def _summarize_session(session_db_id: str, raw_text: str, project_id: str | None
         summary = summarize_text(raw_text)
         if summary:
             update_session_summary(session_db_id, summary)
-            # Also store summary as its own searchable chunk
-            summary_embedding = embed(summary)
-            insert_chunk(
-                project_id=project_id,
-                source_type="session_summary",
-                source_id=session_db_id,
-                source_line_start=None,
-                source_line_end=None,
-                content=summary,
-                embedding=summary_embedding,
-                token_count=len(summary) // 4,
-            )
-            print(f"  Summary stored ({len(summary)} chars)")
+            # Chunk the summary to stay within embedding model token limits
+            summary_chunks = chunk_text(summary)
+            texts = [c.content for c in summary_chunks]
+            try:
+                embeddings = embed_batch(texts)
+            except Exception:
+                embeddings = [embed(t) for t in texts]
+            for chunk, emb in zip(summary_chunks, embeddings):
+                insert_chunk(
+                    project_id=project_id,
+                    source_type="session_summary",
+                    source_id=session_db_id,
+                    source_line_start=chunk.line_start,
+                    source_line_end=chunk.line_end,
+                    content=chunk.content,
+                    embedding=emb,
+                    token_count=chunk.token_count,
+                )
+            print(f"  Summary stored ({len(summary)} chars, {len(summary_chunks)} chunk{'s' if len(summary_chunks) > 1 else ''})")
     except Exception as e:
         print(f"  Summarization failed (non-blocking): {e}")

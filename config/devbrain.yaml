@@ -70,10 +70,12 @@ factory:
     - architecture
     - security_hipaa
   cli_preferences:
-    plan: claude       # Best for reasoning/planning
-    implement: codex   # Best for code generation
-    review: claude     # Best for analysis
-    qa: local          # Run locally, no LLM needed
+    planning: claude          # Best for reasoning/planning
+    implementing: claude      # Code generation (claude, codex, or gemini)
+    review_arch: claude       # Architecture review
+    review_security: claude   # Security/HIPAA review
+    fix: claude               # Fix loop
+    # qa: local — QA runs lint/test commands directly, no LLM
 
 notifications:
   desktop:

@@ -19,6 +19,7 @@ from pathlib import Path
 
 from state_machine import FactoryDB, FactoryJob, JobStatus
 from cli_executor import run_cli, notify_desktop, DEFAULT_CLI_ASSIGNMENTS
+from learning import extract_lessons, get_review_lessons
 
 logger = logging.getLogger(__name__)
 
@@ -80,15 +81,12 @@ class FactoryOrchestrator:
         ):
             if job.status == JobStatus.QUEUED:
                 job = self._run_planning(job)
-            elif job.status == JobStatus.PLANNING:
-                job = self._run_implementation(job)
             elif job.status == JobStatus.IMPLEMENTING:
-                job = self._run_review(job)
+                job = self._run_implementation(job)
             elif job.status == JobStatus.REVIEWING:
-                job = self._run_qa(job)
+                job = self._run_review(job)
             elif job.status == JobStatus.QA:
-                # QA passed — ready for human approval
-                break
+                job = self._run_qa(job)
             elif job.status == JobStatus.FIX_LOOP:
                 if job.error_count >= job.max_retries:
                     job = self.db.transition(job.id, JobStatus.FAILED,
@@ -100,6 +98,16 @@ class FactoryOrchestrator:
         if job.status == JobStatus.READY_FOR_APPROVAL:
             notify_desktop("DevBrain Factory",
                            f"Ready for review: {job.title}")
+
+        # Extract lessons from review findings for the learning loop
+        if job.status in (JobStatus.READY_FOR_APPROVAL, JobStatus.FAILED):
+            try:
+                lessons = extract_lessons(job.id)
+                if lessons:
+                    logger.info("Learning loop: extracted %d lessons from job %s",
+                                len(lessons), job.id[:8])
+            except Exception as e:
+                logger.warning("Learning loop failed (non-blocking): %s", e)
 
         return job
 
@@ -143,6 +151,19 @@ class FactoryOrchestrator:
         cli = self._get_cli("planning", job)
         project_root = self._get_project_root(job)
 
+        # Inject lessons from past reviews
+        lessons = get_review_lessons(job.project_id)
+        lessons_section = ""
+        if lessons:
+            lessons_list = "\n".join(f"- {l}" for l in lessons)
+            lessons_section = f"""
+## Lessons from Past Reviews
+
+The following issues have been flagged in previous factory reviews. Address these proactively in your plan:
+
+{lessons_list}
+"""
+
         prompt = f"""You are a software architect planning an implementation for an autonomous dev factory pipeline. Your plan will be handed to an implementation agent who will build it without human guidance, so be PRECISE and COMPLETE.
 
 PROJECT: {job.project_slug}
@@ -152,6 +173,7 @@ SPEC:
 {job.spec or job.description or job.title}
 
 {DEVBRAIN_INSTRUCTIONS}
+{lessons_section}
 
 ## Your Job
 
@@ -173,7 +195,8 @@ Be specific about function names, class names, API endpoints, component names, a
 Store the final plan in DevBrain using the store tool with type="decision"."""
 
         logger.info("Planning with %s...", cli)
-        result = run_cli(cli, prompt, cwd=project_root)
+        result = run_cli(cli, prompt, cwd=project_root,
+                         env_override={"DEVBRAIN_PROJECT": job.project_slug})
 
         self.db.store_artifact(
             job_id=job.id,
@@ -246,7 +269,8 @@ Use what you find to avoid repeating past mistakes and follow established patter
 IMPORTANT: Follow existing code patterns in the repo. Read similar files before writing new ones. Match the project's style, naming conventions, and architecture patterns."""
 
         logger.info("Implementing with %s...", cli)
-        result = run_cli(cli, prompt, cwd=project_root)
+        result = run_cli(cli, prompt, cwd=project_root,
+                         env_override={"DEVBRAIN_PROJECT": job.project_slug})
 
         self.db.store_artifact(
             job_id=job.id,
@@ -282,7 +306,8 @@ IMPORTANT: Follow existing code patterns in the repo. Read similar files before 
 
     def _run_review(self, job: FactoryJob) -> FactoryJob:
         """Review phase: architecture + security/HIPAA review."""
-        job = self.db.transition(job.id, JobStatus.REVIEWING)
+        if job.status != JobStatus.REVIEWING:
+            job = self.db.transition(job.id, JobStatus.REVIEWING)
         project_root = self._get_project_root(job)
 
         # Get the diff for review
@@ -361,7 +386,8 @@ Be precise: include file paths and line numbers. Only use BLOCKING for issues th
 If this is a re-review round, explicitly state which prior findings are RESOLVED vs still BLOCKING."""
 
         logger.info("Architecture review with %s...", arch_cli)
-        arch_result = run_cli(arch_cli, arch_prompt, cwd=project_root)
+        arch_result = run_cli(arch_cli, arch_prompt, cwd=project_root,
+                              env_override={"DEVBRAIN_PROJECT": job.project_slug})
 
         blocking_count = _count_blocking(arch_result.stdout)
         self.db.store_artifact(
@@ -415,7 +441,8 @@ If this is a re-review round, explicitly state which prior findings are RESOLVED
 Store any security issues found in DevBrain with type="issue" and category="security"."""
 
         logger.info("Security review with %s...", sec_cli)
-        sec_result = run_cli(sec_cli, sec_prompt, cwd=project_root)
+        sec_result = run_cli(sec_cli, sec_prompt, cwd=project_root,
+                             env_override={"DEVBRAIN_PROJECT": job.project_slug})
 
         sec_blocking = _count_blocking(sec_result.stdout)
         self.db.store_artifact(
@@ -439,7 +466,8 @@ Store any security issues found in DevBrain with type="issue" and category="secu
 
     def _run_qa(self, job: FactoryJob) -> FactoryJob:
         """QA phase: run full test suite, lint, type checks."""
-        job = self.db.transition(job.id, JobStatus.QA)
+        if job.status != JobStatus.QA:
+            job = self.db.transition(job.id, JobStatus.QA)
         project_root = self._get_project_root(job)
 
         # Get project test/lint commands from DB
@@ -555,7 +583,8 @@ FIX ATTEMPT: {job.error_count + 1}/{job.max_retries}
 IMPORTANT: Fix ONLY the listed findings. Do not expand scope. Do not "improve" surrounding code. Minimal, targeted fixes only."""
 
         logger.info("Fix loop attempt %d with %s...", job.error_count + 1, cli)
-        result = run_cli(cli, fix_prompt, cwd=project_root)
+        result = run_cli(cli, fix_prompt, cwd=project_root,
+                         env_override={"DEVBRAIN_PROJECT": job.project_slug})
 
         self.db.store_artifact(
             job_id=job.id,
