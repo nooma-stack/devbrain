@@ -563,6 +563,63 @@ server.tool(
   },
 )
 
+// ─── Tool: factory_cleanup ──────────────────────────────────────────────────
+
+server.tool(
+  'factory_cleanup',
+  'Manually archive a terminal factory job (approved, rejected, deployed, or failed). Removes it from the recent completed list.',
+  {
+    job_id: z.string().describe('Job ID to archive'),
+  },
+  async ({ job_id }) => {
+    const jobResult = await query(
+      'SELECT status, title, archived_at FROM devbrain.factory_jobs WHERE id = $1',
+      [job_id],
+    )
+
+    if (jobResult.rows.length === 0) {
+      return { content: [{ type: 'text', text: `Job ${job_id} not found.` }] }
+    }
+
+    const job = jobResult.rows[0]
+    const status = job.status as string
+    const title = job.title as string
+
+    if (job.archived_at) {
+      return { content: [{ type: 'text', text: `Job "${title}" is already archived (archived at ${job.archived_at}).` }] }
+    }
+
+    const terminalStatuses = ['approved', 'rejected', 'deployed', 'failed']
+    if (!terminalStatuses.includes(status)) {
+      return { content: [{ type: 'text', text: `Cannot clean up active jobs. Job "${title}" is currently in status: ${status}.` }] }
+    }
+
+    await query(
+      'UPDATE devbrain.factory_jobs SET archived_at = now() WHERE id = $1',
+      [job_id],
+    )
+
+    // Check for existing cleanup report
+    const reportResult = await query(
+      'SELECT outcome, summary FROM devbrain.factory_cleanup_reports WHERE job_id = $1 ORDER BY created_at DESC LIMIT 1',
+      [job_id],
+    )
+
+    let reportInfo = ''
+    if (reportResult.rows.length > 0) {
+      const report = reportResult.rows[0]
+      reportInfo = `\nCleanup report: ${report.outcome} — ${report.summary}`
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: `Job "${title}" archived successfully (status: ${status}).${reportInfo}`,
+      }],
+    }
+  },
+)
+
 // ─── Start server ────────────────────────────────────────────────────────────
 
 async function main() {
