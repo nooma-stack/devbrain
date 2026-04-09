@@ -11,7 +11,7 @@ database:
 embedding:
   provider: ollama
   url: http://localhost:11434
-  model: mxbai-embed-large
+  model: snowflake-arctic-embed2
   dims: 1024
 
 summarization:
