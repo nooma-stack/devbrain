@@ -30,6 +30,19 @@ def session_exists(source_app: str, source_hash: str) -> bool:
         return cur.fetchone() is not None
 
 
+def get_existing_session_id(source_app: str, session_id: str) -> str | None:
+    """Check if a session already exists by app + session_id (not hash)."""
+    if not session_id:
+        return None
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM devbrain.raw_sessions WHERE source_app = %s AND session_id = %s ORDER BY created_at DESC LIMIT 1",
+            (source_app, session_id),
+        )
+        row = cur.fetchone()
+        return str(row[0]) if row else None
+
+
 def insert_raw_session(
     *,
     project_id: str | None,
@@ -46,25 +59,57 @@ def insert_raw_session(
     files_touched: list[str],
 ) -> str:
     with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO devbrain.raw_sessions
-                (project_id, source_app, source_path, source_hash, session_id,
-                 model_used, started_at, ended_at, message_count, raw_content,
-                 summary, files_touched)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
-            ON CONFLICT (source_app, source_hash) DO NOTHING
-            RETURNING id
-            """,
-            (
-                project_id, source_app, source_path, source_hash, session_id,
-                model_used, started_at, ended_at, message_count, raw_content,
-                summary, psycopg2.extras.Json(files_touched),
-            ),
-        )
-        row = cur.fetchone()
-        conn.commit()
-        return str(row[0]) if row else ""
+        # Check if this session already exists (by session_id, not hash)
+        # If so, UPDATE it instead of creating a duplicate
+        existing_id = None
+        if session_id:
+            cur.execute(
+                "SELECT id FROM devbrain.raw_sessions WHERE source_app = %s AND session_id = %s ORDER BY created_at DESC LIMIT 1",
+                (source_app, session_id),
+            )
+            row = cur.fetchone()
+            existing_id = row[0] if row else None
+
+        if existing_id:
+            # Update existing session with new content
+            cur.execute(
+                """
+                UPDATE devbrain.raw_sessions
+                SET source_hash = %s, source_path = %s, message_count = %s,
+                    raw_content = %s, ended_at = %s, files_touched = %s::jsonb
+                WHERE id = %s
+                RETURNING id
+                """,
+                (
+                    source_hash, source_path, message_count,
+                    raw_content, ended_at, psycopg2.extras.Json(files_touched),
+                    existing_id,
+                ),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return str(row[0]) if row else ""
+        else:
+            # Insert new session
+            cur.execute(
+                """
+                INSERT INTO devbrain.raw_sessions
+                    (project_id, source_app, source_path, source_hash, session_id,
+                     model_used, started_at, ended_at, message_count, raw_content,
+                     summary, files_touched)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                ON CONFLICT (source_app, source_hash) DO NOTHING
+                RETURNING id
+                """,
+                (
+                    project_id, source_app, source_path, source_hash, session_id,
+                    model_used, started_at, ended_at, message_count, raw_content,
+                    summary, psycopg2.extras.Json(files_touched),
+                ),
+            )
+            row = cur.fetchone()
+            conn.commit()
+            return str(row[0]) if row else ""
 
 
 def insert_chunk(
@@ -96,6 +141,18 @@ def insert_chunk(
         row = cur.fetchone()
         conn.commit()
         return str(row[0]) if row else ""
+
+
+def delete_chunks_for_session(session_id: str) -> int:
+    """Delete all chunks for a session (before re-embedding on update)."""
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM devbrain.chunks WHERE source_id = %s",
+            (session_id,),
+        )
+        count = cur.rowcount
+        conn.commit()
+        return count
 
 
 def update_session_summary(session_id: str, summary: str) -> None:

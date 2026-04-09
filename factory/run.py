@@ -8,22 +8,29 @@ Can also be run manually: python factory/run.py <job_id>
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from pathlib import Path
+
+# Disable bytecode caching — ensures we always run from current source,
+# not stale .pyc files after code updates.
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+sys.dont_write_bytecode = True
 
 # Add parent dir to path so we can import from factory package
 sys.path.insert(0, str(Path(__file__).parent))
 
 from orchestrator import FactoryOrchestrator  # noqa: E402
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    handlers=[
-        logging.StreamHandler(),
-        logging.FileHandler(Path(__file__).parent.parent / "logs" / "factory.log"),
-    ],
-)
+# Configure logging — use only FileHandler to avoid double output.
+# StreamHandler would duplicate to both stdout and the log file since
+# launchd and background shells capture stdout to the same log.
+_log_file = Path(__file__).parent.parent / "logs" / "factory.log"
+_handler = logging.FileHandler(_log_file)
+_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
+
+logging.root.setLevel(logging.INFO)
+logging.root.handlers = [_handler]  # Replace any existing handlers
 logger = logging.getLogger("devbrain.factory")
 
 DATABASE_URL = "postgresql://devbrain:devbrain-local@localhost:5433/devbrain"

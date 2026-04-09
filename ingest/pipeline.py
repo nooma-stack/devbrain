@@ -15,7 +15,7 @@ from adapters.gemini import GeminiAdapter
 from adapters.markdown_memory import MarkdownMemoryAdapter
 from adapters.openclaw import OpenClawAdapter
 from chunker import chunk_text
-from db import get_project_id, insert_chunk, insert_raw_session, session_exists, update_session_summary
+from db import delete_chunks_for_session, get_project_id, get_existing_session_id, insert_chunk, insert_raw_session, session_exists, update_session_summary
 from embeddings import embed, embed_batch
 
 ADAPTERS = [ClaudeCodeAdapter(), OpenClawAdapter(), CodexAdapter(), GeminiAdapter(), MarkdownMemoryAdapter()]
@@ -44,7 +44,7 @@ def ingest_file(path: Path, *, force: bool = False) -> bool:
 
     fhash = file_hash(path)
 
-    # Skip if already ingested (unless forced)
+    # Skip if exact same content already ingested (hash match)
     if not force and session_exists(adapter.app_name, fhash):
         return False
 
@@ -54,10 +54,18 @@ def ingest_file(path: Path, *, force: bool = False) -> bool:
         print(f"  Skipped (no messages or parse error)")
         return False
 
-    return _process_session(session, path, fhash)
+    # Check if this is an update to an existing session (same session_id, different hash)
+    is_update = False
+    if session.session_id:
+        existing = get_existing_session_id(adapter.app_name, session.session_id)
+        if existing:
+            is_update = True
+            print(f"  Updating existing session (content grew)")
+
+    return _process_session(session, path, fhash, is_update=is_update)
 
 
-def _process_session(session: UniversalSession, source_path: Path, source_hash: str) -> bool:
+def _process_session(session: UniversalSession, source_path: Path, source_hash: str, *, is_update: bool = False) -> bool:
     """Store raw session, chunk, embed, and store chunks."""
     # Resolve project
     project_id = None
@@ -68,9 +76,9 @@ def _process_session(session: UniversalSession, source_path: Path, source_hash: 
     # Strip NUL bytes — PostgreSQL TEXT columns reject them
     raw_text = session.to_text().replace("\x00", "")
 
-    print(f"  Storing raw session ({session.message_count} messages, {len(raw_text)} chars)...")
+    print(f"  {'Updating' if is_update else 'Storing'} raw session ({session.message_count} messages, {len(raw_text)} chars)...")
 
-    # Store raw session
+    # Store or update raw session
     session_db_id = insert_raw_session(
         project_id=project_id,
         source_app=session.source_app,
@@ -89,6 +97,11 @@ def _process_session(session: UniversalSession, source_path: Path, source_hash: 
     if not session_db_id:
         print(f"  Already exists (hash collision), skipping.")
         return False
+
+    # If updating, delete old chunks so we re-embed the full session
+    if is_update:
+        delete_chunks_for_session(session_db_id)
+        print(f"  Cleared old chunks for re-embedding")
 
     # Chunk the text
     chunks = chunk_text(raw_text)
