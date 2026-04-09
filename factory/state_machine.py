@@ -77,6 +77,13 @@ class FactoryJob:
 class FactoryDB:
     """Database operations for the factory pipeline."""
 
+    TERMINAL_STATES = {
+        JobStatus.APPROVED,
+        JobStatus.REJECTED,
+        JobStatus.DEPLOYED,
+        JobStatus.FAILED,
+    }
+
     def __init__(self, database_url: str):
         self.database_url = database_url
 
@@ -172,6 +179,7 @@ class FactoryDB:
                         JobStatus.DEPLOYED.value, JobStatus.FAILED.value]
             conditions.append("j.status NOT IN %s")
             params.append(tuple(inactive))
+            conditions.append("j.archived_at IS NULL")
 
         where = "WHERE " + " AND ".join(conditions) if conditions else ""
 
@@ -299,6 +307,102 @@ class FactoryDB:
                     "content": r[3], "model_used": r[4],
                     "findings_count": r[5], "blocking_count": r[6],
                     "metadata": r[7] or {}, "created_at": str(r[8]),
+                }
+                for r in cur.fetchall()
+            ]
+
+    def archive_job(self, job_id: str) -> None:
+        """Mark a terminal job as archived by setting archived_at."""
+        job = self.get_job(job_id)
+        if not job:
+            raise ValueError(f"Job {job_id} not found")
+
+        if job.status not in self.TERMINAL_STATES:
+            allowed = sorted(s.value for s in self.TERMINAL_STATES)
+            raise ValueError(
+                f"Cannot archive job in status '{job.status.value}'. "
+                f"Must be one of: {allowed}"
+            )
+
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devbrain.factory_jobs SET archived_at = now() WHERE id = %s",
+                (job_id,),
+            )
+            conn.commit()
+
+        logger.info("Archived job %s", job_id[:8])
+
+    def store_cleanup_report(
+        self,
+        job_id: str,
+        report_type: str,
+        outcome: str,
+        summary: str,
+        phases_traversed: list | None = None,
+        artifacts_summary: dict | None = None,
+        recovery_diagnosis: str | None = None,
+        recovery_action_taken: str | None = None,
+        time_elapsed_seconds: int | None = None,
+        metadata: dict | None = None,
+    ) -> str:
+        """Insert a cleanup report and return its ID."""
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO devbrain.factory_cleanup_reports
+                    (job_id, report_type, outcome, summary, phases_traversed,
+                     artifacts_summary, recovery_diagnosis, recovery_action_taken,
+                     time_elapsed_seconds, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    job_id,
+                    report_type,
+                    outcome,
+                    summary,
+                    json.dumps(phases_traversed or []),
+                    json.dumps(artifacts_summary or {}),
+                    recovery_diagnosis,
+                    recovery_action_taken,
+                    time_elapsed_seconds,
+                    json.dumps(metadata or {}),
+                ),
+            )
+            report_id = str(cur.fetchone()[0])
+            conn.commit()
+            return report_id
+
+    def get_cleanup_reports(self, job_id: str) -> list[dict]:
+        """Get all cleanup reports for a job, ordered by creation time."""
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, job_id, report_type, outcome, summary,
+                       phases_traversed, artifacts_summary, recovery_diagnosis,
+                       recovery_action_taken, time_elapsed_seconds, metadata,
+                       created_at
+                FROM devbrain.factory_cleanup_reports
+                WHERE job_id = %s
+                ORDER BY created_at ASC
+                """,
+                (job_id,),
+            )
+            return [
+                {
+                    "id": str(r[0]),
+                    "job_id": str(r[1]),
+                    "report_type": r[2],
+                    "outcome": r[3],
+                    "summary": r[4],
+                    "phases_traversed": r[5] or [],
+                    "artifacts_summary": r[6] or {},
+                    "recovery_diagnosis": r[7],
+                    "recovery_action_taken": r[8],
+                    "time_elapsed_seconds": r[9],
+                    "metadata": r[10] or {},
+                    "created_at": str(r[11]),
                 }
                 for r in cur.fetchall()
             ]
