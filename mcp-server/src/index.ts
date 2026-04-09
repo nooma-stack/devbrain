@@ -76,12 +76,13 @@ server.tool(
       return { content: [{ type: 'text', text: `Project "${slug}" not found in DevBrain.` }] }
     }
 
-    const [projectInfo, decisions, issues, patterns, jobs] = await Promise.all([
+    const [projectInfo, decisions, issues, patterns, activeJobs, inactiveJobs] = await Promise.all([
       query('SELECT name, description, root_path, constraints, tech_stack FROM devbrain.projects WHERE id = $1', [projectId]),
       query('SELECT title, decision, rationale, created_at FROM devbrain.decisions WHERE project_id = $1 AND status = \'active\' ORDER BY created_at DESC LIMIT 5', [projectId]),
       query('SELECT title, category, description, fix_applied, created_at FROM devbrain.issues WHERE project_id = $1 ORDER BY created_at DESC LIMIT 5', [projectId]),
       query('SELECT name, category, description FROM devbrain.patterns WHERE project_id = $1 ORDER BY created_at DESC LIMIT 5', [projectId]),
-      query('SELECT title, status, current_phase, branch_name FROM devbrain.factory_jobs WHERE project_id = $1 AND status NOT IN (\'approved\', \'rejected\') ORDER BY created_at DESC LIMIT 5', [projectId]),
+      query('SELECT title, status, current_phase, branch_name FROM devbrain.factory_jobs WHERE project_id = $1 AND status NOT IN (\'approved\', \'rejected\', \'deployed\', \'failed\') AND archived_at IS NULL ORDER BY created_at DESC LIMIT 5', [projectId]),
+      query('SELECT title, status, current_phase, branch_name, error_count, archived_at FROM devbrain.factory_jobs WHERE project_id = $1 AND status IN (\'deployed\', \'failed\', \'approved\', \'rejected\') AND (archived_at IS NULL OR archived_at > now() - interval \'24 hours\') ORDER BY updated_at DESC LIMIT 5', [projectId]),
     ])
 
     const ctx = {
@@ -89,7 +90,8 @@ server.tool(
       recent_decisions: decisions.rows,
       recent_issues: issues.rows,
       relevant_patterns: patterns.rows,
-      active_factory_jobs: jobs.rows,
+      active_factory_jobs: activeJobs.rows,
+      recent_completed_jobs: inactiveJobs.rows,
     }
 
     return {
