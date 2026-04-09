@@ -76,6 +76,12 @@ factory:
     review_security: claude   # Security/HIPAA review
     fix: claude               # Fix loop
     # qa: local — QA runs lint/test commands directly, no LLM
+  cleanup:
+    soft_timer_seconds: 600       # 10 min — triggers self-assessment
+    extension_seconds: 300        # 5 min per extension
+    hard_ceiling_seconds: 1800    # 30 min — absolute maximum
+    auto_archive_after_hours: 24  # Archive completed jobs after 24h in context
+    branch_cleanup: true          # Delete branches for failed/rejected jobs
 
 notifications:
   desktop:

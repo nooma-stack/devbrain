@@ -14,19 +14,33 @@ import subprocess
 import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
+
+import yaml
 
 from state_machine import FactoryDB, FactoryJob, JobStatus
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+_CONFIG_PATH = Path(__file__).parent.parent / "config" / "devbrain.yaml"
+with open(_CONFIG_PATH) as _f:
+    _config = yaml.safe_load(_f)
+_CLEANUP_CONFIG = _config.get("factory", {}).get("cleanup", {})
+
+# ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-SOFT_TIMER_SECONDS = 600       # 10 minutes
-EXTENSION_SECONDS = 300        # 5 minutes
-HARD_CEILING_SECONDS = 1800    # 30 minutes
+# Timing configuration — from config with defaults
+SOFT_TIMER_SECONDS = _CLEANUP_CONFIG.get("soft_timer_seconds", 600)
+EXTENSION_SECONDS = _CLEANUP_CONFIG.get("extension_seconds", 300)
+HARD_CEILING_SECONDS = _CLEANUP_CONFIG.get("hard_ceiling_seconds", 1800)
+BRANCH_CLEANUP_ENABLED = _CLEANUP_CONFIG.get("branch_cleanup", True)
 
 TERMINAL_STATES = {JobStatus.APPROVED, JobStatus.REJECTED, JobStatus.DEPLOYED, JobStatus.FAILED}
 SUCCESS_STATES = {JobStatus.APPROVED, JobStatus.DEPLOYED, JobStatus.READY_FOR_APPROVAL}
@@ -313,6 +327,10 @@ class CleanupAgent:
 
     def _cleanup_branch(self, job: FactoryJob) -> None:
         """Best-effort delete the git branch for failed/rejected jobs."""
+        if not BRANCH_CLEANUP_ENABLED:
+            logger.debug("Branch cleanup disabled by config for job %s", job.id[:8])
+            return
+
         branch = job.branch_name or job.metadata.get("branch")
         if not branch:
             logger.debug("No branch to clean up for job %s", job.id[:8])
