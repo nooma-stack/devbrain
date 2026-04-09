@@ -223,6 +223,14 @@ IMPLEMENTATION PLAN:
 
 {DEVBRAIN_INSTRUCTIONS}
 
+## Before Implementing — Search DevBrain
+
+Before writing any code, search DevBrain for:
+1. Past patterns used in this project (type="pattern") — follow established patterns
+2. Past issues/bugs found in similar features (type="issue") — avoid repeating mistakes
+3. Relevant architecture decisions (type="decision") — respect prior decisions
+Use what you find to avoid repeating past mistakes and follow established patterns.
+
 ## Your Job
 
 1. Search DevBrain for relevant patterns and past decisions before coding
@@ -328,6 +336,11 @@ DIFF:
 
 {DEVBRAIN_INSTRUCTIONS}
 
+## Before Reviewing — Search DevBrain
+
+Before reviewing, search DevBrain for past review findings on similar features in this project.
+If you find relevant past findings, check whether those same issues appear in this diff.
+
 ## Review Checklist
 
 1. Code quality and maintainability
@@ -373,6 +386,11 @@ DIFF:
 {diff_content}
 
 {DEVBRAIN_INSTRUCTIONS}
+
+## Before Reviewing — Search DevBrain
+
+Before reviewing, search DevBrain for past security findings and compliance issues in this project.
+If you find relevant past findings, check whether those same issues appear in this diff.
 
 ## Review Checklist
 

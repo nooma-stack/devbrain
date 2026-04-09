@@ -17,20 +17,16 @@ import re
 import subprocess
 from pathlib import Path
 
-from config import ADAPTER_CONFIG
+from config import ADAPTER_CONFIG, load_config
 from db import get_connection, get_project_id
 from embeddings import embed
 
-# File types to index
-INDEXABLE_EXTENSIONS = {
-    ".py", ".ts", ".tsx", ".js", ".jsx", ".sql", ".sh",
-    ".yaml", ".yml", ".json", ".toml", ".md",
-}
-
-# Directories to skip
-SKIP_DIRS = {
-    "node_modules", ".venv", "__pycache__", "dist", "build",
-    ".next", ".git", ".openclaw", ".claude", "vendor",
+# Load file types and ignore patterns from config
+_config = load_config()
+_indexer_config = _config["ingest"]["codebase_indexer"]
+INDEXABLE_EXTENSIONS = {f".{ft}" for ft in _indexer_config["file_types"]}
+SKIP_DIRS = set(_indexer_config["ignore_patterns"]) | {
+    ".git", ".openclaw", ".claude", "vendor",
     "coverage", ".pytest_cache", ".mypy_cache", ".ruff_cache",
 }
 
@@ -150,11 +146,34 @@ def extract_typescript_info(content: str) -> tuple[list[str], list[str], str]:
 def extract_file_info(path: Path, content: str) -> tuple[list[str], list[str], str]:
     """Extract imports, exports, and summary based on file type."""
     if path.suffix == ".py":
-        return extract_python_info(content)
+        imports, exports, _summary = extract_python_info(content)
     elif path.suffix in (".ts", ".tsx", ".js", ".jsx"):
-        return extract_typescript_info(content)
+        imports, exports, _summary = extract_typescript_info(content)
+    elif path.suffix == ".sql":
+        imports = []
+        exports = []
+        for m in re.finditer(
+            r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|VIEW|FUNCTION|INDEX|TYPE)\s+(?:IF\s+NOT\s+EXISTS\s+)?([\w.]+)",
+            content, re.IGNORECASE,
+        ):
+            exports.append(m.group(1))
+        _summary = ""
     else:
         return [], [], f"{path.suffix} file, {len(content)} chars"
+
+    # Build structured summary matching USF spec format
+    file_type = path.suffix.lstrip(".")
+    import_names = []
+    for imp in imports:
+        # Extract module name from full import line
+        m = re.match(r"(?:from\s+)?([\w.]+)", imp.strip())
+        if m:
+            import_names.append(m.group(1))
+    import_list = ", ".join(import_names[:20])
+    if len(import_names) > 20:
+        import_list += f" (+{len(import_names) - 20} more)"
+    summary = f"{file_type} file: {len(exports)} exports, imports: [{import_list}]"
+    return imports, exports, summary
 
 
 def upsert_file_index(
@@ -194,8 +213,31 @@ def upsert_file_index(
         conn.commit()
 
 
-def index_project(project: dict, full: bool = False) -> int:
-    """Index a single project. Returns number of files indexed."""
+def index_project(project_slug_or_dict, full: bool = False) -> int:
+    """Index a single project by slug string or project dict. Returns number of files indexed."""
+    # Support both slug string and dict for backward compatibility
+    if isinstance(project_slug_or_dict, str):
+        pid = get_project_id(project_slug_or_dict)
+        if not pid:
+            print(f"Project '{project_slug_or_dict}' not found in devbrain.projects")
+            return 0
+        with get_connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, slug, root_path FROM devbrain.projects WHERE id = %s",
+                (pid,),
+            )
+            row = cur.fetchone()
+            if not row or not row[2]:
+                print(f"No root_path set for project '{project_slug_or_dict}'")
+                return 0
+            project = {"id": str(row[0]), "slug": row[1], "root_path": row[2]}
+    else:
+        project = project_slug_or_dict
+    return _index_project_impl(project, full=full)
+
+
+def _index_project_impl(project: dict, full: bool = False) -> int:
+    """Index a single project (internal implementation). Returns number of files indexed."""
     root = Path(project["root_path"]).expanduser()
     if not root.exists():
         print(f"  Skipping {project['slug']}: {root} not found")
@@ -294,7 +336,7 @@ def main():
     total = 0
     for project in projects:
         print(f"\nIndexing {project['slug']}...")
-        count = index_project(project, full=args.full)
+        count = _index_project_impl(project, full=args.full)
         total += count
 
     print(f"\n{'='*60}")

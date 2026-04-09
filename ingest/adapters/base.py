@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
@@ -40,6 +41,33 @@ class UniversalSession:
                 prefix = f"[{msg.timestamp}] [{msg.role}]"
             lines.append(f"{prefix} {msg.content[:2000]}")
         return "\n".join(lines)
+
+    def to_json(self) -> str:
+        """Serialize to structured USF JSON format."""
+        return json.dumps(
+            {
+                "usf_version": "1.0",
+                "source_app": self.source_app,
+                "session_id": self.session_id,
+                "project": self.project_slug,
+                "model": self.model,
+                "started_at": self.started_at,
+                "ended_at": self.ended_at,
+                "message_count": self.message_count,
+                "files_changed": self.files_changed,
+                "messages": [
+                    {
+                        "role": msg.role,
+                        "timestamp": msg.timestamp,
+                        "content": msg.content,
+                        "tool_calls": msg.tool_calls,
+                        "files_touched": msg.files_touched,
+                    }
+                    for msg in self.messages
+                ],
+            },
+            ensure_ascii=False,
+        )
 
 
 class TranscriptAdapter(Protocol):

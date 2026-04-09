@@ -72,13 +72,16 @@ def _process_session(session: UniversalSession, source_path: Path, source_hash: 
     if session.project_slug:
         project_id = get_project_id(session.project_slug)
 
-    # Convert to text for storage and chunking
+    # Structured USF JSON for raw_content storage (structured access later)
     # Strip NUL bytes — PostgreSQL TEXT columns reject them
+    raw_json = session.to_json().replace("\x00", "")
+
+    # Plain text for chunking/embedding (embeddings work better on plain text)
     raw_text = session.to_text().replace("\x00", "")
 
-    print(f"  {'Updating' if is_update else 'Storing'} raw session ({session.message_count} messages, {len(raw_text)} chars)...")
+    print(f"  {'Updating' if is_update else 'Storing'} raw session ({session.message_count} messages, {len(raw_json)} chars JSON)...")
 
-    # Store or update raw session
+    # Store or update raw session — raw_content gets the structured JSON
     session_db_id = insert_raw_session(
         project_id=project_id,
         source_app=session.source_app,
@@ -89,7 +92,7 @@ def _process_session(session: UniversalSession, source_path: Path, source_hash: 
         started_at=session.started_at,
         ended_at=session.ended_at,
         message_count=session.message_count,
-        raw_content=raw_text,
+        raw_content=raw_json,
         summary=None,  # Summarization handled separately
         files_touched=session.files_changed,
     )

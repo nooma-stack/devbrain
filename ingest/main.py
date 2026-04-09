@@ -2,9 +2,10 @@
 """DevBrain ingest — one-shot and watch modes.
 
 Usage:
-    python main.py scan          # One-shot: scan all known directories
-    python main.py watch         # Continuous: watch for new session files
-    python main.py file <path>   # Ingest a single file
+    python main.py scan              # One-shot: scan all known directories
+    python main.py watch             # Continuous: watch for new session files
+    python main.py file <path>       # Ingest a single file
+    python main.py index <project>   # Index codebase for a project
 """
 
 from __future__ import annotations
@@ -136,6 +137,10 @@ def main():
             print(f"File not found: {path}")
             sys.exit(1)
         ingest_file(path, force=True)
+    elif command == "index" and len(sys.argv) >= 3:
+        project_slug = sys.argv[2]
+        from codebase_indexer import index_project
+        index_project(project_slug)
     else:
         print(__doc__)
         sys.exit(1)
