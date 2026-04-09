@@ -20,6 +20,7 @@ from pathlib import Path
 from state_machine import FactoryDB, FactoryJob, JobStatus
 from cli_executor import run_cli, notify_desktop, DEFAULT_CLI_ASSIGNMENTS
 from learning import extract_lessons, get_review_lessons
+from cleanup_agent import CleanupAgent
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +71,7 @@ class FactoryOrchestrator:
         if not job:
             raise ValueError(f"Job {job_id} not found")
 
+        cleanup = CleanupAgent(self.db)
         logger.info("Starting pipeline for job %s: %s", job_id[:8], job.title)
 
         while job.status not in (
@@ -89,10 +91,30 @@ class FactoryOrchestrator:
                 job = self._run_qa(job)
             elif job.status == JobStatus.FIX_LOOP:
                 if job.error_count >= job.max_retries:
-                    job = self.db.transition(job.id, JobStatus.FAILED,
-                                             metadata={"failure": "max fix retries exceeded"})
-                    notify_desktop("DevBrain Factory", f"Job FAILED: {job.title} (max retries)")
-                    break
+                    # Attempt recovery before giving up
+                    recovery_report = cleanup.attempt_recovery(job)
+                    self.db.store_cleanup_report(
+                        job_id=job.id,
+                        report_type=recovery_report.report_type,
+                        outcome=recovery_report.outcome,
+                        summary=recovery_report.summary,
+                        phases_traversed=recovery_report.phases_traversed,
+                        artifacts_summary=recovery_report.artifacts_summary,
+                        recovery_diagnosis=recovery_report.recovery_diagnosis,
+                        recovery_action_taken=recovery_report.recovery_action_taken,
+                        time_elapsed_seconds=recovery_report.time_elapsed_seconds,
+                    )
+                    if recovery_report.outcome == "recovered":
+                        logger.info("Recovery succeeded for job %s, returning to IMPLEMENTING",
+                                    job.id[:8])
+                        job = self.db.transition(job.id, JobStatus.IMPLEMENTING)
+                        continue
+                    else:
+                        job = self.db.transition(job.id, JobStatus.FAILED,
+                                                 metadata={"failure": "max fix retries exceeded"})
+                        notify_desktop("DevBrain Factory",
+                                       f"Job FAILED: {job.title} (max retries, recovery attempted)")
+                        break
                 job = self._run_fix(job)
 
         if job.status == JobStatus.READY_FOR_APPROVAL:
@@ -108,6 +130,20 @@ class FactoryOrchestrator:
                                 len(lessons), job.id[:8])
             except Exception as e:
                 logger.warning("Learning loop failed (non-blocking): %s", e)
+
+        # Post-run cleanup for all terminal states
+        if job.status in (
+            JobStatus.READY_FOR_APPROVAL,
+            JobStatus.APPROVED,
+            JobStatus.REJECTED,
+            JobStatus.DEPLOYED,
+            JobStatus.FAILED,
+        ):
+            try:
+                cleanup.run_post_cleanup(job.id)
+                logger.info("Post-cleanup completed for job %s", job.id[:8])
+            except Exception as e:
+                logger.warning("Post-cleanup failed (non-blocking): %s", e)
 
         return job
 
