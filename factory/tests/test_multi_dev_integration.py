@@ -141,8 +141,8 @@ def test_expired_locks_get_cleaned_up_automatically(db):
     registry.release_locks(new_job.id)
 
 
-def test_waiting_job_has_blocked_by_set(db):
-    """A job transitioned to WAITING has blocked_by_job_id populated."""
+def test_blocked_job_has_blocked_by_set(db):
+    """A job transitioned to BLOCKED has blocked_by_job_id populated."""
     registry = FileRegistry(db)
 
     job_a = db.get_job(db.create_job(project_slug="devbrain", title="Blocker A integ", spec="Test"))
@@ -169,10 +169,10 @@ def test_waiting_job_has_blocked_by_set(db):
         )
         conn.commit()
     db.transition(job_b_id, JobStatus.PLANNING)
-    db.transition(job_b_id, JobStatus.WAITING)
+    db.transition(job_b_id, JobStatus.BLOCKED)
 
     job_b = db.get_job(job_b_id)
-    assert job_b.status == JobStatus.WAITING
+    assert job_b.status == JobStatus.BLOCKED
     assert job_b.blocked_by_job_id == job_a.id
 
     # Cleanup
