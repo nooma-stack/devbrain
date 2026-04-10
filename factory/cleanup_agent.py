@@ -101,6 +101,7 @@ class CleanupAgent:
             "job_started": f"🚀 Job started: {job.title}",
             "job_ready": f"✅ Job ready for review: {job.title}",
             "job_failed": f"❌ Job failed: {job.title}",
+            "blocked": f"🔒 Job blocked: {job.title}",
             "unblocked": f"🔓 Job unblocked: {job.title}",
             "needs_human": f"🤔 Job needs human input: {job.title}",
             "recovery_started": f"🛠 Recovery started: {job.title}",
@@ -282,6 +283,140 @@ class CleanupAgent:
             )
 
         return report
+
+    def investigate_block(self, job: FactoryJob, conflicts: list[dict]) -> CleanupReport:
+        """Mode 3 — called when a job transitions to BLOCKED.
+
+        Analyzes why the job is blocked, examines the blocking job's state,
+        evaluates whether the blocked job's plan is still viable, and recommends
+        a resolution action (proceed / replan / cancel / wait).
+
+        The report is stored in factory_cleanup_reports and its summary is
+        returned for inclusion in the notification to the dev.
+        """
+        start = time.monotonic()
+
+        # Collect conflicting file paths and blocking job ids
+        conflict_files = [c["file_path"] for c in conflicts]
+        blocking_job_ids = list({c["blocking_job_id"] for c in conflicts if c.get("blocking_job_id")})
+
+        # Get blocking job details
+        blocking_jobs_info: list[dict] = []
+        for bjid in blocking_job_ids:
+            bj = self.db.get_job(bjid)
+            if bj:
+                blocking_jobs_info.append({
+                    "id": bjid,
+                    "title": bj.title,
+                    "status": bj.status.value,
+                    "submitted_by": bj.submitted_by,
+                    "error_count": bj.error_count,
+                })
+
+        # Classify: active vs completed blockers
+        active_blockers = [
+            b for b in blocking_jobs_info
+            if b["status"] not in ("approved", "rejected", "deployed", "failed", "ready_for_approval")
+        ]
+        completed_blockers = [
+            b for b in blocking_jobs_info
+            if b["status"] in ("approved", "deployed", "ready_for_approval")
+        ]
+
+        # Determine recommendation
+        if active_blockers:
+            recommendation = "wait"
+            rationale = (
+                "Blocking job is still active. Coordinate with the other dev "
+                "to determine the right resolution."
+            )
+        elif completed_blockers:
+            recommendation = "replan"
+            rationale = (
+                "Blocking job has already completed. Since the codebase has "
+                "changed, replanning is strongly recommended to ensure your "
+                "plan still matches the current code."
+            )
+        else:
+            recommendation = "proceed"
+            rationale = "Blocking jobs are no longer active. Safe to proceed with original plan."
+
+        # Build the summary
+        summary_lines = [
+            f"🔒 Job '{job.title}' is blocked on file lock conflicts.",
+            "",
+            f"**Conflicting files** ({len(conflict_files)}):",
+        ]
+        for f in conflict_files:
+            summary_lines.append(f"  • {f}")
+
+        if blocking_jobs_info:
+            summary_lines.append("")
+            summary_lines.append("**Blocking jobs:**")
+            for bj in blocking_jobs_info:
+                dev_tag = f" ({bj['submitted_by']})" if bj.get("submitted_by") else ""
+                summary_lines.append(
+                    f"  • {bj['title']}{dev_tag} — status: {bj['status']}"
+                )
+
+        summary_lines.extend([
+            "",
+            "**Recommendation:** " + recommendation,
+            "",
+            rationale,
+            "",
+            "**To resolve:**",
+            "Ask your AI session: \"what's going on with my blocked job?\"",
+            "Your AI has access to this investigation via DevBrain MCP tools",
+            "(factory_status, factory_file_locks, deep_search) and can help",
+            "you decide between proceed, replan, or cancel.",
+            "",
+            "Or use CLI:",
+            f"  devbrain resolve {job.id[:8]} --proceed",
+            f"  devbrain resolve {job.id[:8]} --replan",
+            f"  devbrain resolve {job.id[:8]} --cancel",
+        ])
+        summary = "\n".join(summary_lines)
+
+        elapsed = int(time.monotonic() - start)
+
+        metadata = {
+            "conflict_files": conflict_files,
+            "blocking_job_ids": blocking_job_ids,
+            "blocking_jobs": blocking_jobs_info,
+            "blocking_dev_id": (
+                blocking_jobs_info[0]["submitted_by"]
+                if blocking_jobs_info and blocking_jobs_info[0].get("submitted_by")
+                else None
+            ),
+            "recommendation": recommendation,
+            "rationale": rationale,
+        }
+
+        # Persist
+        self.db.store_cleanup_report(
+            job_id=job.id,
+            report_type="blocked_investigation",
+            outcome="awaiting_resolution",
+            summary=summary,
+            recovery_diagnosis=rationale,
+            recovery_action_taken=f"recommendation: {recommendation}",
+            time_elapsed_seconds=elapsed,
+            metadata=metadata,
+        )
+
+        return CleanupReport(
+            job_id=job.id,
+            report_type="blocked_investigation",
+            outcome="awaiting_resolution",
+            summary=summary,
+            phases_traversed=[],
+            artifacts_summary={},
+            recovery_diagnosis=rationale,
+            recovery_action_taken=f"recommendation: {recommendation}",
+            time_elapsed_seconds=elapsed,
+            metadata=metadata,
+        )
 
     def _fire_notification(
         self,
