@@ -717,6 +717,102 @@ server.tool(
   },
 )
 
+// ─── Tool: devbrain_resolve_blocked ──────────────────────────────────────
+
+server.tool(
+  'devbrain_resolve_blocked',
+  'Resolve a blocked factory job. Call after investigating via factory_status/factory_file_locks and discussing with the dev. Sets the resolution and spawns a factory process to execute it.',
+  {
+    job_id: z.string().describe('Job ID (full UUID or first 8 chars)'),
+    action: z.enum(['proceed', 'replan', 'cancel']).describe(
+      'proceed: use original plan once locks free. replan: re-run planning with updated code. cancel: kill the job.'
+    ),
+    notes: z.string().optional().describe('Optional notes about why this decision was made'),
+  },
+  async ({ job_id, action, notes }) => {
+    // Resolve short job_id to full UUID if needed
+    let fullJobId = job_id
+    if (job_id.length < 32) {
+      const result = await query<{ id: string }>(
+        "SELECT id FROM devbrain.factory_jobs WHERE id::text LIKE $1 AND status = 'blocked' LIMIT 1",
+        [`${job_id}%`],
+      )
+      if (result.rows.length === 0) {
+        return {
+          content: [{
+            type: 'text',
+            text: `No blocked job found matching "${job_id}".`,
+          }],
+        }
+      }
+      fullJobId = result.rows[0].id
+    }
+
+    // Verify the job exists and is blocked
+    const job = await query(
+      "SELECT id, title, status, submitted_by FROM devbrain.factory_jobs WHERE id = $1",
+      [fullJobId],
+    )
+
+    if (job.rows.length === 0) {
+      return {
+        content: [{
+          type: 'text',
+          text: `Job ${fullJobId} not found.`,
+        }],
+      }
+    }
+
+    const status = job.rows[0].status as string
+    const title = job.rows[0].title as string
+
+    if (status !== 'blocked') {
+      return {
+        content: [{
+          type: 'text',
+          text: `Job "${title}" is not blocked (status: ${status}). Cannot apply resolution.`,
+        }],
+      }
+    }
+
+    // Write resolution + notes to the DB
+    await query(
+      `UPDATE devbrain.factory_jobs
+       SET blocked_resolution = $1,
+           metadata = metadata || jsonb_build_object('resolution_notes', $2::text),
+           updated_at = now()
+       WHERE id = $3`,
+      [action, notes ?? '', fullJobId],
+    )
+
+    // Spawn a detached factory process to execute the resolution
+    try {
+      const factoryPython = resolve(import.meta.dirname, '../../.venv/bin/python')
+      const child = spawn(factoryPython, [FACTORY_RUNNER, fullJobId], {
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        cwd: resolve(import.meta.dirname, '../..'),
+      })
+      child.unref()
+      console.error(`[factory] Spawned resolver for blocked job ${fullJobId.slice(0, 8)} (pid ${child.pid})`)
+    } catch (err) {
+      return {
+        content: [{
+          type: 'text',
+          text: `Resolution "${action}" saved but factory spawn failed: ${err}. Run manually: python factory/run.py ${fullJobId}`,
+        }],
+      }
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: `✅ Resolution "${action}" applied to job "${title}" (${fullJobId.slice(0, 8)}). Factory process spawned to execute.`,
+      }],
+    }
+  },
+)
+
 // ─── Start server ────────────────────────────────────────────────────────────
 
 async function main() {
