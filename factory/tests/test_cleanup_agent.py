@@ -162,3 +162,43 @@ class TestAttemptRecovery:
         assert report.job_id == job_id
         assert report.report_type == "recovery"
         assert report.recovery_diagnosis is not None
+
+
+def test_post_cleanup_releases_file_locks(db, agent):
+    """Post-run cleanup releases all file locks held by the job."""
+    from file_registry import FileRegistry
+
+    registry = FileRegistry(db)
+
+    # Create a failed job
+    job_id = db.create_job(project_slug="devbrain", title="Lock release test task6", spec="Test")
+    db.transition(job_id, JobStatus.PLANNING)
+    db.transition(job_id, JobStatus.FAILED)
+
+    job = db.get_job(job_id)
+    registry.acquire_locks(
+        job_id=job.id,
+        project_id=job.project_id,
+        file_paths=["src/cleanup_lock_a_task6.py", "src/cleanup_lock_b_task6.py"],
+        dev_id="alice",
+    )
+
+    # Verify locks exist
+    assert len(registry.get_job_locks(job.id)) == 2
+
+    # Run cleanup
+    agent.run_post_cleanup(job.id)
+
+    # Verify locks released
+    assert len(registry.get_job_locks(job.id)) == 0
+
+
+def test_cleanup_handles_jobs_with_no_locks(db, agent):
+    """Cleanup agent handles jobs that don't have any locks (no crash)."""
+    job_id = db.create_job(project_slug="devbrain", title="No locks task6", spec="Test")
+    db.transition(job_id, JobStatus.PLANNING)
+    db.transition(job_id, JobStatus.FAILED)
+
+    # Should complete without error even though no locks exist
+    report = agent.run_post_cleanup(job_id)
+    assert report["outcome"] == "failed"

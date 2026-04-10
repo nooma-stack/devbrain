@@ -19,6 +19,7 @@ from typing import Any
 
 import yaml
 
+from file_registry import FileRegistry
 from state_machine import FactoryDB, FactoryJob, JobStatus
 
 logger = logging.getLogger(__name__)
@@ -131,6 +132,23 @@ class CleanupAgent:
 
         # Archive the job
         self.db.archive_job(job_id)
+
+        # Release file locks held by this job
+        try:
+            registry = FileRegistry(self.db)
+            released = registry.release_locks(job_id)
+            if released > 0:
+                logger.info(
+                    "Cleanup released %d file locks for job %s",
+                    released, job_id[:8],
+                )
+            # Also clean up any expired locks globally (safety net)
+            registry.cleanup_expired_locks()
+        except Exception as e:
+            logger.warning(
+                "File lock cleanup failed for job %s: %s (non-blocking)",
+                job_id[:8], e,
+            )
 
         report = CleanupReport(
             job_id=job_id,
