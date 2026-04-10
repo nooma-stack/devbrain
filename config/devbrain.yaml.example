@@ -90,6 +90,7 @@ notifications:
     - job_started
     - job_ready
     - job_failed
+    - blocked              # NEW
     - lock_conflict
     - unblocked
     - needs_human

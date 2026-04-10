@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 class JobStatus(str, Enum):
     QUEUED = "queued"
     PLANNING = "planning"
-    WAITING = "waiting"            # Blocked by file lock conflicts
+    BLOCKED = "blocked"            # Was WAITING — conflicted on file locks, awaiting dev resolution
     IMPLEMENTING = "implementing"
     REVIEWING = "reviewing"
     QA = "qa"
@@ -42,8 +42,13 @@ class JobStatus(str, Enum):
 # Valid state transitions
 TRANSITIONS: dict[JobStatus, list[JobStatus]] = {
     JobStatus.QUEUED: [JobStatus.PLANNING],
-    JobStatus.PLANNING: [JobStatus.IMPLEMENTING, JobStatus.WAITING, JobStatus.FAILED],
-    JobStatus.WAITING: [JobStatus.IMPLEMENTING, JobStatus.FAILED],
+    JobStatus.PLANNING: [JobStatus.IMPLEMENTING, JobStatus.BLOCKED, JobStatus.FAILED],
+    JobStatus.BLOCKED: [
+        JobStatus.IMPLEMENTING,  # proceed resolution
+        JobStatus.PLANNING,      # replan resolution
+        JobStatus.REJECTED,      # cancel resolution
+        JobStatus.FAILED,        # safety net
+    ],
     JobStatus.IMPLEMENTING: [JobStatus.REVIEWING, JobStatus.FAILED],
     JobStatus.REVIEWING: [JobStatus.QA, JobStatus.FIX_LOOP, JobStatus.FAILED],
     JobStatus.QA: [JobStatus.READY_FOR_APPROVAL, JobStatus.FIX_LOOP, JobStatus.FAILED],
@@ -76,6 +81,7 @@ class FactoryJob:
     updated_at: datetime
     submitted_by: str | None = None
     blocked_by_job_id: str | None = None
+    blocked_resolution: str | None = None
 
 
 class FactoryDB:
@@ -143,7 +149,7 @@ class FactoryDB:
                        j.status, j.priority, j.branch_name, j.current_phase,
                        j.error_count, j.max_retries, j.assigned_cli, j.metadata,
                        j.created_at, j.updated_at,
-                       j.submitted_by, j.blocked_by_job_id
+                       j.submitted_by, j.blocked_by_job_id, j.blocked_resolution
                 FROM devbrain.factory_jobs j
                 JOIN devbrain.projects p ON j.project_id = p.id
                 WHERE j.id = %s
@@ -163,6 +169,7 @@ class FactoryDB:
                 created_at=row[14], updated_at=row[15],
                 submitted_by=row[16],
                 blocked_by_job_id=str(row[17]) if row[17] else None,
+                blocked_resolution=row[18],
             )
 
     def list_jobs(
@@ -197,7 +204,7 @@ class FactoryDB:
                        j.status, j.priority, j.branch_name, j.current_phase,
                        j.error_count, j.max_retries, j.assigned_cli, j.metadata,
                        j.created_at, j.updated_at,
-                       j.submitted_by, j.blocked_by_job_id
+                       j.submitted_by, j.blocked_by_job_id, j.blocked_resolution
                 FROM devbrain.factory_jobs j
                 JOIN devbrain.projects p ON j.project_id = p.id
                 {where}
@@ -216,6 +223,7 @@ class FactoryDB:
                     created_at=r[14], updated_at=r[15],
                     submitted_by=r[16],
                     blocked_by_job_id=str(r[17]) if r[17] else None,
+                    blocked_resolution=r[18],
                 )
                 for r in cur.fetchall()
             ]
@@ -260,6 +268,29 @@ class FactoryDB:
 
         logger.info("Job %s: %s → %s", job_id[:8], job.status.value, new_status.value)
         return self.get_job(job_id)
+
+    def set_blocked_resolution(self, job_id: str, resolution: str) -> None:
+        """Set the dev's resolution for a blocked job.
+
+        resolution: 'proceed' | 'replan' | 'cancel'
+        """
+        if resolution not in ("proceed", "replan", "cancel"):
+            raise ValueError(f"Invalid resolution: {resolution}")
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devbrain.factory_jobs SET blocked_resolution = %s, updated_at = now() WHERE id = %s",
+                (resolution, job_id),
+            )
+            conn.commit()
+
+    def clear_blocked_resolution(self, job_id: str) -> None:
+        """Clear the blocked_resolution field (called after factory consumes it)."""
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devbrain.factory_jobs SET blocked_resolution = NULL, updated_at = now() WHERE id = %s",
+                (job_id,),
+            )
+            conn.commit()
 
     def store_artifact(
         self,
@@ -428,6 +459,7 @@ class FactoryDB:
         "job_started",
         "job_ready",
         "job_failed",
+        "blocked",                # NEW
         "lock_conflict",
         "unblocked",
         "needs_human",
