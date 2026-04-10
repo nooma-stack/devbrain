@@ -14,18 +14,20 @@ async def test_dashboard_mounts():
 
 
 @pytest.mark.asyncio
-async def test_dashboard_refresh_updates_loading():
-    """Calling refresh_data updates the loading label (success or error)."""
-    from textual.widgets import Static
+async def test_dashboard_shows_all_panels():
+    """All four panels are mounted on the dashboard."""
+    from dashboard.widgets.jobs_panel import ActiveJobsPanel
+    from dashboard.widgets.events_panel import RecentEventsPanel
+    from dashboard.widgets.locks_panel import FileLocksPanel
+    from dashboard.widgets.completed_panel import RecentCompletedPanel
 
     app = DashboardApp()
     async with app.run_test() as pilot:
         await pilot.pause(0.1)  # let on_mount fire
-        loading = app.query_one("#loading", Static)
-        # Static exposes its current content via .render()
-        text = str(loading.render())
-        # After refresh the label should no longer say "Loading..."
-        assert "Active jobs" in text or "Error" in text
+        assert app.query_one(ActiveJobsPanel) is not None
+        assert app.query_one(RecentEventsPanel) is not None
+        assert app.query_one(FileLocksPanel) is not None
+        assert app.query_one(RecentCompletedPanel) is not None
 
 
 @pytest.mark.asyncio

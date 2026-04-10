@@ -6,13 +6,19 @@ Polls DevBrain DB every REFRESH_INTERVAL seconds.
 
 from __future__ import annotations
 
+from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
 from textual.reactive import reactive
-from textual.widgets import Header, Footer, Label, Static
+from textual.widgets import Header, Footer, Label, Static, DataTable
 
 from state_machine import FactoryDB
 from dashboard.data import DashboardData
+from dashboard.widgets.jobs_panel import ActiveJobsPanel
+from dashboard.widgets.events_panel import RecentEventsPanel
+from dashboard.widgets.locks_panel import FileLocksPanel
+from dashboard.widgets.completed_panel import RecentCompletedPanel
+from dashboard.widgets.job_detail import JobDetailScreen
 
 DATABASE_URL = "postgresql://devbrain:devbrain-local@localhost:5433/devbrain"
 REFRESH_INTERVAL = 2.0  # seconds
@@ -56,7 +62,10 @@ class DashboardApp(App):
     def compose(self) -> ComposeResult:
         yield Header()
         with Container(id="main"):
-            yield Static("Loading...", id="loading")
+            yield ActiveJobsPanel(id="jobs-panel", classes="panel")
+            yield RecentEventsPanel(id="events-panel", classes="panel")
+            yield FileLocksPanel(id="locks-panel", classes="panel")
+            yield RecentCompletedPanel(id="completed-panel", classes="panel")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -65,18 +74,33 @@ class DashboardApp(App):
         self.refresh_data()
 
     def refresh_data(self) -> None:
-        """Poll the DB and update the dashboard. Subclasses will override."""
+        """Poll the DB and update all panels."""
         try:
             jobs = self.data.get_active_jobs(project=self.current_project)
-            loading = self.query_one("#loading", Static)
-            loading.update(f"Active jobs: {len(jobs)}")
+            events = self.data.get_recent_events(project=self.current_project)
+            locks = self.data.get_active_locks(project=self.current_project)
+            completed = self.data.get_recent_completed(project=self.current_project)
+
+            self.query_one("#jobs-panel", ActiveJobsPanel).update_jobs(jobs)
+            self.query_one("#events-panel", RecentEventsPanel).update_events(events)
+            self.query_one("#locks-panel", FileLocksPanel).update_locks(locks)
+            self.query_one("#completed-panel", RecentCompletedPanel).update_completed(completed)
         except Exception as e:
-            loading = self.query_one("#loading", Static)
-            loading.update(f"Error: {e}")
+            self.notify(f"Refresh error: {e}", severity="error")
 
     def action_refresh(self) -> None:
         """Manual refresh."""
         self.refresh_data()
+
+    @on(DataTable.RowSelected)
+    def handle_row_selected(self, event: DataTable.RowSelected) -> None:
+        """Open the job detail modal when a row is selected."""
+        row_key = event.row_key.value if event.row_key else None
+        if not row_key:
+            return
+        details = self.data.get_job_details(row_key)
+        if details:
+            self.push_screen(JobDetailScreen(details))
 
 
 def main():
