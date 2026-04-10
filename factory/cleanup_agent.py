@@ -20,6 +20,7 @@ from typing import Any
 import yaml
 
 from file_registry import FileRegistry
+from notifications.router import NotificationRouter, NotificationEvent
 from state_machine import FactoryDB, FactoryJob, JobStatus
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,22 @@ class CleanupAgent:
 
     def __init__(self, db: FactoryDB):
         self.db = db
+
+    def _event_type_for_status(self, status: JobStatus) -> str | None:
+        """Map a terminal status to a notification event_type. Returns None for silent transitions."""
+        return {
+            JobStatus.READY_FOR_APPROVAL: "job_ready",
+            JobStatus.FAILED: "job_failed",
+        }.get(status)
+
+    def _notification_title(self, job: FactoryJob, event_type: str) -> str:
+        """Build a notification title from job + event."""
+        return {
+            "job_ready": f"✅ Job ready for review: {job.title}",
+            "job_failed": f"❌ Job failed: {job.title}",
+            "unblocked": f"🔓 Job unblocked: {job.title}",
+            "needs_human": f"🤔 Job needs human input: {job.title}",
+        }.get(event_type, f"Job update: {job.title}")
 
     # ------------------------------------------------------------------
     # Public API
@@ -159,6 +176,30 @@ class CleanupAgent:
             artifacts_summary=artifacts_summary,
             time_elapsed_seconds=elapsed,
         )
+
+        # Fire notification for this job's terminal state
+        try:
+            router = NotificationRouter(self.db)
+            event_type = self._event_type_for_status(job.status)
+            if event_type and job.submitted_by:
+                event = NotificationEvent(
+                    event_type=event_type,
+                    recipient_dev_id=job.submitted_by,
+                    title=self._notification_title(job, event_type),
+                    body=report.summary,
+                    job_id=job.id,
+                    metadata={
+                        "final_status": job.status.value,
+                        "error_count": job.error_count,
+                    },
+                )
+                router.send(event)
+        except Exception as e:
+            logger.warning(
+                "Notification dispatch failed for job %s: %s (non-blocking)",
+                job_id[:8], e,
+            )
+
         return report.to_dict()
 
     def attempt_recovery(self, job: FactoryJob) -> CleanupReport:
@@ -200,6 +241,22 @@ class CleanupAgent:
             recovery_action_taken=recovery_action,
             time_elapsed_seconds=elapsed,
         )
+
+        if outcome == "needs_human":
+            # Fire needs_human notification
+            try:
+                router = NotificationRouter(self.db)
+                if job.submitted_by:
+                    router.send(NotificationEvent(
+                        event_type="needs_human",
+                        recipient_dev_id=job.submitted_by,
+                        title=f"🤔 Job needs human input: {job.title}",
+                        body=report.summary,
+                        job_id=job.id,
+                    ))
+            except Exception as e:
+                logger.warning("needs_human notification failed: %s", e)
+
         return report
 
     # ------------------------------------------------------------------
