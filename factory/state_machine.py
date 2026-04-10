@@ -421,3 +421,262 @@ class FactoryDB:
         """Get the next queued job (highest priority, oldest first)."""
         jobs = self.list_jobs(project_slug=project_slug, status=JobStatus.QUEUED)
         return jobs[0] if jobs else None
+
+    # ─── Devs + Notifications CRUD ───────────────────────────────────────────
+
+    DEFAULT_EVENT_SUBSCRIPTIONS = [
+        "job_ready",
+        "job_failed",
+        "lock_conflict",
+        "unblocked",
+        "needs_human",
+    ]
+
+    def register_dev(
+        self,
+        dev_id: str,
+        full_name: str | None = None,
+        channels: list[dict] | None = None,
+        event_subscriptions: list[str] | None = None,
+    ) -> str:
+        """UPSERT a dev into devbrain.devs. Returns the row id as a string.
+
+        On conflict, channels/event_subscriptions/updated_at are updated.
+        full_name is preserved when the new value is None.
+        """
+        channels = channels or []
+        event_subscriptions = (
+            event_subscriptions
+            if event_subscriptions is not None
+            else list(self.DEFAULT_EVENT_SUBSCRIPTIONS)
+        )
+
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO devbrain.devs
+                    (dev_id, full_name, channels, event_subscriptions)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (dev_id) DO UPDATE SET
+                    full_name = COALESCE(EXCLUDED.full_name, devbrain.devs.full_name),
+                    channels = EXCLUDED.channels,
+                    event_subscriptions = EXCLUDED.event_subscriptions,
+                    updated_at = now()
+                RETURNING id
+                """,
+                (
+                    dev_id,
+                    full_name,
+                    json.dumps(channels),
+                    json.dumps(event_subscriptions),
+                ),
+            )
+            row_id = str(cur.fetchone()[0])
+            conn.commit()
+            return row_id
+
+    def get_dev(self, dev_id: str) -> dict | None:
+        """Return a dev as a dict, or None if not found."""
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, dev_id, full_name, channels, event_subscriptions,
+                       created_at, updated_at
+                FROM devbrain.devs
+                WHERE dev_id = %s
+                """,
+                (dev_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            return {
+                "id": str(row[0]),
+                "dev_id": row[1],
+                "full_name": row[2],
+                "channels": row[3] or [],
+                "event_subscriptions": row[4] or [],
+                "created_at": row[5],
+                "updated_at": row[6],
+            }
+
+    def list_devs(self) -> list[dict]:
+        """Return all devs ordered by dev_id."""
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, dev_id, full_name, channels, event_subscriptions,
+                       created_at, updated_at
+                FROM devbrain.devs
+                ORDER BY dev_id ASC
+                """
+            )
+            return [
+                {
+                    "id": str(r[0]),
+                    "dev_id": r[1],
+                    "full_name": r[2],
+                    "channels": r[3] or [],
+                    "event_subscriptions": r[4] or [],
+                    "created_at": r[5],
+                    "updated_at": r[6],
+                }
+                for r in cur.fetchall()
+            ]
+
+    def add_dev_channel(self, dev_id: str, channel: dict) -> None:
+        """Append a channel to the dev's channel list, de-duplicating on type+address."""
+        dev = self.get_dev(dev_id)
+        if not dev:
+            raise ValueError(f"Dev '{dev_id}' not found")
+
+        new_type = channel.get("type")
+        new_address = channel.get("address")
+
+        filtered = [
+            c
+            for c in dev["channels"]
+            if not (c.get("type") == new_type and c.get("address") == new_address)
+        ]
+        filtered.append(channel)
+
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE devbrain.devs
+                   SET channels = %s,
+                       updated_at = now()
+                 WHERE dev_id = %s
+                """,
+                (json.dumps(filtered), dev_id),
+            )
+            conn.commit()
+
+    def remove_dev_channel(
+        self,
+        dev_id: str,
+        channel_type: str,
+        address: str | None = None,
+    ) -> None:
+        """Remove channels matching channel_type (and optionally address)."""
+        dev = self.get_dev(dev_id)
+        if not dev:
+            raise ValueError(f"Dev '{dev_id}' not found")
+
+        def keep(c: dict) -> bool:
+            if c.get("type") != channel_type:
+                return True
+            if address is not None and c.get("address") != address:
+                return True
+            return False
+
+        filtered = [c for c in dev["channels"] if keep(c)]
+
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE devbrain.devs
+                   SET channels = %s,
+                       updated_at = now()
+                 WHERE dev_id = %s
+                """,
+                (json.dumps(filtered), dev_id),
+            )
+            conn.commit()
+
+    def record_notification(
+        self,
+        recipient_dev_id: str,
+        event_type: str,
+        title: str,
+        body: str,
+        job_id: str | None = None,
+        channels_attempted: list | None = None,
+        channels_delivered: list | None = None,
+        delivery_errors: dict | None = None,
+        metadata: dict | None = None,
+    ) -> str:
+        """Insert a notification record and return its id."""
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO devbrain.notifications
+                    (recipient_dev_id, job_id, event_type, title, body,
+                     channels_attempted, channels_delivered, delivery_errors,
+                     metadata)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    recipient_dev_id,
+                    job_id,
+                    event_type,
+                    title,
+                    body,
+                    json.dumps(channels_attempted or []),
+                    json.dumps(channels_delivered or []),
+                    json.dumps(delivery_errors or {}),
+                    json.dumps(metadata or {}),
+                ),
+            )
+            notification_id = str(cur.fetchone()[0])
+            conn.commit()
+            return notification_id
+
+    def get_notifications(
+        self,
+        recipient_dev_id: str | None = None,
+        job_id: str | None = None,
+        event_type: str | None = None,
+        since_hours: int | None = None,
+        limit: int = 50,
+    ) -> list[dict]:
+        """Return notifications matching the given filters, newest first."""
+        conditions: list[str] = []
+        params: list = []
+
+        if recipient_dev_id is not None:
+            conditions.append("recipient_dev_id = %s")
+            params.append(recipient_dev_id)
+        if job_id is not None:
+            conditions.append("job_id = %s")
+            params.append(job_id)
+        if event_type is not None:
+            conditions.append("event_type = %s")
+            params.append(event_type)
+        if since_hours is not None:
+            conditions.append("sent_at >= now() - (%s || ' hours')::interval")
+            params.append(str(since_hours))
+
+        where = "WHERE " + " AND ".join(conditions) if conditions else ""
+        params.append(limit)
+
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT id, recipient_dev_id, job_id, event_type, title, body,
+                       channels_attempted, channels_delivered, delivery_errors,
+                       sent_at, metadata
+                FROM devbrain.notifications
+                {where}
+                ORDER BY sent_at DESC
+                LIMIT %s
+                """,
+                params,
+            )
+            return [
+                {
+                    "id": str(r[0]),
+                    "recipient_dev_id": r[1],
+                    "job_id": str(r[2]) if r[2] else None,
+                    "event_type": r[3],
+                    "title": r[4],
+                    "body": r[5],
+                    "channels_attempted": r[6] or [],
+                    "channels_delivered": r[7] or [],
+                    "delivery_errors": r[8] or {},
+                    "sent_at": r[9],
+                    "metadata": r[10] or {},
+                }
+                for r in cur.fetchall()
+            ]
