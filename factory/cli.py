@@ -235,6 +235,110 @@ def watch(dev):
         click.echo("\nStopped.")
 
 
+@cli.command(name="blocked")
+@click.option("--project", default=None, help="Filter by project slug")
+def blocked(project):
+    """List all currently blocked factory jobs."""
+    db = get_db()
+
+    with db._conn() as conn, conn.cursor() as cur:
+        sql = """
+            SELECT j.id, j.title, j.submitted_by, j.blocked_by_job_id,
+                   j.updated_at, p.slug
+            FROM devbrain.factory_jobs j
+            JOIN devbrain.projects p ON j.project_id = p.id
+            WHERE j.status = 'blocked'
+        """
+        params = []
+        if project:
+            sql += " AND p.slug = %s"
+            params.append(project)
+        sql += " ORDER BY j.updated_at DESC"
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+
+    if not rows:
+        click.echo("No blocked jobs.")
+        return
+
+    for r in rows:
+        job_id, title, submitted_by, blocked_by, updated_at, slug = r
+        click.echo(f"\n🔒 {title} [{slug}]")
+        click.echo(f"   ID: {str(job_id)[:8]}")
+        click.echo(f"   Submitted by: {submitted_by or '(unknown)'}")
+        click.echo(f"   Blocked by job: {str(blocked_by)[:8] if blocked_by else '(unknown)'}")
+        click.echo(f"   Blocked at: {updated_at}")
+
+
+@cli.command(name="resolve")
+@click.argument("job_id")
+@click.option("--proceed", "action", flag_value="proceed", help="Use original plan")
+@click.option("--replan", "action", flag_value="replan", help="Re-run planning with updated codebase")
+@click.option("--cancel", "action", flag_value="cancel", help="Cancel the job")
+@click.option("--notes", default=None, help="Optional notes about why")
+def resolve(job_id, action, notes):
+    """Resolve a blocked job."""
+    if not action:
+        click.echo("Error: must specify --proceed, --replan, or --cancel", err=True)
+        sys.exit(1)
+
+    db = get_db()
+
+    # Resolve short job_id to full UUID
+    with db._conn() as conn, conn.cursor() as cur:
+        if len(job_id) < 32:
+            cur.execute(
+                "SELECT id, title FROM devbrain.factory_jobs WHERE id::text LIKE %s AND status = 'blocked' LIMIT 1",
+                (f"{job_id}%",),
+            )
+        else:
+            cur.execute(
+                "SELECT id, title FROM devbrain.factory_jobs WHERE id = %s",
+                (job_id,),
+            )
+        row = cur.fetchone()
+
+    if not row:
+        click.echo(f"No blocked job found matching '{job_id}'.", err=True)
+        sys.exit(1)
+
+    full_id, title = row
+    full_id = str(full_id)
+
+    # Set the resolution
+    db.set_blocked_resolution(full_id, action)
+
+    # Add notes if provided
+    if notes:
+        import json as _json
+        with db._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                """UPDATE devbrain.factory_jobs
+                   SET metadata = metadata || %s::jsonb
+                   WHERE id = %s""",
+                (_json.dumps({"resolution_notes": notes}), full_id),
+            )
+            conn.commit()
+
+    click.echo(f"✅ Resolution '{action}' set for job '{title}' ({full_id[:8]})")
+
+    # Spawn factory process to execute
+    import subprocess
+    factory_runner = str(Path(__file__).parent / "run.py")
+    python_bin = str(Path(__file__).parent.parent / ".venv" / "bin" / "python")
+    try:
+        subprocess.Popen(
+            [python_bin, factory_runner, full_id],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        click.echo(f"   Factory process spawned to execute resolution.")
+    except Exception as e:
+        click.echo(f"   ⚠️  Failed to spawn factory: {e}", err=True)
+        click.echo(f"   Run manually: {python_bin} {factory_runner} {full_id}")
+
+
 @cli.command(name="telegram-discover")
 @click.option("--dev-id", default=None)
 @click.option("--username", default=None, help="Your Telegram username (optional)")
