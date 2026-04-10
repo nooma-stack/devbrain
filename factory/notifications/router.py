@@ -161,16 +161,21 @@ class NotificationRouter:
         )
 
     def send_multi(self, event: NotificationEvent) -> list[RouterResult]:
-        """For events that notify multiple devs (e.g., lock conflicts)."""
+        """For events that notify multiple devs (e.g., lock conflicts, blocked)."""
         results = [self.send(event)]
 
-        if event.event_type == "lock_conflict":
+        if event.event_type in ("lock_conflict", "blocked"):
             blocking_dev_id = event.metadata.get("blocking_dev_id")
             if blocking_dev_id and blocking_dev_id != event.recipient_dev_id:
+                title_prefix = (
+                    "Your job is blocking another dev's job"
+                    if event.event_type == "blocked"
+                    else f"Your job is blocking {event.recipient_dev_id}"
+                )
                 blocker_event = NotificationEvent(
-                    event_type="lock_conflict",
+                    event_type=event.event_type,
                     recipient_dev_id=blocking_dev_id,
-                    title=f"Your job is blocking {event.recipient_dev_id}",
+                    title=title_prefix,
                     body=(
                         f"Your factory job is holding file locks that another dev's job needs.\n\n"
                         f"{event.body}"

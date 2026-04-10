@@ -85,8 +85,16 @@ class FactoryOrchestrator:
         ):
             if job.status == JobStatus.QUEUED:
                 job = self._run_planning(job)
-            elif job.status == JobStatus.WAITING:
-                job = self._run_waiting(job)
+            elif job.status == JobStatus.BLOCKED:
+                job = self._run_blocked(job)
+                if job.status == JobStatus.BLOCKED:
+                    # Still blocked after handler — no resolution set, exit cleanly.
+                    # A new factory process will be spawned when dev resolves.
+                    logger.info(
+                        "Job %s is BLOCKED with no resolution — factory exiting",
+                        job.id[:8],
+                    )
+                    return job
             elif job.status == JobStatus.IMPLEMENTING:
                 job = self._run_implementation(job)
             elif job.status == JobStatus.REVIEWING:
@@ -279,23 +287,18 @@ Store the final plan in DevBrain using the store tool with type="decision"."""
             )
 
             if not lock_result.success:
-                # File conflicts — go to WAITING
-                blocking_job_id = lock_result.conflicts[0]["blocking_job_id"] if lock_result.conflicts else None
+                # File conflicts — investigate and transition to BLOCKED
+                blocking_job_id = (
+                    lock_result.conflicts[0]["blocking_job_id"]
+                    if lock_result.conflicts else None
+                )
+
                 logger.info(
-                    "Job %s has %d file conflicts — transitioning to WAITING",
+                    "Job %s has %d file conflicts — investigating",
                     job.id[:8], len(lock_result.conflicts),
                 )
-                notify_desktop(
-                    "DevBrain Factory",
-                    f"Job waiting on file locks: {job.title}",
-                )
-                self.db.store_artifact(
-                    job_id=job.id,
-                    phase="planning",
-                    artifact_type="lock_conflicts",
-                    content=json.dumps(lock_result.conflicts, indent=2),
-                )
-                # Set blocked_by_job_id via direct SQL (transition doesn't support this field)
+
+                # Set blocked_by_job_id via direct SQL
                 with self.db._conn() as conn, conn.cursor() as cur:
                     cur.execute(
                         "UPDATE devbrain.factory_jobs SET blocked_by_job_id = %s WHERE id = %s",
@@ -303,43 +306,59 @@ Store the final plan in DevBrain using the store tool with type="decision"."""
                     )
                     conn.commit()
 
-                # Look up blocking dev for notification
-                blocking_dev_id = None
-                if blocking_job_id:
-                    blocking_job = self.db.get_job(blocking_job_id)
-                    if blocking_job:
-                        blocking_dev_id = blocking_job.submitted_by
+                # Store conflicts artifact for reference
+                self.db.store_artifact(
+                    job_id=job.id,
+                    phase="planning",
+                    artifact_type="lock_conflicts",
+                    content=json.dumps(lock_result.conflicts, indent=2),
+                )
 
-                # Fire lock_conflict notification to both devs
+                # Transition to BLOCKED first so investigate_block sees correct state
+                blocked_job = self.db.transition(
+                    job.id, JobStatus.BLOCKED,
+                    metadata={"lock_conflicts": lock_result.conflicts},
+                )
+
+                # Run cleanup agent investigation
+                agent = CleanupAgent(self.db)
+                try:
+                    report = agent.investigate_block(blocked_job, lock_result.conflicts)
+                except Exception as e:
+                    logger.warning("Block investigation failed (non-blocking): %s", e)
+                    report = None
+
+                # Fire notification with the investigation report as the body
                 try:
                     from notifications.router import NotificationRouter, NotificationEvent
                     router = NotificationRouter(self.db)
-                    if job.submitted_by:
-                        conflict_files = [c["file_path"] for c in lock_result.conflicts]
+                    if blocked_job.submitted_by:
+                        notification_body = (
+                            report.summary if report
+                            else (
+                                "Your job is blocked on file lock conflicts.\n\n"
+                                f"Conflicting files: {', '.join(c['file_path'] for c in lock_result.conflicts)}"
+                            )
+                        )
+                        metadata = {
+                            "blocking_job_id": blocking_job_id,
+                            "conflicts": lock_result.conflicts,
+                        }
+                        if report:
+                            metadata["blocking_dev_id"] = report.metadata.get("blocking_dev_id")
+                            metadata["recommendation"] = report.metadata.get("recommendation")
                         router.send_multi(NotificationEvent(
-                            event_type="lock_conflict",
-                            recipient_dev_id=job.submitted_by,
-                            title=f"🔒 Job waiting on file locks: {job.title}",
-                            body=(
-                                "Your job is blocked by another dev's job.\n\n"
-                                "Conflicting files:\n" +
-                                "\n".join(f"  • {f}" for f in conflict_files) +
-                                (f"\n\nBlocking dev: {blocking_dev_id}" if blocking_dev_id else "")
-                            ),
+                            event_type="blocked",
+                            recipient_dev_id=blocked_job.submitted_by,
+                            title=f"🔒 Job blocked: {job.title}",
+                            body=notification_body,
                             job_id=job.id,
-                            metadata={
-                                "blocking_dev_id": blocking_dev_id,
-                                "blocking_job_id": blocking_job_id,
-                                "conflicts": lock_result.conflicts,
-                            },
+                            metadata=metadata,
                         ))
                 except Exception as e:
-                    logger.warning("Lock conflict notification failed: %s", e)
+                    logger.warning("Block notification failed: %s", e)
 
-                return self.db.transition(
-                    job.id, JobStatus.WAITING,
-                    metadata={"lock_conflicts": lock_result.conflicts},
-                )
+                return blocked_job
 
             # No conflicts — create branch and proceed
             slug = re.sub(r'[^a-z0-9-]', '-', job.title.lower())[:40].strip('-')
@@ -358,106 +377,156 @@ Store the final plan in DevBrain using the store tool with type="decision"."""
             return self.db.transition(job.id, JobStatus.FAILED,
                                       metadata={"failure": f"Planning failed: {result.stderr[:500]}"})
 
-    # ─── Waiting Phase ─────────────────────────────────────────────────────
+    # ─── Blocked Phase ─────────────────────────────────────────────────────
 
-    def _run_waiting(self, job: FactoryJob) -> FactoryJob:
-        """Waiting phase: job is blocked by file lock conflicts.
+    def _run_blocked(self, job: FactoryJob) -> FactoryJob:
+        """Blocked phase: job is waiting for dev resolution.
 
-        Poll the registry to see if the blocking job has released its locks.
-        Times out after 1 hour and fails the job.
+        Checks for a resolution set by the dev (via MCP tool or CLI). If set,
+        executes the resolution (cancel / proceed / replan). If not set,
+        returns the job unchanged — the factory process will exit and a new
+        one will be spawned when a resolution arrives.
         """
-        import time
+        resolution = job.blocked_resolution
+        if not resolution:
+            logger.info(
+                "Job %s is BLOCKED with no resolution — factory will exit",
+                job.id[:8],
+            )
+            return job  # No change — caller will break out of loop
 
+        logger.info("Job %s has resolution '%s', executing...", job.id[:8], resolution)
+
+        # Clear the resolution field so it's consumed exactly once
+        self.db.clear_blocked_resolution(job.id)
+
+        if resolution == "cancel":
+            return self._resolve_cancel(job)
+        elif resolution == "proceed":
+            return self._resolve_proceed(job)
+        elif resolution == "replan":
+            return self._resolve_replan(job)
+        else:
+            logger.warning(
+                "Unknown resolution '%s' for job %s, ignoring",
+                resolution, job.id[:8],
+            )
+            return job
+
+    def _resolve_cancel(self, job: FactoryJob) -> FactoryJob:
+        """Cancel a blocked job: release locks, transition to REJECTED."""
         registry = FileRegistry(self.db)
+        registry.release_locks(job.id)
 
-        # Get the files this job needs (from planning artifact)
+        # Clear blocked_by_job_id
+        with self.db._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devbrain.factory_jobs SET blocked_by_job_id = NULL WHERE id = %s",
+                (job.id,),
+            )
+            conn.commit()
+
+        return self.db.transition(
+            job.id, JobStatus.REJECTED,
+            metadata={"rejected_reason": "dev resolution: cancel (from BLOCKED)"},
+        )
+
+    def _resolve_proceed(self, job: FactoryJob) -> FactoryJob:
+        """Proceed with original plan: acquire locks (if free), transition to IMPLEMENTING."""
+        # Re-acquire locks — they should be free if the dev resolved correctly
         artifacts = self.db.get_artifacts(job.id, phase="planning")
         plan_artifact = next(
             (a for a in artifacts if a["artifact_type"] == "plan_doc"),
             None,
         )
-        if not plan_artifact:
-            logger.warning("WAITING job %s has no plan artifact — failing", job.id[:8])
-            return self.db.transition(
-                job.id, JobStatus.FAILED,
-                metadata={"failure": "No plan artifact for WAITING job"},
-            )
+        plan_files = extract_files_from_plan(plan_artifact["content"]) if plan_artifact else []
 
-        plan_files = extract_files_from_plan(plan_artifact["content"])
-
-        # Poll loop: check every 30 seconds, max 1 hour
-        max_wait_seconds = 3600
-        poll_interval = 30
-        waited = 0
-
-        while waited < max_wait_seconds:
-            # Clean up expired locks (safety net for crashed jobs)
-            registry.cleanup_expired_locks()
-
-            # Try to acquire locks
-            lock_result = registry.acquire_locks(
-                job_id=job.id,
-                project_id=job.project_id,
-                file_paths=plan_files,
-                dev_id=job.submitted_by,
-            )
-
-            if lock_result.success:
-                # Clear blocked_by_job_id
-                with self.db._conn() as conn, conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE devbrain.factory_jobs SET blocked_by_job_id = NULL WHERE id = %s",
-                        (job.id,),
-                    )
-                    conn.commit()
-
-                # Create branch and move to IMPLEMENTING
-                project_root = self._get_project_root(job)
-                slug = re.sub(r'[^a-z0-9-]', '-', job.title.lower())[:40].strip('-')
-                branch = f"factory/{job.id[:8]}/{slug}"
-                try:
-                    subprocess.run(
-                        ["git", "checkout", "-b", branch],
-                        cwd=project_root, capture_output=True, timeout=10,
-                    )
-                except Exception as e:
-                    logger.warning("Branch creation failed: %s", e)
-                    branch = None
-
-                logger.info("Job %s unblocked after %ds wait", job.id[:8], waited)
-                notify_desktop(
-                    "DevBrain Factory",
-                    f"Job unblocked: {job.title}",
-                )
-
-                # Fire unblocked notification
-                try:
-                    from notifications.router import NotificationRouter, NotificationEvent
-                    router = NotificationRouter(self.db)
-                    if job.submitted_by:
-                        router.send(NotificationEvent(
-                            event_type="unblocked",
-                            recipient_dev_id=job.submitted_by,
-                            title=f"🔓 Job unblocked: {job.title}",
-                            body="Your job is no longer blocked on file locks and is now implementing.",
-                            job_id=job.id,
-                        ))
-                except Exception as e:
-                    logger.warning("Unblock notification failed: %s", e)
-
-                return self.db.transition(
-                    job.id, JobStatus.IMPLEMENTING, branch_name=branch,
-                )
-
-            time.sleep(poll_interval)
-            waited += poll_interval
-
-        # Timeout — fail the job
-        logger.warning("Job %s waited %ds without clearing — failing", job.id[:8], waited)
-        return self.db.transition(
-            job.id, JobStatus.FAILED,
-            metadata={"failure": f"Waited {waited}s for file locks without clearing"},
+        registry = FileRegistry(self.db)
+        lock_result = registry.acquire_locks(
+            job_id=job.id,
+            project_id=job.project_id,
+            file_paths=plan_files,
+            dev_id=job.submitted_by,
         )
+
+        if not lock_result.success:
+            logger.warning(
+                "Job %s proceed resolution failed — locks still held",
+                job.id[:8],
+            )
+            self.db.store_artifact(
+                job_id=job.id,
+                phase="blocked",
+                artifact_type="proceed_failed",
+                content=json.dumps({
+                    "reason": "locks still held",
+                    "conflicts": lock_result.conflicts,
+                }),
+            )
+            return job  # Still BLOCKED
+
+        # Clear blocked_by_job_id
+        with self.db._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devbrain.factory_jobs SET blocked_by_job_id = NULL WHERE id = %s",
+                (job.id,),
+            )
+            conn.commit()
+
+        # Create branch (same logic as _run_planning success path)
+        project_root = self._get_project_root(job)
+        slug = re.sub(r'[^a-z0-9-]', '-', job.title.lower())[:40].strip('-')
+        branch = f"factory/{job.id[:8]}/{slug}"
+        try:
+            subprocess.run(
+                ["git", "checkout", "-b", branch],
+                cwd=project_root, capture_output=True, timeout=10,
+            )
+        except Exception as e:
+            logger.warning("Branch creation failed: %s", e)
+            branch = None
+
+        # Fire unblocked notification
+        self._fire_unblocked_notification(job)
+
+        return self.db.transition(
+            job.id, JobStatus.IMPLEMENTING, branch_name=branch,
+        )
+
+    def _resolve_replan(self, job: FactoryJob) -> FactoryJob:
+        """Replan: release stale locks, transition back to PLANNING with updated codebase."""
+        registry = FileRegistry(self.db)
+        registry.release_locks(job.id)
+
+        # Clear blocked_by_job_id
+        with self.db._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devbrain.factory_jobs SET blocked_by_job_id = NULL WHERE id = %s",
+                (job.id,),
+            )
+            conn.commit()
+
+        logger.info("Job %s replan resolution — returning to PLANNING", job.id[:8])
+        return self.db.transition(
+            job.id, JobStatus.PLANNING,
+            metadata={"replan_reason": "dev resolution from BLOCKED state"},
+        )
+
+    def _fire_unblocked_notification(self, job: FactoryJob) -> None:
+        """Helper: fire unblocked notification. Non-blocking."""
+        try:
+            from notifications.router import NotificationRouter, NotificationEvent
+            if job.submitted_by:
+                router = NotificationRouter(self.db)
+                router.send(NotificationEvent(
+                    event_type="unblocked",
+                    recipient_dev_id=job.submitted_by,
+                    title=f"🔓 Job unblocked: {job.title}",
+                    body="Your job is no longer blocked on file locks and is now implementing.",
+                    job_id=job.id,
+                ))
+        except Exception as e:
+            logger.warning("Unblock notification failed: %s", e)
 
     # ─── Implementation Phase ──────────────────────────────────────────────
 
