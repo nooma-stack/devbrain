@@ -147,26 +147,6 @@ class CleanupAgent:
             time_elapsed_seconds=elapsed,
         )
 
-        # Archive the job
-        self.db.archive_job(job_id)
-
-        # Release file locks held by this job
-        try:
-            registry = FileRegistry(self.db)
-            released = registry.release_locks(job_id)
-            if released > 0:
-                logger.info(
-                    "Cleanup released %d file locks for job %s",
-                    released, job_id[:8],
-                )
-            # Also clean up any expired locks globally (safety net)
-            registry.cleanup_expired_locks()
-        except Exception as e:
-            logger.warning(
-                "File lock cleanup failed for job %s: %s (non-blocking)",
-                job_id[:8], e,
-            )
-
         report = CleanupReport(
             job_id=job_id,
             report_type="post_run",
@@ -177,7 +157,9 @@ class CleanupAgent:
             time_elapsed_seconds=elapsed,
         )
 
-        # Fire notification for this job's terminal state
+        # Fire notification for this job's terminal state.
+        # Done BEFORE archive/lock release so that transient states like
+        # READY_FOR_APPROVAL (which cannot be archived) still dispatch.
         try:
             router = NotificationRouter(self.db)
             event_type = self._event_type_for_status(job.status)
@@ -197,6 +179,32 @@ class CleanupAgent:
         except Exception as e:
             logger.warning(
                 "Notification dispatch failed for job %s: %s (non-blocking)",
+                job_id[:8], e,
+            )
+
+        # Archive the job (only if in a terminal state the DB accepts)
+        try:
+            self.db.archive_job(job_id)
+        except ValueError as e:
+            logger.debug(
+                "Skipping archive for job %s: %s (non-terminal status)",
+                job_id[:8], e,
+            )
+
+        # Release file locks held by this job
+        try:
+            registry = FileRegistry(self.db)
+            released = registry.release_locks(job_id)
+            if released > 0:
+                logger.info(
+                    "Cleanup released %d file locks for job %s",
+                    released, job_id[:8],
+                )
+            # Also clean up any expired locks globally (safety net)
+            registry.cleanup_expired_locks()
+        except Exception as e:
+            logger.warning(
+                "File lock cleanup failed for job %s: %s (non-blocking)",
                 job_id[:8], e,
             )
 
