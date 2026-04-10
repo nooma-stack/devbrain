@@ -21,6 +21,8 @@ from state_machine import FactoryDB, FactoryJob, JobStatus
 from cli_executor import run_cli, notify_desktop, DEFAULT_CLI_ASSIGNMENTS
 from learning import extract_lessons, get_review_lessons
 from cleanup_agent import CleanupAgent
+from file_registry import FileRegistry
+from plan_parser import extract_files_from_plan
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +85,8 @@ class FactoryOrchestrator:
         ):
             if job.status == JobStatus.QUEUED:
                 job = self._run_planning(job)
+            elif job.status == JobStatus.WAITING:
+                job = self._run_waiting(job)
             elif job.status == JobStatus.IMPLEMENTING:
                 job = self._run_implementation(job)
             elif job.status == JobStatus.REVIEWING:
@@ -243,7 +247,48 @@ Store the final plan in DevBrain using the store tool with type="decision"."""
         )
 
         if result.success:
-            # Create branch for this job
+            # Extract files the plan will modify
+            plan_files = extract_files_from_plan(result.stdout)
+
+            # Attempt to acquire file locks
+            registry = FileRegistry(self.db)
+            lock_result = registry.acquire_locks(
+                job_id=job.id,
+                project_id=job.project_id,
+                file_paths=plan_files,
+                dev_id=job.submitted_by,
+            )
+
+            if not lock_result.success:
+                # File conflicts — go to WAITING
+                blocking_job_id = lock_result.conflicts[0]["blocking_job_id"] if lock_result.conflicts else None
+                logger.info(
+                    "Job %s has %d file conflicts — transitioning to WAITING",
+                    job.id[:8], len(lock_result.conflicts),
+                )
+                notify_desktop(
+                    "DevBrain Factory",
+                    f"Job waiting on file locks: {job.title}",
+                )
+                self.db.store_artifact(
+                    job_id=job.id,
+                    phase="planning",
+                    artifact_type="lock_conflicts",
+                    content=json.dumps(lock_result.conflicts, indent=2),
+                )
+                # Set blocked_by_job_id via direct SQL (transition doesn't support this field)
+                with self.db._conn() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE devbrain.factory_jobs SET blocked_by_job_id = %s WHERE id = %s",
+                        (blocking_job_id, job.id),
+                    )
+                    conn.commit()
+                return self.db.transition(
+                    job.id, JobStatus.WAITING,
+                    metadata={"lock_conflicts": lock_result.conflicts},
+                )
+
+            # No conflicts — create branch and proceed
             slug = re.sub(r'[^a-z0-9-]', '-', job.title.lower())[:40].strip('-')
             branch = f"factory/{job.id[:8]}/{slug}"
             try:
@@ -259,6 +304,91 @@ Store the final plan in DevBrain using the store tool with type="decision"."""
         else:
             return self.db.transition(job.id, JobStatus.FAILED,
                                       metadata={"failure": f"Planning failed: {result.stderr[:500]}"})
+
+    # ─── Waiting Phase ─────────────────────────────────────────────────────
+
+    def _run_waiting(self, job: FactoryJob) -> FactoryJob:
+        """Waiting phase: job is blocked by file lock conflicts.
+
+        Poll the registry to see if the blocking job has released its locks.
+        Times out after 1 hour and fails the job.
+        """
+        import time
+
+        registry = FileRegistry(self.db)
+
+        # Get the files this job needs (from planning artifact)
+        artifacts = self.db.get_artifacts(job.id, phase="planning")
+        plan_artifact = next(
+            (a for a in artifacts if a["artifact_type"] == "plan_doc"),
+            None,
+        )
+        if not plan_artifact:
+            logger.warning("WAITING job %s has no plan artifact — failing", job.id[:8])
+            return self.db.transition(
+                job.id, JobStatus.FAILED,
+                metadata={"failure": "No plan artifact for WAITING job"},
+            )
+
+        plan_files = extract_files_from_plan(plan_artifact["content"])
+
+        # Poll loop: check every 30 seconds, max 1 hour
+        max_wait_seconds = 3600
+        poll_interval = 30
+        waited = 0
+
+        while waited < max_wait_seconds:
+            # Clean up expired locks (safety net for crashed jobs)
+            registry.cleanup_expired_locks()
+
+            # Try to acquire locks
+            lock_result = registry.acquire_locks(
+                job_id=job.id,
+                project_id=job.project_id,
+                file_paths=plan_files,
+                dev_id=job.submitted_by,
+            )
+
+            if lock_result.success:
+                # Clear blocked_by_job_id
+                with self.db._conn() as conn, conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE devbrain.factory_jobs SET blocked_by_job_id = NULL WHERE id = %s",
+                        (job.id,),
+                    )
+                    conn.commit()
+
+                # Create branch and move to IMPLEMENTING
+                project_root = self._get_project_root(job)
+                slug = re.sub(r'[^a-z0-9-]', '-', job.title.lower())[:40].strip('-')
+                branch = f"factory/{job.id[:8]}/{slug}"
+                try:
+                    subprocess.run(
+                        ["git", "checkout", "-b", branch],
+                        cwd=project_root, capture_output=True, timeout=10,
+                    )
+                except Exception as e:
+                    logger.warning("Branch creation failed: %s", e)
+                    branch = None
+
+                logger.info("Job %s unblocked after %ds wait", job.id[:8], waited)
+                notify_desktop(
+                    "DevBrain Factory",
+                    f"Job unblocked: {job.title}",
+                )
+                return self.db.transition(
+                    job.id, JobStatus.IMPLEMENTING, branch_name=branch,
+                )
+
+            time.sleep(poll_interval)
+            waited += poll_interval
+
+        # Timeout — fail the job
+        logger.warning("Job %s waited %ds without clearing — failing", job.id[:8], waited)
+        return self.db.transition(
+            job.id, JobStatus.FAILED,
+            metadata={"failure": f"Waited {waited}s for file locks without clearing"},
+        )
 
     # ─── Implementation Phase ──────────────────────────────────────────────
 
