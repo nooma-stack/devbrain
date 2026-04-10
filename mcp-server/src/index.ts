@@ -76,13 +76,15 @@ server.tool(
       return { content: [{ type: 'text', text: `Project "${slug}" not found in DevBrain.` }] }
     }
 
-    const [projectInfo, decisions, issues, patterns, activeJobs, inactiveJobs] = await Promise.all([
+    const [projectInfo, decisions, issues, patterns, activeJobs, inactiveJobs, lockCount] = await Promise.all([
       query('SELECT name, description, root_path, constraints, tech_stack FROM devbrain.projects WHERE id = $1', [projectId]),
       query('SELECT title, decision, rationale, created_at FROM devbrain.decisions WHERE project_id = $1 AND status = \'active\' ORDER BY created_at DESC LIMIT 5', [projectId]),
       query('SELECT title, category, description, fix_applied, created_at FROM devbrain.issues WHERE project_id = $1 ORDER BY created_at DESC LIMIT 5', [projectId]),
       query('SELECT name, category, description FROM devbrain.patterns WHERE project_id = $1 ORDER BY created_at DESC LIMIT 5', [projectId]),
       query('SELECT title, status, current_phase, branch_name FROM devbrain.factory_jobs WHERE project_id = $1 AND status NOT IN (\'approved\', \'rejected\', \'deployed\', \'failed\') AND archived_at IS NULL ORDER BY created_at DESC LIMIT 5', [projectId]),
       query('SELECT title, status, current_phase, branch_name, error_count, archived_at FROM devbrain.factory_jobs WHERE project_id = $1 AND status IN (\'deployed\', \'failed\', \'approved\', \'rejected\') AND (archived_at IS NULL OR archived_at > now() - interval \'24 hours\') ORDER BY updated_at DESC LIMIT 5', [projectId]),
+      query(`SELECT COUNT(*) as count FROM devbrain.file_locks
+             WHERE project_id = $1 AND expires_at > now()`, [projectId]),
     ])
 
     const ctx = {
@@ -92,6 +94,7 @@ server.tool(
       relevant_patterns: patterns.rows,
       active_factory_jobs: activeJobs.rows,
       recent_completed_jobs: inactiveJobs.rows,
+      active_file_locks: Number(lockCount.rows[0]?.count ?? 0),
     }
 
     return {
@@ -409,8 +412,9 @@ server.tool(
     spec: z.string().describe('Feature requirements and description'),
     priority: z.number().optional().default(0).describe('Priority (higher = more urgent)'),
     assigned_cli: z.string().optional().describe('CLI to use: claude, codex, gemini (default: claude)'),
+    submitted_by: z.string().optional().describe('Dev identifier (SSH user) who submitted this job'),
   },
-  async ({ project, title, spec, priority, assigned_cli }) => {
+  async ({ project, title, spec, priority, assigned_cli, submitted_by }) => {
     const projectId = await resolveProjectId(project)
     if (!projectId) {
       return { content: [{ type: 'text', text: `Project "${project}" not found.` }] }
@@ -418,10 +422,10 @@ server.tool(
 
     const result = await query<{ id: string }>(
       `INSERT INTO devbrain.factory_jobs
-          (project_id, title, spec, status, priority, current_phase, assigned_cli, max_retries)
-       VALUES ($1, $2, $3, 'queued', $4, 'queued', $5, 5)
+          (project_id, title, spec, status, priority, current_phase, assigned_cli, max_retries, submitted_by)
+       VALUES ($1, $2, $3, 'queued', $4, 'queued', $5, 5, $6)
        RETURNING id`,
-      [projectId, title, spec, priority, assigned_cli ?? 'claude'],
+      [projectId, title, spec, priority, assigned_cli ?? 'claude', submitted_by ?? process.env.USER ?? null],
     )
 
     const jobId = result.rows[0].id
@@ -615,6 +619,52 @@ server.tool(
       content: [{
         type: 'text',
         text: `Job "${title}" archived successfully (status: ${status}).${reportInfo}`,
+      }],
+    }
+  },
+)
+
+// ─── Tool: factory_file_locks ───────────────────────────────────────────────
+
+server.tool(
+  'factory_file_locks',
+  'Show currently locked files in the factory. Use to debug why a job is WAITING, or see what other devs are working on.',
+  {
+    project: z.string().optional().describe('Project slug (defaults to DEVBRAIN_PROJECT)'),
+  },
+  async ({ project }) => {
+    const slug = project ?? DEFAULT_PROJECT
+    if (!slug) {
+      return { content: [{ type: 'text', text: 'No project specified.' }] }
+    }
+
+    const projectId = await resolveProjectId(slug)
+    if (!projectId) {
+      return { content: [{ type: 'text', text: `Project "${slug}" not found.` }] }
+    }
+
+    const result = await query(
+      `SELECT fl.file_path, fl.dev_id, fl.locked_at, fl.expires_at,
+              j.title as job_title, j.status as job_status, j.id as job_id
+       FROM devbrain.file_locks fl
+       JOIN devbrain.factory_jobs j ON fl.job_id = j.id
+       WHERE fl.project_id = $1 AND fl.expires_at > now()
+       ORDER BY fl.locked_at ASC`,
+      [projectId],
+    )
+
+    if (result.rows.length === 0) {
+      return { content: [{ type: 'text', text: `No file locks active for project "${slug}".` }] }
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          project: slug,
+          active_locks: result.rows.length,
+          locks: result.rows,
+        }, null, 2),
       }],
     }
   },
