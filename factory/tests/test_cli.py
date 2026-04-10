@@ -62,3 +62,10 @@ def test_history_nl_dry_run_handles_ollama(runner):
     ])
     # Either 0 (ollama returned SQL) or 1 (ollama unreachable)
     assert result.exit_code in (0, 1)
+
+
+def test_dashboard_command_exists(runner):
+    """devbrain dashboard is a registered command."""
+    result = runner.invoke(cli, ["dashboard", "--help"])
+    assert result.exit_code == 0
+    assert "dashboard" in result.output.lower()

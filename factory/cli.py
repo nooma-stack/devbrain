@@ -395,5 +395,22 @@ def telegram_discover(dev_id, username):
         click.echo(f"⚠️  Test failed: {result.error}")
 
 
+@cli.command(name="dashboard")
+@click.option("--project", default=None, help="Filter by project slug")
+def dashboard(project):
+    """Launch the DevBrain factory dashboard (TUI)."""
+    try:
+        from dashboard.app import DashboardApp
+    except ImportError as e:
+        click.echo(
+            f"Error: Textual not installed. Run: pip install textual\n{e}",
+            err=True,
+        )
+        sys.exit(1)
+
+    app = DashboardApp(project=project)
+    app.run()
+
+
 if __name__ == "__main__":
     cli()
