@@ -283,6 +283,40 @@ Store the final plan in DevBrain using the store tool with type="decision"."""
                         (blocking_job_id, job.id),
                     )
                     conn.commit()
+
+                # Look up blocking dev for notification
+                blocking_dev_id = None
+                if blocking_job_id:
+                    blocking_job = self.db.get_job(blocking_job_id)
+                    if blocking_job:
+                        blocking_dev_id = blocking_job.submitted_by
+
+                # Fire lock_conflict notification to both devs
+                try:
+                    from notifications.router import NotificationRouter, NotificationEvent
+                    router = NotificationRouter(self.db)
+                    if job.submitted_by:
+                        conflict_files = [c["file_path"] for c in lock_result.conflicts]
+                        router.send_multi(NotificationEvent(
+                            event_type="lock_conflict",
+                            recipient_dev_id=job.submitted_by,
+                            title=f"🔒 Job waiting on file locks: {job.title}",
+                            body=(
+                                "Your job is blocked by another dev's job.\n\n"
+                                "Conflicting files:\n" +
+                                "\n".join(f"  • {f}" for f in conflict_files) +
+                                (f"\n\nBlocking dev: {blocking_dev_id}" if blocking_dev_id else "")
+                            ),
+                            job_id=job.id,
+                            metadata={
+                                "blocking_dev_id": blocking_dev_id,
+                                "blocking_job_id": blocking_job_id,
+                                "conflicts": lock_result.conflicts,
+                            },
+                        ))
+                except Exception as e:
+                    logger.warning("Lock conflict notification failed: %s", e)
+
                 return self.db.transition(
                     job.id, JobStatus.WAITING,
                     metadata={"lock_conflicts": lock_result.conflicts},
@@ -376,6 +410,22 @@ Store the final plan in DevBrain using the store tool with type="decision"."""
                     "DevBrain Factory",
                     f"Job unblocked: {job.title}",
                 )
+
+                # Fire unblocked notification
+                try:
+                    from notifications.router import NotificationRouter, NotificationEvent
+                    router = NotificationRouter(self.db)
+                    if job.submitted_by:
+                        router.send(NotificationEvent(
+                            event_type="unblocked",
+                            recipient_dev_id=job.submitted_by,
+                            title=f"🔓 Job unblocked: {job.title}",
+                            body="Your job is no longer blocked on file locks and is now implementing.",
+                            job_id=job.id,
+                        ))
+                except Exception as e:
+                    logger.warning("Unblock notification failed: %s", e)
+
                 return self.db.transition(
                     job.id, JobStatus.IMPLEMENTING, branch_name=branch,
                 )
