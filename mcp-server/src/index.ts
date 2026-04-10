@@ -3,7 +3,9 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { spawn } from 'child_process'
-import { resolve } from 'path'
+import { writeFileSync, unlinkSync } from 'fs'
+import { tmpdir } from 'os'
+import { join, resolve } from 'path'
 import { z } from 'zod'
 import { query } from './db.js'
 import { embed, toSqlVector } from './embeddings.js'
@@ -620,6 +622,51 @@ server.tool(
         type: 'text',
         text: `Job "${title}" archived successfully (status: ${status}).${reportInfo}`,
       }],
+    }
+  },
+)
+
+// ─── Tool: devbrain_notify ─────────────────────────────────────────────
+
+server.tool(
+  'devbrain_notify',
+  'Send a notification to a registered dev through their configured channels (tmux, email, chat, telegram, webhooks). Use for agent-driven notifications during factory runs.',
+  {
+    recipient: z.string().describe('dev_id of the recipient (SSH username)'),
+    event_type: z.enum([
+      'job_ready', 'job_failed', 'lock_conflict',
+      'unblocked', 'needs_human',
+    ]).describe('Event type that determines notification routing'),
+    title: z.string().describe('Notification title'),
+    body: z.string().describe('Notification body'),
+  },
+  async ({ recipient, event_type, title, body }) => {
+    const titleFile = join(tmpdir(), `devbrain-notif-title-${Date.now()}.txt`)
+    const bodyFile = join(tmpdir(), `devbrain-notif-body-${Date.now()}.txt`)
+    writeFileSync(titleFile, title)
+    writeFileSync(bodyFile, body)
+
+    try {
+      const pythonBin = resolve(import.meta.dirname, '../../.venv/bin/python')
+      const notifyScript = resolve(import.meta.dirname, '../../factory/notify_cli.py')
+
+      const { spawnSync } = await import('child_process')
+      const result = spawnSync(
+        pythonBin,
+        [notifyScript, recipient, event_type, titleFile, bodyFile],
+        { encoding: 'utf-8' },
+      )
+
+      const output = result.stdout || result.stderr || 'No output'
+      return {
+        content: [{
+          type: 'text',
+          text: `devbrain_notify result:\n${output.trim()}`,
+        }],
+      }
+    } finally {
+      try { unlinkSync(titleFile) } catch {}
+      try { unlinkSync(bodyFile) } catch {}
     }
   },
 )
