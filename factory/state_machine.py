@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 class JobStatus(str, Enum):
     QUEUED = "queued"
     PLANNING = "planning"
+    WAITING = "waiting"            # Blocked by file lock conflicts
     IMPLEMENTING = "implementing"
     REVIEWING = "reviewing"
     QA = "qa"
@@ -41,7 +42,8 @@ class JobStatus(str, Enum):
 # Valid state transitions
 TRANSITIONS: dict[JobStatus, list[JobStatus]] = {
     JobStatus.QUEUED: [JobStatus.PLANNING],
-    JobStatus.PLANNING: [JobStatus.IMPLEMENTING, JobStatus.FAILED],
+    JobStatus.PLANNING: [JobStatus.IMPLEMENTING, JobStatus.WAITING, JobStatus.FAILED],
+    JobStatus.WAITING: [JobStatus.IMPLEMENTING, JobStatus.FAILED],
     JobStatus.IMPLEMENTING: [JobStatus.REVIEWING, JobStatus.FAILED],
     JobStatus.REVIEWING: [JobStatus.QA, JobStatus.FIX_LOOP, JobStatus.FAILED],
     JobStatus.QA: [JobStatus.READY_FOR_APPROVAL, JobStatus.FIX_LOOP, JobStatus.FAILED],
@@ -72,6 +74,8 @@ class FactoryJob:
     metadata: dict
     created_at: datetime
     updated_at: datetime
+    submitted_by: str | None = None
+    blocked_by_job_id: str | None = None
 
 
 class FactoryDB:
@@ -138,7 +142,8 @@ class FactoryDB:
                 SELECT j.id, j.project_id, p.slug, j.title, j.description, j.spec,
                        j.status, j.priority, j.branch_name, j.current_phase,
                        j.error_count, j.max_retries, j.assigned_cli, j.metadata,
-                       j.created_at, j.updated_at
+                       j.created_at, j.updated_at,
+                       j.submitted_by, j.blocked_by_job_id
                 FROM devbrain.factory_jobs j
                 JOIN devbrain.projects p ON j.project_id = p.id
                 WHERE j.id = %s
@@ -156,6 +161,8 @@ class FactoryDB:
                 error_count=row[10], max_retries=row[11],
                 assigned_cli=row[12], metadata=row[13] or {},
                 created_at=row[14], updated_at=row[15],
+                submitted_by=row[16],
+                blocked_by_job_id=str(row[17]) if row[17] else None,
             )
 
     def list_jobs(
@@ -189,7 +196,8 @@ class FactoryDB:
                 SELECT j.id, j.project_id, p.slug, j.title, j.description, j.spec,
                        j.status, j.priority, j.branch_name, j.current_phase,
                        j.error_count, j.max_retries, j.assigned_cli, j.metadata,
-                       j.created_at, j.updated_at
+                       j.created_at, j.updated_at,
+                       j.submitted_by, j.blocked_by_job_id
                 FROM devbrain.factory_jobs j
                 JOIN devbrain.projects p ON j.project_id = p.id
                 {where}
@@ -206,6 +214,8 @@ class FactoryDB:
                     error_count=r[10], max_retries=r[11],
                     assigned_cli=r[12], metadata=r[13] or {},
                     created_at=r[14], updated_at=r[15],
+                    submitted_by=r[16],
+                    blocked_by_job_id=str(r[17]) if r[17] else None,
                 )
                 for r in cur.fetchall()
             ]
