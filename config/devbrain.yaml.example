@@ -1,5 +1,7 @@
-# DevBrain Configuration
-# ======================
+# DevBrain Configuration (Template)
+# ==================================
+# Copy this file to config/devbrain.yaml and fill in your values.
+# The real config/devbrain.yaml is gitignored so secrets stay local.
 
 database:
   host: localhost
@@ -84,8 +86,51 @@ factory:
     branch_cleanup: true          # Delete branches for failed/rejected jobs
 
 notifications:
-  desktop:
-    enabled: true
-    method: osascript  # macOS native
-  mobile:
-    enabled: false     # Phase 2: Telegram
+  notify_events:
+    - job_ready
+    - job_failed
+    - lock_conflict
+    - unblocked
+    - needs_human
+
+  channels:
+    tmux:
+      enabled: true
+      popup_width: 70
+      popup_height: 20
+
+    smtp:
+      enabled: false
+      host: smtp.example.com
+      port: 587
+      use_tls: true
+      username: ""
+      password: ""
+      sender_email: "devbrain@example.com"
+      sender_display_name: "DevBrain"
+
+    gmail_dwd:
+      enabled: false
+      service_account_path: "~/.devbrain/credentials/gmail-sa.json"
+      sender_email: "devbrain@your-workspace.com"
+      sender_display_name: "DevBrain"
+
+    gchat_dwd:
+      enabled: false
+      service_account_path: "~/.devbrain/credentials/gchat-sa.json"
+      sender_email: "devbrain@your-workspace.com"
+      auto_create_dm_space: true
+
+    telegram_bot:
+      enabled: false
+      bot_token: ""
+      bot_username: ""
+
+    webhook_slack:
+      enabled: false
+
+    webhook_discord:
+      enabled: false
+
+    webhook_generic:
+      enabled: false

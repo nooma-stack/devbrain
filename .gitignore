@@ -7,3 +7,10 @@ mcp-server/dist/
 ingest/__pycache__/
 ingest/.venv/
 __pycache__/
+
+# Local config with secrets
+config/devbrain.yaml
+!config/devbrain.yaml.example
+
+# Credentials
+.devbrain/credentials/
