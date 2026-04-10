@@ -233,3 +233,111 @@ def test_router_attempts_multiple_channels(db):
     assert "webhook_slack" in result.channels_attempted
     # Slack should have been delivered (mock returned 200)
     assert "webhook_slack" in result.channels_delivered
+
+
+# ─── Test 6: job_started notification fires when pipeline begins ──────
+
+def test_job_started_notification_fires_from_orchestrator(db):
+    """Running a job through _run_planning fires job_started."""
+    from orchestrator import FactoryOrchestrator
+
+    db.register_dev(
+        dev_id="test_integ_starter",
+        channels=[{"type": "tmux", "address": "test_integ_starter"}],
+    )
+
+    job_id = db.create_job(
+        project_slug="devbrain",
+        title="integ_notif_started_job",
+        spec="Test",
+    )
+    _set_submitted_by(db, job_id, "test_integ_starter")
+
+    orch = FactoryOrchestrator(DATABASE_URL)
+
+    # Mock the CLI call in planning so it doesn't actually run claude
+    from unittest.mock import MagicMock
+    fake_result = MagicMock()
+    fake_result.stdout = "Fake plan"
+    fake_result.stderr = ""
+    fake_result.success = False  # Stop pipeline after planning (transitions to FAILED)
+
+    with patch("orchestrator.run_cli", return_value=fake_result):
+        with patch("notifications.channels.tmux.TmuxChannel._is_session_active", return_value=False):
+            # Reload job to get current state after our SQL update
+            job = db.get_job(job_id)
+            orch._run_planning(job)
+
+    notifs = db.get_notifications(recipient_dev_id="test_integ_starter", limit=10)
+    assert any(n["event_type"] == "job_started" for n in notifs), (
+        f"Expected job_started notification, got: {[n['event_type'] for n in notifs]}"
+    )
+
+
+# ─── Test 7: recovery_started fires at start of recovery attempt ──────
+
+def test_recovery_started_notification(db):
+    """attempt_recovery fires recovery_started at the start."""
+    db.register_dev(
+        dev_id="test_integ_recstart",
+        channels=[{"type": "tmux", "address": "test_integ_recstart"}],
+    )
+
+    job_id = db.create_job(
+        project_slug="devbrain",
+        title="integ_notif_recovery_started_job",
+        spec="Test",
+    )
+    _set_submitted_by(db, job_id, "test_integ_recstart")
+
+    # Set up a job in a state where recovery would fire needs_human (no fix_loop arts)
+    db.transition(job_id, JobStatus.PLANNING)
+
+    agent = CleanupAgent(db)
+    job = db.get_job(job_id)
+
+    with patch("notifications.channels.tmux.TmuxChannel._is_session_active", return_value=False):
+        agent.attempt_recovery(job)
+
+    notifs = db.get_notifications(recipient_dev_id="test_integ_recstart", limit=10)
+    assert any(n["event_type"] == "recovery_started" for n in notifs), (
+        f"Expected recovery_started, got: {[n['event_type'] for n in notifs]}"
+    )
+
+
+# ─── Test 8: recovery_succeeded fires on successful fix ──────────────
+
+def test_recovery_succeeded_notification(db):
+    """attempt_recovery fires recovery_succeeded when the targeted fix succeeds."""
+    db.register_dev(
+        dev_id="test_integ_recwin",
+        channels=[{"type": "tmux", "address": "test_integ_recwin"}],
+    )
+
+    job_id = db.create_job(
+        project_slug="devbrain",
+        title="integ_notif_recovery_win_job",
+        spec="Test",
+    )
+    _set_submitted_by(db, job_id, "test_integ_recwin")
+
+    # Create artifacts that make _diagnose_failure return qa_failure + converging
+    db.transition(job_id, JobStatus.PLANNING)
+    db.store_artifact(job_id, "reviewing", "review", "blocking stuff", blocking_count=5)
+    db.store_artifact(job_id, "fix_loop", "fix", "fix attempt 1")
+    db.store_artifact(job_id, "reviewing", "review", "less blocking", blocking_count=2)
+
+    agent = CleanupAgent(db)
+    job = db.get_job(job_id)
+
+    # Mock _attempt_targeted_fix to return success=True
+    with patch.object(agent, "_attempt_targeted_fix", return_value=(True, "Fix applied successfully")):
+        with patch("notifications.channels.tmux.TmuxChannel._is_session_active", return_value=False):
+            report = agent.attempt_recovery(job)
+
+    assert report.outcome == "recovered"
+
+    notifs = db.get_notifications(recipient_dev_id="test_integ_recwin", limit=10)
+    event_types = [n["event_type"] for n in notifs]
+    assert "recovery_started" in event_types
+    assert "recovery_succeeded" in event_types

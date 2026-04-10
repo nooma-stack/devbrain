@@ -188,6 +188,25 @@ class FactoryOrchestrator:
     def _run_planning(self, job: FactoryJob) -> FactoryJob:
         """Planning phase: generate implementation plan from spec."""
         job = self.db.transition(job.id, JobStatus.PLANNING)
+
+        # Fire job_started notification — job is out of the queue and into the pipeline
+        try:
+            from notifications.router import NotificationRouter, NotificationEvent
+            if job.submitted_by:
+                router = NotificationRouter(self.db)
+                router.send(NotificationEvent(
+                    event_type="job_started",
+                    recipient_dev_id=job.submitted_by,
+                    title=f"🚀 Job started: {job.title}",
+                    body=(
+                        f"Your factory job has left the queue and is now planning.\n\n"
+                        f"Pipeline: planning → implementing → reviewing → qa → ready_for_approval"
+                    ),
+                    job_id=job.id,
+                ))
+        except Exception as e:
+            logger.warning("job_started notification failed: %s", e)
+
         cli = self._get_cli("planning", job)
         project_root = self._get_project_root(job)
 

@@ -425,11 +425,14 @@ class FactoryDB:
     # ─── Devs + Notifications CRUD ───────────────────────────────────────────
 
     DEFAULT_EVENT_SUBSCRIPTIONS = [
+        "job_started",
         "job_ready",
         "job_failed",
         "lock_conflict",
         "unblocked",
         "needs_human",
+        "recovery_started",
+        "recovery_succeeded",
     ]
 
     def register_dev(

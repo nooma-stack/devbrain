@@ -87,11 +87,14 @@ factory:
 
 notifications:
   notify_events:
+    - job_started
     - job_ready
     - job_failed
     - lock_conflict
     - unblocked
     - needs_human
+    - recovery_started
+    - recovery_succeeded
 
   channels:
     tmux:

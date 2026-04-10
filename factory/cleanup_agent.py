@@ -98,10 +98,13 @@ class CleanupAgent:
     def _notification_title(self, job: FactoryJob, event_type: str) -> str:
         """Build a notification title from job + event."""
         return {
+            "job_started": f"🚀 Job started: {job.title}",
             "job_ready": f"✅ Job ready for review: {job.title}",
             "job_failed": f"❌ Job failed: {job.title}",
             "unblocked": f"🔓 Job unblocked: {job.title}",
             "needs_human": f"🤔 Job needs human input: {job.title}",
+            "recovery_started": f"🛠 Recovery started: {job.title}",
+            "recovery_succeeded": f"🎉 Recovery succeeded: {job.title}",
         }.get(event_type, f"Job update: {job.title}")
 
     # ------------------------------------------------------------------
@@ -217,6 +220,17 @@ class CleanupAgent:
         Returns a CleanupReport dataclass.
         """
         start = time.monotonic()
+
+        # Fire recovery_started notification so the dev knows we're trying
+        self._fire_notification(
+            job,
+            event_type="recovery_started",
+            body=(
+                f"Your job hit max fix retries. Recovery agent is attempting "
+                f"to diagnose and fix the failure now."
+            ),
+        )
+
         artifacts = self.db.get_artifacts(job.id)
         diagnosis = self._diagnose_failure(artifacts)
         converging = self._check_fix_convergence(artifacts)
@@ -226,9 +240,9 @@ class CleanupAgent:
 
         if diagnosis["category"] == "qa_failure" and converging:
             # Attempt a targeted fix
-            fix_result = self._attempt_targeted_fix(job, diagnosis)
-            recovery_action = fix_result
-            outcome = "fix_attempted"
+            fix_success, fix_description = self._attempt_targeted_fix(job, diagnosis)
+            recovery_action = fix_description
+            outcome = "recovered" if fix_success else "failed"
         else:
             # Not fixable automatically — needs human attention
             questions = self._build_human_questions(diagnosis)
@@ -250,22 +264,48 @@ class CleanupAgent:
             time_elapsed_seconds=elapsed,
         )
 
-        if outcome == "needs_human":
-            # Fire needs_human notification
-            try:
-                router = NotificationRouter(self.db)
-                if job.submitted_by:
-                    router.send(NotificationEvent(
-                        event_type="needs_human",
-                        recipient_dev_id=job.submitted_by,
-                        title=f"🤔 Job needs human input: {job.title}",
-                        body=report.summary,
-                        job_id=job.id,
-                    ))
-            except Exception as e:
-                logger.warning("needs_human notification failed: %s", e)
+        if outcome == "recovered":
+            self._fire_notification(
+                job,
+                event_type="recovery_succeeded",
+                body=(
+                    f"Recovery agent successfully applied a targeted fix. "
+                    f"Your job is returning to the pipeline.\n\n"
+                    f"Action: {recovery_action}"
+                ),
+            )
+        elif outcome == "needs_human":
+            self._fire_notification(
+                job,
+                event_type="needs_human",
+                body=report.summary,
+            )
 
         return report
+
+    def _fire_notification(
+        self,
+        job: FactoryJob,
+        event_type: str,
+        body: str,
+    ) -> None:
+        """Helper to fire a notification through the router. Non-blocking."""
+        try:
+            if not job.submitted_by:
+                return
+            router = NotificationRouter(self.db)
+            router.send(NotificationEvent(
+                event_type=event_type,
+                recipient_dev_id=job.submitted_by,
+                title=self._notification_title(job, event_type),
+                body=body,
+                job_id=job.id,
+            ))
+        except Exception as e:
+            logger.warning(
+                "%s notification failed for job %s: %s (non-blocking)",
+                event_type, job.id[:8], e,
+            )
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -325,10 +365,10 @@ class CleanupAgent:
         # Converging if the latest count is strictly less than the first
         return counts[-1] < counts[0]
 
-    def _attempt_targeted_fix(self, job: FactoryJob, diagnosis: dict) -> str:
+    def _attempt_targeted_fix(self, job: FactoryJob, diagnosis: dict) -> tuple[bool, str]:
         """Run a targeted fix via CLI executor.
 
-        Returns a description of the action taken.
+        Returns (success, description) tuple.
         """
         try:
             from cli_executor import run_cli, DEFAULT_CLI_ASSIGNMENTS
@@ -343,12 +383,12 @@ class CleanupAgent:
             )
             result = run_cli(cli_name, prompt, cwd=project_root)
             if result.success:
-                return f"Targeted fix applied via {cli_name}. stdout: {result.stdout[:500]}"
+                return True, f"Targeted fix applied via {cli_name}. stdout: {result.stdout[:500]}"
             else:
-                return f"Fix attempt via {cli_name} failed (exit {result.exit_code}): {result.stderr[:500]}"
+                return False, f"Fix attempt via {cli_name} failed (exit {result.exit_code}): {result.stderr[:500]}"
         except Exception as exc:
             logger.error("Targeted fix failed: %s", exc)
-            return f"Fix attempt raised exception: {exc}"
+            return False, f"Fix attempt raised exception: {exc}"
 
     def _get_project_root(self, job: FactoryJob) -> str:
         """Derive the project working directory for a job."""
