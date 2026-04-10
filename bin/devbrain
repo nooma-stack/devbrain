@@ -1,0 +1,4 @@
+#!/bin/bash
+set -e
+DEVBRAIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+exec "$DEVBRAIN_DIR/.venv/bin/python" "$DEVBRAIN_DIR/factory/cli.py" "$@"
