@@ -64,6 +64,25 @@ def test_history_nl_dry_run_handles_ollama(runner):
     assert result.exit_code in (0, 1)
 
 
+def test_status_command(runner):
+    """devbrain status runs without error."""
+    result = runner.invoke(cli, ["status"])
+    assert result.exit_code == 0
+    # Either shows "All quiet" or actual status
+    assert (
+        "quiet" in result.output.lower()
+        or "active" in result.output.lower()
+        or "completed" in result.output.lower()
+        or "no active" in result.output.lower()
+    )
+
+
+def test_status_with_project_filter(runner):
+    """devbrain status --project works."""
+    result = runner.invoke(cli, ["status", "--project", "devbrain"])
+    assert result.exit_code == 0
+
+
 def test_dashboard_command_exists(runner):
     """devbrain dashboard is a registered command."""
     result = runner.invoke(cli, ["dashboard", "--help"])

@@ -412,5 +412,119 @@ def dashboard(project):
     app.run()
 
 
+@cli.command(name="status")
+@click.option("--project", default=None, help="Filter by project slug")
+def status(project):
+    """Compact factory status — works great on small screens."""
+    from dashboard.data import DashboardData
+
+    db = get_db()
+    data = DashboardData(db)
+
+    active = data.get_active_jobs(project=project)
+    locks = data.get_active_locks(project=project)
+    completed = data.get_recent_completed(project=project, hours=24)
+
+    if not active and not locks and not completed:
+        click.echo("All quiet — no active factory jobs.")
+        return
+
+    # Active jobs
+    if active:
+        click.echo(f"\n🟢 Active Jobs ({len(active)})")
+        for j in active:
+            jid = j["id"][:8]
+            status_str = j["status"].upper()[:14]
+            title = j["title"][:25]
+            dev = f"[{j['submitted_by']}]" if j.get("submitted_by") else ""
+            age = _format_age(j.get("updated_at"))
+            retry = (
+                f" ({j['error_count']}/{j['max_retries']})"
+                if j.get("error_count", 0) > 0
+                else ""
+            )
+            click.echo(
+                f"  {jid} {status_str:<14} {title:<25} {dev} {age}{retry}"
+            )
+
+    # Blocked jobs (subset of active, highlighted separately)
+    blocked = [j for j in active if j["status"] == "blocked"] if active else []
+    if blocked:
+        click.echo(f"\n⚠️  Blocked Jobs ({len(blocked)})")
+        for j in blocked:
+            jid = j["id"][:8]
+            title = j["title"][:30]
+            dev = j.get("submitted_by") or "?"
+            blocker_id = (
+                j.get("blocked_by_job_id", "")[:8]
+                if j.get("blocked_by_job_id")
+                else "?"
+            )
+            click.echo(f"  {jid} {title}  [{dev}]")
+            click.echo(f"    Blocked by {blocker_id}")
+            click.echo(
+                f"    Run: devbrain resolve {jid} --proceed|--replan|--cancel"
+            )
+
+    # File locks
+    if locks:
+        click.echo(f"\n🔒 File Locks ({len(locks)})")
+        for lk in locks[:10]:  # Cap at 10 for mobile
+            path = lk["file_path"]
+            if len(path) > 30:
+                path = "…" + path[-28:]
+            jid = lk["job_id"][:8]
+            dev = lk.get("dev_id") or "?"
+            click.echo(f"  {path:<30} {jid} ({dev})")
+        if len(locks) > 10:
+            click.echo(f"  ... and {len(locks) - 10} more")
+
+    # Recent completed
+    if completed:
+        status_icons = {
+            "approved": "✅",
+            "deployed": "🚀",
+            "rejected": "🚫",
+            "failed": "❌",
+        }
+        click.echo(f"\n📋 Recent Completed ({len(completed)})")
+        for j in completed[:8]:  # Cap at 8
+            icon = status_icons.get(j["status"], "•")
+            jid = j["id"][:8]
+            title = j["title"][:30]
+            retries = (
+                f" ({j['error_count']} retries)"
+                if j.get("error_count", 0) > 0
+                else ""
+            )
+            click.echo(f"  {icon} {jid} {j['status']:<9} {title}{retries}")
+
+    if not blocked:
+        click.echo("\nNo blocked jobs needing resolution.")
+    click.echo()
+
+
+def _format_age(updated_at) -> str:
+    """Format timestamp as human-readable age (5m, 2h, 3d)."""
+    if updated_at is None:
+        return "?"
+    try:
+        from datetime import datetime, timezone
+
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        delta = datetime.now(timezone.utc) - updated_at
+        seconds = int(delta.total_seconds())
+        if seconds < 60:
+            return f"{seconds}s"
+        if seconds < 3600:
+            return f"{seconds // 60}m"
+        if seconds < 86400:
+            return f"{seconds // 3600}h"
+        return f"{seconds // 86400}d"
+    except Exception:
+        return "?"
+
+
 if __name__ == "__main__":
     cli()
