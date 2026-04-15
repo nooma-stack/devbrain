@@ -1,2 +1,6 @@
+click>=8.0
+psycopg2-binary>=2.9.0
+pyyaml>=6.0
 textual>=0.80
+pytest>=8.0
 pytest-asyncio>=0.23

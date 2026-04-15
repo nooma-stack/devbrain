@@ -1,0 +1,59 @@
+# Example DevBrain instance config.
+#
+# Copy to your instance repo root as `instance.yaml` and customize.
+# Everything in this file overrides the engine's config/devbrain.yaml.
+# See ../../docs/INSTANCE_PATTERN.md for the full schema.
+
+instance:
+  name: example-instance
+  owner: you@example.com
+  description: |
+    Minimal starter instance. Replace this with what your instance does.
+
+# Projects this instance knows about.
+# Each project maps to a `devbrain.projects` row on first boot.
+projects:
+  - slug: example-api
+    name: Example API
+    root_path: ~/code/example-api
+    tech_stack: [python, fastapi, postgres]
+    constraints: []
+    lint_commands:
+      - "ruff check ."
+    test_commands:
+      - "pytest"
+
+# Ingest project_mappings: which filesystem paths map to which project slug.
+# Used by the claude_code, codex, and similar adapters.
+ingest:
+  project_mappings:
+    "~/code/example-api": example-api
+
+# Factory project paths: where each project's source tree lives.
+# Used by the cleanup agent and factory phases that run commands in-tree.
+factory:
+  project_paths:
+    example-api: "~/code/example-api"
+
+# Notification channels. All disabled by default — enable only what you need.
+# Secrets come from .env, not from here.
+notifications:
+  notify_events:
+    - job_ready
+    - job_failed
+    - blocked
+    - needs_human
+
+  channels:
+    tmux:
+      enabled: true
+      popup_width: 70
+      popup_height: 20
+
+    webhook_slack:
+      enabled: false
+      # URL read from DEVBRAIN_SLACK_WEBHOOK_URL in .env
+
+    smtp:
+      enabled: false
+      # sender_email, host, port, username, password come from .env
