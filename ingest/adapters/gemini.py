@@ -19,6 +19,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from config import ADAPTER_CONFIG
+
 from .base import UniversalMessage, UniversalSession
 
 
@@ -34,33 +36,28 @@ class GeminiAdapter:
         )
 
     def detect_project(self, file_path: Path) -> str | None:
-        """Infer project from directory structure.
+        """Infer project from directory structure under ~/.gemini/tmp/.
 
-        Gemini stores sessions in ~/.gemini/tmp/{project_name}/chats/
+        Lookup order:
+          1. Exact match against ingest.adapters.gemini.dir_to_project
+          2. Substring match against ingest.adapters.gemini.project_keywords
+             ({slug: [keyword, ...]} — case-insensitive on dir name)
         """
+        cfg = ADAPTER_CONFIG.get("gemini", {})
+        dir_to_project: dict[str, str] = cfg.get("dir_to_project", {}) or {}
+        project_keywords: dict[str, list[str]] = cfg.get("project_keywords", {}) or {}
+
         parts = file_path.parts
         try:
             tmp_idx = parts.index("tmp")
             if tmp_idx + 1 < len(parts):
                 project_dir = parts[tmp_idx + 1]
-                slug_map = {
-                    "brightbot": "brightbot",
-                    "pkrelay": "pkrelay",
-                    "devbrain": "devbrain",
-                    "project": None,  # Generic "project" dir
-                }
-                # Direct match
-                if project_dir in slug_map:
-                    return slug_map[project_dir]
-                # Partial match for review/buildout sessions
-                if "brightbot" in project_dir.lower():
-                    return "brightbot"
-                for keyword in ("clinical", "emr", "sales", "finance", "hr",
-                                "support", "therapist", "executive", "podcast",
-                                "department-tools", "workflow"):
-                    if keyword in project_dir.lower():
-                        return "brightbot"
-                return None
+                if project_dir in dir_to_project:
+                    return dir_to_project[project_dir]
+                lower = project_dir.lower()
+                for slug, keywords in project_keywords.items():
+                    if any(kw.lower() in lower for kw in keywords):
+                        return slug
         except (ValueError, IndexError):
             pass
         return None

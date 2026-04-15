@@ -29,10 +29,10 @@ logger = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 
-_CONFIG_PATH = Path(__file__).parent.parent / "config" / "devbrain.yaml"
-with open(_CONFIG_PATH) as _f:
-    _config = yaml.safe_load(_f)
-_CLEANUP_CONFIG = _config.get("factory", {}).get("cleanup", {})
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from config import CLEANUP_CONFIG as _CLEANUP_CONFIG, project_path as _project_path  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -526,11 +526,26 @@ class CleanupAgent:
             return False, f"Fix attempt raised exception: {exc}"
 
     def _get_project_root(self, job: FactoryJob) -> str:
-        """Derive the project working directory for a job."""
-        # Use metadata if available, otherwise fall back to a conventional path
+        """Derive the project working directory for a job.
+
+        Lookup order:
+          1. job.metadata['project_root'] — set by the orchestrator at submission
+          2. config: factory.project_paths[<slug>] — per-project mapping in devbrain.yaml
+          3. ~/<slug> — last-ditch fallback (logs a warning)
+        """
         if "project_root" in job.metadata:
             return job.metadata["project_root"]
-        return f"/Users/patrickkelly/{job.project_slug}"
+        configured = _project_path(job.project_slug)
+        if configured:
+            return configured
+        from pathlib import Path as _Path
+        fallback = str(_Path.home() / job.project_slug)
+        logger.warning(
+            "No project_root in metadata and no factory.project_paths['%s'] in config; "
+            "falling back to %s",
+            job.project_slug, fallback,
+        )
+        return fallback
 
     def _summarize_artifacts(self, artifacts: list[dict]) -> dict:
         """Build a summary dict of artifacts grouped by phase."""

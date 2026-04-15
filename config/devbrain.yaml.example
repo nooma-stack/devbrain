@@ -26,6 +26,14 @@ chunking:
   overlap_tokens: 80
 
 ingest:
+  # Path → project_slug mappings. Used by claude_code, codex, and any
+  # other path-aware adapter to attribute sessions to a project.
+  # Each adapter applies its own path-extraction logic before lookup.
+  # Use absolute paths (~ is expanded). Longest-prefix match wins.
+  project_mappings: {}
+    # "/Users/youruser/code/myproject": myproject
+    # "/Users/youruser/code/another":   another
+
   adapters:
     claude_code:
       enabled: true
@@ -35,11 +43,16 @@ ingest:
       project_detection: path
 
     openclaw:
-      enabled: true
+      enabled: false
       watch_paths:
         - "~/.openclaw/agents/*/sessions"
       file_pattern: "*.jsonl"
       project_detection: content
+      # OpenClaw sessions don't carry path metadata. Set the slug all
+      # OpenClaw sessions belong to (or use agent_projects per-agent).
+      default_project: null
+      agent_projects: {}
+        # research_agent: someproject
 
     codex:
       enabled: false  # Enable when adapter is built
@@ -47,6 +60,26 @@ ingest:
         - "~/.codex"
       file_pattern: "*.json"
       project_detection: path
+
+    gemini:
+      enabled: false
+      watch_paths:
+        - "~/.gemini/tmp"
+      file_pattern: "session-*.json"
+      # Optional: map specific tmp/<dir_name> entries directly.
+      dir_to_project: {}
+        # myproject: myproject
+      # Optional: route by keyword in the dir name (case-insensitive).
+      project_keywords: {}
+        # myproject:
+        #   - api
+        #   - frontend
+
+    markdown_memory:
+      enabled: false
+      # Map of memory directories to project slugs.
+      memory_dirs: {}
+        # "~/code/myproject/memory": myproject
 
   codebase_indexer:
     trigger: git_hook  # or "periodic"
@@ -66,6 +99,12 @@ ingest:
       - .next
 
 factory:
+  # Per-project source tree paths. Used by the cleanup agent and other
+  # phases that need to operate on a project's local checkout.
+  # Falls back to ~/<slug> with a warning if a project is not listed.
+  project_paths: {}
+    # myproject: "~/code/myproject"
+
   max_concurrent_jobs: 2
   max_fix_loop_retries: 5
   default_review_passes:

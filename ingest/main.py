@@ -17,18 +17,29 @@ from pathlib import Path
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler, FileCreatedEvent, FileModifiedEvent
 
+from config import ADAPTER_CONFIG
 from pipeline import ingest_file, detect_adapter
 
 
 # ─── Scan directories ────────────────────────────────────────────────────────
 
-WATCH_DIRS = [
-    Path.home() / ".claude" / "projects",
-    Path.home() / ".openclaw" / "agents",
-    Path.home() / ".codex" / "sessions",
-    Path.home() / ".gemini" / "tmp",
-    Path.home() / "Developer" / "lighthouse" / "brightbot" / "memory",
-]
+
+def _resolve_watch_dirs() -> list[Path]:
+    """Resolve watch directories from each enabled adapter's config.
+
+    Reads ingest.adapters.<name>.watch_paths from config/devbrain.yaml.
+    Skips adapters where enabled=false. Expands ~ in paths.
+    """
+    dirs: list[Path] = []
+    for adapter_name, adapter_cfg in ADAPTER_CONFIG.items():
+        if not adapter_cfg.get("enabled", False):
+            continue
+        for path_str in adapter_cfg.get("watch_paths", []):
+            dirs.append(Path(path_str).expanduser())
+    return dirs
+
+
+WATCH_DIRS = _resolve_watch_dirs()
 
 
 def scan_all():

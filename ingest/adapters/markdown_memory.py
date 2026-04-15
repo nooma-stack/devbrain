@@ -1,13 +1,17 @@
 """Markdown memory file adapter.
 
-Parses project memory/*.md files (like BrightBot's per-date development notes)
-into Universal Session Format for ingestion into DevBrain.
+Parses project memory/*.md files (per-date development notes or other
+project-scoped markdown) into Universal Session Format for ingestion
+into DevBrain. Configure source directories via
+ingest.adapters.markdown_memory.memory_dirs in devbrain.yaml.
 """
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
+
+from config import ADAPTER_CONFIG
 
 from .base import UniversalMessage, UniversalSession
 
@@ -16,18 +20,23 @@ class MarkdownMemoryAdapter:
     app_name = "markdown_memory"
     file_patterns = ["*.md"]
 
-    # Map known memory directories to project slugs
-    MEMORY_DIRS = {
-        "/Users/patrickkelly/Developer/lighthouse/brightbot/memory": "brightbot",
-    }
+    @property
+    def memory_dirs(self) -> dict[str, str]:
+        """Map of expanded memory directory paths to project slugs.
+
+        Read from ingest.adapters.markdown_memory.memory_dirs in config.
+        """
+        cfg = ADAPTER_CONFIG.get("markdown_memory", {})
+        raw = cfg.get("memory_dirs", {}) or {}
+        return {str(Path(k).expanduser()): v for k, v in raw.items()}
 
     def detect(self, file_path: Path) -> bool:
         if file_path.suffix != ".md":
             return False
-        return any(str(file_path).startswith(d) for d in self.MEMORY_DIRS)
+        return any(str(file_path).startswith(d) for d in self.memory_dirs)
 
     def detect_project(self, file_path: Path) -> str | None:
-        for dir_path, slug in self.MEMORY_DIRS.items():
+        for dir_path, slug in self.memory_dirs.items():
             if str(file_path).startswith(dir_path):
                 return slug
         return None

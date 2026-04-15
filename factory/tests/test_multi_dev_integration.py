@@ -4,7 +4,7 @@ from state_machine import FactoryDB, JobStatus
 from file_registry import FileRegistry
 from cleanup_agent import CleanupAgent
 
-DATABASE_URL = "postgresql://devbrain:devbrain-local@localhost:5433/devbrain"
+from config import DATABASE_URL
 
 
 @pytest.fixture

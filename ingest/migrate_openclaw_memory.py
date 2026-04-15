@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """Migrate OpenClaw's FTS memory chunks to DevBrain.
 
-OpenClaw stores 6,020 pre-chunked text entries in ~/.openclaw/memory/main.sqlite
+OpenClaw stores pre-chunked text entries in ~/.openclaw/memory/main.sqlite
 as FTS-only (no vector embeddings). This script reads them, embeds them via
 Ollama, and stores them in DevBrain's chunks table.
+
+Usage:
+    python migrate_openclaw_memory.py <project_slug>
 """
 
 from __future__ import annotations
 
 import sqlite3
+import sys
 from pathlib import Path
 
 from db import get_project_id, insert_chunk
@@ -17,12 +21,15 @@ from embeddings import embed
 OPENCLAW_DB = Path.home() / ".openclaw" / "memory" / "main.sqlite"
 
 
-def migrate():
+def migrate(project_slug: str):
     if not OPENCLAW_DB.exists():
         print(f"OpenClaw memory DB not found: {OPENCLAW_DB}")
         return
 
-    project_id = get_project_id("brightbot")
+    project_id = get_project_id(project_slug)
+    if not project_id:
+        print(f"Project slug not found in DevBrain: {project_slug}")
+        return
 
     conn = sqlite3.connect(str(OPENCLAW_DB))
     cur = conn.cursor()
@@ -142,4 +149,7 @@ def migrate():
 
 
 if __name__ == "__main__":
-    migrate()
+    if len(sys.argv) < 2:
+        print("Usage: python migrate_openclaw_memory.py <project_slug>")
+        sys.exit(1)
+    migrate(sys.argv[1])

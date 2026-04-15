@@ -4,16 +4,16 @@
 # Local-first, model-agnostic, app-agnostic development infrastructure.
 #
 # Usage:
-#   docker compose up -d devbrain-db    # Database only (for development)
-#   docker compose up -d                # Full stack
-#   docker compose down                 # Stop all
-#   docker compose logs -f devbrain-mcp # Tail MCP server logs
+#   docker compose up -d devbrain-db    # Start the database
+#   docker compose down                 # Stop
+#   docker compose logs -f devbrain-db  # Tail logs
 #
 # Ports:
-#   5433 — PostgreSQL (avoids conflict with brightbot-db on 5432)
+#   Default 5433:5432 — override host port via DEVBRAIN_DB_HOST_PORT in .env
+#   to avoid conflicts with other Postgres instances.
 #
-# Note: Ollama runs natively on macOS (not in Docker) for Metal GPU acceleration.
-# The containerized version would use CPU only, which is much slower.
+# Note: Ollama runs natively on the host (not in Docker) for Metal/CUDA
+# acceleration. Install separately and ensure DEVBRAIN_OLLAMA_URL points to it.
 
 services:
   # =============================================================================
@@ -27,13 +27,13 @@ services:
       - devbrain-pgdata:/var/lib/postgresql/data
       - ./migrations:/docker-entrypoint-initdb.d:ro
     environment:
-      POSTGRES_USER: devbrain
-      POSTGRES_PASSWORD: devbrain-local
-      POSTGRES_DB: devbrain
+      POSTGRES_USER: ${DEVBRAIN_DB_USER:-devbrain}
+      POSTGRES_PASSWORD: ${DEVBRAIN_DB_PASSWORD:-devbrain-local}
+      POSTGRES_DB: ${DEVBRAIN_DB_NAME:-devbrain}
     ports:
-      - "5433:5432"
+      - "${DEVBRAIN_DB_HOST_PORT:-5433}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U devbrain"]
+      test: ["CMD-SHELL", "pg_isready -U ${DEVBRAIN_DB_USER:-devbrain}"]
       interval: 5s
       retries: 5
 

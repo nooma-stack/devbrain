@@ -192,45 +192,18 @@ CREATE INDEX idx_factory_artifacts_job ON devbrain.factory_artifacts(job_id);
 CREATE INDEX idx_factory_artifacts_phase ON devbrain.factory_artifacts(phase);
 
 -- ─── Seed Projects ───────────────────────────────────────────────────────────
+-- Only the self-reference 'devbrain' project is seeded. Add your own projects
+-- via the MCP `store` tool, the API, or by inserting rows here for an instance.
 
 INSERT INTO devbrain.projects (slug, name, root_path, description, constraints, tech_stack, lint_commands, test_commands) VALUES
 (
-    'brightbot',
-    'BrightBot',
-    '/Users/patrickkelly/Developer/lighthouse/brightbot',
-    'Healthcare operations platform for Lighthouse Therapy',
-    '["HIPAA compliant — no PHI in logs or error messages", "FERPA compliant — student data protection"]',
-    '{"backend": "Python, FastAPI, Agno, PostgreSQL", "frontend": "Next.js, TypeScript, Tailwind", "deploy": "GCP Cloud Run"}',
-    '{"python": "ruff check .", "python_format": "ruff format --check .", "frontend_lint": "pnpm -C agent-ui run lint --max-warnings 40", "frontend_types": "pnpm -C agent-ui run typecheck"}',
-    '{"backend": "pytest tests/ -v --tb=short -m \"not integration\"", "frontend": "pnpm -C agent-ui exec vitest run"}'
-),
-(
-    'pkrelay',
-    'PKRelay Chrome Extension',
-    '/Users/patrickkelly/pkrelay',
-    'Token-efficient browser relay for AI agent interaction',
-    '[]',
-    '{"runtime": "Chrome Extension MV3", "language": "JavaScript"}',
-    '{}',
-    '{}'
-),
-(
     'devbrain',
     'DevBrain',
-    '/Users/patrickkelly/devbrain',
+    NULL,
     'Universal persistent memory and dev factory infrastructure',
     '[]',
-    '{"mcp_server": "TypeScript, Node.js", "ingest": "Python", "db": "PostgreSQL + pgvector", "embedding": "Ollama mxbai-embed-large", "summarization": "Ollama qwen2.5:7b"}',
+    '{"mcp_server": "TypeScript, Node.js", "ingest": "Python", "db": "PostgreSQL + pgvector"}',
     '{}',
     '{}'
-),
-(
-    'lht-vps',
-    'LHT VPS Infrastructure',
-    NULL,
-    'n8n, Traefik, Docker on Hostinger VPS (SSH: lht-vps)',
-    '[]',
-    '{"containers": "Docker Compose, Traefik, n8n, PostgreSQL", "access": "SSH root@72.60.64.155"}',
-    '{}',
-    '{}'
-);
+)
+ON CONFLICT (slug) DO NOTHING;

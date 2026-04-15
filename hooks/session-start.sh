@@ -3,8 +3,13 @@
 # Queries DevBrain for project context and injects it into the conversation.
 # Called automatically by Claude Code on every session start/resume.
 
-PROJECT="${DEVBRAIN_PROJECT:-brightbot}"
-DB_URL="postgresql://devbrain:devbrain-local@localhost:5433/devbrain"
+PROJECT="${DEVBRAIN_PROJECT:-}"
+DB_URL="${DEVBRAIN_DATABASE_URL:-postgresql://devbrain:devbrain-local@localhost:5433/devbrain}"
+
+if [ -z "$PROJECT" ]; then
+    echo "DevBrain: No DEVBRAIN_PROJECT set; skipping context load."
+    exit 0
+fi
 
 # Quick DB query for project context (no MCP needed, direct SQL)
 CONTEXT=$(psql "$DB_URL" -t -A -c "
