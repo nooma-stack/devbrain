@@ -1,5 +1,9 @@
 # DevBrain Notifications System Implementation Plan
 
+> **Historical planning document.** Absolute paths and test commands in
+> this doc reflect the dev environment at authorship time. For current
+> install and test procedures see [INSTALL.md](../../INSTALL.md).
+>
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build a pluggable, provider-agnostic notification system for DevBrain that delivers factory job events through multiple channels (tmux, SMTP, Gmail DWD, Google Chat DWD, Telegram, Slack/Discord/generic webhooks), with per-dev channel preferences, a history CLI with natural language queries, and an MCP tool for AI-driven notifications.

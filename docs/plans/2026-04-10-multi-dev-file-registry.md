@@ -1,8 +1,12 @@
 # Multi-Dev File Registry Implementation Plan
 
+> **Historical planning document.** Absolute paths and test commands in
+> this doc reflect the dev environment at authorship time. For current
+> install and test procedures see [INSTALL.md](../../INSTALL.md).
+>
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Enable multiple developers at Lighthouse Therapy to run parallel factory jobs on a shared Mac Studio host, with file-level conflict detection preventing overlapping work.
+**Goal:** Enable multiple developers to run parallel factory jobs on a shared host, with file-level conflict detection preventing overlapping work.
 
 **Architecture:** Add a `file_locks` table as a distributed lock registry. The planning phase already identifies which files a job will modify — we parse those from the plan artifact and register them in the lock table before implementation begins. Conflicting jobs enter a WAITING state and are automatically unblocked when the blocking job releases its locks (via the cleanup agent). A TTL on locks protects against crashed jobs.
 

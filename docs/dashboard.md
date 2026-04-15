@@ -6,7 +6,7 @@ A real-time terminal UI for watching factory jobs as they progress.
 
 ```bash
 devbrain dashboard                     # All projects
-devbrain dashboard --project brightbot # Filter to one project
+devbrain dashboard --project myproject # Filter to one project
 ```
 
 Runs in any terminal (including over SSH, inside tmux). Built with [Textual](https://textual.textualize.io/).

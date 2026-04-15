@@ -1,5 +1,11 @@
 # DevBrain Standalone Hardening Plan
 
+> **Historical planning document** for the Phase 0 hardening milestone.
+> Remaining references to specific projects/paths in this doc are part
+> of the audit checklist that drove the hardening work — they describe
+> what was searched for and removed. See [ARCHITECTURE.md](../../ARCHITECTURE.md)
+> and [INSTALL.md](../../INSTALL.md) for the canonical current state.
+
 **Date**: 2026-04-15
 **Phase**: 0 (of 0-8 roadmap)
 **Goal**: Make DevBrain installable by a stranger from the GitHub repo alone, with no external context or tribal knowledge required.
@@ -29,7 +35,7 @@ Explicit exclusions to keep scope controlled:
 - **Discipline layer** (Phase 3) — no curator/eval agents/rule engine
 - **Graph layer** (Phase 5) — no Apache AGE, no `memory_edges`
 - **Cognify/Memify pipelines** (Phase 6) — ingest stays as-is
-- **Multi-instance operational isolation** — documented as a pattern, not implemented. BrightBrain's instance concerns (DB namespacing, multiple launchd services) are Phase 1 feedback.
+- **Multi-instance operational isolation** — documented as a pattern, not implemented. The first instance's concerns (DB namespacing, multiple launchd services) are Phase 1 feedback.
 - **Cross-platform full support** — macOS is primary. Linux "should work" with notes. Windows explicitly not supported in v0.1.
 - **Retry logic / Ollama fallback** — operational polish, later.
 - **Encryption at rest for credentials** — security hardening, later.
@@ -152,10 +158,10 @@ Keep under 300 lines. README is the front door, not the manual.
 
 ### 7. Write INSTANCE_PATTERN.md
 
-**Why seventh**: documents the submodule + YAML pattern so BrightBrain (Phase 1) has a documented home to slot into. Does not require implementation — docs only for Phase 0.
+**Why seventh**: documents the submodule + YAML pattern so the first instance (Phase 1) has a documented home to slot into. Does not require implementation — docs only for Phase 0.
 
 **Sections:**
-- What an instance is (Lighthouse-specific example: BrightBrain carries HIPAA/FERPA context)
+- What an instance is (org-specific example: an org instance carries compliance context like HIPAA/FERPA/SOC2)
 - Repository structure: `instance-name/` with DevBrain as submodule + `instance.yaml` config
 - Minimum `instance.yaml` fields (projects, compliance rules, notification prefs, model preferences)
 - How to bootstrap a new instance
@@ -295,4 +301,4 @@ If gaps surface during dry-run that require more than documentation (e.g., the i
 - [ ] v0.1.0 tagged and released on GitHub
 - [ ] README reviewed by a stranger (or stand-in stranger test) who could describe what DevBrain is in one paragraph
 
-When all of these pass, Phase 0 is done and Phase 1 (Mac Studio install + BrightBrain v0) can begin.
+When all of these pass, Phase 0 is done and Phase 1 (clean install on a fresh machine + first instance bootstrap) can begin.

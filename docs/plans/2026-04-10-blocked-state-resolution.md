@@ -1,5 +1,9 @@
 # Blocked State + Dev-Driven Resolution Implementation Plan
 
+> **Historical planning document.** Absolute paths and test commands in
+> this doc reflect the dev environment at authorship time. For current
+> install and test procedures see [INSTALL.md](../../INSTALL.md).
+>
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Replace the auto-polling WAITING state with a BLOCKED state that halts the job indefinitely, lets the cleanup agent investigate the block and file a findings report, notifies devs with that report, and provides MCP tools / CLI for devs to resolve (proceed/replan/cancel) via their AI session or terminal.
@@ -363,7 +367,7 @@ def test_investigate_block_includes_blocking_job_details(db):
     with db._conn() as conn, conn.cursor() as cur:
         cur.execute(
             "UPDATE devbrain.factory_jobs SET submitted_by = %s WHERE id = %s",
-            ("patrick", blocker_id),
+            ("alice", blocker_id),
         )
         conn.commit()
 
@@ -376,8 +380,8 @@ def test_investigate_block_includes_blocking_job_details(db):
     report = agent.investigate_block(db.get_job(blocked_id), conflicts)
 
     # Summary should mention the blocking dev and job
-    assert "patrick" in report.summary or "blockinv_blocker3" in report.summary
-    assert report.metadata.get("blocking_dev_id") == "patrick"
+    assert "alice" in report.summary or "blockinv_blocker3" in report.summary
+    assert report.metadata.get("blocking_dev_id") == "alice"
 ```
 
 **Step 2: Run the test to verify failure**
