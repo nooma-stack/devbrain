@@ -6,12 +6,20 @@ Polls DevBrain DB every REFRESH_INTERVAL seconds.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Ensure factory/ is on sys.path so `from config import …` works when
+# this app is launched directly via `python factory/dashboard/app.py`.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from textual import on
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical
 from textual.reactive import reactive
 from textual.widgets import Header, Footer, Label, Static, DataTable
 
+from config import DATABASE_URL  # noqa: E402
 from state_machine import FactoryDB
 from dashboard.data import DashboardData
 from dashboard.widgets.jobs_panel import ActiveJobsPanel
@@ -20,7 +28,6 @@ from dashboard.widgets.locks_panel import FileLocksPanel
 from dashboard.widgets.completed_panel import RecentCompletedPanel
 from dashboard.widgets.job_detail import JobDetailScreen
 
-DATABASE_URL = "postgresql://devbrain:devbrain-local@localhost:5433/devbrain"
 REFRESH_INTERVAL = 2.0  # seconds
 
 

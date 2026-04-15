@@ -16,21 +16,15 @@ import psycopg2
 
 logger = logging.getLogger(__name__)
 
-# Load config
-import yaml
+# Load config (env > yaml > defaults precedence; see factory/config.py)
+import sys
 
-CONFIG_PATH = Path(__file__).parent.parent / "config" / "devbrain.yaml"
-with open(CONFIG_PATH) as f:
-    _config = yaml.safe_load(f)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from config import DATABASE_URL, SUMMARIZE_MODEL, load_config  # noqa: E402
 
-OLLAMA_URL = _config["embedding"]["url"]
-EMBED_MODEL = _config["embedding"]["model"]
-SUMMARIZE_MODEL = _config["summarization"]["model"]
-DATABASE_URL = (
-    f"postgresql://{_config['database']['user']}:{_config['database']['password']}"
-    f"@{_config['database']['host']}:{_config['database']['port']}"
-    f"/{_config['database']['database']}"
-)
+_config = load_config()
+OLLAMA_URL = _config.get("embedding", {}).get("url", _config["summarization"]["url"])
+EMBED_MODEL = _config.get("embedding", {}).get("model", "snowflake-arctic-embed2")
 
 EXTRACTION_PROMPT = """You are analyzing code review findings from an automated dev factory pipeline. Extract generalizable lessons that would help future planning avoid the same issues.
 

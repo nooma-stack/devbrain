@@ -6,7 +6,7 @@ from cleanup_agent import CleanupAgent
 from file_registry import FileRegistry
 from notifications.router import NotificationRouter, NotificationEvent
 
-DATABASE_URL = "postgresql://devbrain:devbrain-local@localhost:5433/devbrain"
+from config import DATABASE_URL
 
 
 @pytest.fixture

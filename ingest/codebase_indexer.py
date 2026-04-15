@@ -5,8 +5,8 @@ Scans project directories, extracts file summaries and import graphs,
 embeds them, and stores in devbrain.codebase_index for semantic code search.
 
 Usage:
-    python codebase_indexer.py                    # Index all projects
-    python codebase_indexer.py --project brightbot # Index one project
+    python codebase_indexer.py                       # Index all projects
+    python codebase_indexer.py --project <slug>      # Index one project
 """
 
 from __future__ import annotations

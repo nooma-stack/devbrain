@@ -18,15 +18,10 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-import yaml
-
 logger = logging.getLogger(__name__)
 
-# Load factory CLI preferences from config
-_CONFIG_PATH = Path(__file__).parent.parent / "config" / "devbrain.yaml"
-with open(_CONFIG_PATH) as _f:
-    _config = yaml.safe_load(_f)
-_CLI_PREFERENCES = _config.get("factory", {}).get("cli_preferences", {})
+# Load factory CLI preferences from config (env > yaml > defaults precedence)
+from config import CLI_PREFERENCES as _CLI_PREFERENCES  # noqa: E402
 
 
 @dataclass

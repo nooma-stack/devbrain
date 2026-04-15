@@ -8,7 +8,30 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from config import PROJECT_MAPPINGS
+
 from .base import TranscriptAdapter, UniversalMessage, UniversalSession
+
+
+def _lookup_slug(absolute_path: str) -> str | None:
+    """Map an absolute filesystem path to a project slug via config.
+
+    Tries exact match first, then longest-prefix match, returning None
+    when no mapping applies (sessions not tied to a configured project).
+    """
+    expanded = {
+        str(Path(k).expanduser()): v for k, v in PROJECT_MAPPINGS.items()
+    }
+    if absolute_path in expanded:
+        return expanded[absolute_path]
+    matches = [
+        (path, slug) for path, slug in expanded.items()
+        if absolute_path.startswith(path) and slug
+    ]
+    if not matches:
+        return None
+    matches.sort(key=lambda x: len(x[0]), reverse=True)  # longest prefix wins
+    return matches[0][1]
 
 
 class ClaudeCodeAdapter:
@@ -19,7 +42,7 @@ class ClaudeCodeAdapter:
         return file_path.suffix == ".jsonl" and ".claude" in str(file_path)
 
     def detect_project(self, file_path: Path) -> str | None:
-        """Infer project from the directory structure.
+        """Infer project from the encoded-path directory.
 
         Claude Code stores sessions in ~/.claude/projects/-path-to-project/
         where the path uses dashes instead of slashes.
@@ -29,23 +52,8 @@ class ClaudeCodeAdapter:
             proj_idx = parts.index("projects")
             if proj_idx + 1 < len(parts):
                 encoded_path = parts[proj_idx + 1]
-                # Decode: -Users-patrickkelly-Developer-lighthouse-brightbot
-                # → /Users/patrickkelly/Developer/lighthouse/brightbot
                 decoded = "/" + encoded_path.lstrip("-").replace("-", "/")
-                # Map known paths to slugs
-                path_to_slug = {
-                    "/Users/patrickkelly/Developer/lighthouse/brightbot": "brightbot",
-                    "/Users/patrickkelly/pkrelay": "pkrelay",
-                    "/Users/patrickkelly/devbrain": "devbrain",
-                    "/Users/patrickkelly": None,  # home dir sessions = no specific project
-                }
-                # Try exact match first
-                if decoded in path_to_slug:
-                    return path_to_slug[decoded]
-                # Try partial match
-                for path, slug in path_to_slug.items():
-                    if decoded.startswith(path) and slug:
-                        return slug
+                return _lookup_slug(decoded)
         except (ValueError, IndexError):
             pass
         return None

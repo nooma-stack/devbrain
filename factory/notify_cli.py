@@ -12,10 +12,9 @@ from pathlib import Path
 # Add factory dir to path
 sys.path.insert(0, str(Path(__file__).parent))
 
+from config import DATABASE_URL
 from state_machine import FactoryDB
 from notifications.router import NotificationRouter, NotificationEvent
-
-DATABASE_URL = "postgresql://devbrain:devbrain-local@localhost:5433/devbrain"
 
 
 def main():

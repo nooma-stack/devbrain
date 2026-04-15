@@ -1,5 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  DevBrain ingest service — launchd template.
+
+  Do not load this file directly. Run scripts/install-ingest-service.sh
+  to substitute @DEVBRAIN_HOME@ and write the resolved plist to
+  ~/Library/LaunchAgents/com.devbrain.ingest.plist.
+-->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -7,14 +14,14 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/patrickkelly/devbrain/ingest/.venv/bin/python</string>
+        <string>@DEVBRAIN_HOME@/ingest/.venv/bin/python</string>
         <string>-u</string>
-        <string>/Users/patrickkelly/devbrain/ingest/main.py</string>
+        <string>@DEVBRAIN_HOME@/ingest/main.py</string>
         <string>watch</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/patrickkelly/devbrain/ingest</string>
+    <string>@DEVBRAIN_HOME@/ingest</string>
 
     <key>RunAtLoad</key>
     <true/>
@@ -23,15 +30,17 @@
     <true/>
 
     <key>StandardOutPath</key>
-    <string>/Users/patrickkelly/devbrain/logs/ingest.log</string>
+    <string>@DEVBRAIN_HOME@/logs/ingest.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/patrickkelly/devbrain/logs/ingest.err.log</string>
+    <string>@DEVBRAIN_HOME@/logs/ingest.err.log</string>
 
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>DEVBRAIN_HOME</key>
+        <string>@DEVBRAIN_HOME@</string>
     </dict>
 </dict>
 </plist>

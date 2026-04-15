@@ -33,7 +33,7 @@ logging.root.setLevel(logging.INFO)
 logging.root.handlers = [_handler]  # Replace any existing handlers
 logger = logging.getLogger("devbrain.factory")
 
-DATABASE_URL = "postgresql://devbrain:devbrain-local@localhost:5433/devbrain"
+from config import DATABASE_URL  # noqa: E402
 
 
 def main() -> None:

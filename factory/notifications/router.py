@@ -55,12 +55,12 @@ class NotificationRouter:
 
     @staticmethod
     def _load_config() -> dict:
-        config_path = Path(__file__).parent.parent.parent / "config" / "devbrain.yaml"
-        if not config_path.exists():
-            return {}
-        with open(config_path) as f:
-            full_config = yaml.safe_load(f) or {}
-        return full_config.get("notifications", {})
+        # Defer import: notifications/ is a sub-package, factory/ root may
+        # not be on sys.path when this module is imported via dashed paths.
+        import sys
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from config import NOTIFICATIONS_CONFIG  # noqa: E402
+        return NOTIFICATIONS_CONFIG
 
     def _get_channel(self, channel_type: str) -> NotificationChannel | None:
         """Get (and cache) a channel instance for the given type."""

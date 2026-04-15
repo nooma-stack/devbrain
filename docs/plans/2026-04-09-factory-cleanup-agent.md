@@ -1,5 +1,9 @@
 # Factory Cleanup & Recovery Agent Implementation Plan
 
+> **Historical planning document.** Absolute paths and test commands in
+> this doc reflect the dev environment at authorship time. For current
+> install and test procedures see [INSTALL.md](../../INSTALL.md).
+>
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Add a cleanup/recovery agent to the dev factory that runs after every job completion (housekeeping) and attempts self-healing before jobs transition to FAILED.

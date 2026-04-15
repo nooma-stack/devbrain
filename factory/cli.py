@@ -13,15 +13,12 @@ from pathlib import Path
 import click
 import yaml
 
+from config import DATABASE_URL, NL_MODEL, OLLAMA_URL
 from state_machine import FactoryDB
-
-DATABASE_URL = "postgresql://devbrain:devbrain-local@localhost:5433/devbrain"
-OLLAMA_URL = "http://localhost:11434"
-NL_MODEL = "qwen2.5:7b"
 
 
 def get_db() -> FactoryDB:
-    return FactoryDB(os.environ.get("DEVBRAIN_DATABASE_URL", DATABASE_URL))
+    return FactoryDB(DATABASE_URL)
 
 
 def parse_channel(s: str) -> dict:
@@ -524,6 +521,146 @@ def _format_age(updated_at) -> str:
         return f"{seconds // 86400}d"
     except Exception:
         return "?"
+
+
+# ─── doctor — installation health check ───────────────────────────────────────
+
+
+@cli.command(name="doctor")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of text")
+def doctor(as_json):
+    """Verify DevBrain installation. Exit 0 only if every check passes.
+
+    Checks: Postgres + pgvector, Ollama + required models, MCP server build,
+    ingest venv, config file validity, and reports any env var overrides.
+    """
+    from config import (
+        CONFIG_PATH,
+        DATABASE_URL,
+        DEVBRAIN_HOME,
+        load_config,
+    )
+
+    checks: list[dict] = []
+
+    def add(name: str, ok: bool, detail: str, *, warn: bool = False) -> None:
+        status = "WARN" if warn and not ok else ("PASS" if ok else "FAIL")
+        checks.append({"name": name, "status": status, "detail": detail})
+
+    # 1. DEVBRAIN_HOME resolves to a real directory
+    add(
+        "devbrain_home",
+        DEVBRAIN_HOME.is_dir(),
+        f"{DEVBRAIN_HOME}",
+    )
+
+    # 2. Config file present and parses
+    cfg: dict = {}
+    try:
+        cfg = load_config()
+        add("config_file", CONFIG_PATH.exists(), f"{CONFIG_PATH}")
+    except Exception as exc:
+        add("config_file", False, f"parse error: {exc}")
+
+    # 3. Postgres reachable + pgvector extension installed
+    try:
+        import psycopg2
+
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=3)
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM pg_extension WHERE extname = 'vector';"
+            )
+            has_vector = cur.fetchone() is not None
+        conn.close()
+        add("postgres_reachable", True, DATABASE_URL.split("@")[-1])
+        add(
+            "pgvector_installed",
+            has_vector,
+            "extension 'vector' present" if has_vector
+            else "run: CREATE EXTENSION vector;",
+        )
+    except Exception as exc:
+        add("postgres_reachable", False, str(exc))
+        add("pgvector_installed", False, "skipped — DB unreachable")
+
+    # 4. Ollama reachable + required models pulled
+    embed_model = cfg.get("embedding", {}).get("model", "snowflake-arctic-embed2")
+    summary_model = cfg.get("summarization", {}).get("model", "qwen2.5:7b")
+    ollama_url = cfg.get("embedding", {}).get("url", "http://localhost:11434")
+    try:
+        import urllib.error
+        import urllib.request
+
+        with urllib.request.urlopen(
+            f"{ollama_url.rstrip('/')}/api/tags", timeout=3
+        ) as resp:
+            tags = json.load(resp)
+        models_present = {m.get("name", "").split(":")[0]: m.get("name", "")
+                          for m in tags.get("models", [])}
+        add("ollama_reachable", True, ollama_url)
+        for required in (embed_model, summary_model):
+            base = required.split(":")[0]
+            present = base in models_present
+            add(
+                f"ollama_model:{required}",
+                present,
+                f"have {models_present[base]}" if present
+                else f"pull with: ollama pull {required}",
+            )
+    except Exception as exc:
+        add("ollama_reachable", False, f"{ollama_url}: {exc}")
+        add(f"ollama_model:{embed_model}", False, "skipped — Ollama unreachable")
+        add(f"ollama_model:{summary_model}", False, "skipped — Ollama unreachable")
+
+    # 5. MCP server built
+    mcp_dist = DEVBRAIN_HOME / "mcp-server" / "dist" / "index.js"
+    add(
+        "mcp_server_built",
+        mcp_dist.exists(),
+        str(mcp_dist) if mcp_dist.exists()
+        else "run: cd mcp-server && npm install && npm run build",
+    )
+
+    # 6. Ingest venv
+    ingest_python = DEVBRAIN_HOME / "ingest" / ".venv" / "bin" / "python"
+    add(
+        "ingest_venv",
+        ingest_python.exists(),
+        str(ingest_python) if ingest_python.exists()
+        else "run: cd ingest && python3 -m venv .venv && "
+             ".venv/bin/pip install -r requirements.txt",
+    )
+
+    # 7. Env vars (informational — never fails, just reports overrides)
+    overrides = sorted(k for k in os.environ if k.startswith("DEVBRAIN_"))
+    add(
+        "env_overrides",
+        True,
+        ", ".join(overrides) if overrides else "(none — using yaml + defaults)",
+    )
+
+    # ─── Output ───────────────────────────────────────────────────────────────
+    if as_json:
+        click.echo(json.dumps(checks, indent=2))
+    else:
+        click.echo("DevBrain doctor")
+        click.echo("=" * 60)
+        for c in checks:
+            icon = {"PASS": "✅", "WARN": "⚠️ ", "FAIL": "❌"}[c["status"]]
+            click.echo(f"  {icon} {c['name']:<32} {c['detail']}")
+        click.echo()
+
+    failed = [c for c in checks if c["status"] == "FAIL"]
+    if failed:
+        if not as_json:
+            click.echo(
+                f"❌ {len(failed)} check(s) failed. See INSTALL.md for setup steps.",
+                err=True,
+            )
+        sys.exit(1)
+    if not as_json:
+        click.echo("✅ All checks passed.")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,9 @@
 # DevBrain Factory TUI Dashboard Implementation Plan
 
+> **Historical planning document.** Absolute paths and test commands in
+> this doc reflect the dev environment at authorship time. For current
+> install and test procedures see [INSTALL.md](../../INSTALL.md).
+>
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **Goal:** Build a real-time terminal dashboard (`devbrain dashboard`) that shows active factory jobs, recent events, file locks, and recently completed jobs — updating automatically every few seconds. Runs in any tmux pane so devs can watch their factory work progress alongside their coding session.
@@ -1298,7 +1302,7 @@ A real-time terminal UI for watching factory jobs as they progress.
 
 ```bash
 devbrain dashboard                     # All projects
-devbrain dashboard --project brightbot # Filter to one project
+devbrain dashboard --project myproject # Filter to one project
 ```
 
 Runs in any terminal (including over SSH, inside tmux). Uses [Textual](https://textual.textualize.io/).

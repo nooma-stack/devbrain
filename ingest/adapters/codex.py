@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 
 from .base import UniversalMessage, UniversalSession
+from .claude_code import _lookup_slug
 
 
 class CodexAdapter:
@@ -25,22 +26,17 @@ class CodexAdapter:
         return file_path.suffix == ".jsonl" and ".codex" in str(file_path)
 
     def detect_project(self, file_path: Path) -> str | None:
-        """Infer project from session_meta cwd field."""
+        """Infer project from session_meta cwd field.
+
+        Looks up cwd in ingest.project_mappings from devbrain.yaml.
+        """
         try:
             with open(file_path, encoding="utf-8") as f:
                 for line in f:
                     entry = json.loads(line.strip())
                     if entry.get("type") == "session_meta":
                         cwd = entry.get("payload", {}).get("cwd", "")
-                        path_to_slug = {
-                            "/Users/patrickkelly/Developer/lighthouse/brightbot": "brightbot",
-                            "/Users/patrickkelly/pkrelay": "pkrelay",
-                            "/Users/patrickkelly/devbrain": "devbrain",
-                        }
-                        for path, slug in path_to_slug.items():
-                            if cwd.startswith(path):
-                                return slug
-                        return None
+                        return _lookup_slug(cwd)
         except Exception:
             pass
         return None

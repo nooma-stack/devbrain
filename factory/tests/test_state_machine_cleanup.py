@@ -3,7 +3,7 @@ import json
 import pytest
 from state_machine import FactoryDB, JobStatus
 
-DATABASE_URL = "postgresql://devbrain:devbrain-local@localhost:5433/devbrain"
+from config import DATABASE_URL
 
 
 @pytest.fixture

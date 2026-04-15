@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from config import ADAPTER_CONFIG
+
 from .base import UniversalMessage, UniversalSession
 
 
@@ -19,21 +21,25 @@ class OpenClawAdapter:
         return file_path.suffix == ".jsonl" and ".openclaw" in str(file_path)
 
     def detect_project(self, file_path: Path) -> str | None:
-        """OpenClaw agents work in configured workspaces.
+        """OpenClaw sessions don't carry project metadata.
 
-        Default workspace is brightbot. Agent name can hint at project.
+        Read ingest.adapters.openclaw.default_project from config; per-agent
+        overrides via ingest.adapters.openclaw.agent_projects.<agent_name>.
+        Returns None if no mapping configured (caller may treat as unassigned).
         """
-        # Check if we can determine from the agent config
+        cfg = ADAPTER_CONFIG.get("openclaw", {})
+        agent_projects: dict[str, str] = cfg.get("agent_projects", {}) or {}
+
         parts = file_path.parts
         try:
             agents_idx = parts.index("agents")
             if agents_idx + 1 < len(parts):
                 agent_name = parts[agents_idx + 1]
-                # All OpenClaw agents default to brightbot workspace
-                return "brightbot"
+                if agent_name in agent_projects:
+                    return agent_projects[agent_name]
         except (ValueError, IndexError):
             pass
-        return "brightbot"
+        return cfg.get("default_project")
 
     def parse(self, file_path: Path) -> UniversalSession | None:
         """Parse an OpenClaw JSONL session file."""
