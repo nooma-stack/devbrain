@@ -129,6 +129,82 @@ def setup_github() -> None:
         _info("Skipped — run 'gh auth login' later to enable factory push/PR features.")
 
 
+def setup_ai_cli_logins() -> None:
+    _header("AI CLI Logins")
+    _desc(
+        "For any AI CLI installed on this system, you can log in now so",
+        "DevBrain's factory can spawn them on your behalf. Each CLI uses",
+        "its own subscription (Anthropic, OpenAI, Google Workspace).",
+    )
+    click.echo()
+
+    clis = [
+        {
+            "name": "Claude Code",
+            "cmd": "claude",
+            "login_hint": "Run 'claude' — it opens a browser OAuth flow on first run",
+            "desc": "Anthropic's CLI. Recommended for DevBrain's factory.",
+            "check_args": ["claude", "--version"],
+        },
+        {
+            "name": "Codex CLI",
+            "cmd": "codex",
+            "login_hint": "Run 'codex' — it opens a browser OAuth flow on first run",
+            "desc": "OpenAI's CLI. Requires an OpenAI account with API access.",
+            "check_args": ["codex", "--version"],
+        },
+        {
+            "name": "Gemini CLI",
+            "cmd": "gemini",
+            "login_hint": "Run 'gemini' — it opens a browser OAuth flow on first run",
+            "desc": "Google's CLI. Uses your Google/Workspace account.",
+            "check_args": ["gemini", "--version"],
+        },
+    ]
+
+    any_installed = False
+    for cli in clis:
+        if not shutil.which(cli["cmd"]):
+            continue
+        any_installed = True
+
+        click.echo()
+        click.secho(f"  {cli['name']}:", bold=True)
+        _desc(cli["desc"])
+
+        # Heuristic: run the CLI with --version (or equivalent) and check
+        # if it succeeds. Most of these CLIs produce a version string
+        # without needing authentication.
+        try:
+            result = subprocess.run(
+                cli["check_args"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if result.returncode == 0:
+                _ok(f"{cli['name']} installed at {shutil.which(cli['cmd'])}")
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+
+        if _confirm(f"Launch {cli['name']} now to log in?", default=False):
+            _info(f"Launching {cli['cmd']}... follow the browser prompts")
+            _info("Come back to this terminal when login is done.")
+            click.echo()
+            # Run it interactively so OAuth flow works
+            subprocess.run([cli["cmd"]], check=False)
+            click.echo()
+            _ok(f"{cli['name']} login flow complete")
+        else:
+            _info(f"Skipped. {cli['login_hint']}")
+
+    if not any_installed:
+        _info("No AI CLIs installed yet.")
+        _info("Install one with DevBrain: run 'install-devbrain' and say yes at the AI CLI prompts.")
+        _info("Or install manually:")
+        _info("  Claude Code: curl -fsSL https://claude.ai/install.sh | bash")
+        _info("  Codex:       npm install -g @openai/codex")
+        _info("  Gemini:      npm install -g @google/gemini-cli")
+
+
 def setup_identity() -> str:
     _header("Your Identity")
     _desc(
@@ -511,6 +587,7 @@ def run_setup() -> None:
     click.echo()
 
     setup_github()
+    setup_ai_cli_logins()
     dev_id = setup_identity()
     setup_projects()
     setup_notifications(dev_id)

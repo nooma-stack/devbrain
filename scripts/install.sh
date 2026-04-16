@@ -1005,6 +1005,82 @@ build_mcp() {
     ok "MCP server built at mcp-server/dist/index.js"
 }
 
+install_ai_clis() {
+    step "AI CLIs (optional but recommended)"
+    desc "DevBrain's factory spawns AI CLIs as subprocesses to run planning,"
+    desc "implementation, review, and QA phases. You need at least one of:"
+    desc "  • Claude Code (Anthropic)   — recommended, widest MCP support"
+    desc "  • Gemini CLI (Google)       — alternative with Google account"
+    desc "  • Codex CLI (OpenAI)        — alternative with OpenAI account"
+    desc ""
+    desc "Each CLI uses its own subscription. You can install more later."
+
+    # Claude Code — native installer (Anthropic's recommended path)
+    echo ""
+    if command -v claude &>/dev/null; then
+        ok "Claude Code already installed ($(claude --version 2>/dev/null | head -1 || echo unknown))"
+    else
+        desc "Claude Code is Anthropic's CLI, installed via their native"
+        desc "installer (auto-updates in the background)."
+        if ask "Install Claude Code CLI?"; then
+            if [[ -r /dev/tty ]]; then
+                curl -fsSL https://claude.ai/install.sh | bash </dev/tty || warn "Claude Code install failed"
+            else
+                curl -fsSL https://claude.ai/install.sh | bash || warn "Claude Code install failed"
+            fi
+            if command -v claude &>/dev/null || [[ -x "$HOME/.local/bin/claude" ]]; then
+                ok "Claude Code installed"
+                POST_ACTIONS+=("Log in to Claude Code: run 'claude' and follow the browser prompts")
+            fi
+        fi
+    fi
+
+    # Codex CLI — OpenAI, installed via npm
+    echo ""
+    if command -v codex &>/dev/null; then
+        ok "Codex CLI already installed"
+    else
+        desc "Codex CLI is OpenAI's CLI, installed via npm. Requires Node"
+        desc "(already installed in Phase 2) and an OpenAI account."
+        if ask_no "Install Codex CLI?"; then
+            if npm install -g @openai/codex 2>&1 | tail -5; then
+                ok "Codex CLI installed"
+                POST_ACTIONS+=("Log in to Codex: run 'codex' and follow the browser prompts")
+            else
+                warn "Codex install failed. Try manually: npm install -g @openai/codex"
+            fi
+        fi
+    fi
+
+    # Gemini CLI — Google, installed via npm
+    echo ""
+    if command -v gemini &>/dev/null; then
+        ok "Gemini CLI already installed"
+    else
+        desc "Gemini CLI is Google's CLI, installed via npm. Requires a"
+        desc "Google account; uses your Google Workspace if you have one."
+        if ask_no "Install Gemini CLI?"; then
+            if npm install -g @google/gemini-cli 2>&1 | tail -5; then
+                ok "Gemini CLI installed"
+                POST_ACTIONS+=("Log in to Gemini: run 'gemini' and follow the browser prompts")
+            else
+                warn "Gemini install failed. Try manually: npm install -g @google/gemini-cli"
+            fi
+        fi
+    fi
+
+    # Optional: Claude Desktop app
+    echo ""
+    if [[ "$OS" == "macos" ]] && [[ ! -d /Applications/Claude.app ]]; then
+        desc "Claude Desktop (separate from Claude Code CLI) is Anthropic's"
+        desc "GUI app for conversational use. Not required for DevBrain."
+        if ask_no "Install Claude Desktop app via Homebrew?"; then
+            brew install --cask claude 2>&1 | tail -3 || warn "Claude Desktop install failed"
+            ok "Claude Desktop installed to /Applications"
+        fi
+    fi
+}
+
 install_launchd() {
     step "Background ingest service"
     desc "A persistent background process that watches for new AI session"
@@ -1268,7 +1344,8 @@ main() {
     build_mcp
     install_launchd
 
-    # Phase 6: Optional companions + finalization
+    # Phase 6: AI CLIs (interactive prompts) + optional companions + finalization
+    install_ai_clis
     install_pkrelay
     install_shims
 
