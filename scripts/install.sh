@@ -181,15 +181,24 @@ bootstrap_clone() {
     echo -e "${DIM}Running via curl|bash — cloning the repo first.${RESET}"
     echo ""
 
-    # On macOS, ensure git is available (may block up to 30 min for CLT install).
-    # On Linux, git must be pre-installed via apt/yum/etc.
-    if ! command -v git &>/dev/null; then
-        if [[ "$OSTYPE" == darwin* ]]; then
+    # On macOS, ensure git ACTUALLY works — not just that the command is
+    # present. macOS ships a /usr/bin/git stub that exists without Command
+    # Line Tools; running it triggers the CLT install dialog and fails.
+    # `command -v git` would pass in that state, tricking the installer
+    # into proceeding to git clone which then errors mid-dialog.
+    # Testing with `git --version` via the stub also triggers the dialog,
+    # so we check with `xcode-select -p` instead — that's the reliable
+    # indicator of whether CLT is genuinely installed.
+    if [[ "$OSTYPE" == darwin* ]]; then
+        if ! xcode-select -p &>/dev/null; then
             ensure_macos_clt
-        else
-            fail "git is required. Install it (e.g. 'sudo apt-get install git') and re-run."
-            exit 1
+        elif ! command -v git &>/dev/null; then
+            # CLT installed but git somehow missing — unusual, try to recover
+            ensure_macos_clt
         fi
+    elif ! command -v git &>/dev/null; then
+        fail "git is required. Install it (e.g. 'sudo apt-get install git') and re-run."
+        exit 1
     fi
 
     if [[ -d "$DEVBRAIN_HOME" ]]; then
