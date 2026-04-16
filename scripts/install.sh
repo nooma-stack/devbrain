@@ -22,10 +22,18 @@ set -euo pipefail
 
 # When run from inside a clone, infer DEVBRAIN_HOME from the script location.
 # When run via curl|bash (no $BASH_SOURCE path), default to $HOME/devbrain
-# and clone the repo first.
+# and clone the repo first. Resolve symlinks so the shim
+# (/opt/homebrew/bin/install-devbrain) correctly locates the real repo.
 if [[ -n "${BASH_SOURCE[0]:-}" ]] && [[ -f "${BASH_SOURCE[0]}" ]]; then
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    _SRC_TARGET="${BASH_SOURCE[0]}"
+    while [[ -L "$_SRC_TARGET" ]]; do
+        _SRC_DIR="$(cd "$(dirname "$_SRC_TARGET")" && pwd)"
+        _SRC_TARGET="$(readlink "$_SRC_TARGET")"
+        [[ "$_SRC_TARGET" != /* ]] && _SRC_TARGET="$_SRC_DIR/$_SRC_TARGET"
+    done
+    SCRIPT_DIR="$(cd "$(dirname "$_SRC_TARGET")" && pwd)"
     DEFAULT_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
+    unset _SRC_TARGET _SRC_DIR
 else
     DEFAULT_HOME="$HOME/devbrain"
 fi

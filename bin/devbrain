@@ -1,4 +1,15 @@
 #!/bin/bash
 set -e
-DEVBRAIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Resolve symlinks so this script works whether invoked directly or via
+# a shim (e.g. /opt/homebrew/bin/devbrain -> /Users/you/devbrain/bin/devbrain).
+# macOS's BSD readlink doesn't support -f, so we walk the chain manually.
+_target="${BASH_SOURCE[0]}"
+while [[ -L "$_target" ]]; do
+    _dir="$(cd "$(dirname "$_target")" && pwd)"
+    _target="$(readlink "$_target")"
+    [[ "$_target" != /* ]] && _target="$_dir/$_target"
+done
+DEVBRAIN_DIR="$(cd "$(dirname "$_target")/.." && pwd)"
+
 exec "$DEVBRAIN_DIR/.venv/bin/python" "$DEVBRAIN_DIR/factory/cli.py" "$@"
