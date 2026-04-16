@@ -481,6 +481,76 @@ install_node() {
     fi
 }
 
+# Python version we target on macOS. Change this to pin a different
+# version (e.g., PY_MAJOR_MINOR="3.13" for stability).
+PY_MAJOR_MINOR="3.14"
+PY_BREW_FORMULA="python@${PY_MAJOR_MINOR}"
+PY_BIN="/opt/homebrew/bin/python${PY_MAJOR_MINOR}"
+PY_IMPORT_CHECK="import xml.parsers.expat, ssl, ensurepip"
+
+_fix_tahoe_libexpat_mismatch() {
+    # macOS Tahoe-specific Homebrew bottle bug: Python's pyexpat.so is
+    # stamped to load /usr/lib/libexpat.1.dylib (system, too old) instead
+    # of /opt/homebrew/opt/expat/lib/libexpat.1.dylib (Homebrew's newer
+    # expat). Symbols added in expat 2.7.0+ (like _XML_SetAllocTree…)
+    # aren't in the system version, so pyexpat fails to load at import.
+    #
+    # We surgically repoint the library reference using install_name_tool.
+    # Much faster than rebuilding from source (~30 sec vs ~30 min).
+    info "Attempting auto-fix: repoint pyexpat.so to Homebrew's libexpat..."
+
+    # Ensure Homebrew's expat is available
+    if [[ ! -f /opt/homebrew/opt/expat/lib/libexpat.1.dylib ]]; then
+        info "Installing Homebrew expat..."
+        brew install expat
+    fi
+
+    # Find the broken pyexpat.so (path includes version-specific directory)
+    local pyexpat_so
+    pyexpat_so=$(ls /opt/homebrew/Cellar/${PY_BREW_FORMULA}/*/Frameworks/Python.framework/Versions/${PY_MAJOR_MINOR}/lib/python${PY_MAJOR_MINOR}/lib-dynload/pyexpat.cpython-*-darwin.so 2>/dev/null | head -1)
+
+    if [[ -z "$pyexpat_so" ]]; then
+        fail "Could not locate pyexpat.so under /opt/homebrew/Cellar/${PY_BREW_FORMULA}"
+        return 1
+    fi
+
+    info "Patching: $pyexpat_so"
+    install_name_tool -change \
+        /usr/lib/libexpat.1.dylib \
+        /opt/homebrew/opt/expat/lib/libexpat.1.dylib \
+        "$pyexpat_so"
+
+    # Re-sign the binary since install_name_tool invalidates the signature
+    codesign --force --sign - "$pyexpat_so" 2>/dev/null || true
+
+    # Re-test
+    if "$PY_BIN" -c "$PY_IMPORT_CHECK" 2>/dev/null; then
+        ok "Fix applied successfully"
+        return 0
+    else
+        warn "install_name_tool fix did not resolve the issue"
+        return 1
+    fi
+}
+
+_rebuild_python_from_source() {
+    # Fallback when the bottle can't be salvaged. Compiling from source
+    # lets Python link against Homebrew's own expat/ssl/etc. directly,
+    # avoiding any system-library ABI mismatches. Takes ~20-30 minutes
+    # on Apple Silicon.
+    warn "Rebuilding Python from source — this takes 20-30 minutes."
+    warn "The progress output will be verbose; that's normal."
+    brew uninstall --ignore-dependencies "$PY_BREW_FORMULA" 2>/dev/null || true
+    brew install --build-from-source "$PY_BREW_FORMULA"
+
+    if "$PY_BIN" -c "$PY_IMPORT_CHECK" 2>/dev/null; then
+        ok "Source build succeeded"
+        return 0
+    else
+        return 1
+    fi
+}
+
 install_python() {
     step "Python"
     desc "Runs the ingest pipeline (session capture + embedding), the"
@@ -488,35 +558,53 @@ install_python() {
     desc "the DevBrain CLI."
 
     if [[ "$OS" == "macos" ]]; then
-        # We pin to Python 3.13 rather than the latest 'python@3' because:
-        #  • macOS CLT ships python3 with broken ensurepip (can't bootstrap
-        #    pip into fresh venvs).
-        #  • Homebrew's python@3 currently tracks Python 3.14.4, whose
-        #    bottle has known compat issues on macOS Tahoe — shared libs
-        #    like pyexpat and _sha2 report "not a mach-o file" at import
-        #    time, breaking pip inside new venvs.
-        #  • python@3.13 is the stable default, has mature bottles, and
-        #    every package we use ships 3.13 wheels.
-        if [[ -x /opt/homebrew/bin/python3.13 ]] && /opt/homebrew/bin/python3.13 -c "import xml.parsers.expat, ssl, ensurepip" 2>/dev/null; then
-            skip "Python $(/opt/homebrew/bin/python3.13 --version | awk '{print $2}') (Homebrew, verified working)"
-        else
-            if [[ -x /opt/homebrew/bin/python3.13 ]]; then
-                warn "Existing python@3.13 failed import check — reinstalling..."
-                brew reinstall python@3.13
-            else
-                info "Installing Python 3.13 via Homebrew..."
-                brew install python@3.13
-            fi
-            # Verify the install actually works
-            if ! /opt/homebrew/bin/python3.13 -c "import xml.parsers.expat, ssl, ensurepip" 2>/dev/null; then
-                fail "python@3.13 install is broken after install/reinstall."
-                fail "Run manually to debug:"
-                fail "  /opt/homebrew/bin/python3.13 -c 'import xml.parsers.expat'"
-                fail "Then re-run this installer."
-                exit 1
-            fi
-            ok "Python 3.13 installed and verified at /opt/homebrew/bin/python3.13"
+        # Fast path: Python is installed and imports cleanly
+        if [[ -x "$PY_BIN" ]] && "$PY_BIN" -c "$PY_IMPORT_CHECK" 2>/dev/null; then
+            skip "Python $("$PY_BIN" --version | awk '{print $2}') (Homebrew, verified working)"
+            return 0
         fi
+
+        # Install or reinstall if needed
+        if [[ ! -x "$PY_BIN" ]]; then
+            info "Installing $PY_BREW_FORMULA via Homebrew..."
+            brew install "$PY_BREW_FORMULA"
+        fi
+
+        # Run the real import check and show the error if it fails
+        if "$PY_BIN" -c "$PY_IMPORT_CHECK" 2>/dev/null; then
+            ok "Python $("$PY_BIN" --version | awk '{print $2}') installed and verified"
+            return 0
+        fi
+
+        warn "Python import check failed. Diagnosing..."
+        echo ""
+        local err
+        err=$("$PY_BIN" -c "$PY_IMPORT_CHECK" 2>&1 || true)
+        echo "$err" | head -10
+        echo ""
+
+        # Pattern match known issues and apply targeted fixes
+        if echo "$err" | grep -qE 'libexpat\.1\.dylib|_XML_SetAlloc|symbol not found.*XML_'; then
+            info "Detected known Homebrew bottle issue on macOS Tahoe"
+            info "(pyexpat linked to wrong libexpat version)."
+            if _fix_tahoe_libexpat_mismatch; then
+                ok "Python $("$PY_BIN" --version | awk '{print $2}') working after patch"
+                return 0
+            fi
+            warn "Surgical fix insufficient. Falling back to source build..."
+        else
+            warn "Unknown failure pattern — falling back to source build..."
+        fi
+
+        if _rebuild_python_from_source; then
+            ok "Python $("$PY_BIN" --version | awk '{print $2}') built from source"
+            return 0
+        fi
+
+        fail "Unable to get a working Python after install, patch, and source rebuild."
+        fail "Please file an issue with the output above. To debug manually:"
+        fail "  $PY_BIN -c '$PY_IMPORT_CHECK'"
+        exit 1
     else
         # Linux: system Python is fine. Need 3.11+.
         if command -v python3 &>/dev/null; then
@@ -537,11 +625,9 @@ install_python() {
 }
 
 # Resolve the Python interpreter to use for venv creation.
-# On macOS, use Homebrew's 3.13 by absolute path to avoid both the
-# broken CLT python and the unstable 3.14 bottle on Tahoe.
 _python_for_venv() {
-    if [[ "$OS" == "macos" && -x /opt/homebrew/bin/python3.13 ]]; then
-        echo "/opt/homebrew/bin/python3.13"
+    if [[ "$OS" == "macos" && -x "$PY_BIN" ]]; then
+        echo "$PY_BIN"
     else
         echo "python3"
     fi
