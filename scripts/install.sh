@@ -119,8 +119,11 @@ is_in_devbrain_repo() {
 ensure_macos_clt() {
     # Xcode Command Line Tools include git. On a fresh macOS they're absent.
     # We trigger the installer and auto-poll for completion so users don't
-    # have to re-run this script after CLT installs.
-    if command -v git &>/dev/null; then
+    # have to re-run this script after CLT installs. Detection is done by
+    # stat-ing the actual binary inside the CLT directory — `command -v git`
+    # is unreliable because of macOS's git stub at /usr/bin/git.
+    if [[ -x /Library/Developer/CommandLineTools/usr/bin/git ]] \
+       || [[ -x /Applications/Xcode.app/Contents/Developer/usr/bin/git ]]; then
         return 0
     fi
 
@@ -147,11 +150,13 @@ ensure_macos_clt() {
     afplay /System/Library/Sounds/Glass.aiff 2>/dev/null &
     osascript -e 'display notification "Accept the Command Line Tools install dialog" with title "DevBrain Installer" sound name "Glass"' 2>/dev/null || true
 
-    # Poll every 5s until git appears, with progress indication
+    # Poll every 5s until CLT's git binary appears on disk. We check the
+    # filesystem directly to avoid being fooled by the /usr/bin/git stub
+    # which exists even when CLT isn't really installed.
     local waited=0
     local max_wait=1800  # 30 minutes
     echo -n "  Waiting for Command Line Tools install to complete"
-    while ! command -v git &>/dev/null; do
+    while [[ ! -x /Library/Developer/CommandLineTools/usr/bin/git ]]; do
         sleep 5
         waited=$((waited + 5))
         if (( waited % 30 == 0 )); then
@@ -181,19 +186,21 @@ bootstrap_clone() {
     echo -e "${DIM}Running via curl|bash — cloning the repo first.${RESET}"
     echo ""
 
-    # On macOS, ensure git ACTUALLY works — not just that the command is
-    # present. macOS ships a /usr/bin/git stub that exists without Command
-    # Line Tools; running it triggers the CLT install dialog and fails.
-    # `command -v git` would pass in that state, tricking the installer
-    # into proceeding to git clone which then errors mid-dialog.
-    # Testing with `git --version` via the stub also triggers the dialog,
-    # so we check with `xcode-select -p` instead — that's the reliable
-    # indicator of whether CLT is genuinely installed.
+    # On macOS, verify Command Line Tools are REALLY installed by stat-ing
+    # the git binary inside the CLT directory directly. Three indirect
+    # checks that don't work reliably:
+    #   1. `command -v git` — passes on the /usr/bin/git stub that exists
+    #      without CLT; running the stub triggers the install dialog.
+    #   2. `git --version` — same problem, invokes the stub.
+    #   3. `xcode-select -p` — can return a stale path even after
+    #      `rm -rf /Library/Developer/CommandLineTools` (which is what
+    #      reinstall.sh --full does). The internal xcode-select config
+    #      isn't cleared when the directory is deleted externally.
+    # Stat-ing the binary directly is the only check that reflects actual
+    # filesystem state without triggering any installer dialogs.
     if [[ "$OSTYPE" == darwin* ]]; then
-        if ! xcode-select -p &>/dev/null; then
-            ensure_macos_clt
-        elif ! command -v git &>/dev/null; then
-            # CLT installed but git somehow missing — unusual, try to recover
+        if [[ ! -x /Library/Developer/CommandLineTools/usr/bin/git ]] \
+           && [[ ! -x /Applications/Xcode.app/Contents/Developer/usr/bin/git ]]; then
             ensure_macos_clt
         fi
     elif ! command -v git &>/dev/null; then
