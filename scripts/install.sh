@@ -488,18 +488,34 @@ install_python() {
     desc "the DevBrain CLI."
 
     if [[ "$OS" == "macos" ]]; then
-        # Always prefer Homebrew's Python over macOS/CLT's bundled Python.
-        # macOS Tahoe (and its Command Line Tools) ship python3 at
-        # /usr/local/bin/python3 with broken ensurepip — `python3 -m venv`
-        # creates a venv but fails to install pip into it. Homebrew's Python
-        # has a working ensurepip, so we install it unconditionally and
-        # later use its absolute path for venv creation.
-        if [[ -x /opt/homebrew/bin/python3 ]]; then
-            skip "Python $(/opt/homebrew/bin/python3 --version | awk '{print $2}') (Homebrew)"
+        # We pin to Python 3.13 rather than the latest 'python@3' because:
+        #  • macOS CLT ships python3 with broken ensurepip (can't bootstrap
+        #    pip into fresh venvs).
+        #  • Homebrew's python@3 currently tracks Python 3.14.4, whose
+        #    bottle has known compat issues on macOS Tahoe — shared libs
+        #    like pyexpat and _sha2 report "not a mach-o file" at import
+        #    time, breaking pip inside new venvs.
+        #  • python@3.13 is the stable default, has mature bottles, and
+        #    every package we use ships 3.13 wheels.
+        if [[ -x /opt/homebrew/bin/python3.13 ]] && /opt/homebrew/bin/python3.13 -c "import xml.parsers.expat, ssl, ensurepip" 2>/dev/null; then
+            skip "Python $(/opt/homebrew/bin/python3.13 --version | awk '{print $2}') (Homebrew, verified working)"
         else
-            info "Installing Python 3 via Homebrew (system Python is unreliable for venvs)..."
-            brew install python@3
-            ok "Python installed at /opt/homebrew/bin/python3"
+            if [[ -x /opt/homebrew/bin/python3.13 ]]; then
+                warn "Existing python@3.13 failed import check — reinstalling..."
+                brew reinstall python@3.13
+            else
+                info "Installing Python 3.13 via Homebrew..."
+                brew install python@3.13
+            fi
+            # Verify the install actually works
+            if ! /opt/homebrew/bin/python3.13 -c "import xml.parsers.expat, ssl, ensurepip" 2>/dev/null; then
+                fail "python@3.13 install is broken after install/reinstall."
+                fail "Run manually to debug:"
+                fail "  /opt/homebrew/bin/python3.13 -c 'import xml.parsers.expat'"
+                fail "Then re-run this installer."
+                exit 1
+            fi
+            ok "Python 3.13 installed and verified at /opt/homebrew/bin/python3.13"
         fi
     else
         # Linux: system Python is fine. Need 3.11+.
@@ -521,11 +537,11 @@ install_python() {
 }
 
 # Resolve the Python interpreter to use for venv creation.
-# On macOS, prefer Homebrew's python over /usr/local/bin/python3 (CLT/system),
-# which has a broken ensurepip and cannot bootstrap pip into a fresh venv.
+# On macOS, use Homebrew's 3.13 by absolute path to avoid both the
+# broken CLT python and the unstable 3.14 bottle on Tahoe.
 _python_for_venv() {
-    if [[ "$OS" == "macos" && -x /opt/homebrew/bin/python3 ]]; then
-        echo "/opt/homebrew/bin/python3"
+    if [[ "$OS" == "macos" && -x /opt/homebrew/bin/python3.13 ]]; then
+        echo "/opt/homebrew/bin/python3.13"
     else
         echo "python3"
     fi
