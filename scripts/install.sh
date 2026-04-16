@@ -872,6 +872,63 @@ _wait_for_docker_daemon() {
     return 0
 }
 
+ensure_docker_ready() {
+    # Explicit checkpoint that the user has completed Docker Desktop
+    # setup. On first install, Docker Desktop shows a license dialog
+    # that blocks the daemon from starting — we can't auto-accept it.
+    # Pausing here with a clear prompt (instead of racing in background)
+    # gives the user a clean UX and ensures the DB can start next.
+    step "Docker daemon check"
+    desc "DevBrain's database runs in a Docker container. Before we can"
+    desc "start it, the Docker daemon needs to be fully running."
+
+    if docker info &>/dev/null 2>&1; then
+        ok "Docker daemon is already running"
+        return 0
+    fi
+
+    # Try to launch Docker Desktop first (idempotent; no-op if already open)
+    if [[ "$OS" == "macos" && -d /Applications/Docker.app ]]; then
+        info "Launching Docker Desktop..."
+        open -a Docker 2>/dev/null || true
+    fi
+
+    local attempts=0
+    local max_attempts=5
+    while true; do
+        attempts=$((attempts + 1))
+        echo ""
+        warn "Docker Desktop needs to be fully started before we continue."
+        desc "Please make sure:"
+        desc "  1. Docker Desktop is open (Cmd+Tab; check Dock or menu bar)"
+        desc "  2. You've accepted the license agreement (first-launch dialog)"
+        desc "  3. The whale icon in the menu bar is solid (not pulsing)"
+        echo ""
+        desc "The installer will pause here until you confirm Docker is ready."
+        desc "Remaining installer steps (Ollama models, MCP build, etc.) will"
+        desc "run automatically after DB startup — no more attention needed."
+        echo ""
+
+        if ! ask "I've completed Docker setup — continue?"; then
+            fail "Aborting install. Re-run 'install-devbrain' when Docker is ready."
+            exit 1
+        fi
+
+        info "Verifying Docker daemon..."
+        if _wait_for_docker_daemon 20; then
+            ok "Docker daemon responding"
+            return 0
+        fi
+
+        if (( attempts >= max_attempts )); then
+            fail "Docker daemon still not responding after $max_attempts checks."
+            fail "Please debug Docker Desktop and re-run 'install-devbrain'."
+            exit 1
+        fi
+        warn "Daemon still not responding. Check Docker Desktop."
+    done
+}
+
 start_postgres() {
     step "PostgreSQL + pgvector"
     desc "DevBrain's database stores all memory (sessions, chunks, decisions,"
@@ -883,46 +940,14 @@ start_postgres() {
         return 0
     fi
 
-    if ! command -v docker &>/dev/null; then
-        fail "Docker command not found — install it first or open Docker Desktop"
-        POST_ACTIONS+=("Start Docker Desktop, then run: cd $DEVBRAIN_HOME && docker compose up -d devbrain-db")
+    # By the time this runs, ensure_docker_ready() has verified the daemon.
+    # If somehow Docker still isn't there, bail clearly.
+    if ! docker info &>/dev/null 2>&1; then
+        fail "Docker daemon not responding at start_postgres"
+        fail "This shouldn't happen after ensure_docker_ready — please debug."
         return
     fi
 
-    # If the daemon isn't responding, try to start Docker Desktop automatically
-    # on macOS. First launch always needs a manual license-accept click, but
-    # subsequent launches are fully unattended.
-    if ! docker info &>/dev/null 2>&1; then
-        if [[ "$OS" == "macos" ]] && [[ -d /Applications/Docker.app ]]; then
-            info "Docker daemon not running — launching Docker Desktop..."
-            open -a Docker
-
-            # First-launch detection: if Docker Desktop has never been run,
-            # a license/tutorial dialog will block until user interaction.
-            if [[ ! -f "$HOME/Library/Application Support/Docker Desktop/settings-store.json" ]] \
-               && [[ ! -f "$HOME/Library/Application Support/Docker Desktop/settings.json" ]]; then
-                echo ""
-                warn "This appears to be Docker's first launch."
-                warn "A license agreement dialog may appear — accept it to continue."
-                echo ""
-            fi
-
-            if _wait_for_docker_daemon 90; then
-                ok "Docker daemon is up"
-            else
-                warn "Docker daemon didn't come up within 90 seconds."
-                warn "If a license dialog is waiting, accept it and re-run install-devbrain."
-                POST_ACTIONS+=("Open Docker Desktop, accept any license dialog, then re-run: install-devbrain")
-                return
-            fi
-        else
-            fail "Docker daemon not running"
-            POST_ACTIONS+=("Start Docker Desktop, then run: cd $DEVBRAIN_HOME && docker compose up -d devbrain-db")
-            return
-        fi
-    fi
-
-    # Daemon is up — start the database
     info "Starting PostgreSQL container..."
     (cd "$DEVBRAIN_HOME" && docker compose up -d devbrain-db)
     info "Waiting for Postgres to be ready..."
@@ -1212,7 +1237,7 @@ main() {
     info "DevBrain home: $DEVBRAIN_HOME"
     echo ""
 
-    # Dependencies
+    # Phase 1: Foundation dependencies (may prompt for sudo password once)
     if [[ "$OS" == "macos" ]]; then
         install_homebrew
         ensure_rosetta_on_apple_silicon
@@ -1220,25 +1245,31 @@ main() {
         install_linux_essentials
     fi
 
-    install_docker
-    install_ollama
+    # Phase 2: Fast brew installs (no user interaction)
     install_node
     install_python
     install_gh
     install_psql
 
-    # DevBrain build
+    # Phase 3: Docker — install, then explicitly wait for user to complete
+    # Docker Desktop setup (license agreement). This is the main interactive
+    # checkpoint; everything after this phase runs unattended.
+    install_docker
+    ensure_docker_ready
+
+    # Phase 4: DB startup — now that Docker is confirmed running
     setup_config
     setup_venvs
     start_postgres
+
+    # Phase 5: Heavy downloads + builds (~10-20 min unattended)
+    install_ollama
     pull_models
     build_mcp
     install_launchd
 
-    # Optional companions
+    # Phase 6: Optional companions + finalization
     install_pkrelay
-
-    # Global shortcuts
     install_shims
 
     # Verify
