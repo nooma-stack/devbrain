@@ -45,21 +45,37 @@ DevBrain solves this as shared infrastructure:
 curl -fsSL https://raw.githubusercontent.com/nooma-stack/devbrain/main/scripts/install.sh | bash
 ```
 
-This clones DevBrain to `~/devbrain`, installs every dependency
-(Homebrew/apt, Docker, Ollama, Node, Python, gh, psql), starts
-PostgreSQL, pulls Ollama models (~10 GB, one-time), builds the MCP
-server, optionally installs the launchd ingest service and PKRelay,
-and runs `devbrain doctor` to verify. Idempotent — safe to re-run.
+This single command:
 
-Then walk through interactive setup:
+1. Clones DevBrain to `~/devbrain`
+2. Installs every dependency (Homebrew/apt, Docker, Ollama, Node,
+   Python, gh, psql)
+3. Starts PostgreSQL, pulls Ollama models (~10 GB, one-time)
+4. Builds the MCP server, optionally installs the launchd ingest
+   service and PKRelay
+5. Runs `devbrain doctor` to verify
+6. Installs `devbrain` and `install-devbrain` as global commands
+7. Auto-launches the interactive setup wizard for projects,
+   notification channels, and MCP client config
+
+Idempotent — safe to re-run for upgrades or after partial failures.
+
+After install, you can use `devbrain` from anywhere:
 
 ```bash
-cd ~/devbrain && ./bin/devbrain setup
+devbrain doctor             # health check
+devbrain setup              # re-run the setup wizard
+devbrain status             # factory job state
+devbrain dashboard          # live TUI
+install-devbrain            # update DevBrain + dependencies
 ```
 
-Prompts you through GitHub auth, project registration, notification
-channels, MCP client config, and prints a checklist of any manual
-steps left to do.
+**Non-interactive install** (CI/CD, scripts):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/nooma-stack/devbrain/main/scripts/install.sh | \
+  bash -s -- --yes --no-setup --no-pkrelay
+```
 
 **Manual install** — if you'd rather follow each step yourself, see
 [**INSTALL.md**](INSTALL.md).

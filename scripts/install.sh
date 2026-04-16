@@ -38,11 +38,15 @@ PKRELAY_REPO="https://github.com/nooma-stack/pkrelay.git"
 OLLAMA_MODELS=("snowflake-arctic-embed2" "qwen2.5:7b")
 AUTO_YES=false
 SKIP_PKRELAY=false
+SKIP_SETUP=false
+SKIP_SHIMS=false
 
 for arg in "$@"; do
     case "$arg" in
         --yes|-y) AUTO_YES=true ;;
         --no-pkrelay) SKIP_PKRELAY=true ;;
+        --no-setup) SKIP_SETUP=true ;;
+        --no-shims) SKIP_SHIMS=true ;;
     esac
 done
 
@@ -547,6 +551,60 @@ install_pkrelay() {
     info "See the post-install actions below."
 }
 
+# ─── Shell shims (put `devbrain` + `install-devbrain` in PATH) ─────────────
+
+pick_bin_dir() {
+    # Prefer Homebrew's bin dir (always in PATH for brew users), fall back
+    # to /usr/local/bin, then ~/.local/bin (no sudo, needs PATH export).
+    local candidates=(
+        "/opt/homebrew/bin"
+        "/usr/local/bin"
+        "$HOME/.local/bin"
+    )
+    for dir in "${candidates[@]}"; do
+        if [[ -d "$dir" && -w "$dir" ]]; then
+            echo "$dir"
+            return 0
+        fi
+    done
+    mkdir -p "$HOME/.local/bin"
+    echo "$HOME/.local/bin"
+}
+
+install_shims() {
+    step "Command-line shortcuts"
+    desc "Install 'devbrain' and 'install-devbrain' as global commands so you"
+    desc "can run them from anywhere without cd-ing to the repo."
+
+    if $SKIP_SHIMS; then
+        info "Skipped (--no-shims flag)"
+        return
+    fi
+
+    local bin_dir
+    bin_dir="$(pick_bin_dir)"
+
+    local devbrain_shim="$bin_dir/devbrain"
+    local install_shim="$bin_dir/install-devbrain"
+
+    ln -sf "$DEVBRAIN_HOME/bin/devbrain" "$devbrain_shim"
+    ok "Linked $devbrain_shim → $DEVBRAIN_HOME/bin/devbrain"
+
+    ln -sf "$DEVBRAIN_HOME/scripts/install.sh" "$install_shim"
+    ok "Linked $install_shim → $DEVBRAIN_HOME/scripts/install.sh"
+
+    # If bin_dir isn't in PATH, tell the user how to fix it.
+    case ":$PATH:" in
+        *":$bin_dir:"*)
+            ok "$bin_dir is already in PATH"
+            ;;
+        *)
+            warn "$bin_dir is not in your PATH."
+            POST_ACTIONS+=("Add $bin_dir to your PATH: echo 'export PATH=\"$bin_dir:\$PATH\"' >> ~/.zshrc && source ~/.zshrc")
+            ;;
+    esac
+}
+
 # ─── Verification ──────────────────────────────────────────────────────────
 
 run_doctor() {
@@ -653,8 +711,25 @@ main() {
     # Optional companions
     install_pkrelay
 
+    # Global shortcuts
+    install_shims
+
     # Verify
     run_doctor
+
+    # Auto-run the interactive setup wizard unless disabled
+    if $SKIP_SETUP; then
+        info "Skipping setup wizard (--no-setup flag)"
+    else
+        echo ""
+        if $AUTO_YES || ask "Run interactive setup wizard now?"; then
+            echo ""
+            "$DEVBRAIN_HOME/bin/devbrain" setup || true
+        else
+            info "Skipped — run './bin/devbrain setup' when ready."
+        fi
+    fi
+
     print_post_actions
     print_next_steps
 }
