@@ -231,12 +231,67 @@ detect_os() {
             OS="linux"
             ARCH="$(uname -m)"
             ;;
+        msys*|cygwin*|win32*)
+            echo ""
+            echo "────────────────────────────────────────────────────────────"
+            echo "  Windows detected"
+            echo "────────────────────────────────────────────────────────────"
+            echo ""
+            echo "DevBrain's installer requires macOS or Linux. On Windows,"
+            echo "the recommended path is to run this inside WSL2 (Windows"
+            echo "Subsystem for Linux):"
+            echo ""
+            echo "  1. Enable WSL2:"
+            echo "       wsl --install -d Ubuntu"
+            echo "     (then restart Windows, open Ubuntu from Start menu)"
+            echo ""
+            echo "  2. Inside the Ubuntu terminal, run the installer:"
+            echo "       curl -fsSL https://raw.githubusercontent.com/nooma-stack/devbrain/main/scripts/install.sh | bash"
+            echo ""
+            echo "Docker Desktop for Windows uses WSL2 as its backend anyway,"
+            echo "so this integrates cleanly with your existing Docker setup."
+            echo ""
+            exit 1
+            ;;
         *)
             echo "Unsupported OS: $OSTYPE"
             echo "DevBrain supports macOS and Linux. See INSTALL.md for details."
             exit 1
             ;;
     esac
+}
+
+ensure_rosetta_on_apple_silicon() {
+    # Apple Silicon Macs benefit from Rosetta 2 for running x86_64 Docker
+    # containers and the occasional x86_64 CLI tool. macOS Tahoe doesn't
+    # ship Rosetta by default — Docker Desktop prompts for it on first
+    # launch. Pre-installing here gets that out of the way before Docker
+    # needs it, and saves the first-run Docker prompt.
+    if [[ "$OS" != "macos" ]] || [[ "$ARCH" != "arm64" ]]; then
+        return 0
+    fi
+
+    # Check if Rosetta is already installed/working
+    if /usr/bin/pgrep -q oahd 2>/dev/null; then
+        return 0  # oahd is the Rosetta daemon — its presence means installed
+    fi
+    # Fallback check: can we actually run an x86_64 binary?
+    if arch -x86_64 /usr/bin/true 2>/dev/null; then
+        return 0
+    fi
+
+    step "Rosetta 2 (Apple Silicon x86_64 emulation)"
+    desc "Rosetta lets Apple Silicon Macs run x86_64 binaries under"
+    desc "emulation. Docker Desktop uses it for Intel-based container"
+    desc "images (which is most public Docker images on Docker Hub)."
+    desc "Pre-installing here avoids Docker prompting you for it later."
+
+    info "Installing Rosetta 2 (silent, ~1 minute)..."
+    if /usr/sbin/softwareupdate --install-rosetta --agree-to-license 2>&1 | tail -3; then
+        ok "Rosetta 2 installed"
+    else
+        warn "Rosetta install returned non-zero. Docker may prompt later."
+    fi
 }
 
 # ─── Dependency Installers ─────────────────────────────────────────────────
@@ -1137,6 +1192,7 @@ main() {
     # Dependencies
     if [[ "$OS" == "macos" ]]; then
         install_homebrew
+        ensure_rosetta_on_apple_silicon
     else
         install_linux_essentials
     fi
