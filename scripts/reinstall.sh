@@ -24,6 +24,13 @@ set -euo pipefail
 DEVBRAIN_HOME="${DEVBRAIN_HOME:-$HOME/devbrain}"
 PKRELAY_HOME="${PKRELAY_HOME:-$HOME/pkrelay}"
 
+# Anchor CWD to $HOME so that when DEVBRAIN_HOME gets deleted mid-script,
+# subshells (e.g., spawned by the Homebrew uninstaller) don't spam
+# "getcwd: No such file or directory" noise. The working dir going
+# invalid is harmless because we only ever use absolute paths — but it's
+# ugly output that can mask real errors.
+cd "$HOME"
+
 FULL_RESET=false
 AUTO_YES=false
 
