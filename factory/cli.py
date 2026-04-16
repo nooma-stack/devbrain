@@ -392,6 +392,13 @@ def telegram_discover(dev_id, username):
         click.echo(f"⚠️  Test failed: {result.error}")
 
 
+@cli.command(name="setup")
+def setup_cmd():
+    """Interactive first-time setup wizard."""
+    from setup import run_setup
+    run_setup()
+
+
 @cli.command(name="dashboard")
 @click.option("--project", default=None, help="Filter by project slug")
 def dashboard(project):
