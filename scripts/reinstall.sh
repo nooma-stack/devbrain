@@ -230,6 +230,31 @@ if $FULL_RESET; then
             sudo rm -rf /usr/local/cli-plugins 2>/dev/null || true
         fi
 
+        # Docker Desktop also installs many CLI binaries in /usr/local/bin
+        # (docker, docker-compose, hub-tool, compose-switch, kubectl.docker,
+        # com.docker.cli, docker-credential-osxkeychain). These are symlinks
+        # into /Applications/Docker.app and survive cask uninstalls, blocking
+        # future `brew install` with errors like:
+        # "there is already a Binary at '/usr/local/bin/hub-tool'"
+        # Remove any symlink in /usr/local/bin whose target is or contained
+        # Docker.app. Handles dangling symlinks (target already deleted too).
+        info "Cleaning up Docker CLI binaries in /usr/local/bin..."
+        for bin_dir in /usr/local/bin /usr/local/sbin; do
+            [[ -d "$bin_dir" ]] || continue
+            # Known Docker binary names (enumerate for broken symlinks)
+            for bin in docker docker-compose hub-tool compose-switch \
+                       kubectl.docker com.docker.cli com.docker.diagnose \
+                       docker-credential-osxkeychain docker-credential-desktop; do
+                if [[ -e "$bin_dir/$bin" || -L "$bin_dir/$bin" ]]; then
+                    sudo rm -f "$bin_dir/$bin" 2>/dev/null || true
+                fi
+            done
+            # Catch-all for any remaining symlinks pointing at Docker.app
+            while IFS= read -r -d '' link; do
+                sudo rm -f "$link" 2>/dev/null || true
+            done < <(find "$bin_dir" -maxdepth 1 -type l -lname "*Docker.app*" -print0 2>/dev/null)
+        done
+
         # Some Docker installs also leave helper files here
         for path in \
             "$HOME/Library/Application Support/com.docker.helper" \
@@ -328,6 +353,22 @@ _check_removed "launchd plist" "$HOME/Library/LaunchAgents/com.devbrain.ingest.p
 if $FULL_RESET; then
     _check_removed "Docker.app" "/Applications/Docker.app" || ((verify_failures++))
     _check_removed "Docker CLI plugins" "/usr/local/cli-plugins" || ((verify_failures++))
+
+    # Check for Docker binaries in /usr/local/bin that would block re-install
+    leftover_docker=""
+    for bin in docker docker-compose hub-tool compose-switch kubectl.docker \
+               com.docker.cli docker-credential-osxkeychain; do
+        if [[ -e "/usr/local/bin/$bin" || -L "/usr/local/bin/$bin" ]]; then
+            leftover_docker+="$bin "
+        fi
+    done
+    if [[ -n "$leftover_docker" ]]; then
+        warn "Docker binaries still in /usr/local/bin: $leftover_docker"
+        info "Remove with: sudo rm -f /usr/local/bin/{$(echo "$leftover_docker" | tr ' ' ',' | sed 's/,$//')}"
+        ((verify_failures++))
+    else
+        ok "Docker CLI binaries in /usr/local/bin: none"
+    fi
     _check_removed "Homebrew prefix" "/opt/homebrew" || ((verify_failures++))
     _check_removed "Homebrew /etc/paths.d entry" "/etc/paths.d/homebrew" || ((verify_failures++))
     _check_removed "CLT" "/Library/Developer/CommandLineTools" || ((verify_failures++))
