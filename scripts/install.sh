@@ -753,6 +753,25 @@ setup_venvs() {
     ok "Ingest deps installed (psycopg2, watchdog, pyyaml)"
 }
 
+_wait_for_docker_daemon() {
+    # Poll `docker info` until the daemon responds, or timeout. Prints
+    # a progress dot per second so the user knows we're still alive.
+    local max_wait="${1:-60}"
+    local waited=0
+    echo -n "  Waiting for Docker daemon"
+    while ! docker info &>/dev/null 2>&1; do
+        sleep 1
+        waited=$((waited + 1))
+        echo -n "."
+        if (( waited >= max_wait )); then
+            echo ""
+            return 1
+        fi
+    done
+    echo ""
+    return 0
+}
+
 start_postgres() {
     step "PostgreSQL + pgvector"
     desc "DevBrain's database stores all memory (sessions, chunks, decisions,"
@@ -761,29 +780,62 @@ start_postgres() {
 
     if docker ps 2>/dev/null | grep -q devbrain-db; then
         skip "devbrain-db container running"
-    elif ! command -v docker &>/dev/null; then
-        fail "Docker not available — install it first or open Docker Desktop"
+        return 0
+    fi
+
+    if ! command -v docker &>/dev/null; then
+        fail "Docker command not found — install it first or open Docker Desktop"
         POST_ACTIONS+=("Start Docker Desktop, then run: cd $DEVBRAIN_HOME && docker compose up -d devbrain-db")
         return
-    elif ! docker info &>/dev/null 2>&1; then
-        fail "Docker daemon not running"
-        POST_ACTIONS+=("Start Docker Desktop, then run: cd $DEVBRAIN_HOME && docker compose up -d devbrain-db")
-        return
-    else
-        info "Starting PostgreSQL container..."
-        (cd "$DEVBRAIN_HOME" && docker compose up -d devbrain-db)
-        info "Waiting for Postgres to be ready..."
-        local retries=0
-        while ! docker exec devbrain-db pg_isready -U devbrain &>/dev/null; do
-            retries=$((retries + 1))
-            if [[ $retries -gt 30 ]]; then
-                fail "Postgres did not become ready in 30s"
+    fi
+
+    # If the daemon isn't responding, try to start Docker Desktop automatically
+    # on macOS. First launch always needs a manual license-accept click, but
+    # subsequent launches are fully unattended.
+    if ! docker info &>/dev/null 2>&1; then
+        if [[ "$OS" == "macos" ]] && [[ -d /Applications/Docker.app ]]; then
+            info "Docker daemon not running — launching Docker Desktop..."
+            open -a Docker
+
+            # First-launch detection: if Docker Desktop has never been run,
+            # a license/tutorial dialog will block until user interaction.
+            if [[ ! -f "$HOME/Library/Application Support/Docker Desktop/settings-store.json" ]] \
+               && [[ ! -f "$HOME/Library/Application Support/Docker Desktop/settings.json" ]]; then
+                echo ""
+                warn "This appears to be Docker's first launch."
+                warn "A license agreement dialog may appear — accept it to continue."
+                echo ""
+            fi
+
+            if _wait_for_docker_daemon 90; then
+                ok "Docker daemon is up"
+            else
+                warn "Docker daemon didn't come up within 90 seconds."
+                warn "If a license dialog is waiting, accept it and re-run install-devbrain."
+                POST_ACTIONS+=("Open Docker Desktop, accept any license dialog, then re-run: install-devbrain")
                 return
             fi
-            sleep 1
-        done
-        ok "PostgreSQL running on port ${DEVBRAIN_DB_HOST_PORT:-5433}"
+        else
+            fail "Docker daemon not running"
+            POST_ACTIONS+=("Start Docker Desktop, then run: cd $DEVBRAIN_HOME && docker compose up -d devbrain-db")
+            return
+        fi
     fi
+
+    # Daemon is up — start the database
+    info "Starting PostgreSQL container..."
+    (cd "$DEVBRAIN_HOME" && docker compose up -d devbrain-db)
+    info "Waiting for Postgres to be ready..."
+    local retries=0
+    while ! docker exec devbrain-db pg_isready -U devbrain &>/dev/null; do
+        retries=$((retries + 1))
+        if [[ $retries -gt 30 ]]; then
+            fail "Postgres did not become ready in 30s"
+            return
+        fi
+        sleep 1
+    done
+    ok "PostgreSQL running on port ${DEVBRAIN_DB_HOST_PORT:-5433}"
 }
 
 pull_models() {
