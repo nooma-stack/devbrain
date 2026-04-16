@@ -12,4 +12,16 @@ while [[ -L "$_target" ]]; do
 done
 DEVBRAIN_DIR="$(cd "$(dirname "$_target")/.." && pwd)"
 
+# Load .env if present. `set -a` auto-exports all variables, so API keys
+# (ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY) and other secrets
+# become environment variables visible to Python + every child process
+# the factory spawns. Without this, keys saved to .env during setup
+# wouldn't be picked up by subprocesses.
+if [[ -f "$DEVBRAIN_DIR/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$DEVBRAIN_DIR/.env"
+    set +a
+fi
+
 exec "$DEVBRAIN_DIR/.venv/bin/python" "$DEVBRAIN_DIR/factory/cli.py" "$@"

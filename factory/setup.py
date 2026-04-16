@@ -88,13 +88,52 @@ def _save_yaml(cfg: dict) -> None:
 
 
 def _append_env(key: str, value: str) -> None:
+    """Upsert KEY=value into .env with 0600 permissions.
+
+    - Existing KEY= lines are replaced (re-running setup updates keys).
+    - File is created with mode 0600 (owner read/write only) so secrets
+      aren't world-readable on shared systems.
+    - Empty lines preserved; comments preserved.
+    """
     env_path = DEVBRAIN_HOME / ".env"
+    lines: list[str] = []
+    key_updated = False
+
     if env_path.exists():
-        content = env_path.read_text()
-        if f"{key}=" in content:
-            return
-    with open(env_path, "a") as f:
-        f.write(f"\n{key}={value}\n")
+        lines = env_path.read_text().splitlines()
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if stripped.startswith(f"{key}=") or stripped.startswith(f"export {key}="):
+                lines[i] = f"{key}={value}"
+                key_updated = True
+                break
+
+    if not key_updated:
+        if lines and lines[-1]:
+            lines.append("")  # blank line before new entry
+        lines.append(f"{key}={value}")
+
+    env_path.write_text("\n".join(lines) + "\n")
+    env_path.chmod(0o600)
+
+
+_SECURITY_NOTE_SHOWN = False
+
+
+def _show_env_security_note() -> None:
+    """Print a one-time explainer about how .env stores secrets."""
+    global _SECURITY_NOTE_SHOWN
+    if _SECURITY_NOTE_SHOWN:
+        return
+    _SECURITY_NOTE_SHOWN = True
+    click.echo()
+    _info("About .env security:")
+    _desc(f"  • Location: {DEVBRAIN_HOME}/.env")
+    _desc("  • Permissions: 0600 (owner read/write only)")
+    _desc("  • Git-ignored — won't be committed")
+    _desc("  • Loaded by bin/devbrain and mcp-server/run.sh into env vars")
+    _desc("  • Visible in `ps auxe` for processes you launch (OS standard)")
+    _desc("  • Rotate keys anytime: edit .env directly or re-run 'devbrain setup'")
 
 
 # ─── Sections ──────────────────────────────────────────────────────────────
@@ -201,8 +240,9 @@ def setup_ai_cli_logins() -> None:
             key = _prompt(f"    {cli['env_var']}", hide_input=True, default="").strip()
             if key:
                 _append_env(cli["env_var"], key)
-                _ok(f"{cli['env_var']} saved to .env")
+                _ok(f"{cli['env_var']} saved to .env (mode 0600)")
                 _info(f"The CLI will pick this up automatically on next run.")
+                _show_env_security_note()
             else:
                 _warn("Empty key — skipped.")
         else:
