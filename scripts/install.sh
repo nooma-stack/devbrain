@@ -20,7 +20,19 @@ set -euo pipefail
 
 # ─── Configuration ──────────────────────────────────────────────────────────
 
-DEVBRAIN_HOME="${DEVBRAIN_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd || pwd)}"
+# When run from inside a clone, infer DEVBRAIN_HOME from the script location.
+# When run via curl|bash (no $BASH_SOURCE path), default to $HOME/devbrain
+# and clone the repo first.
+if [[ -n "${BASH_SOURCE[0]:-}" ]] && [[ -f "${BASH_SOURCE[0]}" ]]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    DEFAULT_HOME="$(cd "$SCRIPT_DIR/.." && pwd)"
+else
+    DEFAULT_HOME="$HOME/devbrain"
+fi
+DEVBRAIN_HOME="${DEVBRAIN_HOME:-$DEFAULT_HOME}"
+DEVBRAIN_REPO="${DEVBRAIN_REPO:-https://github.com/nooma-stack/devbrain.git}"
+DEVBRAIN_BRANCH="${DEVBRAIN_BRANCH:-main}"
+
 PKRELAY_HOME="${PKRELAY_HOME:-$HOME/pkrelay}"
 PKRELAY_REPO="https://github.com/nooma-stack/pkrelay.git"
 OLLAMA_MODELS=("snowflake-arctic-embed2" "qwen2.5:7b")
@@ -71,6 +83,54 @@ ask_no() {
     local prompt="$1 [y/N]: "
     read -rp "  $prompt" answer
     [[ "$answer" =~ ^[Yy] ]]
+}
+
+# ─── Bootstrap (clone repo if running remotely) ─────────────────────────────
+
+is_in_devbrain_repo() {
+    [[ -f "$DEVBRAIN_HOME/scripts/install.sh" ]] && \
+    [[ -f "$DEVBRAIN_HOME/bin/devbrain" ]] && \
+    [[ -d "$DEVBRAIN_HOME/factory" ]]
+}
+
+bootstrap_clone() {
+    echo ""
+    echo -e "${BOLD}DevBrain Bootstrap${RESET}"
+    echo -e "${DIM}Running via curl|bash — cloning the repo first.${RESET}"
+    echo ""
+
+    if ! command -v git &>/dev/null; then
+        if [[ "$OSTYPE" == darwin* ]]; then
+            info "git not found — triggering Xcode Command Line Tools install."
+            xcode-select --install 2>/dev/null || true
+            warn "Accept the macOS dialog to install Command Line Tools, then"
+            warn "re-run this command. (Includes git.)"
+            exit 1
+        else
+            fail "git is required. Install it (e.g. 'sudo apt-get install git') and re-run."
+            exit 1
+        fi
+    fi
+
+    if [[ -d "$DEVBRAIN_HOME" ]]; then
+        if [[ -d "$DEVBRAIN_HOME/.git" ]]; then
+            info "DevBrain already cloned at $DEVBRAIN_HOME — pulling latest..."
+            (cd "$DEVBRAIN_HOME" && git fetch --quiet && git checkout --quiet "$DEVBRAIN_BRANCH" && git pull --ff-only --quiet)
+        else
+            fail "$DEVBRAIN_HOME exists but is not a git repo."
+            fail "Set DEVBRAIN_HOME=/different/path or remove the existing directory."
+            exit 1
+        fi
+    else
+        info "Cloning DevBrain ($DEVBRAIN_BRANCH) to $DEVBRAIN_HOME..."
+        git clone --quiet --branch "$DEVBRAIN_BRANCH" "$DEVBRAIN_REPO" "$DEVBRAIN_HOME"
+        ok "Cloned"
+    fi
+
+    echo ""
+    info "Re-executing installer from cloned repo..."
+    echo ""
+    exec bash "$DEVBRAIN_HOME/scripts/install.sh" "$@"
 }
 
 # ─── OS Detection ──────────────────────────────────────────────────────────
@@ -551,6 +611,13 @@ print_next_steps() {
 # ─── Main ──────────────────────────────────────────────────────────────────
 
 main() {
+    # If we're not in a DevBrain repo (e.g., piped from curl), clone first
+    # then re-execute from the cloned location.
+    if ! is_in_devbrain_repo; then
+        bootstrap_clone "$@"
+        exit 0  # unreachable — exec replaces the process
+    fi
+
     echo ""
     echo -e "${BOLD}DevBrain Installer${RESET}"
     echo -e "${DIM}Local-first persistent memory and dev factory for coding agents${RESET}"

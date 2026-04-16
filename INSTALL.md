@@ -1,5 +1,19 @@
 # Installing DevBrain
 
+> **Most users want the one-liner**, not these manual steps. From a
+> fresh macOS or Linux machine:
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/nooma-stack/devbrain/main/scripts/install.sh | bash
+> ```
+>
+> Then run `cd ~/devbrain && ./bin/devbrain setup` for the interactive
+> wizard. The sections below are the manual reference for when you
+> want to understand or customize each step.
+
+---
+
+
 DevBrain is a local-first persistent memory and dev-automation system. It runs
 entirely on your machine: a Postgres database (in Docker), an Ollama server
 (native), a Node-based MCP server, and a Python ingest watcher.

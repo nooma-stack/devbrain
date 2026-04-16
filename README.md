@@ -39,21 +39,30 @@ DevBrain solves this as shared infrastructure:
 
 ## Quick start
 
+**One-liner install** (macOS or Linux):
+
 ```bash
-git clone <repo-url> devbrain && cd devbrain
-cp .env.example .env
-cp config/devbrain.yaml.example config/devbrain.yaml
-docker compose up -d devbrain-db
-ollama pull snowflake-arctic-embed2 && ollama pull qwen2.5:7b
-(cd mcp-server && npm install && npm run build)
-(cd ingest && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt)
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-./bin/devbrain doctor
+curl -fsSL https://raw.githubusercontent.com/nooma-stack/devbrain/main/scripts/install.sh | bash
 ```
 
-If `devbrain doctor` exits 0, you're running. See
-[**INSTALL.md**](INSTALL.md) for the detailed walkthrough, prerequisites,
-platform notes, and troubleshooting.
+This clones DevBrain to `~/devbrain`, installs every dependency
+(Homebrew/apt, Docker, Ollama, Node, Python, gh, psql), starts
+PostgreSQL, pulls Ollama models (~10 GB, one-time), builds the MCP
+server, optionally installs the launchd ingest service and PKRelay,
+and runs `devbrain doctor` to verify. Idempotent — safe to re-run.
+
+Then walk through interactive setup:
+
+```bash
+cd ~/devbrain && ./bin/devbrain setup
+```
+
+Prompts you through GitHub auth, project registration, notification
+channels, MCP client config, and prints a checklist of any manual
+steps left to do.
+
+**Manual install** — if you'd rather follow each step yourself, see
+[**INSTALL.md**](INSTALL.md).
 
 ---
 
