@@ -181,9 +181,45 @@ if $FULL_RESET; then
         skip "Ollama not installed"
     fi
 
-    # ─── Step 6 (--full only): Homebrew ────────────────────────────────────
+    # ─── Step 6 (--full only): Docker Desktop ──────────────────────────────
+    # Order matters — quit + uninstall Docker Desktop via brew BEFORE
+    # removing Homebrew itself. Otherwise /Applications/Docker.app and
+    # Docker's data dirs can survive the Homebrew uninstall.
     echo ""
-    echo -e "${BOLD}[6] Removing Homebrew (--full)${RESET}"
+    echo -e "${BOLD}[6] Removing Docker Desktop (--full)${RESET}"
+    if [[ -d /Applications/Docker.app ]]; then
+        info "Quitting Docker Desktop..."
+        osascript -e 'quit app "Docker"' 2>/dev/null || true
+        sleep 2
+        if command -v brew &>/dev/null; then
+            info "Uninstalling Docker cask..."
+            brew uninstall --cask docker --force 2>/dev/null || true
+        fi
+        if [[ -d /Applications/Docker.app ]]; then
+            info "Removing Docker.app manually..."
+            sudo rm -rf /Applications/Docker.app
+        fi
+        # Clean up Docker's data directories
+        for dir in \
+            "$HOME/Library/Application Support/Docker Desktop" \
+            "$HOME/Library/Containers/com.docker.docker" \
+            "$HOME/Library/Group Containers/group.com.docker" \
+            "$HOME/Library/Caches/com.docker.docker" \
+            "$HOME/Library/Logs/Docker Desktop" \
+            "$HOME/Library/Preferences/com.docker.docker.plist" \
+            "$HOME/.docker"; do
+            if [[ -e "$dir" ]]; then
+                rm -rf "$dir" 2>/dev/null || sudo rm -rf "$dir" 2>/dev/null || true
+            fi
+        done
+        ok "Docker Desktop + data directories removed"
+    else
+        skip "Docker Desktop not installed"
+    fi
+
+    # ─── Step 7 (--full only): Homebrew ────────────────────────────────────
+    echo ""
+    echo -e "${BOLD}[7] Removing Homebrew (--full)${RESET}"
     if command -v brew &>/dev/null; then
         warn "Uninstalling Homebrew. This may take a moment..."
         if [[ -r /dev/tty ]]; then
@@ -191,14 +227,27 @@ if $FULL_RESET; then
         else
             NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/uninstall.sh)" || true
         fi
-        ok "Homebrew uninstalled"
+        # Force-remove any leftover /opt/homebrew directory
+        if [[ -d /opt/homebrew ]]; then
+            info "Cleaning up /opt/homebrew..."
+            sudo rm -rf /opt/homebrew
+        fi
+        # Clean up shell rc lines added by the DevBrain installer
+        for rc in "$HOME/.zprofile" "$HOME/.bash_profile"; do
+            if [[ -f "$rc" ]]; then
+                # Remove our two markers' blocks (brew shellenv + local/bin)
+                sed -i.bak '/# Added by DevBrain installer/,+1d' "$rc" 2>/dev/null || true
+                rm -f "${rc}.bak"
+            fi
+        done
+        ok "Homebrew uninstalled and shell rc cleaned"
     else
         skip "Homebrew not installed"
     fi
 
-    # ─── Step 7 (--full only): Xcode CLT ───────────────────────────────────
+    # ─── Step 8 (--full only): Xcode CLT ───────────────────────────────────
     echo ""
-    echo -e "${BOLD}[7] Removing Xcode Command Line Tools (--full)${RESET}"
+    echo -e "${BOLD}[8] Removing Xcode Command Line Tools (--full)${RESET}"
     if [[ -d /Library/Developer/CommandLineTools ]]; then
         warn "Removing CLT requires sudo..."
         sudo rm -rf /Library/Developer/CommandLineTools
