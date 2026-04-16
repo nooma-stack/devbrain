@@ -252,10 +252,19 @@ if $FULL_RESET; then
         else
             NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/uninstall.sh)" || true
         fi
-        # Force-remove any leftover /opt/homebrew directory
+        # Force-remove any leftover /opt/homebrew directory (Homebrew's
+        # own uninstaller in NONINTERACTIVE mode leaves etc/, share/,
+        # var/ behind, plus any stray files from earlier failed installs).
         if [[ -d /opt/homebrew ]]; then
             info "Cleaning up /opt/homebrew..."
             sudo rm -rf /opt/homebrew
+        fi
+
+        # /etc/paths.d/homebrew is root-owned, so Homebrew's uninstaller
+        # can't remove it in NONINTERACTIVE mode. Clean it up ourselves.
+        if [[ -f /etc/paths.d/homebrew ]]; then
+            info "Cleaning up /etc/paths.d/homebrew..."
+            sudo rm -f /etc/paths.d/homebrew
         fi
         # Clean up shell rc lines added by the DevBrain installer
         for rc in "$HOME/.zprofile" "$HOME/.bash_profile"; do
@@ -320,6 +329,7 @@ if $FULL_RESET; then
     _check_removed "Docker.app" "/Applications/Docker.app" || ((verify_failures++))
     _check_removed "Docker CLI plugins" "/usr/local/cli-plugins" || ((verify_failures++))
     _check_removed "Homebrew prefix" "/opt/homebrew" || ((verify_failures++))
+    _check_removed "Homebrew /etc/paths.d entry" "/etc/paths.d/homebrew" || ((verify_failures++))
     _check_removed "CLT" "/Library/Developer/CommandLineTools" || ((verify_failures++))
     _check_cmd_removed "docker binary" "docker" || ((verify_failures++))
     _check_cmd_removed "brew binary" "brew" || ((verify_failures++))
