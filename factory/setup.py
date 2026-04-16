@@ -450,22 +450,46 @@ def setup_notifications(dev_id: str) -> None:
 
     # Telegram
     click.echo()
-    _desc("Telegram bot — Sends direct messages via a Telegram bot you")
-    _desc("create. Create a bot with @BotFather, get the token, then")
-    _desc("message your bot so DevBrain can discover your chat ID.")
+    _desc("Telegram bot — Sends notifications to your Telegram account via")
+    _desc("a bot you create just for yourself (not public). Two-step setup:")
+    _desc("  create the bot with @BotFather, then send /start to it so DevBrain")
+    _desc("  can discover your chat ID.")
     if _confirm("Enable Telegram notifications?", default=False):
-        token = _prompt("  Bot token (from @BotFather)")
+        click.echo()
+        _info("How to create a bot (takes ~1 minute):")
+        _desc("  1. Open Telegram (app or web.telegram.org)")
+        _desc("  2. Search for @BotFather (official blue-check bot)")
+        _desc("  3. Send:  /newbot")
+        _desc("  4. BotFather asks for a display name — type any name")
+        _desc("     (e.g., 'DevBrain Alice')")
+        _desc("  5. BotFather asks for a username — must end in 'bot'")
+        _desc("     and be globally unique (e.g., 'alice_devbrain_bot')")
+        _desc("  6. BotFather replies with a token like '1234567890:AAE...xyz'")
+        _desc("     Copy just the token (everything after the number:colon)")
+        click.echo()
+        token = _prompt("  Paste the bot token", hide_input=True)
         bot_username = _prompt("  Bot username (without @)")
         cfg["notifications"]["channels"]["telegram_bot"] = {
             "enabled": True,
             "bot_username": bot_username,
         }
         _append_env("TELEGRAM_BOT_TOKEN", token)
-        _ok("Telegram token saved to .env")
+        _ok("Telegram token saved to .env (mode 0600)")
+        _show_env_security_note()
+
+        click.echo()
+        _info(f"Next steps (do these before testing):")
+        _desc(f"  7. In Telegram, search for @{bot_username}")
+        _desc(f"  8. Send /start to your bot (just type /start and send)")
+        _desc(f"  9. Back in this terminal (after setup finishes), run:")
+        _desc(f"     ./bin/devbrain telegram-discover --username YOUR_TELEGRAM_HANDLE")
+        _desc(f"     (that's your @username on Telegram, not the bot's)")
+        _desc(f"  10. That command completes the pairing and sends a test message.")
         _add_action(
-            "Message your Telegram bot",
-            f"Open Telegram, search for @{bot_username}, and send /start.\n"
-            f"     Then run: ./bin/devbrain telegram-discover --username YOUR_HANDLE",
+            "Message your Telegram bot and pair DevBrain to your chat",
+            f"Open Telegram, search for @{bot_username}, send /start.\n"
+            f"     Then run: ./bin/devbrain telegram-discover --username YOUR_HANDLE\n"
+            f"     (YOUR_HANDLE is your personal @ on Telegram, not the bot's name)",
             condition="Telegram enabled",
         )
 
@@ -500,65 +524,124 @@ def setup_notifications(dev_id: str) -> None:
     _ok(f"Notification config saved ({len(channels_to_register)} channel(s) enabled)")
 
 
+def _merge_mcp_into_json(config_path: Path, devbrain_entry: dict) -> tuple[str, bool]:
+    """Auto-merge DevBrain's MCP config into an AI CLI's JSON config file.
+
+    Creates the file + parent directory if missing. Preserves all other
+    config keys and other MCP servers. If 'devbrain' is already configured
+    with the same command, it's a no-op; if configured with a different
+    command, we update it (so re-running setup after moving DEVBRAIN_HOME
+    does the right thing).
+
+    Returns (message, success). success=False means we didn't write
+    (e.g., invalid existing JSON — user must fix manually).
+    """
+    config_path = config_path.expanduser()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    existing: dict = {}
+    if config_path.exists() and config_path.stat().st_size > 0:
+        try:
+            with open(config_path) as f:
+                existing = json.load(f)
+            if not isinstance(existing, dict):
+                return (f"{config_path} is JSON but not an object — refusing to overwrite", False)
+        except json.JSONDecodeError as e:
+            return (f"{config_path} has invalid JSON ({e.msg}) — refusing to overwrite. "
+                    f"Fix the file or delete it and re-run 'devbrain setup'.", False)
+
+    existing.setdefault("mcpServers", {})
+    if not isinstance(existing["mcpServers"], dict):
+        return (f"{config_path} has a non-dict 'mcpServers' — refusing to overwrite", False)
+
+    previous = existing["mcpServers"].get("devbrain")
+    existing["mcpServers"]["devbrain"] = devbrain_entry
+
+    with open(config_path, "w") as f:
+        json.dump(existing, f, indent=2)
+        f.write("\n")
+
+    if previous is None:
+        return (f"Added devbrain MCP server to {config_path}", True)
+    elif previous == devbrain_entry:
+        return (f"devbrain MCP server already configured in {config_path} (no change)", True)
+    else:
+        return (f"Updated existing devbrain MCP server in {config_path}", True)
+
+
 def setup_mcp_client() -> None:
     _header("MCP Client Configuration")
     _desc(
         "DevBrain exposes its tools via the Model Context Protocol (MCP).",
-        "Your AI agent needs a one-time config snippet to connect. This",
-        "step generates the right snippet for your agent of choice.",
+        "For each AI CLI you have installed, we'll auto-merge DevBrain's",
+        "MCP server config into the CLI's JSON config file — creating the",
+        "file if it doesn't exist, preserving any existing config.",
     )
     click.echo()
 
     run_sh = DEVBRAIN_HOME / "mcp-server" / "run.sh"
-    config_snippet = {
-        "mcpServers": {
-            "devbrain": {
-                "command": str(run_sh),
-            }
-        }
-    }
+    devbrain_entry = {"command": str(run_sh)}
 
+    # (display name, config path, command to detect if CLI is installed)
     agents = [
-        ("Claude Code", "~/.claude/settings.json", "mcpServers"),
-        ("Codex CLI", "~/.codex/config.json", "mcpServers"),
-        ("Gemini CLI", "~/.gemini/settings.json", "mcpServers"),
+        ("Claude Code", "~/.claude/settings.json", "claude"),
+        ("Codex CLI", "~/.codex/config.json", "codex"),
+        ("Gemini CLI", "~/.gemini/settings.json", "gemini"),
     ]
 
-    for agent_name, config_path, key in agents:
-        _desc(f"{agent_name} — reads MCP server config from {config_path}.")
-        if _confirm(f"Generate config for {agent_name}?", default=(agent_name == "Claude Code")):
+    any_configured = False
+    for agent_name, config_path_str, cli_cmd in agents:
+        if not shutil.which(cli_cmd):
+            _info(f"{agent_name}: CLI not installed — skipping MCP config")
             click.echo()
-            click.echo(f"  Add this to {config_path}:")
+            continue
+
+        config_path = Path(config_path_str).expanduser()
+        _desc(f"{agent_name} — config file: {config_path}")
+
+        if not _confirm(f"Auto-configure MCP for {agent_name}?", default=True):
             click.echo()
-            formatted = json.dumps(config_snippet, indent=2)
+            continue
+
+        message, success = _merge_mcp_into_json(config_path, devbrain_entry)
+        if success:
+            _ok(message)
+            any_configured = True
+            _add_action(
+                f"Restart {agent_name}",
+                f"{agent_name} picks up MCP config changes on its next session start.\n"
+                f"     After restart, run '/mcp' inside {agent_name} to verify DevBrain tools are available.",
+                condition=f"{agent_name} configured",
+            )
+        else:
+            _warn(message)
+            # Fall back to manual-paste flow
+            _info("Showing config snippet for manual paste:")
+            click.echo()
+            manual_snippet = {"mcpServers": {"devbrain": devbrain_entry}}
+            formatted = json.dumps(manual_snippet, indent=2)
             for line in formatted.splitlines():
                 click.secho(f"    {line}", fg="cyan")
             click.echo()
-
             try:
                 subprocess.run(
-                    ["pbcopy"],
-                    input=formatted.encode(),
-                    check=True,
-                    capture_output=True,
+                    ["pbcopy"], input=formatted.encode(),
+                    check=True, capture_output=True,
                 )
                 _ok("Copied to clipboard")
             except (FileNotFoundError, subprocess.CalledProcessError):
                 _info("(pbcopy not available — copy manually from above)")
-
             _add_action(
-                f"Add MCP config to {agent_name}",
-                f"Paste the snippet above into {config_path}\n"
-                f"     (already copied to clipboard if on macOS).",
-                condition=f"{agent_name} selected",
-            )
-
-            _add_action(
-                f"Restart {agent_name}",
-                f"MCP config changes take effect on the next session start.",
-                condition=f"{agent_name} selected",
+                f"Manually add MCP config to {agent_name}",
+                f"Merge this into {config_path} (clipboard has the snippet):\n"
+                f"     {formatted.replace(chr(10), chr(10) + '     ')}",
+                condition=f"{agent_name} needs manual MCP config",
             )
         click.echo()
+
+    if not any_configured:
+        _info("No AI CLIs configured. Install one (e.g., Claude Code via the")
+        _info("native installer) and re-run 'devbrain setup' to wire it up.")
 
 
 def setup_pkrelay() -> None:
