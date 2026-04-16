@@ -232,24 +232,30 @@ if $FULL_RESET; then
 
         # Docker Desktop also installs many CLI binaries in /usr/local/bin
         # (docker, docker-compose, hub-tool, compose-switch, kubectl.docker,
-        # com.docker.cli, docker-credential-osxkeychain). These are symlinks
-        # into /Applications/Docker.app and survive cask uninstalls, blocking
+        # com.docker.*, docker-credential-*). These are symlinks into
+        # /Applications/Docker.app and survive cask uninstalls, blocking
         # future `brew install` with errors like:
         # "there is already a Binary at '/usr/local/bin/hub-tool'"
-        # Remove any symlink in /usr/local/bin whose target is or contained
-        # Docker.app. Handles dangling symlinks (target already deleted too).
+        # "there is already a Binary at '/usr/local/bin/docker-credential-desktop'"
+        # Strategy: use shell globs for the pattern-matching names AND a
+        # find-based catch-all for any remaining Docker symlinks.
         info "Cleaning up Docker CLI binaries in /usr/local/bin..."
         for bin_dir in /usr/local/bin /usr/local/sbin; do
             [[ -d "$bin_dir" ]] || continue
-            # Known Docker binary names (enumerate for broken symlinks)
-            for bin in docker docker-compose hub-tool compose-switch \
-                       kubectl.docker com.docker.cli com.docker.diagnose \
-                       docker-credential-osxkeychain docker-credential-desktop; do
+
+            # Glob-matched family names (docker-credential-*, com.docker.*)
+            # Use shell expansion via sudo sh -c since sudo doesn't expand globs directly.
+            sudo sh -c "rm -f $bin_dir/docker-credential-* $bin_dir/com.docker.* 2>/dev/null" || true
+
+            # Known fixed-name binaries
+            for bin in docker docker-compose hub-tool compose-switch kubectl.docker; do
                 if [[ -e "$bin_dir/$bin" || -L "$bin_dir/$bin" ]]; then
                     sudo rm -f "$bin_dir/$bin" 2>/dev/null || true
                 fi
             done
-            # Catch-all for any remaining symlinks pointing at Docker.app
+
+            # Catch-all for anything else pointing at Docker.app (covers future
+            # Docker binaries we haven't hardcoded)
             while IFS= read -r -d '' link; do
                 sudo rm -f "$link" 2>/dev/null || true
             done < <(find "$bin_dir" -maxdepth 1 -type l -lname "*Docker.app*" -print0 2>/dev/null)
@@ -354,17 +360,18 @@ if $FULL_RESET; then
     _check_removed "Docker.app" "/Applications/Docker.app" || ((verify_failures++))
     _check_removed "Docker CLI plugins" "/usr/local/cli-plugins" || ((verify_failures++))
 
-    # Check for Docker binaries in /usr/local/bin that would block re-install
-    leftover_docker=""
-    for bin in docker docker-compose hub-tool compose-switch kubectl.docker \
-               com.docker.cli docker-credential-osxkeychain; do
-        if [[ -e "/usr/local/bin/$bin" || -L "/usr/local/bin/$bin" ]]; then
-            leftover_docker+="$bin "
-        fi
-    done
+    # Check for Docker binaries in /usr/local/bin that would block re-install.
+    # Use find instead of hardcoded enumeration so we catch any new binary
+    # Docker might install in the future (e.g., new credential helpers).
+    leftover_docker=$(find /usr/local/bin -maxdepth 1 \
+        \( -name "docker*" -o -name "com.docker.*" -o -name "hub-tool" \
+           -o -name "compose-switch" -o -name "kubectl.docker" \) 2>/dev/null)
     if [[ -n "$leftover_docker" ]]; then
-        warn "Docker binaries still in /usr/local/bin: $leftover_docker"
-        info "Remove with: sudo rm -f /usr/local/bin/{$(echo "$leftover_docker" | tr ' ' ',' | sed 's/,$//')}"
+        warn "Docker-related binaries still in /usr/local/bin:"
+        while IFS= read -r f; do
+            [[ -n "$f" ]] && echo -e "    ${YELLOW}•${RESET} $f"
+        done <<< "$leftover_docker"
+        info "Remove with: sudo rm -f /usr/local/bin/docker-credential-* /usr/local/bin/com.docker.* /usr/local/bin/hub-tool /usr/local/bin/compose-switch"
         ((verify_failures++))
     else
         ok "Docker CLI binaries in /usr/local/bin: none"
