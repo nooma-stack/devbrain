@@ -78,14 +78,25 @@ desc() { echo -e "  ${DIM}$1${RESET}"; }
 ask() {
     if $AUTO_YES; then return 0; fi
     local prompt="$1 [Y/n]: "
-    read -rp "  $prompt" answer
+    local answer
+    # Read from /dev/tty so prompts work even when stdin is a pipe (curl|bash).
+    if [[ -r /dev/tty ]]; then
+        read -rp "  $prompt" answer </dev/tty
+    else
+        read -rp "  $prompt" answer
+    fi
     [[ -z "$answer" || "$answer" =~ ^[Yy] ]]
 }
 
 ask_no() {
     if $AUTO_YES; then return 1; fi
     local prompt="$1 [y/N]: "
-    read -rp "  $prompt" answer
+    local answer
+    if [[ -r /dev/tty ]]; then
+        read -rp "  $prompt" answer </dev/tty
+    else
+        read -rp "  $prompt" answer
+    fi
     [[ "$answer" =~ ^[Yy] ]]
 }
 
@@ -97,19 +108,76 @@ is_in_devbrain_repo() {
     [[ -d "$DEVBRAIN_HOME/factory" ]]
 }
 
+ensure_macos_clt() {
+    # Xcode Command Line Tools include git. On a fresh macOS they're absent.
+    # We trigger the installer and auto-poll for completion so users don't
+    # have to re-run this script after CLT installs.
+    if command -v git &>/dev/null; then
+        return 0
+    fi
+
+    echo ""
+    echo "════════════════════════════════════════════════════════════"
+    echo "  MACOS COMMAND LINE TOOLS REQUIRED"
+    echo "════════════════════════════════════════════════════════════"
+    echo ""
+    info "git is needed to clone DevBrain and isn't installed yet."
+    info "Triggering the Xcode Command Line Tools installer now."
+    echo ""
+    warn "IMPORTANT — the macOS popup may appear BEHIND this terminal:"
+    warn "  • Press Cmd+Tab or check Mission Control if you don't see it"
+    warn "  • Click 'Install' (NOT 'Get Xcode' — that's 12GB of overkill)"
+    warn "  • Accept the license, then wait ~5-10 minutes for download"
+    echo ""
+    info "This script will automatically resume once git is available."
+    echo ""
+
+    # Trigger the installer dialog (returns immediately; install happens async)
+    xcode-select --install 2>/dev/null || true
+
+    # Alert the user: sound + desktop notification in case they're AFK
+    afplay /System/Library/Sounds/Glass.aiff 2>/dev/null &
+    osascript -e 'display notification "Accept the Command Line Tools install dialog" with title "DevBrain Installer" sound name "Glass"' 2>/dev/null || true
+
+    # Poll every 5s until git appears, with progress indication
+    local waited=0
+    local max_wait=1800  # 30 minutes
+    echo -n "  Waiting for Command Line Tools install to complete"
+    while ! command -v git &>/dev/null; do
+        sleep 5
+        waited=$((waited + 5))
+        if (( waited % 30 == 0 )); then
+            local mins=$((waited / 60))
+            local secs=$((waited % 60))
+            echo ""
+            echo -n "  Still waiting... ($mins min $secs sec). If no dialog appeared, run 'xcode-select --install' in another terminal"
+        else
+            echo -n "."
+        fi
+        if (( waited >= max_wait )); then
+            echo ""
+            fail "Gave up waiting after 30 minutes."
+            fail "Install manually: xcode-select --install"
+            fail "Then re-run this installer."
+            exit 1
+        fi
+    done
+    echo ""
+    ok "Command Line Tools installed (after ${waited}s)"
+    echo ""
+}
+
 bootstrap_clone() {
     echo ""
     echo -e "${BOLD}DevBrain Bootstrap${RESET}"
     echo -e "${DIM}Running via curl|bash — cloning the repo first.${RESET}"
     echo ""
 
+    # On macOS, ensure git is available (may block up to 30 min for CLT install).
+    # On Linux, git must be pre-installed via apt/yum/etc.
     if ! command -v git &>/dev/null; then
         if [[ "$OSTYPE" == darwin* ]]; then
-            info "git not found — triggering Xcode Command Line Tools install."
-            xcode-select --install 2>/dev/null || true
-            warn "Accept the macOS dialog to install Command Line Tools, then"
-            warn "re-run this command. (Includes git.)"
-            exit 1
+            ensure_macos_clt
         else
             fail "git is required. Install it (e.g. 'sudo apt-get install git') and re-run."
             exit 1
@@ -119,7 +187,11 @@ bootstrap_clone() {
     if [[ -d "$DEVBRAIN_HOME" ]]; then
         if [[ -d "$DEVBRAIN_HOME/.git" ]]; then
             info "DevBrain already cloned at $DEVBRAIN_HOME — pulling latest..."
-            (cd "$DEVBRAIN_HOME" && git fetch --quiet && git checkout --quiet "$DEVBRAIN_BRANCH" && git pull --ff-only --quiet)
+            if ! (cd "$DEVBRAIN_HOME" && git fetch --quiet 2>/dev/null && git checkout --quiet "$DEVBRAIN_BRANCH" 2>/dev/null && git pull --ff-only --quiet 2>/dev/null); then
+                warn "Pull failed — repo may have local changes. Continuing with existing checkout."
+            else
+                ok "Updated to latest $DEVBRAIN_BRANCH"
+            fi
         else
             fail "$DEVBRAIN_HOME exists but is not a git repo."
             fail "Set DEVBRAIN_HOME=/different/path or remove the existing directory."
@@ -134,7 +206,17 @@ bootstrap_clone() {
     echo ""
     info "Re-executing installer from cloned repo..."
     echo ""
-    exec bash "$DEVBRAIN_HOME/scripts/install.sh" "$@"
+
+    # Redirect stdin to /dev/tty so interactive prompts (sudo passwords,
+    # Homebrew license acceptance, our own ask() prompts) work even though
+    # we were originally invoked via curl|bash (which has a pipe as stdin).
+    if [[ -r /dev/tty ]]; then
+        exec bash "$DEVBRAIN_HOME/scripts/install.sh" "$@" </dev/tty
+    else
+        # No controlling TTY available (e.g., CI). Require --yes for unattended.
+        warn "No /dev/tty available — running non-interactively. Set --yes if needed."
+        exec bash "$DEVBRAIN_HOME/scripts/install.sh" "$@"
+    fi
 }
 
 # ─── OS Detection ──────────────────────────────────────────────────────────
@@ -166,8 +248,15 @@ install_homebrew() {
     if command -v brew &>/dev/null; then
         skip "Homebrew $(brew --version | head -1 | awk '{print $2}')"
     else
-        info "Installing Homebrew..."
-        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        info "Installing Homebrew (will prompt for your macOS password)..."
+        # Homebrew's installer refuses to run if stdin isn't a TTY — redirect
+        # from /dev/tty so sudo's password prompt works even when this script
+        # was invoked via curl|bash.
+        if [[ -r /dev/tty ]]; then
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/tty
+        else
+            NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+        fi
         eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv 2>/dev/null)"
         ok "Homebrew installed"
     fi
