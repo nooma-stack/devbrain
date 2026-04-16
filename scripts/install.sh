@@ -245,36 +245,43 @@ _detect_existing_python_tooling() {
     # Detect Python setups that could be affected by adding brew shellenv
     # to the shell rc (which prepends /opt/homebrew/bin to PATH and would
     # change which python3 the user gets in new shells).
-    local found=()
+    #
+    # Returns a newline-separated list (possibly empty) on stdout.
+    # Uses a plain string instead of a bash array for macOS bash 3.2
+    # compatibility — `${array[@]}` on an empty array triggers an
+    # "unbound variable" error under `set -u`.
+    local found=""
+    local NL=$'\n'
 
     if [[ -d "$HOME/.pyenv" ]] || command -v pyenv &>/dev/null; then
-        found+=("pyenv")
+        found+="pyenv${NL}"
     fi
     if command -v conda &>/dev/null; then
-        found+=("conda (active)")
+        found+="conda (active)${NL}"
     elif [[ -d "$HOME/miniconda3" || -d "$HOME/anaconda3" || -d "$HOME/miniforge3" ]]; then
-        found+=("conda/miniconda (installed but inactive)")
+        found+="conda/miniconda (installed but inactive)${NL}"
     fi
     if command -v asdf &>/dev/null; then
-        found+=("asdf")
+        found+="asdf${NL}"
     fi
     if [[ -d /Library/Frameworks/Python.framework ]]; then
-        found+=("python.org installer")
+        found+="python.org installer${NL}"
     fi
 
     # Check shell rc for existing Python-related PATH manipulation
-    local rc
+    local rc=""
     case "${SHELL:-}" in
         */zsh)  rc="$HOME/.zshrc" ;;
         */bash) rc="$HOME/.bash_profile" ;;
     esac
-    if [[ -n "${rc:-}" && -f "$rc" ]]; then
+    if [[ -n "$rc" && -f "$rc" ]]; then
         if grep -qE 'pyenv init|conda init|asdf\.sh|PATH=.*python' "$rc" 2>/dev/null; then
-            found+=("custom Python config in $(basename "$rc")")
+            found+="custom Python config in $(basename "$rc")${NL}"
         fi
     fi
 
-    printf '%s\n' "${found[@]}"
+    # Trim trailing newline, emit only if non-empty
+    printf '%s' "${found%"$NL"}"
 }
 
 _persist_brew_shellenv() {
