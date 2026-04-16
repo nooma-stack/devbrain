@@ -241,11 +241,48 @@ detect_os() {
 
 # ─── Dependency Installers ─────────────────────────────────────────────────
 
+_detect_existing_python_tooling() {
+    # Detect Python setups that could be affected by adding brew shellenv
+    # to the shell rc (which prepends /opt/homebrew/bin to PATH and would
+    # change which python3 the user gets in new shells).
+    local found=()
+
+    if [[ -d "$HOME/.pyenv" ]] || command -v pyenv &>/dev/null; then
+        found+=("pyenv")
+    fi
+    if command -v conda &>/dev/null; then
+        found+=("conda (active)")
+    elif [[ -d "$HOME/miniconda3" || -d "$HOME/anaconda3" || -d "$HOME/miniforge3" ]]; then
+        found+=("conda/miniconda (installed but inactive)")
+    fi
+    if command -v asdf &>/dev/null; then
+        found+=("asdf")
+    fi
+    if [[ -d /Library/Frameworks/Python.framework ]]; then
+        found+=("python.org installer")
+    fi
+
+    # Check shell rc for existing Python-related PATH manipulation
+    local rc
+    case "${SHELL:-}" in
+        */zsh)  rc="$HOME/.zshrc" ;;
+        */bash) rc="$HOME/.bash_profile" ;;
+    esac
+    if [[ -n "${rc:-}" && -f "$rc" ]]; then
+        if grep -qE 'pyenv init|conda init|asdf\.sh|PATH=.*python' "$rc" 2>/dev/null; then
+            found+=("custom Python config in $(basename "$rc")")
+        fi
+    fi
+
+    printf '%s\n' "${found[@]}"
+}
+
 _persist_brew_shellenv() {
     # Homebrew's official post-install instruction: persist `brew shellenv`
     # to the user's shell rc so brew + brew-installed commands are in PATH
-    # for future shell sessions. We do this automatically so users don't
-    # have to copy/paste the snippet from Homebrew's install output.
+    # for future shell sessions. This puts /opt/homebrew/bin at the FRONT
+    # of PATH, which can shadow existing pyenv/conda/asdf setups. We detect
+    # those and prompt before modifying the user's shell rc.
     local rc
     case "${SHELL:-}" in
         */zsh)  rc="$HOME/.zprofile" ;;
@@ -253,14 +290,67 @@ _persist_brew_shellenv() {
         *)      return 0 ;;
     esac
     if [[ -f "$rc" ]] && grep -q 'brew shellenv' "$rc" 2>/dev/null; then
-        return 0  # already configured
+        skip "brew shellenv already in $rc"
+        return 0
     fi
+
+    local existing
+    existing=$(_detect_existing_python_tooling)
+
+    if [[ -n "$existing" ]]; then
+        echo ""
+        warn "Existing Python tooling detected on this machine:"
+        while IFS= read -r tool; do
+            [[ -n "$tool" ]] && echo -e "    ${YELLOW}•${RESET} $tool"
+        done <<< "$existing"
+        echo ""
+        desc "Adding 'brew shellenv' to $rc puts /opt/homebrew/bin at the FRONT"
+        desc "of your PATH for new terminal sessions. Effects:"
+        desc "  • python3, pip3, etc. will resolve to Homebrew's versions in fresh shells"
+        desc "  • pyenv/conda/asdf init scripts in .zshrc still run AFTER .zprofile,"
+        desc "    so they will override this and keep their own Python in PATH"
+        desc "  • Could surprise you if you have a manual python.org or custom setup"
+        echo ""
+        desc "DevBrain itself does NOT depend on this — our venvs always use"
+        desc "/opt/homebrew/bin/python3 via absolute path, so they work either way."
+        desc "If you skip this, brew-installed tools (gh, docker, ollama, psql)"
+        desc "won't be in PATH for new shells until you manually add brew shellenv."
+        echo ""
+        if ! ask "Add brew shellenv to $rc?"; then
+            info "Skipped. To enable later, run:"
+            echo -e "    ${CYAN}echo 'eval \"\$(/opt/homebrew/bin/brew shellenv)\"' >> $rc${RESET}"
+            return 0
+        fi
+    fi
+
     {
         echo ""
         echo "# Added by DevBrain installer — Homebrew shell environment"
         echo 'eval "$(/opt/homebrew/bin/brew shellenv)"'
     } >> "$rc"
     ok "Added Homebrew to $rc (effective on next shell start)"
+}
+
+_ensure_local_bin_in_path() {
+    # Ensure ~/.local/bin is in PATH for new shells. This is the XDG
+    # standard for user-installed binaries (used by Claude Code, pipx,
+    # cargo, and many others). Adding it is non-controversial and
+    # doesn't shadow anything.
+    local rc
+    case "${SHELL:-}" in
+        */zsh)  rc="$HOME/.zprofile" ;;
+        */bash) rc="$HOME/.bash_profile" ;;
+        *)      return 0 ;;
+    esac
+    mkdir -p "$HOME/.local/bin"
+    if [[ -f "$rc" ]] && grep -q '\.local/bin' "$rc" 2>/dev/null; then
+        return 0  # already configured
+    fi
+    {
+        echo ""
+        echo "# Added by DevBrain installer — XDG user bin directory"
+        echo 'export PATH="$HOME/.local/bin:$PATH"'
+    } >> "$rc"
 }
 
 install_homebrew() {
@@ -737,6 +827,10 @@ install_shims() {
         return
     fi
 
+    # Always ensure ~/.local/bin is in PATH (XDG standard, non-controversial)
+    # so our shims work even when the user opted out of brew shellenv.
+    _ensure_local_bin_in_path
+
     local bin_dir
     bin_dir="$(pick_bin_dir)"
 
@@ -752,11 +846,11 @@ install_shims() {
     # If bin_dir isn't in PATH, tell the user how to fix it.
     case ":$PATH:" in
         *":$bin_dir:"*)
-            ok "$bin_dir is already in PATH"
+            ok "$bin_dir is in PATH"
             ;;
         *)
-            warn "$bin_dir is not in your PATH."
-            POST_ACTIONS+=("Add $bin_dir to your PATH: echo 'export PATH=\"$bin_dir:\$PATH\"' >> ~/.zshrc && source ~/.zshrc")
+            warn "$bin_dir is not yet in PATH for this shell."
+            warn "Open a new terminal session, or run: source $rc"
             ;;
     esac
 }
