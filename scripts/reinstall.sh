@@ -264,6 +264,72 @@ if $FULL_RESET; then
     fi
 fi
 
+# ─── Post-wipe verification ────────────────────────────────────────────────
+
+echo ""
+echo -e "${BOLD}Verifying uninstall${RESET}"
+
+_check_removed() {
+    local label="$1"
+    local path="$2"
+    if [[ -e "$path" ]]; then
+        warn "$label: still present at $path"
+        return 1
+    else
+        ok "$label: removed"
+        return 0
+    fi
+}
+
+_check_cmd_removed() {
+    local label="$1"
+    local cmd="$2"
+    if command -v "$cmd" &>/dev/null; then
+        warn "$label: still in PATH ($(command -v "$cmd"))"
+        return 1
+    else
+        ok "$label: removed"
+        return 0
+    fi
+}
+
+verify_failures=0
+
+_check_removed "DevBrain repo" "$DEVBRAIN_HOME" || ((verify_failures++))
+_check_removed "launchd plist" "$HOME/Library/LaunchAgents/com.devbrain.ingest.plist" || ((verify_failures++))
+
+if $FULL_RESET; then
+    _check_removed "Docker.app" "/Applications/Docker.app" || ((verify_failures++))
+    _check_removed "Homebrew prefix" "/opt/homebrew" || ((verify_failures++))
+    _check_removed "CLT" "/Library/Developer/CommandLineTools" || ((verify_failures++))
+    _check_cmd_removed "docker binary" "docker" || ((verify_failures++))
+    _check_cmd_removed "brew binary" "brew" || ((verify_failures++))
+    _check_cmd_removed "ollama binary" "ollama" || ((verify_failures++))
+
+    # Check for leftover Docker LaunchAgents that could auto-start Docker
+    if ls "$HOME/Library/LaunchAgents/"com.docker.* &>/dev/null || \
+       ls /Library/LaunchAgents/com.docker.* &>/dev/null 2>&1 || \
+       ls /Library/LaunchDaemons/com.docker.* &>/dev/null 2>&1; then
+        warn "Docker LaunchAgents/Daemons still present (can auto-restart Docker)"
+        info "Clean up with:"
+        info "  ls ~/Library/LaunchAgents/com.docker.* /Library/LaunchAgents/com.docker.* /Library/LaunchDaemons/com.docker.* 2>/dev/null"
+        info "  sudo rm -f ~/Library/LaunchAgents/com.docker.* /Library/LaunchAgents/com.docker.* /Library/LaunchDaemons/com.docker.*"
+        ((verify_failures++))
+    else
+        ok "No Docker LaunchAgents/Daemons remaining"
+    fi
+fi
+
+if (( verify_failures > 0 )); then
+    echo ""
+    warn "$verify_failures verification check(s) failed — some artifacts remain."
+    warn "Review the warnings above. The installer is idempotent so re-running"
+    warn "it will work, but the clean-slate test is compromised."
+else
+    echo ""
+    ok "All items verified removed"
+fi
+
 # ─── Done ──────────────────────────────────────────────────────────────────
 
 echo ""
