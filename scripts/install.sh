@@ -398,6 +398,36 @@ install_linux_essentials() {
     fi
 }
 
+_launch_docker_in_background() {
+    # Kick Docker Desktop to launch in the background so the daemon is
+    # warm by the time start_postgres() needs it. Safe to call multiple
+    # times — `open -a Docker` is idempotent (no-op if already running).
+    if [[ -d /Applications/Docker.app ]]; then
+        # First-launch detection: absence of Docker's settings file means
+        # this is Docker's first-ever launch, which will require the user
+        # to accept a license dialog before the daemon starts.
+        local is_first_launch=false
+        if [[ ! -f "$HOME/Library/Application Support/Docker Desktop/settings-store.json" ]] \
+           && [[ ! -f "$HOME/Library/Application Support/Docker Desktop/settings.json" ]]; then
+            is_first_launch=true
+        fi
+
+        info "Launching Docker Desktop in background..."
+        open -a Docker 2>/dev/null || true
+
+        if $is_first_launch; then
+            echo ""
+            warn "FIRST LAUNCH: Docker Desktop's license agreement dialog"
+            warn "will appear. Accept it when convenient — you can keep working"
+            warn "while it shows; the installer will wait for the daemon later"
+            warn "in the Postgres step (in ~10-20 min once Ollama models finish)."
+            echo ""
+        else
+            info "Daemon will be warm by the time we need it."
+        fi
+    fi
+}
+
 install_docker() {
     step "Docker"
     desc "Runs PostgreSQL + pgvector in a container. DevBrain stores all"
@@ -405,19 +435,26 @@ install_docker() {
 
     if command -v docker &>/dev/null; then
         skip "Docker $(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')"
+        # Even if Docker is already installed, kick the daemon if it's
+        # not running so it's ready by the Postgres step.
+        if [[ "$OS" == "macos" ]] && ! docker info &>/dev/null 2>&1; then
+            _launch_docker_in_background
+        fi
     elif [[ "$OS" == "macos" ]]; then
         info "Installing Docker Desktop via Homebrew..."
         desc "(Alternatives: Colima or OrbStack — see INSTALL.md)"
         brew install --cask docker
         ok "Docker Desktop installed"
-        warn "ACTION REQUIRED: Open Docker Desktop from Applications to"
-        warn "accept the license agreement before containers can start."
-        POST_ACTIONS+=("Open Docker Desktop (Applications → Docker) and accept the license agreement")
+        _launch_docker_in_background
     else
         info "Installing Docker Engine..."
         curl -fsSL https://get.docker.com | sh
         sudo usermod -aG docker "$USER"
         ok "Docker installed (you may need to log out/in for group changes)"
+        # Start dockerd on Linux systemd systems
+        if command -v systemctl &>/dev/null; then
+            sudo systemctl start docker 2>/dev/null || true
+        fi
     fi
 }
 
