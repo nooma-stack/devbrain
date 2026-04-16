@@ -1024,24 +1024,39 @@ install_pkrelay() {
         return
     fi
 
+    # PKRelay is an optional companion install. Its failures must NOT
+    # fail the DevBrain install — we explicitly ignore errors from its
+    # installer and surface them as warnings.
     if [[ -d "$PKRELAY_HOME" ]]; then
         skip "PKRelay already cloned at $PKRELAY_HOME"
         info "Pulling latest..."
-        (cd "$PKRELAY_HOME" && git pull --ff-only 2>/dev/null || true)
+        (cd "$PKRELAY_HOME" && git pull --ff-only 2>/dev/null) || warn "PKRelay pull failed — using existing checkout"
     else
         info "Cloning PKRelay..."
-        git clone "$PKRELAY_REPO" "$PKRELAY_HOME"
+        if ! git clone "$PKRELAY_REPO" "$PKRELAY_HOME" 2>&1 | tail -5; then
+            warn "PKRelay clone failed — skipping (DevBrain install continues)"
+            return 0
+        fi
         ok "PKRelay cloned to $PKRELAY_HOME"
     fi
 
     if [[ -f "$PKRELAY_HOME/install.sh" ]]; then
         info "Running PKRelay installer..."
-        (cd "$PKRELAY_HOME" && bash install.sh)
-        ok "PKRelay installed"
+        if (cd "$PKRELAY_HOME" && bash install.sh); then
+            ok "PKRelay installed"
+        else
+            warn "PKRelay installer returned non-zero. DevBrain continues."
+            warn "Install PKRelay manually later: cd $PKRELAY_HOME && bash install.sh"
+            POST_ACTIONS+=("PKRelay install failed during setup — run manually: cd $PKRELAY_HOME && bash install.sh")
+        fi
     elif [[ -f "$PKRELAY_HOME/package.json" ]]; then
         info "Building PKRelay..."
-        (cd "$PKRELAY_HOME" && npm install --silent && npm run build --silent 2>/dev/null || true)
-        ok "PKRelay built"
+        if (cd "$PKRELAY_HOME" && npm install --silent && npm run build --silent 2>/dev/null); then
+            ok "PKRelay built"
+        else
+            warn "PKRelay build failed. DevBrain continues."
+            POST_ACTIONS+=("PKRelay build failed — debug from $PKRELAY_HOME")
+        fi
     fi
 
     POST_ACTIONS+=("Load PKRelay in Chrome: chrome://extensions → Enable Developer Mode → Load Unpacked → select $PKRELAY_HOME")
