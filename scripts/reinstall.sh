@@ -219,7 +219,25 @@ if $FULL_RESET; then
                 rm -rf "$dir" 2>/dev/null || sudo rm -rf "$dir" 2>/dev/null || true
             fi
         done
-        ok "Docker Desktop + data directories removed"
+
+        # Docker Desktop installs CLI plugins to /usr/local/cli-plugins/
+        # that persist across app uninstalls. Next `brew install --cask
+        # docker-desktop` refuses to overwrite these and errors with:
+        # "there is already a Binary at '/usr/local/cli-plugins/docker-compose'"
+        # Remove the whole plugin dir if it's Docker's (empty otherwise OK).
+        if [[ -d /usr/local/cli-plugins ]]; then
+            info "Removing Docker CLI plugins at /usr/local/cli-plugins..."
+            sudo rm -rf /usr/local/cli-plugins 2>/dev/null || true
+        fi
+
+        # Some Docker installs also leave helper files here
+        for path in \
+            "$HOME/Library/Application Support/com.docker.helper" \
+            "$HOME/Library/Application Support/Docker"; do
+            [[ -e "$path" ]] && rm -rf "$path" 2>/dev/null
+        done
+
+        ok "Docker Desktop + data directories + CLI plugins removed"
     else
         skip "Docker Desktop not installed"
     fi
@@ -300,6 +318,7 @@ _check_removed "launchd plist" "$HOME/Library/LaunchAgents/com.devbrain.ingest.p
 
 if $FULL_RESET; then
     _check_removed "Docker.app" "/Applications/Docker.app" || ((verify_failures++))
+    _check_removed "Docker CLI plugins" "/usr/local/cli-plugins" || ((verify_failures++))
     _check_removed "Homebrew prefix" "/opt/homebrew" || ((verify_failures++))
     _check_removed "CLT" "/Library/Developer/CommandLineTools" || ((verify_failures++))
     _check_cmd_removed "docker binary" "docker" || ((verify_failures++))
