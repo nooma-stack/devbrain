@@ -1013,7 +1013,12 @@ install_ai_clis() {
     desc "  • Gemini CLI (Google)       — alternative with Google account"
     desc "  • Codex CLI (OpenAI)        — alternative with OpenAI account"
     desc ""
-    desc "Each CLI uses its own subscription. You can install more later."
+    desc "Each CLI supports two auth methods:"
+    desc "  • OAuth (subscription)  — Claude Max/Pro, ChatGPT Pro, Google acct."
+    desc "  • API key               — pay-as-you-go billing (you provide a key)"
+    desc ""
+    desc "Auth happens in the setup wizard (after install). Install the CLIs"
+    desc "you want now; you'll pick OAuth vs API key for each during setup."
 
     # Claude Code — native installer (Anthropic's recommended path)
     echo ""

@@ -130,11 +130,17 @@ def setup_github() -> None:
 
 
 def setup_ai_cli_logins() -> None:
-    _header("AI CLI Logins")
+    _header("AI CLI Auth")
     _desc(
-        "For any AI CLI installed on this system, you can log in now so",
-        "DevBrain's factory can spawn them on your behalf. Each CLI uses",
-        "its own subscription (Anthropic, OpenAI, Google Workspace).",
+        "For any AI CLI installed on this system, you can authenticate now",
+        "so DevBrain's factory can spawn them on your behalf. Two options",
+        "per CLI:",
+        "",
+        "  OAuth (subscription)  — Claude Max/Pro, ChatGPT Pro/Plus, Google",
+        "                          account. Opens a browser to log in.",
+        "  API key               — Pay-as-you-go billing. Key stored in .env",
+        "                          (gitignored) and loaded as an env var",
+        "                          the CLI picks up automatically.",
     )
     click.echo()
 
@@ -142,23 +148,23 @@ def setup_ai_cli_logins() -> None:
         {
             "name": "Claude Code",
             "cmd": "claude",
-            "login_hint": "Run 'claude' — it opens a browser OAuth flow on first run",
             "desc": "Anthropic's CLI. Recommended for DevBrain's factory.",
-            "check_args": ["claude", "--version"],
+            "env_var": "ANTHROPIC_API_KEY",
+            "key_url": "https://console.anthropic.com/settings/keys",
         },
         {
             "name": "Codex CLI",
             "cmd": "codex",
-            "login_hint": "Run 'codex' — it opens a browser OAuth flow on first run",
-            "desc": "OpenAI's CLI. Requires an OpenAI account with API access.",
-            "check_args": ["codex", "--version"],
+            "desc": "OpenAI's CLI. Works with ChatGPT subscription or OpenAI API.",
+            "env_var": "OPENAI_API_KEY",
+            "key_url": "https://platform.openai.com/api-keys",
         },
         {
             "name": "Gemini CLI",
             "cmd": "gemini",
-            "login_hint": "Run 'gemini' — it opens a browser OAuth flow on first run",
-            "desc": "Google's CLI. Uses your Google/Workspace account.",
-            "check_args": ["gemini", "--version"],
+            "desc": "Google's CLI. Works with Google account or API key.",
+            "env_var": "GEMINI_API_KEY",
+            "key_url": "https://aistudio.google.com/apikey",
         },
     ]
 
@@ -171,30 +177,38 @@ def setup_ai_cli_logins() -> None:
         click.echo()
         click.secho(f"  {cli['name']}:", bold=True)
         _desc(cli["desc"])
+        _ok(f"Installed at {shutil.which(cli['cmd'])}")
 
-        # Heuristic: run the CLI with --version (or equivalent) and check
-        # if it succeeds. Most of these CLIs produce a version string
-        # without needing authentication.
-        try:
-            result = subprocess.run(
-                cli["check_args"],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0:
-                _ok(f"{cli['name']} installed at {shutil.which(cli['cmd'])}")
-        except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
+        # Show three-way choice
+        click.echo()
+        click.echo(f"    1. OAuth — opens browser for subscription login")
+        click.echo(f"    2. API key — paste a {cli['env_var']} for pay-as-you-go billing")
+        click.echo(f"    3. Skip (configure later)")
+        click.echo()
 
-        if _confirm(f"Launch {cli['name']} now to log in?", default=False):
+        choice = _prompt(f"Auth method for {cli['name']} (1/2/3)", default="3").strip()
+
+        if choice == "1":
             _info(f"Launching {cli['cmd']}... follow the browser prompts")
             _info("Come back to this terminal when login is done.")
             click.echo()
-            # Run it interactively so OAuth flow works
             subprocess.run([cli["cmd"]], check=False)
             click.echo()
             _ok(f"{cli['name']} login flow complete")
+        elif choice == "2":
+            _info(f"Get an API key from: {cli['key_url']}")
+            click.echo()
+            key = _prompt(f"    {cli['env_var']}", hide_input=True, default="").strip()
+            if key:
+                _append_env(cli["env_var"], key)
+                _ok(f"{cli['env_var']} saved to .env")
+                _info(f"The CLI will pick this up automatically on next run.")
+            else:
+                _warn("Empty key — skipped.")
         else:
-            _info(f"Skipped. {cli['login_hint']}")
+            _info(f"Skipped. Configure later by either:")
+            _info(f"  • Running '{cli['cmd']}' for OAuth login")
+            _info(f"  • Adding {cli['env_var']}=sk-... to .env for API key")
 
     if not any_installed:
         _info("No AI CLIs installed yet.")
