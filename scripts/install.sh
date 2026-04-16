@@ -241,12 +241,36 @@ detect_os() {
 
 # ─── Dependency Installers ─────────────────────────────────────────────────
 
+_persist_brew_shellenv() {
+    # Homebrew's official post-install instruction: persist `brew shellenv`
+    # to the user's shell rc so brew + brew-installed commands are in PATH
+    # for future shell sessions. We do this automatically so users don't
+    # have to copy/paste the snippet from Homebrew's install output.
+    local rc
+    case "${SHELL:-}" in
+        */zsh)  rc="$HOME/.zprofile" ;;
+        */bash) rc="$HOME/.bash_profile" ;;
+        *)      return 0 ;;
+    esac
+    if [[ -f "$rc" ]] && grep -q 'brew shellenv' "$rc" 2>/dev/null; then
+        return 0  # already configured
+    fi
+    {
+        echo ""
+        echo "# Added by DevBrain installer — Homebrew shell environment"
+        echo 'eval "$(/opt/homebrew/bin/brew shellenv)"'
+    } >> "$rc"
+    ok "Added Homebrew to $rc (effective on next shell start)"
+}
+
 install_homebrew() {
     step "Package manager"
     desc "Homebrew is the standard macOS package manager. All other"
     desc "dependencies are installed through it."
     if command -v brew &>/dev/null; then
         skip "Homebrew $(brew --version | head -1 | awk '{print $2}')"
+        # Even when brew is already installed, ensure shellenv is persisted.
+        _persist_brew_shellenv
     else
         info "Installing Homebrew (will prompt for your macOS password)..."
         # Homebrew's installer refuses to run if stdin isn't a TTY — redirect
@@ -258,6 +282,7 @@ install_homebrew() {
             NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
         fi
         eval "$(/opt/homebrew/bin/brew shellenv 2>/dev/null || /usr/local/bin/brew shellenv 2>/dev/null)"
+        _persist_brew_shellenv
         ok "Homebrew installed"
     fi
 }
@@ -365,29 +390,47 @@ install_python() {
     desc "factory orchestrator (automated code generation pipeline), and"
     desc "the DevBrain CLI."
 
-    if command -v python3 &>/dev/null; then
-        local ver
-        ver="$(python3 --version | awk '{print $2}')"
-        local major minor
-        major="${ver%%.*}"
-        minor="${ver#*.}"
-        minor="${minor%%.*}"
-        if [[ "$major" -ge 3 && "$minor" -ge 11 ]]; then
-            skip "Python $ver"
-            return
-        else
-            warn "Python $ver found but 3.11+ required"
-        fi
-    fi
-
     if [[ "$OS" == "macos" ]]; then
-        info "Installing Python 3 via Homebrew..."
-        brew install python@3
-        ok "Python installed"
+        # Always prefer Homebrew's Python over macOS/CLT's bundled Python.
+        # macOS Tahoe (and its Command Line Tools) ship python3 at
+        # /usr/local/bin/python3 with broken ensurepip — `python3 -m venv`
+        # creates a venv but fails to install pip into it. Homebrew's Python
+        # has a working ensurepip, so we install it unconditionally and
+        # later use its absolute path for venv creation.
+        if [[ -x /opt/homebrew/bin/python3 ]]; then
+            skip "Python $(/opt/homebrew/bin/python3 --version | awk '{print $2}') (Homebrew)"
+        else
+            info "Installing Python 3 via Homebrew (system Python is unreliable for venvs)..."
+            brew install python@3
+            ok "Python installed at /opt/homebrew/bin/python3"
+        fi
     else
+        # Linux: system Python is fine. Need 3.11+.
+        if command -v python3 &>/dev/null; then
+            local ver major minor
+            ver="$(python3 --version | awk '{print $2}')"
+            major="${ver%%.*}"; minor="${ver#*.}"; minor="${minor%%.*}"
+            if [[ "$major" -ge 3 && "$minor" -ge 11 ]]; then
+                skip "Python $ver"
+                return
+            else
+                warn "Python $ver found but 3.11+ required"
+            fi
+        fi
         info "Installing Python 3..."
         sudo apt-get install -y -qq python3 python3-venv python3-pip
         ok "Python installed"
+    fi
+}
+
+# Resolve the Python interpreter to use for venv creation.
+# On macOS, prefer Homebrew's python over /usr/local/bin/python3 (CLT/system),
+# which has a broken ensurepip and cannot bootstrap pip into a fresh venv.
+_python_for_venv() {
+    if [[ "$OS" == "macos" && -x /opt/homebrew/bin/python3 ]]; then
+        echo "/opt/homebrew/bin/python3"
+    else
+        echo "python3"
     fi
 }
 
@@ -422,9 +465,18 @@ install_psql() {
         skip "psql $(psql --version 2>/dev/null | awk '{print $NF}')"
     elif [[ "$OS" == "macos" ]]; then
         info "Installing libpq (psql client) via Homebrew..."
-        brew install libpq
-        brew link --force libpq 2>/dev/null || true
-        ok "psql installed"
+        # libpq is keg-only by default (Homebrew prints a "caveat" warning
+        # because it could conflict with a full PostgreSQL install). For
+        # DevBrain we only need the client and Postgres runs in Docker, so
+        # there's no real conflict — we force-link to put psql in PATH.
+        # HOMEBREW_NO_ENV_HINTS suppresses the noise.
+        HOMEBREW_NO_ENV_HINTS=1 brew install --quiet libpq 2>&1 | grep -vE '^(==>|Warning:|If you|For compilers|export |  echo|libpq is keg-only|because it conflicts|Hide these hints)' || true
+        brew link --force --quiet libpq 2>/dev/null || true
+        if command -v psql &>/dev/null; then
+            ok "psql installed and linked into PATH"
+        else
+            warn "psql linked but not in PATH yet — will be in next shell session"
+        fi
     else
         info "Installing postgresql-client..."
         sudo apt-get install -y -qq postgresql-client
@@ -460,10 +512,20 @@ setup_venvs() {
     desc "DevBrain uses two venvs: a root venv for the CLI and factory,"
     desc "and an ingest venv for the session capture pipeline."
 
-    # Root venv
+    local PY
+    PY="$(_python_for_venv)"
+    info "Using Python: $PY ($($PY --version 2>&1 | awk '{print $2}'))"
+
+    # Root venv. Use --without-pip to avoid the macOS Tahoe ensurepip bug,
+    # then bootstrap pip explicitly via get-pip.py for reliability.
     if [[ ! -f "$DEVBRAIN_HOME/.venv/bin/python" ]]; then
         info "Creating root venv..."
-        python3 -m venv "$DEVBRAIN_HOME/.venv"
+        if ! $PY -m venv "$DEVBRAIN_HOME/.venv" 2>/dev/null; then
+            warn "Default venv creation failed — retrying with --without-pip + manual bootstrap"
+            rm -rf "$DEVBRAIN_HOME/.venv"
+            $PY -m venv --without-pip "$DEVBRAIN_HOME/.venv"
+            curl -sSL https://bootstrap.pypa.io/get-pip.py | "$DEVBRAIN_HOME/.venv/bin/python"
+        fi
         ok "Root venv created"
     else
         skip "Root .venv"
@@ -473,10 +535,15 @@ setup_venvs() {
     "$DEVBRAIN_HOME/.venv/bin/pip" install -q -r "$DEVBRAIN_HOME/requirements.txt"
     ok "Root deps installed (click, psycopg2, pyyaml, textual, pytest)"
 
-    # Ingest venv
+    # Ingest venv (same fallback strategy)
     if [[ ! -f "$DEVBRAIN_HOME/ingest/.venv/bin/python" ]]; then
         info "Creating ingest venv..."
-        python3 -m venv "$DEVBRAIN_HOME/ingest/.venv"
+        if ! $PY -m venv "$DEVBRAIN_HOME/ingest/.venv" 2>/dev/null; then
+            warn "Default venv creation failed — retrying with --without-pip + manual bootstrap"
+            rm -rf "$DEVBRAIN_HOME/ingest/.venv"
+            $PY -m venv --without-pip "$DEVBRAIN_HOME/ingest/.venv"
+            curl -sSL https://bootstrap.pypa.io/get-pip.py | "$DEVBRAIN_HOME/ingest/.venv/bin/python"
+        fi
         ok "Ingest venv created"
     else
         skip "Ingest .venv"
