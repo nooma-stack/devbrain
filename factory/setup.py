@@ -251,12 +251,23 @@ def setup_ai_cli_logins() -> None:
         choice = _prompt(f"Auth method for {cli['name']} (1/2/3)", default="3").strip()
 
         if choice == "1":
-            _info(f"Launching {cli['cmd']}... follow the browser prompts")
-            _info("Come back to this terminal when login is done.")
             click.echo()
+            _info(f"Launching {cli['name']} CLI for OAuth login.")
+            _warn("IMPORTANT — after the browser login completes:")
+            _desc("  • Complete the OAuth flow in your browser")
+            _desc("  • The CLI may enter interactive mode (a chat prompt)")
+            _desc("  • Type '/quit' or '/exit' (or press Ctrl+C twice)")
+            _desc("    to exit the CLI and return to this setup wizard")
+            click.echo()
+            _info(f"Press Enter to launch {cli['cmd']}...")
+            try:
+                input()  # Pause so user reads the instructions
+            except (EOFError, KeyboardInterrupt):
+                _info("Skipped.")
+                continue
             subprocess.run([cli["cmd"]], check=False)
             click.echo()
-            _ok(f"{cli['name']} login flow complete")
+            _ok(f"{cli['name']} login flow complete (token stored by CLI)")
         elif choice == "2":
             _info(f"Get an API key from: {cli['key_url']}")
             click.echo()
