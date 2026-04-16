@@ -10,6 +10,7 @@ Called via: ./bin/devbrain setup
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -19,6 +20,28 @@ from pathlib import Path
 
 import click
 import yaml
+
+
+def _ensure_tty_stdin() -> None:
+    """Force sys.stdin to the controlling terminal so Click prompts work.
+
+    When `devbrain setup` is spawned as a subprocess from install.sh
+    (which itself was invoked via curl|bash and later exec'd with its
+    stdin redirected to /dev/tty), the inherited stdin sometimes ends
+    up in a state where Click reads EOF immediately and aborts without
+    user input. Explicitly re-opening /dev/tty here guarantees Click
+    has a live terminal to read from regardless of how the script was
+    invoked.
+    """
+    try:
+        tty_fd = os.open("/dev/tty", os.O_RDWR)
+    except OSError:
+        return  # No TTY available (CI, piped input) — leave stdin as-is
+    try:
+        # Wrap as text streams with line buffering so prompts get flushed
+        sys.stdin = os.fdopen(tty_fd, "r", buffering=1)
+    except Exception:
+        os.close(tty_fd)
 
 from config import (
     CONFIG_PATH,
@@ -631,6 +654,13 @@ def run_verification() -> None:
 # ─── Main entry point ──────────────────────────────────────────────────────
 
 def run_setup() -> None:
+    # Guarantee a working stdin for Click prompts. Without this, running
+    # the wizard from a subprocess chain (install.sh → devbrain subprocess
+    # → python) can result in Click seeing EOF and aborting immediately
+    # without user input. Opening /dev/tty directly bypasses any stdin
+    # weirdness inherited from parent processes.
+    _ensure_tty_stdin()
+
     click.echo()
     click.secho("  DevBrain Setup Wizard", bold=True)
     click.secho("  Local-first persistent memory and dev factory for coding agents", dim=True)
@@ -640,15 +670,25 @@ def run_setup() -> None:
     click.echo("  or by re-running this wizard.")
     click.echo()
 
-    setup_github()
-    setup_ai_cli_logins()
-    dev_id = setup_identity()
-    setup_projects()
-    setup_notifications(dev_id)
-    setup_mcp_client()
-    setup_pkrelay()
-    run_verification()
-    print_post_actions()
+    try:
+        setup_github()
+        setup_ai_cli_logins()
+        dev_id = setup_identity()
+        setup_projects()
+        setup_notifications(dev_id)
+        setup_mcp_client()
+        setup_pkrelay()
+        run_verification()
+        print_post_actions()
+    except click.exceptions.Abort:
+        # User pressed Ctrl+C or stdin EOF. Print a clear recovery message
+        # rather than the bare "Aborted!" Click shows by default.
+        click.echo()
+        click.echo()
+        _warn("Setup interrupted.")
+        _info("Your progress so far has been saved to config/devbrain.yaml and .env.")
+        _info("Re-run 'devbrain setup' anytime to continue — it picks up where it left off.")
+        sys.exit(1)
 
     click.echo()
     click.secho("━" * 60, bold=True)
