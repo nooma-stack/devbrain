@@ -1395,18 +1395,18 @@ def print_post_actions() -> None:
         click.echo()
 
     click.echo(
-        f"  After completing these, run {click.style('./bin/devbrain doctor', fg='cyan')}"
+        f"  After completing these, run {click.style('./bin/devbrain devdoctor', fg='cyan')}"
     )
     click.echo("  to verify everything is green.")
 
 
 def run_verification() -> None:
     _header("Verification")
-    _desc("Running devbrain doctor to confirm the installation...")
+    _desc("Running devbrain devdoctor to confirm the installation...")
     click.echo()
 
     result = subprocess.run(
-        [str(DEVBRAIN_HOME / "bin" / "devbrain"), "doctor"],
+        [str(DEVBRAIN_HOME / "bin" / "devbrain"), "devdoctor"],
         capture_output=False,
     )
 
@@ -1415,7 +1415,7 @@ def run_verification() -> None:
         _ok("DevBrain is ready!")
     else:
         click.echo()
-        _warn("Some checks failed — see above. Fix and re-run 'devbrain doctor'.")
+        _warn("Some checks failed — run 'devbrain devdoctor --fix' to remediate.")
 
 
 # ─── Main entry point ──────────────────────────────────────────────────────
@@ -1456,7 +1456,7 @@ MENU_SECTIONS: list[tuple[str, str, callable]] = [
     ("Factory CLI permissions tier (read-only / guarded / unrestricted)",
      "factory-permissions", setup_factory_permissions),
     ("PKRelay browser extension (optional)",   "pkrelay",  setup_pkrelay),
-    ("Run DevBrain Doctor (health check)",     "doctor",   run_verification),
+    ("Run DevDoctor (health check + offered fixes)", "devdoctor", run_verification),
     ("Check for DevBrain updates",             "updates",  check_for_updates),
     ("Show post-setup required actions",       "actions",  print_post_actions),
     ("Uninstall DevBrain (choose what to remove)", "uninstall", uninstall_devbrain),
@@ -1554,9 +1554,14 @@ def run_setup(section: str | None = None) -> None:
         elif section == "full":
             _run_full_setup()
         else:
+            # Legacy aliases for renamed section keys.
+            _section_aliases = {"doctor": "devdoctor"}
+            resolved = _section_aliases.get(section, section)
+            if resolved != section:
+                _info(f"(section '{section}' is now '{resolved}')")
             # Find the requested section
             for label, key, runner in MENU_SECTIONS:
-                if key == section and runner:
+                if key == resolved and runner:
                     click.echo()
                     click.secho(f"  Running: {label}", bold=True)
                     runner()

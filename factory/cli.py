@@ -407,7 +407,7 @@ def setup_cmd(section):
       devbrain setup mcp          — auto-configure MCP for installed AI CLIs
       devbrain setup factory-permissions  — set factory CLI permissions tier
       devbrain setup pkrelay      — install optional PKRelay browser bridge
-      devbrain setup doctor       — run devbrain doctor (health check)
+      devbrain setup devdoctor    — run devbrain devdoctor (health check)
       devbrain setup updates      — check for and pull DevBrain updates
       devbrain setup actions      — show remaining post-setup actions
       devbrain setup uninstall    — uninstall DevBrain with dependency choices
@@ -554,13 +554,11 @@ def _format_age(updated_at) -> str:
 # ─── doctor — installation health check ───────────────────────────────────────
 
 
-@cli.command(name="doctor")
-@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of text")
-def doctor(as_json):
-    """Verify DevBrain installation. Exit 0 only if every check passes.
+def _run_devdoctor_checks() -> list[dict]:
+    """Execute every devdoctor health check and return structured results.
 
-    Checks: Postgres + pgvector, Ollama + required models, MCP server build,
-    ingest venv, config file validity, and reports any env var overrides.
+    Extracted so `devdoctor`, the legacy `doctor` alias, and the
+    `upgrade` command can all share a single source of truth.
     """
     from config import (
         CONFIG_PATH,
@@ -719,27 +717,183 @@ def doctor(as_json):
         ", ".join(overrides) if overrides else "(none — using yaml + defaults)",
     )
 
-    # ─── Output ───────────────────────────────────────────────────────────────
+    return checks
+
+
+def _render_devdoctor_report(checks: list[dict]) -> None:
+    """Print the human-readable devdoctor report."""
+    click.echo("DevDoctor")
+    click.echo("=" * 60)
+    for c in checks:
+        icon = {"PASS": "✅", "WARN": "⚠️ ", "FAIL": "❌"}[c["status"]]
+        click.echo(f"  {icon} {c['name']:<32} {c['detail']}")
+    click.echo()
+
+
+def _offer_devdoctor_fixes(checks: list[dict]) -> None:
+    """Interactively offer to remediate WARN/FAIL items found by devdoctor.
+
+    Each remediation is opt-in with y/N prompts. Actions that affect
+    long-running processes (notably the Postgres container) also print
+    an explicit "restart your Claude Code sessions afterwards" reminder,
+    because the MCP subprocess reads yaml once at startup and won't
+    notice a rotated password until it re-launches.
+    """
+    actionable = [c for c in checks if c["status"] in ("WARN", "FAIL")]
+    if not actionable:
+        click.echo("✅ Nothing to fix.")
+        return
+
+    ctx = click.get_current_context()
+
+    click.echo()
+    click.secho("── Interactive remediation ─────────────────────────────────",
+                bold=True)
+    click.echo()
+    click.echo("For each flagged item, confirm y/N to apply the fix.")
+    click.echo("After any fix that recreates the database container, open a")
+    click.echo("new terminal (and restart any Claude Code session using")
+    click.echo("DevBrain MCP) so the MCP subprocess reloads.")
+    click.echo()
+
+    for c in actionable:
+        name = c["name"]
+        detail = c["detail"]
+        icon = {"WARN": "⚠️ ", "FAIL": "❌"}[c["status"]]
+        click.secho(f"{icon} {name}", bold=True)
+        click.echo(f"   {detail}")
+
+        if name == "db_password_rotated":
+            click.echo("   Fix: generate a new password, ALTER USER inside the")
+            click.echo("        container, sync .env + yaml, recreate the container.")
+            if click.confirm("   Rotate DB password now?", default=True):
+                ctx.invoke(rotate_db_password, yes=False, recreate=True)
+                click.secho(
+                    "   → After this runs, open a new terminal (and restart "
+                    "any Claude Code sessions) before using DevBrain MCP tools.",
+                    fg="yellow",
+                )
+
+        elif name == "factory_permissions_tier":
+            click.echo("   Fix: interactive wizard to pick tier + subcategories.")
+            if click.confirm("   Run factory-permissions wizard now?", default=True):
+                from setup import run_setup
+                run_setup(section="factory-permissions")
+
+        elif name == "mcp_server_built":
+            click.echo("   Fix: rebuild the MCP server (npm install + build).")
+            if click.confirm("   Rebuild now?", default=True):
+                import subprocess
+                from config import DEVBRAIN_HOME
+                mcp_dir = DEVBRAIN_HOME / "mcp-server"
+                subprocess.call(["npm", "install", "--silent"], cwd=str(mcp_dir))
+                subprocess.call(["npm", "run", "build", "--silent"], cwd=str(mcp_dir))
+                click.secho(
+                    "   → Restart any running Claude Code sessions so the MCP"
+                    " subprocess picks up the rebuilt dist/.",
+                    fg="yellow",
+                )
+
+        elif name == "postgres_reachable":
+            click.echo("   Fix: the most common cause is a .env / yaml")
+            click.echo("        password mismatch with Postgres. Rotate:")
+            click.echo(
+                f"        {click.style('./bin/devbrain rotate-db-password', fg='cyan')}"
+            )
+
+        elif name.startswith("ollama_model:"):
+            model = name.split(":", 1)[1]
+            click.echo(f"   Fix: pull {model} via Ollama.")
+            if click.confirm("   Pull now?", default=True):
+                import subprocess
+                subprocess.call(["ollama", "pull", model])
+
+        elif name == "pgvector_installed":
+            click.echo("   Fix: run CREATE EXTENSION vector; in the devbrain DB.")
+            if click.confirm("   Create the extension now?", default=True):
+                try:
+                    import psycopg2
+                    from config import DATABASE_URL
+                    with psycopg2.connect(DATABASE_URL) as conn, conn.cursor() as cur:
+                        cur.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+                    click.echo("   ✓ vector extension present")
+                except Exception as exc:
+                    click.echo(f"   ✗ {exc}", err=True)
+
+        else:
+            click.echo("   (no automated remediation — see INSTALL.md)")
+
+        click.echo()
+
+    click.echo("Re-run 'devbrain devdoctor' to verify.")
+
+
+@cli.command(name="devdoctor")
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of text")
+@click.option("--fix", is_flag=True,
+              help="Interactively remediate WARN/FAIL items")
+def devdoctor(as_json: bool, fix: bool) -> None:
+    """Verify DevBrain installation. Exit 0 only if every check passes.
+
+    Checks: Postgres + pgvector, Ollama + required models, MCP server build,
+    ingest venv, config file validity, factory permissions tier, DB
+    password strength, and reports any env var overrides.
+
+    With --fix, devdoctor walks each WARN/FAIL item and offers to
+    remediate (rotate DB password, set factory tier, rebuild MCP, etc.).
+    """
+    checks = _run_devdoctor_checks()
+
     if as_json:
         click.echo(json.dumps(checks, indent=2))
     else:
-        click.echo("DevBrain doctor")
-        click.echo("=" * 60)
-        for c in checks:
-            icon = {"PASS": "✅", "WARN": "⚠️ ", "FAIL": "❌"}[c["status"]]
-            click.echo(f"  {icon} {c['name']:<32} {c['detail']}")
-        click.echo()
+        _render_devdoctor_report(checks)
 
     failed = [c for c in checks if c["status"] == "FAIL"]
+    warned = [c for c in checks if c["status"] == "WARN"]
+
+    if fix and not as_json and (failed or warned):
+        _offer_devdoctor_fixes(checks)
+        # Don't sys.exit after a fix pass — user gets to see results
+        # and re-run devdoctor manually.
+        return
+
     if failed:
         if not as_json:
             click.echo(
                 f"❌ {len(failed)} check(s) failed. See INSTALL.md for setup steps.",
                 err=True,
             )
+            if warned:
+                click.echo(
+                    f"   {len(warned)} warning(s) — run 'devbrain devdoctor --fix' "
+                    "to remediate interactively.",
+                    err=True,
+                )
         sys.exit(1)
+
     if not as_json:
-        click.echo("✅ All checks passed.")
+        if warned:
+            click.echo(
+                f"⚠️  {len(warned)} warning(s) — run 'devbrain devdoctor --fix' "
+                "to remediate interactively."
+            )
+        else:
+            click.echo("✅ All checks passed.")
+
+
+@cli.command(name="doctor", hidden=True)
+@click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of text")
+@click.option("--fix", is_flag=True, help="Interactively remediate WARN/FAIL items")
+@click.pass_context
+def doctor_alias(ctx: click.Context, as_json: bool, fix: bool) -> None:
+    """Legacy alias for `devdoctor`. Kept so existing scripts keep working."""
+    click.echo(
+        "(Note: 'doctor' has been renamed to 'devdoctor'. "
+        "The old name still works; prefer the new one in scripts.)",
+        err=True,
+    )
+    ctx.invoke(devdoctor, as_json=as_json, fix=fix)
 
 
 def _rewrite_env_password(env_path: Path, new_password: str) -> None:
@@ -971,7 +1125,182 @@ def rotate_db_password(yes: bool, recreate: bool) -> None:
     click.echo()
     click.echo("✅ Rotation complete.")
     click.echo()
-    click.echo("Next: run './bin/devbrain doctor' to verify.")
+    click.echo("Next: run './bin/devbrain devdoctor' to verify.")
+
+
+@cli.command(name="upgrade")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompts")
+@click.option("--no-pull", is_flag=True, help="Skip git pull")
+@click.option("--no-rebuild", is_flag=True, help="Skip MCP rebuild")
+@click.option("--no-rotate", is_flag=True, help="Skip DB rotation check")
+@click.option("--no-tier", is_flag=True, help="Skip factory tier check")
+@click.pass_context
+def upgrade(
+    ctx: click.Context,
+    yes: bool,
+    no_pull: bool,
+    no_rebuild: bool,
+    no_rotate: bool,
+    no_tier: bool,
+) -> None:
+    """Migrate an existing install to the latest defaults.
+
+    Chains five steps:
+
+    \b
+      1. git pull --ff-only           (skip with --no-pull)
+      2. Rebuild the MCP server       (skip with --no-rebuild)
+      3. Rotate DB password if weak   (skip with --no-rotate)
+      4. Set factory tier if unsafe   (skip with --no-tier)
+      5. Run devdoctor for verification
+
+    Intended for existing DevBrain installs that pre-date newer defaults
+    (random DB password, loopback-only Postgres binding, factory
+    permission tiers). Idempotent — steps whose condition is already
+    satisfied skip with a checkmark.
+
+    Run this from a regular terminal (not inside a Claude Code session
+    whose MCP subprocess is connected to the DB). After completion,
+    restart any Claude Code sessions so the rebuilt MCP + rotated
+    password take effect.
+    """
+    import subprocess
+
+    from config import DEVBRAIN_HOME, load_config
+
+    click.echo()
+    click.secho("DevBrain Upgrade", bold=True)
+    click.echo("=" * 66)
+    click.echo()
+    click.echo("Steps:")
+    click.echo("  1. git pull --ff-only")
+    click.echo("  2. Rebuild MCP server (npm install + build)")
+    click.echo("  3. Rotate DB password if still on the old devbrain-local default")
+    click.echo("  4. Prompt for factory permissions tier if set to 3 / unset")
+    click.echo("  5. Run devdoctor")
+    click.echo()
+    click.secho(
+        "⚠️  Restart any running Claude Code sessions after this finishes —",
+        fg="yellow",
+    )
+    click.secho(
+        "   their MCP subprocesses keep the old dist/ and yaml password in memory.",
+        fg="yellow",
+    )
+    click.echo()
+
+    if not yes and not click.confirm("Proceed?", default=True):
+        click.echo("Aborted.")
+        return
+
+    # ─── Step 1: git pull ────────────────────────────────────────────────
+    click.echo()
+    click.secho("[1/5] git pull --ff-only", bold=True)
+    if no_pull:
+        click.echo("   (skipped via --no-pull)")
+    else:
+        rc = subprocess.call(
+            ["git", "pull", "--ff-only"], cwd=str(DEVBRAIN_HOME)
+        )
+        if rc != 0:
+            raise click.ClickException(
+                "git pull failed — resolve manually, then re-run 'devbrain upgrade'."
+            )
+
+    # ─── Step 2: rebuild MCP ─────────────────────────────────────────────
+    click.echo()
+    click.secho("[2/5] Rebuild MCP server", bold=True)
+    if no_rebuild:
+        click.echo("   (skipped via --no-rebuild)")
+    else:
+        mcp_dir = DEVBRAIN_HOME / "mcp-server"
+        if not mcp_dir.is_dir():
+            click.echo("   (mcp-server/ not present — skipped)")
+        else:
+            click.echo("   npm install...")
+            rc = subprocess.call(
+                ["npm", "install", "--silent"], cwd=str(mcp_dir)
+            )
+            if rc == 0:
+                click.echo("   npm run build...")
+                rc = subprocess.call(
+                    ["npm", "run", "build", "--silent"], cwd=str(mcp_dir)
+                )
+            if rc != 0:
+                raise click.ClickException("MCP rebuild failed")
+            click.echo("   ✓ rebuilt")
+
+    # ─── Step 3: DB password ────────────────────────────────────────────
+    click.echo()
+    click.secho("[3/5] Check DB password", bold=True)
+    if no_rotate:
+        click.echo("   (skipped via --no-rotate)")
+    else:
+        # Re-import config after git pull in case defaults changed.
+        cfg = load_config()
+        weak = {"devbrain-local", "REPLACE_DURING_INSTALL", ""}
+        pw = os.environ.get(
+            "DEVBRAIN_DB_PASSWORD",
+            cfg.get("database", {}).get("password", ""),
+        )
+        if pw in weak:
+            click.echo(
+                "   Weak/default password detected — rotating now."
+            )
+            click.echo(
+                "   (This recreates the devbrain-db container with the"
+                " loopback-only port binding.)"
+            )
+            ctx.invoke(rotate_db_password, yes=yes, recreate=True)
+        else:
+            click.echo("   ✓ custom password in use")
+
+    # ─── Step 4: factory tier ───────────────────────────────────────────
+    click.echo()
+    click.secho("[4/5] Check factory permissions tier", bold=True)
+    if no_tier:
+        click.echo("   (skipped via --no-tier)")
+    else:
+        cfg = load_config()
+        factory_cfg = cfg.get("factory", {})
+        tier = factory_cfg.get("permissions_tier")
+        if tier in (1, 2):
+            click.echo(f"   ✓ tier {tier}")
+        else:
+            click.echo(
+                f"   Tier {tier!r} (unrestricted or unset) — launching "
+                "factory-permissions wizard."
+            )
+            from setup import run_setup
+            run_setup(section="factory-permissions")
+
+    # ─── Step 5: devdoctor ──────────────────────────────────────────────
+    click.echo()
+    click.secho("[5/5] Final health check", bold=True)
+    try:
+        ctx.invoke(devdoctor, as_json=False, fix=False)
+    except SystemExit as exc:
+        # devdoctor calls sys.exit(1) on FAIL. Don't let that abort
+        # the friendly post-message we owe the user.
+        if exc.code not in (None, 0):
+            click.echo()
+            click.secho(
+                "⚠️  devdoctor reported failures — review above and run "
+                "'devbrain devdoctor --fix' to remediate.",
+                fg="yellow",
+            )
+
+    click.echo()
+    click.secho("✅ Upgrade complete.", fg="green", bold=True)
+    click.echo()
+    click.secho(
+        "Next: restart any Claude Code sessions that use DevBrain MCP",
+        fg="yellow",
+    )
+    click.secho(
+        "      (their MCP subprocesses still hold the pre-upgrade state).",
+        fg="yellow",
+    )
 
 
 if __name__ == "__main__":

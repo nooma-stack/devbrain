@@ -12,7 +12,7 @@ Rotating means updating all three. The safe order preserves your data.
 
 ## When to rotate
 
-- `devbrain doctor` flagged `db_password_rotated` as WARN.
+- `devbrain devdoctor` flagged `db_password_rotated` as WARN.
 - Your install dates from before the installer generated random passwords
   (your yaml still says `password: devbrain-local`).
 - You shared a machine and want a fresh credential.
@@ -78,7 +78,7 @@ docker compose down
 docker compose up -d devbrain-db
 
 # 6. Verify.
-./bin/devbrain doctor
+./bin/devbrain devdoctor
 ```
 
 `NEW_PW` stays in your shell history for this session — close the

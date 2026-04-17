@@ -4,8 +4,9 @@
 # ============================================================================
 #
 # Installs all DevBrain dependencies, builds components, and verifies the
-# install via `devbrain doctor`. Idempotent — safe to re-run after updates
-# or partial failures. Each step checks whether work is needed before acting.
+# install via `devbrain devdoctor`. Idempotent — safe to re-run after
+# updates or partial failures. Each step checks whether work is needed
+# before acting.
 #
 # Usage:
 #   ./scripts/install.sh              # Interactive (prompts for optional steps)
@@ -1456,16 +1457,17 @@ install_shims() {
 
 run_doctor() {
     step "Verification"
-    desc "Running devbrain doctor to verify the installation..."
+    desc "Running devbrain devdoctor to verify the installation..."
     echo ""
 
-    if "$DEVBRAIN_HOME/bin/devbrain" doctor; then
+    if "$DEVBRAIN_HOME/bin/devbrain" devdoctor; then
         echo ""
         ok "All checks passed!"
     else
         echo ""
         fail "Some checks failed — see output above for details."
-        fail "Fix the issues and re-run this script (it's idempotent)."
+        fail "Run './bin/devbrain devdoctor --fix' for interactive remediation,"
+        fail "or re-run this script (it's idempotent)."
     fi
 }
 
@@ -1492,7 +1494,7 @@ print_post_actions() {
     done
 
     echo ""
-    echo -e "  After completing these, re-run ${CYAN}./bin/devbrain doctor${RESET}"
+    echo -e "  After completing these, re-run ${CYAN}./bin/devbrain devdoctor${RESET}"
     echo -e "  to verify everything is green."
     echo ""
 }
