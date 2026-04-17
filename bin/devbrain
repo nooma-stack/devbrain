@@ -12,6 +12,52 @@ while [[ -L "$_target" ]]; do
 done
 DEVBRAIN_DIR="$(cd "$(dirname "$_target")/.." && pwd)"
 
+# ─── Auto-update on `devbrain setup` ───────────────────────────────────────
+# Pull the latest main before the wizard runs, so users always get the newest
+# setup code (fixes, new prompts, etc.) without having to cd and git pull.
+# Skipped if:
+#   - first arg isn't "setup"
+#   - DEVBRAIN_NO_UPDATE=1 is set
+#   - not on the 'main' branch (user is testing a feature branch)
+#   - working tree has uncommitted changes
+#   - no network / fetch fails / not a git repo
+# We happen BEFORE python starts, so the new code is loaded from disk directly.
+_auto_update() {
+    cd "$DEVBRAIN_DIR" 2>/dev/null || return 0
+    [[ -d .git ]] || return 0
+
+    local branch
+    branch="$(git symbolic-ref --short HEAD 2>/dev/null)" || return 0
+    [[ "$branch" == "main" ]] || return 0
+
+    # Dirty tree → don't pull (preserve user's work-in-progress)
+    [[ -z "$(git status --porcelain 2>/dev/null)" ]] || return 0
+
+    # Fetch with short timeout so offline users aren't stuck
+    if ! git fetch --quiet origin main 2>/dev/null; then
+        return 0
+    fi
+
+    local local_head remote_head
+    local_head="$(git rev-parse HEAD 2>/dev/null)"
+    remote_head="$(git rev-parse origin/main 2>/dev/null)"
+    [[ "$local_head" != "$remote_head" ]] || return 0
+
+    # Updates available — pull and tell the user.
+    echo ""
+    echo "  Pulling DevBrain updates: ${local_head:0:7} → ${remote_head:0:7}"
+    if git pull --ff-only --quiet origin main 2>/dev/null; then
+        echo "  ✓ Updated to latest"
+    else
+        echo "  ⚠ git pull failed — continuing with current code"
+    fi
+    echo ""
+}
+
+if [[ "${1:-}" == "setup" ]] && [[ "${DEVBRAIN_NO_UPDATE:-}" != "1" ]]; then
+    _auto_update
+fi
+
 # Load .env if present. `set -a` auto-exports all variables, so API keys
 # (ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY) and other secrets
 # become environment variables visible to Python + every child process

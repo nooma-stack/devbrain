@@ -143,6 +143,99 @@ def _append_env(key: str, value: str) -> None:
 _SECURITY_NOTE_SHOWN = False
 
 
+def check_for_updates() -> None:
+    """Menu-driven 'check for updates' — fetches from origin, shows what's
+    new, and offers to pull. Mirrors bin/devbrain's auto-update logic but
+    interactive. Safe to call when already up-to-date or on a non-main branch.
+    """
+    _header("Check for DevBrain Updates")
+
+    # Must be in a git repo
+    try:
+        branch = subprocess.run(
+            ["git", "-C", str(DEVBRAIN_HOME), "symbolic-ref", "--short", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        _warn(f"{DEVBRAIN_HOME} is not a git repository — can't check for updates.")
+        return
+
+    if branch != "main":
+        _info(f"You're on branch '{branch}' — auto-update only pulls 'main'.")
+        _info(f"To update anyway: cd {DEVBRAIN_HOME} && git pull")
+        if not _confirm("Fetch from origin to see what's on main anyway?", default=True):
+            return
+
+    # Fetch
+    _info("Fetching from origin...")
+    fetch = subprocess.run(
+        ["git", "-C", str(DEVBRAIN_HOME), "fetch", "--quiet", "origin"],
+        capture_output=True, text=True,
+    )
+    if fetch.returncode != 0:
+        _warn(f"git fetch failed: {fetch.stderr.strip() or 'unknown error'}")
+        _info("Check your network connection and try again.")
+        return
+
+    # Compare local HEAD to origin/main
+    local = subprocess.run(
+        ["git", "-C", str(DEVBRAIN_HOME), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+    remote = subprocess.run(
+        ["git", "-C", str(DEVBRAIN_HOME), "rev-parse", "origin/main"],
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+
+    if local == remote:
+        _ok(f"Up-to-date ({local[:7]})")
+        return
+
+    count = subprocess.run(
+        ["git", "-C", str(DEVBRAIN_HOME), "rev-list", "--count", f"{local}..{remote}"],
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+    log = subprocess.run(
+        ["git", "-C", str(DEVBRAIN_HOME), "log", "--oneline", "--no-decorate",
+         f"{local}..{remote}"],
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+
+    _info(f"{count} new commit(s) on origin/main:")
+    click.echo()
+    for line in log.splitlines():
+        click.secho(f"    {line}", fg="cyan")
+    click.echo()
+
+    # Check for dirty tree before offering pull
+    status = subprocess.run(
+        ["git", "-C", str(DEVBRAIN_HOME), "status", "--porcelain"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    if status:
+        _warn("Working tree has uncommitted changes — refusing to auto-pull.")
+        _info("Commit or stash your changes, then re-run this option.")
+        return
+
+    if branch != "main":
+        _info(f"You're on '{branch}', not 'main' — can't fast-forward from here.")
+        _info(f"To merge manually: cd {DEVBRAIN_HOME} && git checkout main && git pull")
+        return
+
+    if _confirm("Pull these changes now?", default=True):
+        pull = subprocess.run(
+            ["git", "-C", str(DEVBRAIN_HOME), "pull", "--ff-only", "--quiet"],
+            capture_output=True, text=True,
+        )
+        if pull.returncode == 0:
+            _ok(f"Updated: {local[:7]} → {remote[:7]}")
+            _info("New code takes effect on the next 'devbrain setup' or CLI invocation.")
+        else:
+            _warn(f"git pull failed: {pull.stderr.strip() or 'unknown error'}")
+    else:
+        _info("Skipped. Re-run 'devbrain setup updates' anytime to pull.")
+
+
 def _show_env_security_note() -> None:
     """Print a one-time explainer about how .env stores secrets."""
     global _SECURITY_NOTE_SHOWN
@@ -998,6 +1091,7 @@ MENU_SECTIONS: list[tuple[str, str, callable]] = [
     ("MCP client config (Claude Code, Codex, Gemini)", "mcp", setup_mcp_client),
     ("PKRelay browser extension (optional)",   "pkrelay",  setup_pkrelay),
     ("Verify installation (run devbrain doctor)", "verify", run_verification),
+    ("Check for DevBrain updates",             "updates",  check_for_updates),
     ("Show post-setup required actions",       "actions",  print_post_actions),
     ("Exit",                                    "exit",    None),  # special-cased
 ]

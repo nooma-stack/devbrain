@@ -407,8 +407,12 @@ def setup_cmd(section):
       devbrain setup mcp          — auto-configure MCP for installed AI CLIs
       devbrain setup pkrelay      — install optional PKRelay browser bridge
       devbrain setup verify       — run devbrain doctor
+      devbrain setup updates      — check for and pull DevBrain updates
       devbrain setup actions      — show remaining post-setup actions
       devbrain setup full         — run every section in order (first-time flow)
+
+    `devbrain setup` auto-updates from origin/main before running. Skip
+    with DEVBRAIN_NO_UPDATE=1 in your environment.
     """
     from setup import run_setup
     run_setup(section=section)
