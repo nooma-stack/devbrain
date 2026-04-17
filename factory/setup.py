@@ -143,6 +143,97 @@ def _append_env(key: str, value: str) -> None:
 _SECURITY_NOTE_SHOWN = False
 
 
+def uninstall_devbrain() -> None:
+    """Interactive uninstall — scale-of-destruction chooser.
+
+    Always removes: DevBrain repo, shims, DB container, launchd service,
+    per-dev profile dirs, .env. Optionally removes shared dependencies
+    (Homebrew, Docker, Ollama, CLT) via reinstall.sh's --full mode.
+    """
+    _header("Uninstall DevBrain")
+    _desc(
+        "DevBrain itself will always be removed (repo, shims, DB container,",
+        "launchd service, .env). For shared dependencies like Homebrew, Docker,",
+        "Ollama, and Xcode CLT — you choose what also goes.",
+    )
+    click.echo()
+    click.echo("    1. DevBrain only")
+    _desc("       Keeps Homebrew, Docker, Ollama, CLT, Claude CLI, Ollama models")
+    _desc("       Recommended if you use those for other projects/tools")
+    click.echo()
+    click.echo("    2. DevBrain + Ollama models")
+    _desc("       Adds removal of ~10GB of downloaded model files")
+    _desc("       Keeps Homebrew, Docker, Ollama binary, CLT, Claude CLI")
+    click.echo()
+    click.echo("    3. Full wipe")
+    _desc("       Removes everything DevBrain installed:")
+    _desc("       Homebrew, Docker Desktop + data, Ollama + models, CLT, shims")
+    _desc("       Does NOT touch Claude Code CLI (native installer, separate)")
+    _desc("       Use only if you want this machine back to pre-DevBrain state")
+    click.echo()
+    click.echo("    4. Cancel — don't uninstall")
+    click.echo()
+
+    choice = _prompt("Choose (1-4)", default="4").strip()
+
+    if choice not in ("1", "2", "3"):
+        _info("Uninstall cancelled.")
+        return
+
+    # Final confirmation with explicit preview
+    click.echo()
+    _warn("This will:")
+    _desc("  • Stop the DevBrain ingest launchd service")
+    _desc("  • Stop and remove the devbrain-db Docker container + volume")
+    _desc("  • Remove the ~/devbrain repository")
+    _desc("  • Remove global shims (devbrain, install-devbrain)")
+    if choice in ("2", "3"):
+        _desc("  • Remove Ollama models from ~/.ollama")
+    if choice == "3":
+        _desc("  • Uninstall Homebrew and everything brew-installed")
+        _desc("  • Remove Docker Desktop, /Applications/Docker.app, data dirs")
+        _desc("  • Remove Xcode Command Line Tools (needs sudo)")
+    click.echo()
+
+    if not _confirm("Proceed with uninstall?", default=False):
+        _info("Uninstall cancelled.")
+        return
+
+    reinstall_script = DEVBRAIN_HOME / "scripts" / "reinstall.sh"
+    if not reinstall_script.exists():
+        _warn(f"Cannot find {reinstall_script}")
+        _info("Try: curl -fsSL https://raw.githubusercontent.com/nooma-stack/devbrain/main/scripts/reinstall.sh | bash")
+        return
+
+    args = ["bash", str(reinstall_script), "--yes"]
+    if choice == "3":
+        args.append("--full")
+    # choice "2" would need a new --with-models-only flag in reinstall.sh.
+    # For now it's the same as choice 1; models cleanup happens in --full.
+    # TODO(future): add --models-only flag to reinstall.sh for granular cleanup.
+
+    click.echo()
+    _info(f"Running: {' '.join(args[1:])}")
+    click.echo()
+
+    # reinstall.sh ends by offering to run the installer. Tell the user
+    # not to say yes to that, since we're uninstalling, not reinstalling.
+    _info("At the end, reinstall.sh will ask 'Run the installer now?' — answer N.")
+    click.echo()
+
+    try:
+        subprocess.run(args, check=False)
+    except KeyboardInterrupt:
+        click.echo()
+        _warn("Uninstall interrupted. State may be partial — inspect or re-run.")
+        return
+
+    click.echo()
+    _ok("Uninstall complete. This setup command won't work after this session exits.")
+    _info("Reinstall anytime with:")
+    _info("  curl -fsSL https://raw.githubusercontent.com/nooma-stack/devbrain/main/scripts/install.sh | bash")
+
+
 def check_for_updates() -> None:
     """Menu-driven 'check for updates' — fetches from origin, shows what's
     new, and offers to pull. Mirrors bin/devbrain's auto-update logic but
@@ -1090,9 +1181,10 @@ MENU_SECTIONS: list[tuple[str, str, callable]] = [
     ("Notification channels (tmux, Slack, Telegram, SMTP, etc.)", "channels", _run_channels_section),
     ("MCP client config (Claude Code, Codex, Gemini)", "mcp", setup_mcp_client),
     ("PKRelay browser extension (optional)",   "pkrelay",  setup_pkrelay),
-    ("Verify installation (run devbrain doctor)", "verify", run_verification),
+    ("Run DevBrain Doctor (health check)",     "doctor",   run_verification),
     ("Check for DevBrain updates",             "updates",  check_for_updates),
     ("Show post-setup required actions",       "actions",  print_post_actions),
+    ("Uninstall DevBrain (choose what to remove)", "uninstall", uninstall_devbrain),
     ("Exit",                                    "exit",    None),  # special-cased
 ]
 

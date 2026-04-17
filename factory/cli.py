@@ -406,9 +406,10 @@ def setup_cmd(section):
       devbrain setup channels     — notification channels (tmux, Slack, Telegram, ...)
       devbrain setup mcp          — auto-configure MCP for installed AI CLIs
       devbrain setup pkrelay      — install optional PKRelay browser bridge
-      devbrain setup verify       — run devbrain doctor
+      devbrain setup doctor       — run devbrain doctor (health check)
       devbrain setup updates      — check for and pull DevBrain updates
       devbrain setup actions      — show remaining post-setup actions
+      devbrain setup uninstall    — uninstall DevBrain with dependency choices
       devbrain setup full         — run every section in order (first-time flow)
 
     `devbrain setup` auto-updates from origin/main before running. Skip
