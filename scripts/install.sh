@@ -83,6 +83,81 @@ fail() { echo -e "  ${RED}✗${RESET} $1"; }
 info() { echo -e "  ${CYAN}→${RESET} $1"; }
 desc() { echo -e "  ${DIM}$1${RESET}"; }
 
+# ─── Install style (verbose vs quiet) ──────────────────────────────────────
+#
+# Default: verbose — every command streams its output to the terminal.
+# Quiet:   noisy commands are wrapped by `_run` which redirects their
+#          output to a logfile and shows a spinner. On failure, the last
+#          30 lines of the logfile are printed to stderr.
+#
+# Set via welcome prompt on startup or via DEVBRAIN_INSTALL_STYLE env var.
+
+INSTALL_STYLE="${INSTALL_STYLE:-verbose}"
+INSTALL_LOG=""
+
+# shellcheck source=install-welcome.sh
+if [[ -f "${BASH_SOURCE[0]%/*}/install-welcome.sh" ]]; then
+    # shellcheck disable=SC1091
+    source "${BASH_SOURCE[0]%/*}/install-welcome.sh"
+fi
+
+# _run — wrap a noisy command. Usage:
+#     _run "Installing Docker" brew install --cask docker
+# In verbose mode, the command runs inline with its usual output.
+# In quiet mode, output goes to $INSTALL_LOG and a spinner runs until
+# the command exits. On failure, the tail of the log is dumped.
+_run() {
+    local description="$1"
+    shift
+
+    if [[ "$INSTALL_STYLE" != "quiet" ]] || [[ -z "$INSTALL_LOG" ]]; then
+        info "$description"
+        "$@"
+        return $?
+    fi
+
+    local spin_chars='⣾⣽⣻⢿⡿⣟⣯⣷'
+    local spin_len=${#spin_chars}
+    local i=0
+
+    printf '  %s⠿%s %s' "$CYAN" "$RESET" "$description"
+    {
+        echo ""
+        echo "=== $(date '+%H:%M:%S') ${description} ==="
+        echo "+ $*"
+    } >>"$INSTALL_LOG"
+
+    "$@" >>"$INSTALL_LOG" 2>&1 &
+    local pid=$!
+
+    # Hide cursor during spin
+    printf '\033[?25l'
+    while kill -0 "$pid" 2>/dev/null; do
+        local ch="${spin_chars:i%spin_len:1}"
+        printf '\r  %s%s%s %s' "$CYAN" "$ch" "$RESET" "$description"
+        i=$((i + 1))
+        sleep 0.1
+    done
+    printf '\033[?25h'
+
+    wait "$pid"
+    local rc=$?
+    if [[ $rc -eq 0 ]]; then
+        printf '\r  %s✓%s %s\n' "$GREEN" "$RESET" "$description"
+    else
+        printf '\r  %s✗%s %s (exit %d)\n' "$RED" "$RESET" "$description" "$rc"
+        {
+            echo ""
+            echo "Last 30 lines of $INSTALL_LOG:"
+            echo "────────────────────────────────────────────────────────────"
+            tail -30 "$INSTALL_LOG"
+            echo "────────────────────────────────────────────────────────────"
+            echo "Full log: $INSTALL_LOG"
+        } >&2
+    fi
+    return $rc
+}
+
 ask() {
     if $AUTO_YES; then return 0; fi
     local prompt="$1 [Y/n]: "
@@ -520,9 +595,8 @@ install_docker() {
             _launch_docker_in_background
         fi
     elif [[ "$OS" == "macos" ]]; then
-        info "Installing Docker Desktop via Homebrew..."
         desc "(Alternatives: Colima or OrbStack — see INSTALL.md)"
-        brew install --cask docker
+        _run "Installing Docker Desktop via Homebrew" brew install --cask docker
         ok "Docker Desktop installed"
         _launch_docker_in_background
     else
@@ -546,12 +620,10 @@ install_ollama() {
     if command -v ollama &>/dev/null; then
         skip "Ollama $(ollama --version 2>/dev/null | awk '{print $NF}')"
     elif [[ "$OS" == "macos" ]]; then
-        info "Installing Ollama via Homebrew..."
-        brew install ollama
+        _run "Installing Ollama via Homebrew" brew install ollama
         ok "Ollama installed"
     else
-        info "Installing Ollama..."
-        curl -fsSL https://ollama.com/install.sh | sh
+        _run "Installing Ollama" bash -c "curl -fsSL https://ollama.com/install.sh | sh"
         ok "Ollama installed"
     fi
 
@@ -586,13 +658,11 @@ install_node() {
     fi
 
     if [[ "$OS" == "macos" ]]; then
-        info "Installing Node.js 22 via Homebrew..."
-        brew install node@22
+        _run "Installing Node.js 22 via Homebrew" brew install node@22
         ok "Node.js installed"
     else
-        info "Installing Node.js 22 via nodesource..."
-        curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
-        sudo apt-get install -y -qq nodejs
+        _run "Installing Node.js 22 via nodesource" bash -c \
+            "curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash - && sudo apt-get install -y -qq nodejs"
         ok "Node.js installed"
     fi
 }
@@ -657,7 +727,8 @@ _rebuild_python_from_source() {
     warn "Rebuilding Python from source — this takes 20-30 minutes."
     warn "The progress output will be verbose; that's normal."
     brew uninstall --ignore-dependencies "$PY_BREW_FORMULA" 2>/dev/null || true
-    brew install --build-from-source "$PY_BREW_FORMULA"
+    _run "Rebuilding Python from source (~20-30 min)" \
+        brew install --build-from-source "$PY_BREW_FORMULA"
 
     if "$PY_BIN" -c "$PY_IMPORT_CHECK" 2>/dev/null; then
         ok "Source build succeeded"
@@ -682,8 +753,7 @@ install_python() {
 
         # Install or reinstall if needed
         if [[ ! -x "$PY_BIN" ]]; then
-            info "Installing $PY_BREW_FORMULA via Homebrew..."
-            brew install "$PY_BREW_FORMULA"
+            _run "Installing $PY_BREW_FORMULA via Homebrew" brew install "$PY_BREW_FORMULA"
         fi
 
         # Run the real import check and show the error if it fails
@@ -757,16 +827,16 @@ install_gh() {
     if command -v gh &>/dev/null; then
         skip "GitHub CLI $(gh --version 2>/dev/null | head -1 | awk '{print $NF}')"
     elif [[ "$OS" == "macos" ]]; then
-        info "Installing GitHub CLI via Homebrew..."
-        brew install gh
+        _run "Installing GitHub CLI via Homebrew" brew install gh
         ok "GitHub CLI installed"
     else
-        info "Installing GitHub CLI..."
-        (type -p wget >/dev/null || sudo apt-get install -y -qq wget) \
-            && sudo mkdir -p -m 755 /etc/apt/keyrings \
-            && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null \
-            && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null \
-            && sudo apt-get update -qq && sudo apt-get install -y -qq gh
+        _run "Installing GitHub CLI" bash -c '
+            (type -p wget >/dev/null || sudo apt-get install -y -qq wget) \
+                && sudo mkdir -p -m 755 /etc/apt/keyrings \
+                && wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null \
+                && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list >/dev/null \
+                && sudo apt-get update -qq && sudo apt-get install -y -qq gh
+        '
         ok "GitHub CLI installed"
     fi
 }
@@ -974,9 +1044,9 @@ setup_venvs() {
     else
         skip "Root .venv"
     fi
-    info "Installing root Python dependencies..."
-    "$DEVBRAIN_HOME/.venv/bin/pip" install -q --upgrade pip
-    "$DEVBRAIN_HOME/.venv/bin/pip" install -q -r "$DEVBRAIN_HOME/requirements.txt"
+    _run "Installing root Python dependencies" bash -c \
+        "'$DEVBRAIN_HOME/.venv/bin/pip' install -q --upgrade pip \
+         && '$DEVBRAIN_HOME/.venv/bin/pip' install -q -r '$DEVBRAIN_HOME/requirements.txt'"
     ok "Root deps installed (click, psycopg2, pyyaml, textual, pytest)"
 
     # Ingest venv (same fallback strategy)
@@ -992,9 +1062,9 @@ setup_venvs() {
     else
         skip "Ingest .venv"
     fi
-    info "Installing ingest Python dependencies..."
-    "$DEVBRAIN_HOME/ingest/.venv/bin/pip" install -q --upgrade pip
-    "$DEVBRAIN_HOME/ingest/.venv/bin/pip" install -q -r "$DEVBRAIN_HOME/ingest/requirements.txt"
+    _run "Installing ingest Python dependencies" bash -c \
+        "'$DEVBRAIN_HOME/ingest/.venv/bin/pip' install -q --upgrade pip \
+         && '$DEVBRAIN_HOME/ingest/.venv/bin/pip' install -q -r '$DEVBRAIN_HOME/ingest/requirements.txt'"
     ok "Ingest deps installed (psycopg2, watchdog, pyyaml)"
 }
 
@@ -1093,8 +1163,8 @@ start_postgres() {
         return
     fi
 
-    info "Starting PostgreSQL container..."
-    (cd "$DEVBRAIN_HOME" && docker compose up -d devbrain-db)
+    _run "Starting PostgreSQL container" bash -c \
+        "cd '$DEVBRAIN_HOME' && docker compose up -d devbrain-db"
     info "Waiting for Postgres to be ready..."
     local retries=0
     while ! docker exec devbrain-db pg_isready -U devbrain &>/dev/null; do
@@ -1130,8 +1200,8 @@ pull_models() {
         if ollama list 2>/dev/null | grep -q "$base"; then
             skip "$model"
         else
-            info "Pulling $model (this may take several minutes)..."
-            ollama pull "$model"
+            _run "Pulling $model (several minutes, ~5-10 GB each)" \
+                ollama pull "$model"
             ok "$model pulled"
         fi
     done
@@ -1143,10 +1213,10 @@ build_mcp() {
     desc "agents search memory, store decisions, manage factory jobs, and"
     desc "send notifications — all through a standard protocol."
 
-    info "Installing npm dependencies..."
-    (cd "$DEVBRAIN_HOME/mcp-server" && npm install --silent 2>&1 | tail -1)
-    info "Building TypeScript..."
-    (cd "$DEVBRAIN_HOME/mcp-server" && npm run build --silent 2>&1 | tail -1)
+    _run "Installing mcp-server npm dependencies" bash -c \
+        "cd '$DEVBRAIN_HOME/mcp-server' && npm install --silent"
+    _run "Building mcp-server TypeScript" bash -c \
+        "cd '$DEVBRAIN_HOME/mcp-server' && npm run build --silent"
     ok "MCP server built at mcp-server/dist/index.js"
 }
 
@@ -1453,10 +1523,23 @@ main() {
         exit 0  # unreachable — exec replaces the process
     fi
 
-    echo ""
-    echo -e "${BOLD}DevBrain Installer${RESET}"
-    echo -e "${DIM}Local-first persistent memory and dev factory for coding agents${RESET}"
-    echo ""
+    # Welcome screen — animated if the terminal supports it, static
+    # banner otherwise. Then ask verbose vs quiet install style.
+    if declare -F welcome_show >/dev/null 2>&1; then
+        welcome_show
+        INSTALL_STYLE="$(welcome_prompt_style)"
+    else
+        echo ""
+        echo -e "${BOLD}DevBrain Installer${RESET}"
+        echo -e "${DIM}Local-first persistent memory and dev factory for coding agents${RESET}"
+        echo ""
+    fi
+
+    if [[ "$INSTALL_STYLE" == "quiet" ]]; then
+        INSTALL_LOG="/tmp/devbrain-install-$$.log"
+        : >"$INSTALL_LOG"
+        info "Quiet mode — full output streaming to $INSTALL_LOG"
+    fi
 
     detect_os
     info "Detected: $OS ($ARCH)"
