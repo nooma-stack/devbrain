@@ -1,8 +1,7 @@
-import { config } from './db.js'
+import { getChunkingConfig } from './db.js'
 
 const CHARS_PER_TOKEN = 4
-const MAX_TOKENS = config.chunking.max_tokens as number
-const OVERLAP_TOKENS = config.chunking.overlap_tokens as number
+const { max_tokens: MAX_TOKENS, overlap_tokens: OVERLAP_TOKENS } = getChunkingConfig()
 
 export interface Chunk {
   content: string

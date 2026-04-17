@@ -1,7 +1,6 @@
-import { config } from './db.js'
+import { getSummarizationConfig } from './db.js'
 
-const OLLAMA_URL = config.summarization.url
-const SUMMARIZE_MODEL = config.summarization.model
+const { url: OLLAMA_URL, model: SUMMARIZE_MODEL } = getSummarizationConfig()
 
 export async function summarizeSession(content: string): Promise<string> {
   const prompt = `You are a technical session summarizer. Summarize this AI coding session transcript concisely. Focus on:

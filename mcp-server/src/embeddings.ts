@@ -1,7 +1,6 @@
-import { config } from './db.js'
+import { getEmbeddingConfig } from './db.js'
 
-const OLLAMA_URL = config.embedding.url
-const EMBED_MODEL = config.embedding.model
+const { url: OLLAMA_URL, model: EMBED_MODEL } = getEmbeddingConfig()
 
 export async function embed(text: string): Promise<number[]> {
   const response = await fetch(`${OLLAMA_URL}/api/embed`, {
