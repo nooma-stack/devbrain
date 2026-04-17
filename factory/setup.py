@@ -524,6 +524,152 @@ def setup_notifications(dev_id: str) -> None:
     _ok(f"Notification config saved ({len(channels_to_register)} channel(s) enabled)")
 
 
+DEVBRAIN_CLAUDE_MD_MARKER_BEGIN = "<!-- DEVBRAIN-BEGIN (managed by `devbrain setup mcp` — edit outside markers) -->"
+DEVBRAIN_CLAUDE_MD_MARKER_END = "<!-- DEVBRAIN-END -->"
+
+DEVBRAIN_CLAUDE_MD_CONTENT = """## DevBrain — Persistent Memory
+
+DevBrain provides cross-session memory and a dev factory pipeline via
+MCP tools (prefixed `mcp__devbrain__`).
+
+- **Start of session**: call `get_project_context` for current project's
+  recent decisions, patterns, and active factory jobs.
+- **Before architectural assumptions**: `deep_search` for prior sessions.
+- **On decision / pattern / issue**: `store` with the right type.
+- **End of session**: `end_session` with summary and next steps.
+- **Factory**: `factory_plan` / `factory_status` / `factory_approve`
+  for autonomous implementation with human approval gates.
+"""
+
+MCP_TOOL_TIERS = {
+    "queries": [
+        "mcp__devbrain__deep_search",
+        "mcp__devbrain__get_project_context",
+        "mcp__devbrain__get_source_context",
+        "mcp__devbrain__list_projects",
+        "mcp__devbrain__factory_status",
+        "mcp__devbrain__factory_file_locks",
+    ],
+    "memory_writes": [
+        "mcp__devbrain__store",
+        "mcp__devbrain__end_session",
+        "mcp__devbrain__devbrain_notify",
+    ],
+    "factory_ops": [
+        "mcp__devbrain__factory_plan",
+        "mcp__devbrain__factory_approve",
+        "mcp__devbrain__factory_cleanup",
+        "mcp__devbrain__devbrain_resolve_blocked",
+    ],
+}
+
+
+def _append_devbrain_claude_md() -> tuple[str, bool]:
+    """Idempotently append/update the DevBrain section in ~/.claude/CLAUDE.md.
+
+    Uses HTML-comment markers so we can find and update our block later
+    without disturbing the user's other content. Creates the file + dir
+    if missing.
+    """
+    md_path = Path("~/.claude/CLAUDE.md").expanduser()
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+
+    block = (
+        f"{DEVBRAIN_CLAUDE_MD_MARKER_BEGIN}\n"
+        f"{DEVBRAIN_CLAUDE_MD_CONTENT}"
+        f"{DEVBRAIN_CLAUDE_MD_MARKER_END}\n"
+    )
+
+    if not md_path.exists():
+        md_path.write_text(block)
+        return (f"Created {md_path} with DevBrain section", True)
+
+    content = md_path.read_text()
+    if DEVBRAIN_CLAUDE_MD_MARKER_BEGIN in content and DEVBRAIN_CLAUDE_MD_MARKER_END in content:
+        # Replace existing block in place
+        import re
+        pattern = re.compile(
+            re.escape(DEVBRAIN_CLAUDE_MD_MARKER_BEGIN)
+            + r".*?"
+            + re.escape(DEVBRAIN_CLAUDE_MD_MARKER_END) + r"\n?",
+            re.DOTALL,
+        )
+        new_content = pattern.sub(block, content, count=1)
+        if new_content == content:
+            return (f"DevBrain section already up-to-date in {md_path}", True)
+        md_path.write_text(new_content)
+        return (f"Updated DevBrain section in {md_path}", True)
+
+    # Append to existing file (preserve trailing newline)
+    suffix = "" if content.endswith("\n") else "\n"
+    md_path.write_text(content + suffix + "\n" + block)
+    return (f"Appended DevBrain section to {md_path}", True)
+
+
+def _update_permissions(config_path: Path, tools_to_allow: list[str]) -> tuple[str, bool]:
+    """Add MCP tools to permissions.allow in settings.json (deduped).
+
+    Preserves existing permissions. Returns message + success.
+    """
+    config_path = config_path.expanduser()
+    if not config_path.exists():
+        return (f"{config_path} does not exist — create it first via setup mcp", False)
+    try:
+        with open(config_path) as f:
+            settings = json.load(f)
+    except json.JSONDecodeError as e:
+        return (f"{config_path} has invalid JSON ({e.msg}) — fix manually", False)
+    if not isinstance(settings, dict):
+        return (f"{config_path} is not a JSON object — refusing to modify", False)
+
+    settings.setdefault("permissions", {})
+    perms = settings["permissions"]
+    if not isinstance(perms, dict):
+        return (f"{config_path}: 'permissions' is not a dict — refusing to modify", False)
+
+    allow = perms.setdefault("allow", [])
+    if not isinstance(allow, list):
+        return (f"{config_path}: 'permissions.allow' is not a list — refusing to modify", False)
+
+    existing = set(allow)
+    added = [t for t in tools_to_allow if t not in existing]
+    allow.extend(added)
+
+    with open(config_path, "w") as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+
+    if added:
+        return (f"Pre-approved {len(added)} MCP tool(s) in {config_path}", True)
+    else:
+        return (f"All requested tools already pre-approved in {config_path}", True)
+
+
+def _register_session_start_hook(config_path: Path, hook_path: Path) -> tuple[str, bool]:
+    """Add a session-start hook command to settings.json. Idempotent."""
+    config_path = config_path.expanduser()
+    if not config_path.exists():
+        return (f"{config_path} does not exist — create it first via setup mcp", False)
+    try:
+        with open(config_path) as f:
+            settings = json.load(f)
+    except json.JSONDecodeError as e:
+        return (f"{config_path} has invalid JSON ({e.msg}) — fix manually", False)
+
+    settings.setdefault("hooks", {})
+    existing = settings["hooks"].get("sessionStart")
+    new_entry = {"type": "command", "command": str(hook_path)}
+
+    if existing == new_entry:
+        return (f"Session-start hook already configured in {config_path}", True)
+
+    settings["hooks"]["sessionStart"] = new_entry
+    with open(config_path, "w") as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+    return (f"Registered session-start hook in {config_path}", True)
+
+
 def _merge_mcp_into_json(config_path: Path, devbrain_entry: dict) -> tuple[str, bool]:
     """Auto-merge DevBrain's MCP config into an AI CLI's JSON config file.
 
@@ -607,6 +753,12 @@ def setup_mcp_client() -> None:
         if success:
             _ok(message)
             any_configured = True
+
+            # Claude Code supports CLAUDE.md, permissions.allow, and
+            # hooks.sessionStart. Offer those optional tie-ins now.
+            if agent_name == "Claude Code":
+                _configure_claude_extras(config_path)
+
             _add_action(
                 f"Restart {agent_name}",
                 f"{agent_name} picks up MCP config changes on its next session start.\n"
@@ -642,6 +794,70 @@ def setup_mcp_client() -> None:
     if not any_configured:
         _info("No AI CLIs configured. Install one (e.g., Claude Code via the")
         _info("native installer) and re-run 'devbrain setup' to wire it up.")
+
+
+def _configure_claude_extras(settings_path: Path) -> None:
+    """Offer three Claude Code tie-ins after MCP server registration:
+    CLAUDE.md snippet, permissions pre-approval, session-start hook.
+    """
+    click.echo()
+    click.secho("  Claude Code integration extras", bold=True)
+
+    # 1. CLAUDE.md snippet
+    _desc("")
+    _desc("Persistent memory instructions (~/.claude/CLAUDE.md):")
+    _desc("  Add a brief DevBrain section so Claude knows about DevBrain's")
+    _desc("  tools on every session. Uses <!-- DEVBRAIN-BEGIN --> markers so")
+    _desc("  your other instructions stay untouched and can be updated cleanly.")
+    if _confirm("  Add DevBrain section to ~/.claude/CLAUDE.md?", default=True):
+        msg, success = _append_devbrain_claude_md()
+        (_ok if success else _warn)(msg)
+
+    # 2. Permissions pre-approval (3-tier choice)
+    click.echo()
+    _desc("Pre-approve DevBrain MCP tools (skip Claude's per-call prompts):")
+    click.echo()
+    click.echo("    1. Queries only             — deep_search, get_project_context, etc.")
+    click.echo("                                  (memory queries flow, all writes prompted)")
+    click.echo("    2. Queries + memory writes  — adds store, end_session, devbrain_notify")
+    click.echo("                                  (DevBrain manages memory autonomously)")
+    click.echo("    3. All DevBrain tools       — adds factory_plan, factory_approve, ...")
+    click.echo("                                  (full factory flow with no prompts —")
+    click.echo("                                   for active factory users)")
+    click.echo("    4. None                     — keep Claude's default per-call prompts")
+    click.echo()
+    perm_choice = _prompt("  Choose (1-4)", default="1").strip()
+
+    tools_to_allow: list[str] = []
+    if perm_choice == "1":
+        tools_to_allow = MCP_TOOL_TIERS["queries"]
+    elif perm_choice == "2":
+        tools_to_allow = MCP_TOOL_TIERS["queries"] + MCP_TOOL_TIERS["memory_writes"]
+    elif perm_choice == "3":
+        tools_to_allow = (MCP_TOOL_TIERS["queries"]
+                          + MCP_TOOL_TIERS["memory_writes"]
+                          + MCP_TOOL_TIERS["factory_ops"])
+
+    if tools_to_allow:
+        msg, success = _update_permissions(settings_path, tools_to_allow)
+        (_ok if success else _warn)(msg)
+    else:
+        _info("Kept Claude's default per-call prompts.")
+
+    # 3. Session-start hook (opt-in)
+    click.echo()
+    _desc("Auto-run DevBrain session-start hook (opt-in):")
+    _desc("  Runs hooks/session-start.sh before each Claude Code session")
+    _desc("  to preload the current project's recent decisions / issues / jobs.")
+    _desc("  Claude will print a context summary at the start of each new")
+    _desc("  session so you know what DevBrain context Claude already has loaded.")
+    if _confirm("  Enable session-start hook?", default=False):
+        hook_path = DEVBRAIN_HOME / "hooks" / "session-start.sh"
+        if hook_path.exists():
+            msg, success = _register_session_start_hook(settings_path, hook_path)
+            (_ok if success else _warn)(msg)
+        else:
+            _warn(f"Hook script not found at {hook_path} — skipped.")
 
 
 def setup_pkrelay() -> None:
