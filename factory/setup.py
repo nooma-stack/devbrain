@@ -747,33 +747,150 @@ def run_verification() -> None:
 
 # ─── Main entry point ──────────────────────────────────────────────────────
 
-def run_setup() -> None:
-    # Guarantee a working stdin for Click prompts. Without this, running
-    # the wizard from a subprocess chain (install.sh → devbrain subprocess
-    # → python) can result in Click seeing EOF and aborting immediately
-    # without user input. Opening /dev/tty directly bypasses any stdin
-    # weirdness inherited from parent processes.
+# ─── Menu / dispatch ────────────────────────────────────────────────────────
+
+def _resolve_dev_id_for_section() -> str:
+    """Return the dev_id for sections that need one (e.g., notifications).
+    Uses existing registration if present, otherwise $USER as default.
+    Does not prompt — sections that need actual registration should call
+    setup_identity() first."""
+    import os
+    db = FactoryDB(DATABASE_URL)
+    candidate = os.environ.get("USER", "")
+    existing = db.get_dev(candidate) if candidate else None
+    if existing:
+        return candidate
+    _warn("No dev identity registered yet.")
+    _info("Running identity setup first (required for this section)...")
+    return setup_identity()
+
+
+def _run_channels_section() -> None:
+    """Wrapper for setup_notifications that resolves dev_id first."""
+    dev_id = _resolve_dev_id_for_section()
+    setup_notifications(dev_id)
+
+
+# (menu label, section key, runner callable)
+MENU_SECTIONS: list[tuple[str, str, callable]] = [
+    ("Full setup (run every section in order)", "full", None),  # special-cased
+    ("GitHub authentication",                  "github",   setup_github),
+    ("AI CLI authentication (Claude / Codex / Gemini, OAuth or API key)", "ai-clis", setup_ai_cli_logins),
+    ("Dev identity (register or update)",      "identity", setup_identity),
+    ("Projects (register new or update)",      "projects", setup_projects),
+    ("Notification channels (tmux, Slack, Telegram, SMTP, etc.)", "channels", _run_channels_section),
+    ("MCP client config (Claude Code, Codex, Gemini)", "mcp", setup_mcp_client),
+    ("PKRelay browser extension (optional)",   "pkrelay",  setup_pkrelay),
+    ("Verify installation (run devbrain doctor)", "verify", run_verification),
+    ("Show post-setup required actions",       "actions",  print_post_actions),
+    ("Exit",                                    "exit",    None),  # special-cased
+]
+
+
+def _run_full_setup() -> None:
+    """The linear, first-time-user flow: every section in order."""
+    click.echo()
+    click.secho("  Running full setup — every section in order.", bold=True)
+    click.echo()
+
+    setup_github()
+    setup_ai_cli_logins()
+    dev_id = setup_identity()
+    setup_projects()
+    setup_notifications(dev_id)
+    setup_mcp_client()
+    setup_pkrelay()
+    run_verification()
+    print_post_actions()
+
+
+def _show_menu() -> None:
+    """Print the menu of available sections."""
+    click.echo()
+    click.secho("  What would you like to do?", bold=True)
+    click.echo()
+    for i, (label, _, _) in enumerate(MENU_SECTIONS, 1):
+        click.echo(f"    {i:>2}. {label}")
+    click.echo()
+
+
+def _run_menu_loop() -> None:
+    """Interactive menu: pick a section, run it, return to menu until exit."""
+    while True:
+        _show_menu()
+        choice_raw = _prompt(f"Choose (1-{len(MENU_SECTIONS)})", default="1")
+        try:
+            idx = int(choice_raw) - 1
+            if not 0 <= idx < len(MENU_SECTIONS):
+                raise ValueError()
+        except ValueError:
+            _warn(f"Invalid choice: '{choice_raw}'. Enter a number 1-{len(MENU_SECTIONS)}.")
+            continue
+
+        label, section_key, runner = MENU_SECTIONS[idx]
+
+        if section_key == "exit":
+            click.echo()
+            _info("Exiting setup. Run 'devbrain setup' anytime to return.")
+            return
+        if section_key == "full":
+            _run_full_setup()
+            return  # full flow is terminal
+
+        click.echo()
+        try:
+            runner()
+        except click.exceptions.Abort:
+            click.echo()
+            _warn("Section interrupted.")
+
+        click.echo()
+        if not _confirm("Return to menu?", default=True):
+            click.echo()
+            print_post_actions()
+            return
+
+
+def run_setup(section: str | None = None) -> None:
+    """Entry point for 'devbrain setup'.
+
+    Behavior:
+      - no argument       → interactive menu (recommended for most users)
+      - section=<key>     → jump directly to that section, then exit
+      - section='full'    → run all sections linearly (first-time-user flow)
+
+    Valid section keys: github, ai-clis, identity, projects, channels,
+    mcp, pkrelay, verify, actions, full.
+    """
     _ensure_tty_stdin()
 
     click.echo()
     click.secho("  DevBrain Setup Wizard", bold=True)
     click.secho("  Local-first persistent memory and dev factory for coding agents", dim=True)
     click.echo()
-    click.echo("  This wizard walks you through first-time configuration.")
-    click.echo("  Every setting can be changed later in config/devbrain.yaml")
-    click.echo("  or by re-running this wizard.")
-    click.echo()
 
     try:
-        setup_github()
-        setup_ai_cli_logins()
-        dev_id = setup_identity()
-        setup_projects()
-        setup_notifications(dev_id)
-        setup_mcp_client()
-        setup_pkrelay()
-        run_verification()
-        print_post_actions()
+        if section is None:
+            click.echo("  Every setting can be changed later — pick a section to run,")
+            click.echo("  or choose 'Full setup' for the linear first-time flow.")
+            _run_menu_loop()
+        elif section == "full":
+            _run_full_setup()
+        else:
+            # Find the requested section
+            for label, key, runner in MENU_SECTIONS:
+                if key == section and runner:
+                    click.echo()
+                    click.secho(f"  Running: {label}", bold=True)
+                    runner()
+                    click.echo()
+                    print_post_actions()
+                    return
+            # Unknown section
+            valid = [k for _, k, r in MENU_SECTIONS if r or k == "full"]
+            _warn(f"Unknown section: '{section}'")
+            _info(f"Valid sections: {', '.join(valid)}")
+            sys.exit(2)
     except click.exceptions.Abort:
         # User pressed Ctrl+C or stdin EOF. Print a clear recovery message
         # rather than the bare "Aborted!" Click shows by default.
@@ -781,7 +898,7 @@ def run_setup() -> None:
         click.echo()
         _warn("Setup interrupted.")
         _info("Your progress so far has been saved to config/devbrain.yaml and .env.")
-        _info("Re-run 'devbrain setup' anytime to continue — it picks up where it left off.")
+        _info("Re-run 'devbrain setup' anytime to continue — sections are idempotent.")
         sys.exit(1)
 
     click.echo()

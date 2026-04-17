@@ -393,10 +393,25 @@ def telegram_discover(dev_id, username):
 
 
 @cli.command(name="setup")
-def setup_cmd():
-    """Interactive first-time setup wizard."""
+@click.argument("section", required=False)
+def setup_cmd(section):
+    """Interactive setup wizard (menu-driven).
+
+    Run with no arguments for the menu. Or jump directly to a section:
+
+      devbrain setup github       — GitHub CLI auth
+      devbrain setup ai-clis      — Claude/Codex/Gemini auth (OAuth or API key)
+      devbrain setup identity     — register or update your dev identity
+      devbrain setup projects     — register projects with DevBrain
+      devbrain setup channels     — notification channels (tmux, Slack, Telegram, ...)
+      devbrain setup mcp          — auto-configure MCP for installed AI CLIs
+      devbrain setup pkrelay      — install optional PKRelay browser bridge
+      devbrain setup verify       — run devbrain doctor
+      devbrain setup actions      — show remaining post-setup actions
+      devbrain setup full         — run every section in order (first-time flow)
+    """
     from setup import run_setup
-    run_setup()
+    run_setup(section=section)
 
 
 @cli.command(name="dashboard")
