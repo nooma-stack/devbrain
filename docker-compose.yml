@@ -28,10 +28,13 @@ services:
       - ./migrations:/docker-entrypoint-initdb.d:ro
     environment:
       POSTGRES_USER: ${DEVBRAIN_DB_USER:-devbrain}
-      POSTGRES_PASSWORD: ${DEVBRAIN_DB_PASSWORD:-devbrain-local}
+      POSTGRES_PASSWORD: ${DEVBRAIN_DB_PASSWORD:?DEVBRAIN_DB_PASSWORD must be set in .env (run scripts/install.sh to generate one)}
       POSTGRES_DB: ${DEVBRAIN_DB_NAME:-devbrain}
     ports:
-      - "${DEVBRAIN_DB_HOST_PORT:-5433}:5432"
+      # Bind to loopback only — DevBrain is local-first and Postgres should
+      # never be reachable from the LAN. Override the port (not the host)
+      # via DEVBRAIN_DB_HOST_PORT if 5433 conflicts with another instance.
+      - "127.0.0.1:${DEVBRAIN_DB_HOST_PORT:-5433}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DEVBRAIN_DB_USER:-devbrain}"]
       interval: 5s

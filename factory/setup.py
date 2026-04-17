@@ -725,6 +725,171 @@ MCP tools (prefixed `mcp__devbrain__`).
   for autonomous implementation with human approval gates.
 """
 
+FACTORY_PERMISSION_TIERS = {
+    1: ("Read-only audit",
+        "file reads, git log/diff/status — factory can observe only"),
+    2: ("Guarded dev",
+        "Read/Write/Edit + safe dev commands (pytest, npm, git, tsc, ...)"),
+    3: ("Unrestricted",
+        "--dangerously-skip-permissions — full autonomy, filesystem + shell"),
+}
+
+# Tier 2 subcategory labels shown in the setup wizard. Order matters —
+# this is the prompt sequence the user sees.
+FACTORY_TIER_2_SUBCATEGORY_PROMPTS = [
+    ("file_modification",   "File modification (Write, Edit)",                                   True),
+    ("git_commit",          "Git commit/branch (add, commit, branch, checkout, reset, ...)",    True),
+    ("git_push",            "Git push / PR creation (push, pull, fetch, merge, gh)",            False),
+    ("python",              "Python dev loop (pytest, python, ruff, black, mypy, uv, pip)",     True),
+    ("node_typescript",     "Node/TypeScript dev loop (npm, node, tsc, yarn, jest, prettier)",  True),
+    ("build_tools",         "Build tools (make, cargo, go)",                                    True),
+    ("filesystem_ops",      "Filesystem ops (mkdir, cp, mv, touch)",                            True),
+    ("devbrain_mcp_writes", "DevBrain MCP writes (store, end_session, notify)",                 True),
+]
+
+
+def _write_factory_tier_2_subcategories(subcats: dict[str, bool]) -> tuple[str, bool]:
+    """Replace (or insert) the permissions_tier_2_subcategories: block.
+
+    Line-based — preserves comments and ordering.
+
+    Two passes: first strip all existing subcategory blocks inside the
+    factory: section, then insert a fresh block right after the
+    permissions_tier: line (canonical placement). Single-pass insertion
+    double-emitted when both an old block and a permissions_tier: line
+    existed simultaneously.
+    """
+    from config import CONFIG_PATH
+    import re
+
+    if not CONFIG_PATH.exists():
+        return (f"{CONFIG_PATH} does not exist", False)
+
+    new_block = ["  permissions_tier_2_subcategories:"]
+    for key, _label, _default in FACTORY_TIER_2_SUBCATEGORY_PROMPTS:
+        value = subcats.get(key, _default)
+        new_block.append(f"    {key}: {'true' if value else 'false'}")
+
+    lines = CONFIG_PATH.read_text().splitlines()
+
+    # Pass 1: strip every existing subcategory block inside factory:
+    stripped: list[str] = []
+    in_factory = False
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if re.match(r"^factory:", line):
+            in_factory = True
+            stripped.append(line)
+            i += 1
+            continue
+        if in_factory and re.match(r"^[^\s#]", line):
+            in_factory = False
+        if in_factory and re.match(r"^  permissions_tier_2_subcategories:", line):
+            # Skip the header line and all 4-space-indented children
+            i += 1
+            while i < len(lines) and re.match(r"^    \S", lines[i]):
+                i += 1
+            continue
+        stripped.append(line)
+        i += 1
+
+    # Pass 2: insert new block at canonical position (after permissions_tier:)
+    out: list[str] = []
+    in_factory = False
+    inserted = False
+    for line in stripped:
+        if re.match(r"^factory:", line):
+            in_factory = True
+            out.append(line)
+            continue
+        if in_factory and re.match(r"^[^\s#]", line):
+            if not inserted:
+                out.extend(new_block)
+                inserted = True
+            in_factory = False
+        if (in_factory and not inserted
+                and re.match(r"^  permissions_tier:", line)):
+            out.append(line)
+            out.extend(new_block)
+            inserted = True
+            continue
+        out.append(line)
+
+    # Edge case: factory: was the last top-level section
+    if in_factory and not inserted:
+        out.extend(new_block)
+        inserted = True
+
+    if not inserted:
+        return (
+            f"Could not locate factory: block in {CONFIG_PATH}", False,
+        )
+
+    CONFIG_PATH.write_text("\n".join(out) + "\n")
+    enabled = [k for k, v in subcats.items() if v]
+    return (
+        f"Tier 2 subcategories updated ({len(enabled)}/8 enabled)",
+        True,
+    )
+
+
+def _write_factory_permissions_tier(tier: int) -> tuple[str, bool]:
+    """Update factory.permissions_tier in config/devbrain.yaml.
+
+    Line-based rewrite so we don't round-trip through PyYAML (which
+    would strip comments). Adds the key if missing, replaces if present.
+    Scoped to the factory: block.
+    """
+    from config import CONFIG_PATH
+    import re
+
+    if not CONFIG_PATH.exists():
+        return (f"{CONFIG_PATH} does not exist", False)
+
+    lines = CONFIG_PATH.read_text().splitlines()
+    out: list[str] = []
+    in_factory_block = False
+    replaced = False
+
+    for line in lines:
+        if re.match(r"^factory:", line):
+            in_factory_block = True
+            out.append(line)
+            continue
+        if in_factory_block and re.match(r"^  permissions_tier:", line):
+            out.append(f"  permissions_tier: {tier}")
+            replaced = True
+            continue
+        if re.match(r"^[^\s#]", line):
+            # Leaving the factory: block without having seen the key —
+            # inject it just before the next top-level key.
+            if in_factory_block and not replaced:
+                out.append(f"  permissions_tier: {tier}")
+                replaced = True
+            in_factory_block = False
+        out.append(line)
+
+    # If factory: was the last block and we never left it, append at end.
+    if in_factory_block and not replaced:
+        out.append(f"  permissions_tier: {tier}")
+        replaced = True
+
+    if not replaced:
+        return (
+            f"Could not find or add 'permissions_tier' in {CONFIG_PATH} "
+            f"(no 'factory:' block?)",
+            False,
+        )
+
+    CONFIG_PATH.write_text("\n".join(out) + "\n")
+    return (
+        f"factory.permissions_tier set to {tier} "
+        f"({FACTORY_PERMISSION_TIERS[tier][0]}) in {CONFIG_PATH}",
+        True,
+    )
+
+
 MCP_TOOL_TIERS = {
     "queries": [
         "mcp__devbrain__deep_search",
@@ -1028,7 +1193,13 @@ def _configure_claude_extras(settings_path: Path) -> None:
     else:
         _info("Kept Claude's default per-call prompts.")
 
-    # 3. Session-start hook (opt-in)
+    # 3. Factory permissions tier — what the factory subprocess can do.
+    # Complements the MCP tier above (which controls the interactive
+    # session): that gates user-facing prompts, this gates what autonomous
+    # factory-spawned claude runs can execute on their own.
+    _prompt_factory_permissions_tier()
+
+    # 4. Session-start hook (opt-in)
     click.echo()
     _desc("Auto-run DevBrain session-start hook (opt-in):")
     _desc("  Runs hooks/session-start.sh before each Claude Code session")
@@ -1042,6 +1213,108 @@ def _configure_claude_extras(settings_path: Path) -> None:
             (_ok if success else _warn)(msg)
         else:
             _warn(f"Hook script not found at {hook_path} — skipped.")
+
+
+def _prompt_factory_permissions_tier() -> None:
+    """Prompt the user for factory CLI permissions tier and write it to yaml.
+
+    Shared between the Claude Code extras flow (inside setup_mcp_client)
+    and the standalone `devbrain setup factory-permissions` section so
+    users can change the tier later without re-running MCP setup. When
+    the user picks tier 2, also prompts per-subcategory.
+    """
+    from config import (
+        FACTORY_PERMISSIONS_TIER as _current_tier,
+        FACTORY_TIER_2_SUBCATEGORIES as _current_subcats,
+    )
+
+    click.echo()
+    _desc("Factory CLI permissions (what autonomous factory subprocesses can do):")
+    click.echo()
+    click.echo("    1. Read-only audit        — file reads, git log/diff/status only")
+    click.echo("                                (for dry runs & untrusted specs —")
+    click.echo("                                 factory can observe, cannot modify)")
+    click.echo("    2. Guarded dev (default)  — Read/Write/Edit + safe dev commands")
+    click.echo("                                (pytest, npm, git commit, tsc, ruff)")
+    click.echo("                                — typical factory op, no arbitrary shell)")
+    click.echo("    3. Unrestricted           — --dangerously-skip-permissions")
+    click.echo("                                (full autonomy — for power users")
+    click.echo("                                 running trusted specs)")
+    click.echo()
+    _desc(f"Current setting: tier {_current_tier} "
+          f"({FACTORY_PERMISSION_TIERS.get(_current_tier, ('unknown', ''))[0]})")
+
+    default = str(_current_tier if _current_tier in (1, 2, 3) else 2)
+    tier_choice = _prompt("  Choose (1-3)", default=default).strip()
+
+    if tier_choice not in ("1", "2", "3"):
+        _warn(f"Invalid choice '{tier_choice}' — leaving tier unchanged.")
+        return
+
+    tier = int(tier_choice)
+
+    # Write the tier if it changed. (A no-op write is fine but we prefer
+    # the cleaner "already set" message when nothing changes.)
+    if tier != _current_tier:
+        msg, success = _write_factory_permissions_tier(tier)
+        (_ok if success else _warn)(msg)
+        if not success:
+            return
+    else:
+        _info(f"Factory permissions tier already set to {tier}.")
+
+    if tier == 3:
+        _warn("Tier 3 grants factory subprocesses full autonomy.")
+        _warn("Lessons stored in DevBrain that reach the planning prompt")
+        _warn("become a prompt-injection → code-execution path at this tier.")
+        return
+
+    if tier == 1:
+        # Tier 1 has no subcategory knobs — the allowlist is fixed.
+        return
+
+    # Tier 2 — prompt for each subcategory toggle.
+    _prompt_tier_2_subcategories(_current_subcats)
+
+
+def _prompt_tier_2_subcategories(current: dict[str, bool]) -> None:
+    """Prompt the user for each tier-2 subcategory and persist the result."""
+    click.echo()
+    _desc("Pick which tier 2 subcategories the factory is allowed to use:")
+    _desc("  (accept default to keep current setting)")
+    click.echo()
+
+    chosen: dict[str, bool] = {}
+    for key, label, default_value in FACTORY_TIER_2_SUBCATEGORY_PROMPTS:
+        existing = current.get(key, default_value)
+        chosen[key] = _confirm(f"  {label}?", default=existing)
+
+    msg, success = _write_factory_tier_2_subcategories(chosen)
+    (_ok if success else _warn)(msg)
+
+    enabled = [
+        label for (key, label, _default) in FACTORY_TIER_2_SUBCATEGORY_PROMPTS
+        if chosen[key]
+    ]
+    disabled = [
+        label for (key, label, _default) in FACTORY_TIER_2_SUBCATEGORY_PROMPTS
+        if not chosen[key]
+    ]
+    if disabled:
+        _info(f"Disabled: {', '.join(d.split(' (')[0] for d in disabled)}")
+    if len(enabled) == len(FACTORY_TIER_2_SUBCATEGORY_PROMPTS):
+        _info("All tier 2 subcategories enabled.")
+
+
+def setup_factory_permissions() -> None:
+    """Standalone section: configure factory CLI permissions tier."""
+    _header("Factory CLI permissions tier")
+    _desc(
+        "Controls what factory-spawned claude subprocesses can do when",
+        "running autonomously (planning, implementing, reviewing, fixing).",
+        "Separate from the interactive MCP tier set in 'setup mcp'.",
+    )
+    _prompt_factory_permissions_tier()
 
 
 def setup_pkrelay() -> None:
@@ -1180,6 +1453,8 @@ MENU_SECTIONS: list[tuple[str, str, callable]] = [
     ("Projects (register new or update)",      "projects", setup_projects),
     ("Notification channels (tmux, Slack, Telegram, SMTP, etc.)", "channels", _run_channels_section),
     ("MCP client config (Claude Code, Codex, Gemini)", "mcp", setup_mcp_client),
+    ("Factory CLI permissions tier (read-only / guarded / unrestricted)",
+     "factory-permissions", setup_factory_permissions),
     ("PKRelay browser extension (optional)",   "pkrelay",  setup_pkrelay),
     ("Run DevBrain Doctor (health check)",     "doctor",   run_verification),
     ("Check for DevBrain updates",             "updates",  check_for_updates),

@@ -21,7 +21,12 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # Load factory CLI preferences from config (env > yaml > defaults precedence)
-from config import CLI_PREFERENCES as _CLI_PREFERENCES  # noqa: E402
+from config import (  # noqa: E402
+    CLI_PREFERENCES as _CLI_PREFERENCES,
+    FACTORY_PERMISSIONS_EXTRA_TOOLS as _EXTRA_TOOLS,
+    FACTORY_PERMISSIONS_TIER as _TIER,
+    FACTORY_TIER_2_SUBCATEGORIES as _SUBCATS,
+)
 
 
 @dataclass
@@ -33,13 +38,123 @@ class CLIResult:
     success: bool
 
 
-# CLI tool configurations
+# Tool allowlists for the claude CLI's --allowedTools flag, keyed by
+# factory permissions tier. Tier 3 is handled separately via
+# --dangerously-skip-permissions.
+#
+# Claude's --allowedTools accepts Tool(pattern) entries. Bash(cmd:*) means
+# any Bash invocation whose command starts with "cmd". We enumerate common
+# dev-loop commands rather than allow Bash(*) since the latter is
+# effectively tier 3.
+FACTORY_CLAUDE_ALLOWLIST_TIER_1 = [
+    "Read", "Grep", "Glob",
+    "Bash(git log:*)", "Bash(git diff:*)", "Bash(git status:*)",
+    "Bash(git show:*)", "Bash(git blame:*)",
+    "Bash(ls:*)", "Bash(cat:*)", "Bash(head:*)", "Bash(tail:*)",
+    "Bash(wc:*)", "Bash(find:*)", "Bash(which:*)", "Bash(pwd)",
+    # DevBrain MCP — read-only queries are part of the factory's job
+    "mcp__devbrain__deep_search",
+    "mcp__devbrain__get_project_context",
+    "mcp__devbrain__get_source_context",
+    "mcp__devbrain__list_projects",
+    "mcp__devbrain__factory_status",
+    "mcp__devbrain__factory_file_locks",
+]
+
+# Tier 2 is built from Tier 1 plus a set of opt-in/opt-out subcategories.
+# Users pick which subcategories to include via `devbrain setup
+# factory-permissions`. Defaults are set in config._DEFAULTS and chosen
+# to cover the 80% case (full dev loop) while leaving `git_push` off
+# by default so a human reviews factory output before pushing.
+FACTORY_TIER_2_SUBCATEGORY_TOOLS: dict[str, list[str]] = {
+    "file_modification": ["Write", "Edit"],
+    "git_commit": [
+        "Bash(git add:*)", "Bash(git commit:*)", "Bash(git branch:*)",
+        "Bash(git checkout:*)", "Bash(git reset:*)", "Bash(git stash:*)",
+        "Bash(git rebase:*)", "Bash(git tag:*)", "Bash(git worktree:*)",
+    ],
+    "git_push": [
+        "Bash(git push:*)", "Bash(git pull:*)", "Bash(git fetch:*)",
+        "Bash(git merge:*)", "Bash(gh:*)",
+    ],
+    "python": [
+        "Bash(pytest:*)", "Bash(python:*)", "Bash(python3:*)",
+        "Bash(ruff:*)", "Bash(black:*)", "Bash(mypy:*)",
+        "Bash(uv:*)", "Bash(pip:*)", "Bash(pip3:*)",
+    ],
+    "node_typescript": [
+        "Bash(npm:*)", "Bash(node:*)", "Bash(tsc:*)", "Bash(yarn:*)",
+        "Bash(jest:*)", "Bash(prettier:*)", "Bash(eslint:*)",
+        "Bash(pnpm:*)", "Bash(npx:*)",
+    ],
+    "build_tools": [
+        "Bash(make:*)", "Bash(cargo:*)", "Bash(go:*)",
+    ],
+    "filesystem_ops": [
+        "Bash(mkdir:*)", "Bash(cp:*)", "Bash(mv:*)", "Bash(touch:*)",
+    ],
+    "devbrain_mcp_writes": [
+        "mcp__devbrain__store",
+        "mcp__devbrain__end_session",
+        "mcp__devbrain__devbrain_notify",
+    ],
+}
+
+# Default enablement per subcategory. git_push defaults off so the factory
+# commits locally and the developer reviews the branch before pushing.
+FACTORY_TIER_2_SUBCATEGORY_DEFAULTS: dict[str, bool] = {
+    "file_modification": True,
+    "git_commit": True,
+    "git_push": False,
+    "python": True,
+    "node_typescript": True,
+    "build_tools": True,
+    "filesystem_ops": True,
+    "devbrain_mcp_writes": True,
+}
+
+
+def _tier_2_allowlist(subcategories: dict[str, bool]) -> list[str]:
+    """Compose tier-2 allowlist from enabled subcategories on top of tier 1."""
+    allowlist = list(FACTORY_CLAUDE_ALLOWLIST_TIER_1)
+    for name, tools in FACTORY_TIER_2_SUBCATEGORY_TOOLS.items():
+        if subcategories.get(name, FACTORY_TIER_2_SUBCATEGORY_DEFAULTS[name]):
+            allowlist.extend(tools)
+    return allowlist
+
+
+def _build_claude_extra_args(
+    tier: int,
+    extra_tools: list[str],
+    subcategories: dict[str, bool] | None = None,
+) -> list[str]:
+    """Build the claude CLI extra_args list based on the factory tier.
+
+    Tier 1 and 2 pass --allowedTools entries derived from the tier's
+    allowlist (tier 2 composed from subcategory toggles) plus any
+    user-provided extras. Tier 3 uses --dangerously-skip-permissions.
+    """
+    base = ["--output-format", "text", "--max-turns", "50"]
+    if tier >= 3:
+        return base + ["--dangerously-skip-permissions"]
+    if tier == 2:
+        allowlist = _tier_2_allowlist(subcategories or _SUBCATS)
+    else:  # tier 1
+        allowlist = list(FACTORY_CLAUDE_ALLOWLIST_TIER_1)
+    allowlist = allowlist + list(extra_tools)
+    args = list(base)
+    for tool in allowlist:
+        args.extend(["--allowedTools", tool])
+    return args
+
+
+# CLI tool configurations — claude's extra_args are tier-driven.
 CLI_CONFIGS = {
     "claude": {
         "command": "claude",
-        "flag": "-p",  # prompt flag
-        "extra_args": ["--output-format", "text", "--max-turns", "50", "--dangerously-skip-permissions"],
-        "timeout": None,  # No timeout — let the CLI run to completion
+        "flag": "-p",
+        "extra_args": _build_claude_extra_args(_TIER, _EXTRA_TOOLS, _SUBCATS),
+        "timeout": None,
     },
     "codex": {
         "command": "codex",

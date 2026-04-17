@@ -405,6 +405,7 @@ def setup_cmd(section):
       devbrain setup projects     — register projects with DevBrain
       devbrain setup channels     — notification channels (tmux, Slack, Telegram, ...)
       devbrain setup mcp          — auto-configure MCP for installed AI CLIs
+      devbrain setup factory-permissions  — set factory CLI permissions tier
       devbrain setup pkrelay      — install optional PKRelay browser bridge
       devbrain setup doctor       — run devbrain doctor (health check)
       devbrain setup updates      — check for and pull DevBrain updates
@@ -659,7 +660,58 @@ def doctor(as_json):
              ".venv/bin/pip install -r requirements.txt",
     )
 
-    # 7. Env vars (informational — never fails, just reports overrides)
+    # 7. Factory permissions tier — tier 3 (unrestricted / legacy default)
+    # triggers a WARN since it grants --dangerously-skip-permissions to
+    # every spawned factory subprocess. Tiers 1 and 2 are safer.
+    factory_cfg = cfg.get("factory", {})
+    tier_labels = {1: "read-only audit", 2: "guarded dev", 3: "UNRESTRICTED"}
+    if "permissions_tier" in factory_cfg:
+        tier = factory_cfg["permissions_tier"]
+        tier_is_safe = tier in (1, 2)
+        detail = f"tier {tier} ({tier_labels.get(tier, 'unknown')})"
+        if tier == 2:
+            subs = factory_cfg.get("permissions_tier_2_subcategories", {}) or {}
+            enabled = sum(1 for v in subs.values() if v)
+            total = len(subs) or 8
+            flags = []
+            if subs.get("git_push") is False:
+                flags.append("git_push=off")
+            elif subs.get("git_push") is True:
+                flags.append("git_push=on")
+            detail += f" — {enabled}/{total} subcategories"
+            if flags:
+                detail += f" ({', '.join(flags)})"
+        elif not tier_is_safe:
+            detail += " — run: devbrain setup factory-permissions"
+        add("factory_permissions_tier", tier_is_safe, detail, warn=True)
+    else:
+        add(
+            "factory_permissions_tier",
+            False,
+            "not set — defaulting to tier 3 (unrestricted). "
+            "Run: devbrain setup factory-permissions",
+            warn=True,
+        )
+
+    # 8. DB password isn't the insecure default from earlier templates.
+    # `devbrain-local` was shipped in git history of a public repo; any
+    # install still using it has a trivially-known password. Warn (not
+    # fail) since the system is functional — user just needs to rotate.
+    weak_passwords = {"devbrain-local", "REPLACE_DURING_INSTALL", ""}
+    effective_pw = os.environ.get(
+        "DEVBRAIN_DB_PASSWORD",
+        cfg.get("database", {}).get("password", ""),
+    )
+    pw_is_strong = effective_pw not in weak_passwords
+    add(
+        "db_password_rotated",
+        pw_is_strong,
+        "custom password in use" if pw_is_strong
+        else "weak/default password — run: devbrain rotate-db-password",
+        warn=True,
+    )
+
+    # 9. Env vars (informational — never fails, just reports overrides)
     overrides = sorted(k for k in os.environ if k.startswith("DEVBRAIN_"))
     add(
         "env_overrides",
@@ -688,6 +740,238 @@ def doctor(as_json):
         sys.exit(1)
     if not as_json:
         click.echo("✅ All checks passed.")
+
+
+def _rewrite_env_password(env_path: Path, new_password: str) -> None:
+    """Replace (or append) DEVBRAIN_DB_PASSWORD in a .env file."""
+    if env_path.exists():
+        lines = [
+            ln for ln in env_path.read_text().splitlines()
+            if not ln.startswith("DEVBRAIN_DB_PASSWORD=")
+        ]
+    else:
+        lines = []
+    lines.append("")
+    lines.append(f"# Database password — rotated {time.strftime('%Y-%m-%d')}")
+    lines.append(f"DEVBRAIN_DB_PASSWORD={new_password}")
+    env_path.write_text("\n".join(lines) + "\n")
+
+
+def _rewrite_yaml_db_password(yaml_path: Path, new_password: str) -> None:
+    """Replace password: under database: in config/devbrain.yaml.
+
+    Line-based rewrite instead of round-tripping through PyYAML (which
+    would strip comments and re-order keys). Scope is limited to the
+    database: block to avoid touching notification-channel passwords.
+    """
+    out: list[str] = []
+    in_db_block = False
+    replaced = False
+    for line in yaml_path.read_text().splitlines():
+        if re.match(r"^database:", line):
+            in_db_block = True
+            out.append(line)
+            continue
+        if in_db_block and re.match(r"^  password:", line):
+            out.append(f"  password: {new_password}")
+            replaced = True
+            continue
+        if re.match(r"^[^\s#]", line):
+            in_db_block = False
+        out.append(line)
+    if not replaced:
+        raise click.ClickException(
+            f"Could not find 'password:' under 'database:' in {yaml_path}"
+        )
+    yaml_path.write_text("\n".join(out) + "\n")
+
+
+@cli.command(name="rotate-db-password")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
+@click.option(
+    "--recreate/--no-recreate",
+    default=True,
+    help="Recreate the container after rotation to apply any "
+         "docker-compose.yml changes (default: yes)",
+)
+def rotate_db_password(yes: bool, recreate: bool) -> None:
+    """Rotate the Postgres password, preserving data.
+
+    Generates a new random password, applies it inside the running
+    container via ALTER USER, then syncs the new value to .env and
+    config/devbrain.yaml. Optionally recreates the container so updated
+    docker-compose settings (e.g., loopback-only port binding) take effect.
+    """
+    import secrets
+    import subprocess
+
+    import psycopg2
+    from psycopg2 import sql
+
+    from config import CONFIG_PATH, DEVBRAIN_HOME, build_database_url, load_config
+
+    # Refuse to run if DEVBRAIN_DATABASE_URL overrides the config — the
+    # user wired credentials up explicitly and this command wouldn't help.
+    if os.environ.get("DEVBRAIN_DATABASE_URL"):
+        raise click.ClickException(
+            "DEVBRAIN_DATABASE_URL is set in the environment, which overrides "
+            "config/devbrain.yaml. Unset it (or rotate manually) before using "
+            "this command."
+        )
+
+    cfg = load_config()
+    db_cfg = cfg.get("database", {})
+    db_user = db_cfg.get("user", "devbrain")
+    db_name = db_cfg.get("database", "devbrain")
+    db_host = db_cfg.get("host", "localhost")
+    db_port = db_cfg.get("port", 5433)
+    current_url = build_database_url(cfg)
+    env_path = DEVBRAIN_HOME / ".env"
+    yaml_path = CONFIG_PATH
+
+    click.echo("DevBrain — rotate database password")
+    click.echo("=" * 60)
+    click.echo(f"  User:     {db_user}")
+    click.echo(f"  Host:     {db_host}:{db_port}")
+    click.echo(f"  Database: {db_name}")
+    click.echo(f"  .env:     {env_path}")
+    click.echo(f"  yaml:     {yaml_path}")
+    click.echo()
+
+    if not yes and not click.confirm("Rotate the password now?", default=True):
+        click.echo("Aborted.")
+        return
+
+    # Step 1: verify the current password actually works. If it doesn't,
+    # there's no point generating a new one — we couldn't apply it.
+    click.echo("→ Connecting with current password...", nl=False)
+    try:
+        verify_conn = psycopg2.connect(current_url, connect_timeout=5)
+    except psycopg2.Error as exc:
+        click.echo(" ❌")
+        raise click.ClickException(
+            f"Can't connect with the current password: {exc}\n"
+            f"Your .env/yaml may be out of sync with Postgres already. "
+            f"See docs/rotate-db-password.md for manual recovery."
+        )
+    click.echo(" ✅")
+
+    # Step 2: generate and apply new password. ALTER USER takes effect
+    # immediately for new connections; existing ones keep working until
+    # they disconnect.
+    new_password = secrets.token_hex(32)
+    click.echo("→ Applying new password via ALTER USER...", nl=False)
+    try:
+        with verify_conn:
+            with verify_conn.cursor() as cur:
+                cur.execute(
+                    sql.SQL("ALTER USER {user} PASSWORD {pw}").format(
+                        user=sql.Identifier(db_user),
+                        pw=sql.Literal(new_password),
+                    )
+                )
+    except psycopg2.Error as exc:
+        click.echo(" ❌")
+        verify_conn.close()
+        raise click.ClickException(f"ALTER USER failed: {exc}")
+    verify_conn.close()
+    click.echo(" ✅")
+
+    # Step 3: verify we can connect with the NEW password before writing
+    # it to .env/yaml. If this fails, the DB has a password we can't
+    # recover from config, so print it loudly so the user can paste it in.
+    click.echo("→ Verifying new password...", nl=False)
+    new_url = (
+        f"postgresql://{db_user}:{new_password}"
+        f"@{db_host}:{db_port}/{db_name}"
+    )
+    try:
+        psycopg2.connect(new_url, connect_timeout=5).close()
+    except psycopg2.Error as exc:
+        click.echo(" ❌")
+        click.echo(
+            f"\nALTER USER succeeded but the new password doesn't connect: {exc}",
+            err=True,
+        )
+        click.echo(
+            "\nThe database now has this password (NOT yet written to disk):",
+            err=True,
+        )
+        click.echo(f"\n  {new_password}\n", err=True)
+        click.echo(
+            "Update .env (DEVBRAIN_DB_PASSWORD) and config/devbrain.yaml "
+            "(database.password) manually, then re-run 'devbrain doctor'.",
+            err=True,
+        )
+        sys.exit(1)
+    click.echo(" ✅")
+
+    # Step 4: write to .env and yaml. Order: .env first (smaller blast
+    # radius if the process dies between them — re-running this command
+    # will pick up .env and sync yaml).
+    click.echo("→ Writing DEVBRAIN_DB_PASSWORD to .env...", nl=False)
+    _rewrite_env_password(env_path, new_password)
+    click.echo(" ✅")
+
+    click.echo("→ Updating config/devbrain.yaml...", nl=False)
+    _rewrite_yaml_db_password(yaml_path, new_password)
+    click.echo(" ✅")
+
+    # Step 5: optionally recreate the container so docker-compose.yml
+    # changes (port binding, etc.) take effect. Password rotation alone
+    # doesn't require a recreate — ALTER USER already applied it.
+    if recreate:
+        if subprocess.run(
+            ["docker", "--version"], capture_output=True
+        ).returncode != 0:
+            click.echo(
+                "⚠️  docker not available — skipping container recreate.",
+                err=True,
+            )
+        else:
+            click.echo("→ Recreating devbrain-db container...")
+            compose_dir = str(DEVBRAIN_HOME)
+            down_rc = subprocess.call(
+                ["docker", "compose", "down"], cwd=compose_dir
+            )
+            if down_rc != 0:
+                click.echo(
+                    "⚠️  'docker compose down' returned non-zero. Continuing.",
+                    err=True,
+                )
+            up_rc = subprocess.call(
+                ["docker", "compose", "up", "-d", "devbrain-db"],
+                cwd=compose_dir,
+            )
+            if up_rc != 0:
+                raise click.ClickException(
+                    "'docker compose up -d devbrain-db' failed. The new "
+                    "password is already in .env/yaml and stored in Postgres "
+                    "— fix docker-compose errors and bring the container up "
+                    "manually."
+                )
+
+            # Poll until Postgres accepts connections again
+            click.echo("→ Waiting for Postgres to accept connections...", nl=False)
+            for _ in range(30):
+                try:
+                    psycopg2.connect(new_url, connect_timeout=1).close()
+                    click.echo(" ✅")
+                    break
+                except psycopg2.Error:
+                    time.sleep(1)
+            else:
+                click.echo(" ⚠️")
+                click.echo(
+                    "Container is up but Postgres didn't accept connections "
+                    "within 30s. Check 'docker logs devbrain-db'.",
+                    err=True,
+                )
+
+    click.echo()
+    click.echo("✅ Rotation complete.")
+    click.echo()
+    click.echo("Next: run './bin/devbrain doctor' to verify.")
 
 
 if __name__ == "__main__":

@@ -47,6 +47,26 @@ _DEFAULTS: dict = {
             "branch_cleanup": True,
         },
         "project_paths": {},
+        # Permissions tier controls what factory-spawned claude subprocesses
+        # are allowed to do. 1 = read-only audit, 2 = guarded dev (curated
+        # allowlist), 3 = unrestricted (--dangerously-skip-permissions).
+        # Default 3 preserves pre-tier behavior; fresh installs choose via
+        # `devbrain setup mcp` and should land on 2.
+        "permissions_tier": 3,
+        "permissions_extra_allowed_tools": [],
+        # Tier 2 sub-category toggles. git_push is default-off so the
+        # developer reviews the factory's work before anything leaves the
+        # local machine.
+        "permissions_tier_2_subcategories": {
+            "file_modification": True,
+            "git_commit": True,
+            "git_push": False,
+            "python": True,
+            "node_typescript": True,
+            "build_tools": True,
+            "filesystem_ops": True,
+            "devbrain_mcp_writes": True,
+        },
     },
     "notifications": {
         "notify_events": [],
@@ -114,3 +134,10 @@ FACTORY_CONFIG = _config.get("factory", {})
 NOTIFICATIONS_CONFIG = _config.get("notifications", {})
 CLEANUP_CONFIG = FACTORY_CONFIG.get("cleanup", {})
 CLI_PREFERENCES = FACTORY_CONFIG.get("cli_preferences", {})
+FACTORY_PERMISSIONS_TIER = int(FACTORY_CONFIG.get("permissions_tier", 3))
+FACTORY_PERMISSIONS_EXTRA_TOOLS = list(
+    FACTORY_CONFIG.get("permissions_extra_allowed_tools", [])
+)
+FACTORY_TIER_2_SUBCATEGORIES = dict(
+    FACTORY_CONFIG.get("permissions_tier_2_subcategories", {})
+)

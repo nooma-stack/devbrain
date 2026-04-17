@@ -7,7 +7,9 @@ database:
   host: localhost
   port: 5433
   user: devbrain
-  password: devbrain-local
+  # Replaced with a random value by scripts/install.sh when this template
+  # is copied to config/devbrain.yaml. Do not commit a real password.
+  password: REPLACE_DURING_INSTALL
   database: devbrain
 
 embedding:
@@ -123,6 +125,41 @@ factory:
     hard_ceiling_seconds: 1800    # 30 min — absolute maximum
     auto_archive_after_hours: 24  # Archive completed jobs after 24h in context
     branch_cleanup: true          # Delete branches for failed/rejected jobs
+
+  # What factory-spawned claude subprocesses are allowed to do.
+  #   1 — Read-only audit: file reads, git log/diff/status only. Factory
+  #       can observe but not modify anything. Use for dry runs, untrusted
+  #       specs, or CI validation.
+  #   2 — Guarded dev (recommended): Read/Write/Edit plus a curated
+  #       allowlist of dev commands grouped into subcategories you can
+  #       toggle (see permissions_tier_2_subcategories below).
+  #   3 — Unrestricted: passes --dangerously-skip-permissions to claude.
+  #       Full autonomy — filesystem, network, arbitrary shell. Use only
+  #       for power-user workflows with trusted specs.
+  # The interactive wizard (`devbrain setup mcp`, or
+  # `devbrain setup factory-permissions`) lets you pick this without
+  # editing yaml.
+  permissions_tier: 2
+
+  # Tier 2 subcategory toggles. Each is y/N during `devbrain setup
+  # factory-permissions`. Only consulted when permissions_tier == 2.
+  #
+  # git_push is default OFF so the factory commits locally and the
+  # developer reviews the branch before pushing. Flip it to true if
+  # you want the factory to push and create PRs on its own.
+  permissions_tier_2_subcategories:
+    file_modification: true    # Write, Edit
+    git_commit: true           # add, commit, branch, checkout, reset, stash, rebase, tag, worktree
+    git_push: false            # push, pull, fetch, merge, gh (PR creation)
+    python: true               # pytest, python, ruff, black, mypy, uv, pip
+    node_typescript: true      # npm, node, tsc, yarn, jest, prettier, eslint, pnpm, npx
+    build_tools: true          # make, cargo, go
+    filesystem_ops: true       # mkdir, cp, mv, touch
+    devbrain_mcp_writes: true  # store, end_session, devbrain_notify
+
+  # Extra --allowedTools entries appended to tier 1/2 (ignored at tier 3).
+  # Use Tool(pattern) syntax, e.g. "Bash(terraform:*)".
+  permissions_extra_allowed_tools: []
 
 notifications:
   notify_events:
