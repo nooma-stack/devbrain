@@ -554,6 +554,67 @@ def _format_age(updated_at) -> str:
 # ─── doctor — installation health check ───────────────────────────────────────
 
 
+def _peek_container_postgres_password() -> str | None:
+    """Return the POSTGRES_PASSWORD env var the devbrain-db container was
+    created with, or None if docker isn't available / the container
+    doesn't exist / the var isn't present.
+
+    Used by devdoctor to detect a .env/yaml <-> container password
+    mismatch — the situation where someone edited config after the
+    container was already initialized, so Postgres's stored credentials
+    disagree with what the factory and MCP server try to use.
+    """
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            ["docker", "inspect", "devbrain-db",
+             "--format", "{{range .Config.Env}}{{println .}}{{end}}"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        if line.startswith("POSTGRES_PASSWORD="):
+            return line.split("=", 1)[1]
+    return None
+
+
+def _diagnose_pg_failure(exc: Exception, cfg: dict) -> str:
+    """Produce a helpful detail string for a Postgres connection failure.
+
+    Specifically detect the "yaml/.env password does not match what the
+    container was initialized with" scenario by peeking at the
+    container's env vars, and steer the user toward the right fix.
+    """
+    err = str(exc).replace("\n", " ").strip()
+    lower = err.lower()
+
+    if "password authentication failed" in lower:
+        container_pw = _peek_container_postgres_password()
+        if container_pw:
+            config_pw = os.environ.get(
+                "DEVBRAIN_DB_PASSWORD",
+                cfg.get("database", {}).get("password", ""),
+            )
+            if container_pw != config_pw:
+                return (
+                    "auth failed — container has a DIFFERENT password "
+                    "than .env/yaml. Run: devbrain devdoctor --fix"
+                )
+        return "password authentication failed — run: devbrain rotate-db-password"
+
+    if "could not connect" in lower or "connection refused" in lower:
+        return (
+            "Postgres unreachable. Start it: "
+            "cd \"$DEVBRAIN_HOME\" && docker compose up -d devbrain-db"
+        )
+
+    return err[:160]
+
+
 def _run_devdoctor_checks() -> list[dict]:
     """Execute every devdoctor health check and return structured results.
 
@@ -607,7 +668,7 @@ def _run_devdoctor_checks() -> list[dict]:
             else "run: CREATE EXTENSION vector;",
         )
     except Exception as exc:
-        add("postgres_reachable", False, str(exc))
+        add("postgres_reachable", False, _diagnose_pg_failure(exc, cfg))
         add("pgvector_installed", False, "skipped — DB unreachable")
 
     # 4. Ollama reachable + required models pulled
@@ -795,11 +856,66 @@ def _offer_devdoctor_fixes(checks: list[dict]) -> None:
                 )
 
         elif name == "postgres_reachable":
-            click.echo("   Fix: the most common cause is a .env / yaml")
-            click.echo("        password mismatch with Postgres. Rotate:")
-            click.echo(
-                f"        {click.style('./bin/devbrain rotate-db-password', fg='cyan')}"
+            from config import CONFIG_PATH, DEVBRAIN_HOME, load_config
+
+            container_pw = _peek_container_postgres_password()
+            cfg_now = load_config()
+            effective_pw = os.environ.get(
+                "DEVBRAIN_DB_PASSWORD",
+                cfg_now.get("database", {}).get("password", ""),
             )
+
+            if container_pw and container_pw != effective_pw:
+                # The yaml/.env vs container password mismatch. Offer to
+                # sync config to match the container (non-destructive —
+                # just updates two files — and keeps the DB's existing data).
+                click.echo(
+                    "   Detected: devbrain-db container was initialized with"
+                )
+                click.echo(
+                    "             a different POSTGRES_PASSWORD than your .env/yaml."
+                )
+                click.echo(
+                    "   Fix:      copy the container's password into .env + yaml so"
+                )
+                click.echo(
+                    "             authentication succeeds (then optionally rotate"
+                )
+                click.echo(
+                    "             for a fresh value + loopback binding)."
+                )
+                if click.confirm(
+                    "   Sync .env + yaml to match the container?", default=True
+                ):
+                    env_path = DEVBRAIN_HOME / ".env"
+                    _rewrite_env_password(env_path, container_pw)
+                    _rewrite_yaml_db_password(CONFIG_PATH, container_pw)
+                    click.echo("   ✓ .env + yaml now match the container")
+                    if click.confirm(
+                        "   Also rotate to a fresh password and recreate the "
+                        "container (applies loopback binding)?",
+                        default=True,
+                    ):
+                        ctx.invoke(rotate_db_password, yes=False, recreate=True)
+                        click.secho(
+                            "   → Restart any Claude Code sessions using "
+                            "DevBrain MCP so their subprocesses reload.",
+                            fg="yellow",
+                        )
+                    else:
+                        click.secho(
+                            "   → Postgres is still on its old port binding "
+                            "(0.0.0.0). Run rotate-db-password later to "
+                            "tighten to 127.0.0.1.",
+                            fg="yellow",
+                        )
+            else:
+                click.echo(
+                    "   Fix: likely a config/container password mismatch."
+                )
+                click.echo(
+                    f"        Try {click.style('./bin/devbrain rotate-db-password', fg='cyan')}."
+                )
 
         elif name.startswith("ollama_model:"):
             model = name.split(":", 1)[1]
