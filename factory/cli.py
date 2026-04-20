@@ -604,7 +604,12 @@ def _diagnose_pg_failure(exc: Exception, cfg: dict) -> str:
                     "auth failed — container has a DIFFERENT password "
                     "than .env/yaml. Run: devbrain devdoctor --fix"
                 )
-        return "password authentication failed — run: devbrain rotate-db-password"
+        # Auth is failing but the container's POSTGRES_PASSWORD env var
+        # (if any) matches config. Most common cause at this point is
+        # an ALTER USER on the live container that didn't update config.
+        # rotate-db-password can't self-recover (its verify step fails);
+        # devdoctor --fix prompts for the live password and syncs.
+        return "password authentication failed — run: devbrain devdoctor --fix"
 
     if "could not connect" in lower or "connection refused" in lower:
         return (
@@ -856,65 +861,124 @@ def _offer_devdoctor_fixes(checks: list[dict]) -> None:
                 )
 
         elif name == "postgres_reachable":
+            import psycopg2
+
             from config import CONFIG_PATH, DEVBRAIN_HOME, load_config
 
             container_pw = _peek_container_postgres_password()
             cfg_now = load_config()
+            db_cfg = cfg_now.get("database", {})
             effective_pw = os.environ.get(
                 "DEVBRAIN_DB_PASSWORD",
-                cfg_now.get("database", {}).get("password", ""),
+                db_cfg.get("password", ""),
             )
 
+            recovered_pw: str | None = None
+
             if container_pw and container_pw != effective_pw:
-                # The yaml/.env vs container password mismatch. Offer to
-                # sync config to match the container (non-destructive —
-                # just updates two files — and keeps the DB's existing data).
+                # Case A — POSTGRES_PASSWORD env on the container differs
+                # from .env/yaml. Classic "config was edited after init"
+                # drift. We can auto-recover by copying the container
+                # value into config (container's stored auth still
+                # matches its original env — Postgres was initialized
+                # from POSTGRES_PASSWORD and no one's touched it since).
                 click.echo(
                     "   Detected: devbrain-db container was initialized with"
                 )
                 click.echo(
                     "             a different POSTGRES_PASSWORD than your .env/yaml."
                 )
-                click.echo(
-                    "   Fix:      copy the container's password into .env + yaml so"
-                )
-                click.echo(
-                    "             authentication succeeds (then optionally rotate"
-                )
-                click.echo(
-                    "             for a fresh value + loopback binding)."
-                )
                 if click.confirm(
                     "   Sync .env + yaml to match the container?", default=True
                 ):
-                    env_path = DEVBRAIN_HOME / ".env"
-                    _rewrite_env_password(env_path, container_pw)
-                    _rewrite_yaml_db_password(CONFIG_PATH, container_pw)
-                    click.echo("   ✓ .env + yaml now match the container")
-                    if click.confirm(
-                        "   Also rotate to a fresh password and recreate the "
-                        "container (applies loopback binding)?",
-                        default=True,
-                    ):
-                        ctx.invoke(rotate_db_password, yes=False, recreate=True)
-                        click.secho(
-                            "   → Restart any Claude Code sessions using "
-                            "DevBrain MCP so their subprocesses reload.",
-                            fg="yellow",
-                        )
-                    else:
-                        click.secho(
-                            "   → Postgres is still on its old port binding "
-                            "(0.0.0.0). Run rotate-db-password later to "
-                            "tighten to 127.0.0.1.",
-                            fg="yellow",
-                        )
+                    recovered_pw = container_pw
             else:
+                # Case B — env var matches config but auth still fails.
+                # Someone ran ALTER USER on the live container (either
+                # manually or via a partial rotation). POSTGRES_PASSWORD
+                # env is stale; we can't introspect the live credential
+                # from outside. Ask the user, verify by opening a
+                # connection, then use that as the recovered password.
                 click.echo(
-                    "   Fix: likely a config/container password mismatch."
+                    "   The container's POSTGRES_PASSWORD env var matches"
                 )
                 click.echo(
-                    f"        Try {click.style('./bin/devbrain rotate-db-password', fg='cyan')}."
+                    "   your config, but auth is still failing. Likely"
+                )
+                click.echo(
+                    "   an ALTER USER ran on the live container and the"
+                )
+                click.echo(
+                    "   env var is stale. Enter the current live password"
+                )
+                click.echo(
+                    "   and we'll verify + sync + optionally rotate forward."
+                )
+                if click.confirm(
+                    "   Enter the current DB password now?", default=True
+                ):
+                    manual_pw = click.prompt(
+                        "   Current password",
+                        hide_input=True,
+                        confirmation_prompt=False,
+                        default="",
+                        show_default=False,
+                    ).strip()
+                    if not manual_pw:
+                        click.echo("   (no password entered — skipping)")
+                    else:
+                        test_url = (
+                            f"postgresql://"
+                            f"{db_cfg.get('user', 'devbrain')}:{manual_pw}"
+                            f"@{db_cfg.get('host', 'localhost')}:"
+                            f"{db_cfg.get('port', 5433)}"
+                            f"/{db_cfg.get('database', 'devbrain')}"
+                        )
+                        try:
+                            psycopg2.connect(
+                                test_url, connect_timeout=5
+                            ).close()
+                            click.echo("   ✓ password verified")
+                            recovered_pw = manual_pw
+                        except psycopg2.Error as exc:
+                            click.echo(
+                                f"   ✗ that password didn't work: "
+                                f"{str(exc).splitlines()[0]}",
+                                err=True,
+                            )
+
+            if recovered_pw:
+                env_path = DEVBRAIN_HOME / ".env"
+                _rewrite_env_password(env_path, recovered_pw)
+                _rewrite_yaml_db_password(CONFIG_PATH, recovered_pw)
+                click.echo("   ✓ .env + yaml now match the DB")
+                if click.confirm(
+                    "   Also rotate to a fresh password and recreate the "
+                    "container (applies loopback binding)?",
+                    default=True,
+                ):
+                    ctx.invoke(rotate_db_password, yes=False, recreate=True)
+                    click.secho(
+                        "   → Restart any Claude Code sessions using "
+                        "DevBrain MCP so their subprocesses reload.",
+                        fg="yellow",
+                    )
+                else:
+                    click.secho(
+                        "   → The container is still on its old port "
+                        "binding (0.0.0.0). Run rotate-db-password later "
+                        "to tighten to 127.0.0.1.",
+                        fg="yellow",
+                    )
+            else:
+                click.echo(
+                    "   Skipped — no recovery action taken. If you know"
+                )
+                click.echo(
+                    "   the live DB password, you can also pass it to"
+                )
+                click.echo(
+                    f"   {click.style('devbrain rotate-db-password --current-password ...', fg='cyan')}"
                 )
 
         elif name.startswith("ollama_model:"):
@@ -1064,13 +1128,27 @@ def _rewrite_yaml_db_password(yaml_path: Path, new_password: str) -> None:
     help="Recreate the container after rotation to apply any "
          "docker-compose.yml changes (default: yes)",
 )
-def rotate_db_password(yes: bool, recreate: bool) -> None:
+@click.option(
+    "--current-password",
+    default=None,
+    help="Use this value as the CURRENT DB password (instead of reading "
+         "from .env/yaml). Useful after an ALTER USER that left config "
+         "and the live DB out of sync — pass the live password here and "
+         "rotation will sync config to match on success.",
+)
+def rotate_db_password(
+    yes: bool, recreate: bool, current_password: str | None,
+) -> None:
     """Rotate the Postgres password, preserving data.
 
     Generates a new random password, applies it inside the running
     container via ALTER USER, then syncs the new value to .env and
     config/devbrain.yaml. Optionally recreates the container so updated
     docker-compose settings (e.g., loopback-only port binding) take effect.
+
+    Use --current-password when .env/yaml drifted from the live DB
+    (typically after a manual ALTER USER). Rotation will authenticate
+    with the supplied value and write the new password to both files.
     """
     import secrets
     import subprocess
@@ -1095,7 +1173,15 @@ def rotate_db_password(yes: bool, recreate: bool) -> None:
     db_name = db_cfg.get("database", "devbrain")
     db_host = db_cfg.get("host", "localhost")
     db_port = db_cfg.get("port", 5433)
-    current_url = build_database_url(cfg)
+    if current_password is not None:
+        # User-supplied recovery password — build a URL with it instead
+        # of trusting config, which may be out of sync with the live DB.
+        current_url = (
+            f"postgresql://{db_user}:{current_password}"
+            f"@{db_host}:{db_port}/{db_name}"
+        )
+    else:
+        current_url = build_database_url(cfg)
     env_path = DEVBRAIN_HOME / ".env"
     yaml_path = CONFIG_PATH
 
@@ -1106,6 +1192,8 @@ def rotate_db_password(yes: bool, recreate: bool) -> None:
     click.echo(f"  Database: {db_name}")
     click.echo(f"  .env:     {env_path}")
     click.echo(f"  yaml:     {yaml_path}")
+    if current_password is not None:
+        click.echo("  Source:   --current-password flag (recovery mode)")
     click.echo()
 
     if not yes and not click.confirm("Rotate the password now?", default=True):
@@ -1119,10 +1207,14 @@ def rotate_db_password(yes: bool, recreate: bool) -> None:
         verify_conn = psycopg2.connect(current_url, connect_timeout=5)
     except psycopg2.Error as exc:
         click.echo(" ❌")
+        hint = (
+            "If the config drifted from the live DB (e.g. someone ran "
+            "ALTER USER manually), retry with:\n"
+            "    devbrain rotate-db-password --current-password '<live-pw>'\n"
+            "Or run 'devbrain devdoctor --fix' to interactively recover."
+        )
         raise click.ClickException(
-            f"Can't connect with the current password: {exc}\n"
-            f"Your .env/yaml may be out of sync with Postgres already. "
-            f"See docs/rotate-db-password.md for manual recovery."
+            f"Can't connect with the current password: {exc}\n{hint}"
         )
     click.echo(" ✅")
 
