@@ -71,41 +71,44 @@ EOF
 }
 
 # Spinning-brain frames. 11 cols × 6 rows each, space-padded to constant
-# width. The "rotation" is conveyed by varying width + feature offsets so
-# the brain appears to turn around its vertical axis. Forward rotation:
-# front → 3/4-right → edge → 3/4-left → front, then repeats.
+# width. The "rotation" is conveyed by varying width as the brain turns
+# on its vertical axis: front (widest) → 3/4-right → edge (narrowest)
+# → 3/4-left → front, then repeats. The `|` down the middle is the
+# longitudinal fissure between the hemispheres; `~` and `%` read as
+# the convoluted cortex surface (sulci / gyri). No facial features —
+# this is a brain seen from above, not a cartoon head.
 
 _welcome_brain_frames() {
     # Each frame begins with "---" so we can split on it.
     cat <<'EOF'
 ---
-  .-"""-.
- /   _   \
-| (o) (o) |
-| \__ / /\|
- \  \_/  /
-  '-___-'
+  _~%%%~_
+ /~%%|%%~\
+ |%~%|%~%|
+ |%%~|%~%|
+  \~%%|%%/
+   `-%%-'
 ---
-   .--.-.
-  / _  \ \
- |(o)(o)  |
- | \_/  /\|
-  \  _  /
-   '-.-'
+   _~%%_
+   /%|%~\
+   |~|%~|
+   |%|~%|
+    \%%/
+     `-'
 ---
-    .-.
-   /   \
-  |     |
-  |  |  |
-   \   /
-    '-'
+    _~_
+    /~\
+    |%|
+    |%|
+    \~/
+    `'
 ---
-   .-.--.
-  / /  _ \
- |  (o)(o)|
- |/\  / _/
-  \  _  /
-   '-.-'
+   _%%~_
+   /~%|%\
+   |~%|~|
+   |%~|%|
+    \%%/
+     `-'
 EOF
 }
 
