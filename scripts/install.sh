@@ -638,6 +638,60 @@ _launch_docker_in_background() {
     fi
 }
 
+# Fallback Docker Desktop installer — downloads the DMG from docker.com
+# and runs Docker's own unattended installer. Used when the Homebrew
+# cask install fails, which happens on macOS Sequoia/Tahoe when the
+# terminal doesn't have App Management permission: brew moves
+# Docker.app into /Applications, then fails on
+#   xattr -w com.apple.metadata:kMDItemAlternateNames ... /Applications/Docker.app/Contents/Resources/bin/kubectl
+# with "Operation not permitted". Docker's native installer handles
+# placement correctly and doesn't hit that restriction.
+_install_docker_desktop_from_dmg() {
+    local arch_path
+    case "$ARCH" in
+        arm64|aarch64) arch_path="arm64" ;;
+        x86_64|amd64)  arch_path="amd64" ;;
+        *) warn "Unsupported arch for Docker DMG: $ARCH"; return 1 ;;
+    esac
+    local dmg_url="https://desktop.docker.com/mac/main/$arch_path/Docker.dmg"
+    local dmg_path="/tmp/devbrain-docker.dmg"
+    local mount_point="/Volumes/Docker"
+
+    info "Downloading Docker Desktop DMG ($arch_path)..."
+    if ! curl -fsSL "$dmg_url" -o "$dmg_path"; then
+        warn "DMG download failed from $dmg_url"
+        rm -f "$dmg_path"
+        return 1
+    fi
+
+    # If a previous run left Docker mounted, detach it first so hdiutil
+    # attach below doesn't fail with "Resource busy".
+    if mount | grep -q " $mount_point "; then
+        hdiutil detach "$mount_point" -quiet 2>/dev/null || true
+    fi
+
+    info "Mounting DMG..."
+    if ! sudo hdiutil attach "$dmg_path" -nobrowse -quiet; then
+        warn "Failed to mount Docker DMG"
+        rm -f "$dmg_path"
+        return 1
+    fi
+
+    info "Running Docker's installer..."
+    if ! sudo "$mount_point/Docker.app/Contents/MacOS/install" --accept-license; then
+        warn "Docker installer returned non-zero"
+        sudo hdiutil detach "$mount_point" -quiet 2>/dev/null || true
+        rm -f "$dmg_path"
+        return 1
+    fi
+
+    sudo hdiutil detach "$mount_point" -quiet 2>/dev/null || true
+    rm -f "$dmg_path"
+
+    [[ -d /Applications/Docker.app ]] || { warn "Docker.app not in /Applications after install"; return 1; }
+    return 0
+}
+
 install_docker() {
     step "Docker"
     desc "Runs PostgreSQL + pgvector in a container. DevBrain stores all"
@@ -652,8 +706,23 @@ install_docker() {
         fi
     elif [[ "$OS" == "macos" ]]; then
         desc "(Alternatives: Colima or OrbStack — see INSTALL.md)"
-        _run "Installing Docker Desktop via Homebrew" brew install --cask docker
-        ok "Docker Desktop installed"
+        if _run "Installing Docker Desktop via Homebrew" brew install --cask docker-desktop; then
+            ok "Docker Desktop installed"
+        else
+            warn "Homebrew cask install failed."
+            warn "Most common cause on Sequoia/Tahoe: the terminal lacks"
+            warn "App Management permission, so brew can't set xattrs on"
+            warn "files inside /Applications/Docker.app."
+            info "Falling back to Docker's own DMG installer..."
+            if _install_docker_desktop_from_dmg; then
+                ok "Docker Desktop installed via DMG"
+            else
+                fail "Docker Desktop install failed both ways."
+                fail "Manual install: https://www.docker.com/products/docker-desktop"
+                fail "Then re-run this installer — it will detect Docker and continue."
+                return 1
+            fi
+        fi
         _launch_docker_in_background
     else
         info "Installing Docker Engine..."
