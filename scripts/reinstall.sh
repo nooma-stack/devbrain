@@ -342,14 +342,26 @@ _check_removed() {
 _check_cmd_removed() {
     local label="$1"
     local cmd="$2"
-    if command -v "$cmd" &>/dev/null; then
-        warn "$label: still in PATH ($(command -v "$cmd"))"
-        return 1
-    else
+    local resolved
+    resolved=$(command -v "$cmd" 2>/dev/null || true)
+    if [[ -z "$resolved" ]]; then
         ok "$label: removed"
         return 0
     fi
+    # bash's hash table can return a path for a binary that was just rm'd.
+    # Treat "resolved but file missing" as removed (with a stale-hash note).
+    if [[ ! -e "$resolved" ]]; then
+        ok "$label: removed (shell hash is stale: $resolved — open a new terminal)"
+        return 0
+    fi
+    warn "$label: still in PATH ($resolved)"
+    return 1
 }
+
+# Flush bash's command hash table so the checks below see reality, not
+# cached lookups from earlier in this script (e.g., `brew uninstall ...`
+# hashes /opt/homebrew/bin/brew before we rm -rf /opt/homebrew).
+hash -r 2>/dev/null || true
 
 verify_failures=0
 
