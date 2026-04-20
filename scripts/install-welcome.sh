@@ -322,6 +322,220 @@ _welcome_animate() {
     trap - EXIT INT TERM
 }
 
+# ─── Animation + inline prompt ─────────────────────────────────────────────
+#
+# Like _welcome_animate, but runs until the user picks verbose/quiet.
+# The prompt is overlaid below the tagline so the brain + rain keep
+# animating behind the choice. Echoes "verbose" or "quiet" to stdout
+# (caller captures via $()); all visual output goes to /dev/tty via
+# fd 4 so the captured stdout stays clean.
+
+_welcome_animate_with_prompt() {
+    # Open fd 4 → /dev/tty for visual output. If that fails (no
+    # controlling TTY, weird CI env), bail to the caller's fallback.
+    if ! { exec 4>/dev/tty; } 2>/dev/null; then
+        echo "verbose"
+        return 0
+    fi
+    if [[ ! -r /dev/tty ]]; then
+        exec 4>&- 2>/dev/null || true
+        echo "verbose"
+        return 0
+    fi
+
+    local cols lines
+    cols=$(tput cols)
+    lines=$(tput lines)
+
+    # Banner
+    local banner_lines=()
+    local line
+    while IFS='' read -r line; do
+        banner_lines+=("$line")
+    done < <(_welcome_banner_lines)
+    local banner_h=${#banner_lines[@]}
+    local banner_w=54
+
+    # Brain frames
+    local frames_raw
+    frames_raw=$(_welcome_brain_frames)
+    local -a frames=()
+    local buf=""
+    local in_frame=0
+    while IFS='' read -r line; do
+        if [[ "$line" == "---" ]]; then
+            if [[ $in_frame -eq 1 ]]; then
+                frames+=("$buf")
+            fi
+            buf=""
+            in_frame=1
+            continue
+        fi
+        local padded
+        padded=$(printf '%-11s' "$line")
+        padded="${padded:0:11}"
+        buf+="${padded}"$'\n'
+    done <<< "$frames_raw"
+    [[ -n "$buf" ]] && frames+=("$buf")
+    local frame_count=${#frames[@]}
+    local brain_w=11
+    local brain_h=6
+
+    # Layout
+    local banner_row=3
+    local banner_col=$(( (cols - banner_w) / 2 + 1 ))
+    [[ $banner_col -lt 1 ]] && banner_col=1
+    local brain_row=$(( banner_row + banner_h + 2 ))
+    local brain_col=$(( (cols - brain_w) / 2 + 1 ))
+    local tagline_row=$(( brain_row + brain_h + 1 ))
+    local tagline_col=$(( (cols - ${#_welcome_tagline}) / 2 + 1 ))
+
+    local prompt_text='[1] Verbose   [2] Quiet   (Enter = verbose)'
+    local prompt_row=$(( tagline_row + 2 ))
+    local prompt_col=$(( (cols - ${#prompt_text}) / 2 + 1 ))
+    [[ $prompt_col -lt 1 ]] && prompt_col=1
+
+    # Rain state
+    local -a head=()
+    local -a speed=()
+    local c
+    for (( c = 1; c <= cols; c++ )); do
+        head[c]=$(( RANDOM % lines - (RANDOM % 15) ))
+        speed[c]=$(( (RANDOM % 3) + 1 ))
+    done
+
+    local -a chars=(
+        '@' '#' '$' '%' '&' '*' '+' '!' '?' '/' '\' '~' '='
+        '0' '1' '2' '3' '4' '5' '6' '7' '8' '9'
+        'A' 'B' 'C' 'D' 'E' 'F' 'H' 'K' 'M' 'N' 'P' 'R' 'T' 'X' 'Y' 'Z'
+    )
+    local char_count=${#chars[@]}
+
+    trap '_welcome_cleanup >&4 2>/dev/null; exec 4>&- 2>/dev/null' EXIT INT TERM
+    printf '%s%s%s' "$_ANSI_HIDE_CURSOR" "$_ANSI_CLEAR" "$_ANSI_HOME" >&4
+
+    local choice=""
+    local trail_len=10
+    local frame_no=0
+
+    while true; do
+        # Poll for keypress. 1/v=verbose, 2/q=quiet, Enter=default.
+        # Other keys are ignored so fat-fingering doesn't pick for them.
+        local key=""
+        if IFS= read -r -t 0.05 -n 1 -s key </dev/tty 2>/dev/null; then
+            case "$key" in
+                1|v|V)       choice="verbose"; break ;;
+                2|q|Q)       choice="quiet";   break ;;
+                ''|$'\n'|$'\r') choice="verbose"; break ;;
+            esac
+        fi
+
+        local current_frame="${frames[$(( frame_no % frame_count ))]}"
+
+        local out="$_ANSI_HOME"
+        local row col
+        for (( row = 1; row <= lines; row++ )); do
+            out+=$(printf '\033[%d;1H\033[K' "$row")
+        done
+
+        # Rain
+        for (( c = 1; c <= cols; c++ )); do
+            if (( frame_no % speed[c] == 0 )); then
+                head[c]=$(( head[c] + 1 ))
+            fi
+            if (( head[c] > lines + trail_len )); then
+                head[c]=$(( -(RANDOM % 15) ))
+                speed[c]=$(( (RANDOM % 3) + 1 ))
+            fi
+
+            local t
+            for (( t = 0; t < trail_len; t++ )); do
+                local r=$(( head[c] - t ))
+                (( r < 1 || r > lines )) && continue
+
+                if (( r >= brain_row && r < brain_row + brain_h \
+                      && c >= brain_col && c < brain_col + brain_w )); then
+                    continue
+                fi
+                if (( r >= banner_row && r < banner_row + banner_h \
+                      && c >= banner_col && c < banner_col + banner_w )); then
+                    continue
+                fi
+                if (( r == tagline_row \
+                      && c >= tagline_col \
+                      && c < tagline_col + ${#_welcome_tagline} )); then
+                    continue
+                fi
+                if (( r == prompt_row \
+                      && c >= prompt_col \
+                      && c < prompt_col + ${#prompt_text} )); then
+                    continue
+                fi
+
+                local ch="${chars[$(( RANDOM % char_count ))]}"
+                local color
+                if (( t == 0 )); then
+                    color="$_ANSI_WHITE"
+                elif (( t < 3 )); then
+                    color="$_ANSI_BRIGHT_GREEN"
+                else
+                    color="${_ANSI_DIM}${_ANSI_GREEN}"
+                fi
+                out+=$(printf '\033[%d;%dH%s%s' "$r" "$c" "$color" "$ch")
+            done
+        done
+
+        # Banner
+        local br
+        for (( br = 0; br < banner_h; br++ )); do
+            out+=$(printf '\033[%d;%dH%s%s%s' \
+                "$(( banner_row + br ))" "$banner_col" \
+                "$_ANSI_BOLD$_ANSI_CYAN" \
+                "${banner_lines[br]}" \
+                "$_ANSI_RESET")
+        done
+
+        # Brain
+        local IFS_bak="$IFS"
+        IFS=$'\n'
+        local -a brain_lines=($current_frame)
+        IFS="$IFS_bak"
+        local i
+        for (( i = 0; i < brain_h && i < ${#brain_lines[@]}; i++ )); do
+            out+=$(printf '\033[%d;%dH%s%s%s' \
+                "$(( brain_row + i ))" "$brain_col" \
+                "$_ANSI_BOLD$_ANSI_MAGENTA" \
+                "${brain_lines[i]}" \
+                "$_ANSI_RESET")
+        done
+
+        # Tagline
+        out+=$(printf '\033[%d;%dH%s%s%s' \
+            "$tagline_row" "$tagline_col" \
+            "$_ANSI_DIM" \
+            "$_welcome_tagline" \
+            "$_ANSI_RESET")
+
+        # Prompt overlay (bold white so it pops against the rain)
+        out+=$(printf '\033[%d;%dH%s%s%s%s' \
+            "$prompt_row" "$prompt_col" \
+            "$_ANSI_BOLD$_ANSI_WHITE" \
+            "$prompt_text" \
+            "$_ANSI_RESET" \
+            "")
+
+        printf '%s' "$out" >&4
+        frame_no=$(( frame_no + 1 ))
+        sleep 0.08
+    done
+
+    _welcome_cleanup >&4 2>/dev/null
+    exec 4>&- 2>/dev/null
+    trap - EXIT INT TERM
+
+    echo "$choice"
+}
+
 # ─── Static banner (shown always, animation or not) ────────────────────────
 
 _welcome_static_banner() {
@@ -340,11 +554,13 @@ _welcome_static_banner() {
 # ─── Public: show the welcome screen ───────────────────────────────────────
 
 welcome_show() {
+    # When animation is available, the full welcome (banner + brain +
+    # rain + verbose/quiet prompt overlay) is rendered inside
+    # welcome_prompt_style so the animation keeps running through the
+    # user's choice. Nothing to do here in that case. For terminals
+    # that can't animate, fall back to the static banner.
     if welcome_can_animate; then
-        _welcome_animate 3000
-        # After the animation, wipe the screen so the static banner
-        # starts clean without any lingering rain / brain fragments.
-        printf '%s%s' "$_ANSI_CLEAR" "$_ANSI_HOME"
+        return 0
     fi
     _welcome_static_banner
 }
@@ -378,6 +594,12 @@ welcome_prompt_style() {
     fi
     if [[ -n "${CI:-}" ]]; then
         echo "verbose"
+        return 0
+    fi
+
+    # Animated path: brain + rain keep running behind the prompt.
+    if welcome_can_animate; then
+        _welcome_animate_with_prompt
         return 0
     fi
 
