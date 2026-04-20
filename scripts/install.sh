@@ -19,6 +19,16 @@
 
 set -euo pipefail
 
+# Anchor CWD to $HOME before doing anything else. When install is run right
+# after an uninstall (e.g., scripts/reinstall.sh wiped $HOME/devbrain and
+# the user's shell was sitting inside it), the inherited CWD no longer
+# exists. bash subshells print "getcwd: No such file or directory" noise
+# and — more importantly — `git clone` fails with
+#   fatal: Unable to read current working directory: No such file or directory
+# even though the clone destination is an absolute path, because git calls
+# getcwd() internally during setup.
+cd "$HOME" 2>/dev/null || cd /
+
 # ─── Configuration ──────────────────────────────────────────────────────────
 
 # When run from inside a clone, infer DEVBRAIN_HOME from the script location.
