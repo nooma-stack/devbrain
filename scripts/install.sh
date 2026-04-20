@@ -112,6 +112,51 @@ if [[ -f "${BASH_SOURCE[0]%/*}/install-welcome.sh" ]]; then
     source "${BASH_SOURCE[0]%/*}/install-welcome.sh"
 fi
 
+# _prime_sudo — prompt for the user's sudo password once, up front, and
+# keep the cached credential alive for the rest of the install. Without
+# this, later steps that shell out to sudo (brew install --cask docker
+# runs `sudo mv Docker.app /Applications`, apt-get commands, etc.) will
+# trigger a Password: prompt mid-install. In quiet mode that prompt
+# collides with the spinner's carriage-return repainting — the user
+# sees a mangled line and can't tell the installer is blocked waiting
+# for input. Priming eliminates the collision because the downstream
+# sudo calls find cached creds and exit silently.
+#
+# The background refresher runs `sudo -n true` once a minute so the
+# cached credential never times out during a long install. It exits
+# cleanly when the parent dies (kill -0 $PPID fails) or when sudo
+# stops accepting the cache (e.g., user revoked it).
+_prime_sudo() {
+    local reason="$1"
+
+    # Passwordless sudo (CI, NOPASSWD entry) — nothing to do.
+    if sudo -n true 2>/dev/null; then
+        return 0
+    fi
+
+    echo ""
+    info "$reason"
+    info "You'll be asked for your macOS login password once — later"
+    info "steps reuse the cached credential so the spinner stays clean."
+    echo ""
+
+    if ! sudo -v; then
+        fail "sudo authentication failed — can't continue."
+        return 1
+    fi
+
+    # Background credential refresher. Runs detached from terminal I/O
+    # so it never fights the spinner or any later prompt.
+    (
+        while true; do
+            sleep 60
+            kill -0 "$PPID" 2>/dev/null || exit 0
+            sudo -n true 2>/dev/null || exit 0
+        done
+    ) </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+}
+
 # _run — wrap a noisy command. Usage:
 #     _run "Installing Docker" brew install --cask docker
 # In verbose mode, the command runs inline with its usual output.
@@ -1558,7 +1603,13 @@ main() {
     info "DevBrain home: $DEVBRAIN_HOME"
     echo ""
 
-    # Phase 1: Foundation dependencies (may prompt for sudo password once)
+    # Prime sudo once up front so every downstream step (Homebrew bootstrap,
+    # `brew install --cask docker` moving Docker.app into /Applications,
+    # Linux apt-get, etc.) finds a cached credential. Prevents the sudo
+    # Password: prompt from colliding with the quiet-mode spinner later.
+    _prime_sudo "DevBrain install needs sudo for a few system-level steps (Homebrew, Docker Desktop)."
+
+    # Phase 1: Foundation dependencies
     if [[ "$OS" == "macos" ]]; then
         install_homebrew
         ensure_rosetta_on_apple_silicon
