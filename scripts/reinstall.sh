@@ -198,6 +198,15 @@ if $FULL_RESET; then
         info "Quitting Docker Desktop..."
         osascript -e 'quit app "Docker"' 2>/dev/null || true
         sleep 2
+        # osascript only quits the main GUI process. Docker Desktop also spawns
+        # a menu-bar helper, backend daemons (com.docker.*), and a VM. Without
+        # terminating these explicitly, the helper keeps holding the menu-bar
+        # icon after /Applications/Docker.app is removed, leaving an orphan
+        # icon that only disappears when the user clicks it.
+        killall Docker 2>/dev/null || true
+        pkill -f "Docker Desktop" 2>/dev/null || true
+        pkill -f "com.docker" 2>/dev/null || true
+        sleep 1
         if command -v brew &>/dev/null; then
             info "Uninstalling Docker cask..."
             brew uninstall --cask docker --force 2>/dev/null || true
