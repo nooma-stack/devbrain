@@ -995,7 +995,24 @@ def _update_permissions(config_path: Path, tools_to_allow: list[str]) -> tuple[s
 
 
 def _register_session_start_hook(config_path: Path, hook_path: Path) -> tuple[str, bool]:
-    """Add a session-start hook command to settings.json. Idempotent."""
+    """Add a session-start hook command to settings.json. Idempotent.
+
+    Claude Code's hook schema (see https://code.claude.com/docs/en/hooks)
+    keys events in PascalCase and maps each to a list of matcher entries,
+    each of which holds a list of hook commands:
+
+        {
+          "hooks": {
+            "SessionStart": [
+              {"matcher": "", "hooks": [{"type": "command", "command": "..."}]}
+            ]
+          }
+        }
+
+    An earlier version of this function wrote the key as "sessionStart"
+    with a flat command object, which Claude Code silently dropped with
+    a "Unknown hook event 'sessionStart' was ignored" warning.
+    """
     config_path = config_path.expanduser()
     if not config_path.exists():
         return (f"{config_path} does not exist — create it first via setup mcp", False)
@@ -1006,13 +1023,34 @@ def _register_session_start_hook(config_path: Path, hook_path: Path) -> tuple[st
         return (f"{config_path} has invalid JSON ({e.msg}) — fix manually", False)
 
     settings.setdefault("hooks", {})
-    existing = settings["hooks"].get("sessionStart")
-    new_entry = {"type": "command", "command": str(hook_path)}
 
-    if existing == new_entry:
+    # Clean up the legacy bad key if an older install wrote it.
+    settings["hooks"].pop("sessionStart", None)
+
+    command_str = str(hook_path)
+    hook_cmd = {"type": "command", "command": command_str}
+
+    entries = settings["hooks"].get("SessionStart")
+    if not isinstance(entries, list):
+        entries = []
+    settings["hooks"]["SessionStart"] = entries
+
+    # Idempotent: skip if any existing matcher entry already runs our
+    # exact command.
+    already_present = any(
+        isinstance(entry, dict)
+        and any(
+            isinstance(h, dict)
+            and h.get("type") == "command"
+            and h.get("command") == command_str
+            for h in (entry.get("hooks") or [])
+        )
+        for entry in entries
+    )
+    if already_present:
         return (f"Session-start hook already configured in {config_path}", True)
 
-    settings["hooks"]["sessionStart"] = new_entry
+    entries.append({"matcher": "", "hooks": [hook_cmd]})
     with open(config_path, "w") as f:
         json.dump(settings, f, indent=2)
         f.write("\n")
