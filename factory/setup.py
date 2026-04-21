@@ -1102,6 +1102,86 @@ def _merge_mcp_into_json(config_path: Path, devbrain_entry: dict) -> tuple[str, 
         return (f"Updated existing devbrain MCP server in {config_path}", True)
 
 
+def _register_claude_code_mcp(run_sh: Path) -> tuple[str, bool]:
+    """Register DevBrain with Claude Code via its supported `claude mcp add`
+    API (writes to ~/.claude.json at user scope).
+
+    An earlier version of this installer wrote an mcpServers block into
+    ~/.claude/settings.json. That key is Claude *Desktop*'s MCP config
+    location — Claude *Code* ignores it and shows DevBrain as "not
+    registered" even though settings.json had the entry. Symptom:
+    `claude mcp list` doesn't include devbrain, mcp__devbrain__* tools
+    don't load, and users think the install failed.
+
+    Shelling out to the documented `claude mcp add` command is more
+    robust than writing ~/.claude.json directly — Anthropic owns that
+    schema and the CLI also handles the -s user/project/local scope
+    flag, file creation, and JSON serialization.
+    """
+    run_sh_str = str(run_sh)
+
+    # Probe for an existing registration so we stay idempotent.
+    try:
+        probe = subprocess.run(
+            ["claude", "mcp", "get", "devbrain"],
+            capture_output=True, text=True, check=False,
+        )
+    except FileNotFoundError:
+        return ("claude CLI not found — skipping Claude Code MCP registration", False)
+
+    already_registered = probe.returncode == 0
+    if already_registered and run_sh_str in probe.stdout:
+        return ("DevBrain MCP server already registered in Claude Code (user scope)", True)
+
+    # Different command (likely after moving DEVBRAIN_HOME) — remove and
+    # re-add rather than leaving a stale entry behind.
+    if already_registered:
+        subprocess.run(
+            ["claude", "mcp", "remove", "devbrain"],
+            capture_output=True, text=True, check=False,
+        )
+
+    add = subprocess.run(
+        ["claude", "mcp", "add", "devbrain", "-s", "user", run_sh_str],
+        capture_output=True, text=True, check=False,
+    )
+    if add.returncode != 0:
+        err = (add.stderr or add.stdout or "").strip().splitlines()[-1:] or ["no output"]
+        return (f"'claude mcp add' failed: {err[-1]}", False)
+
+    return (
+        "Registered DevBrain MCP server in Claude Code (user scope, ~/.claude.json)",
+        True,
+    )
+
+
+def _cleanup_legacy_claude_settings(settings_path: Path) -> None:
+    """Drop the dead mcpServers block that an older installer wrote into
+    ~/.claude/settings.json (Claude Desktop's key, ignored by Claude Code).
+
+    Leaving it in place is harmless but confusing — it looks like DevBrain
+    is configured when it isn't. Silent no-op if the file doesn't exist,
+    isn't JSON, or doesn't contain the key.
+    """
+    settings_path = settings_path.expanduser()
+    if not settings_path.exists():
+        return
+    try:
+        with open(settings_path) as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return
+    if not isinstance(data, dict) or "mcpServers" not in data:
+        return
+    del data["mcpServers"]
+    try:
+        with open(settings_path, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+    except OSError:
+        pass
+
+
 def setup_mcp_client() -> None:
     _header("MCP Client Configuration")
     _desc(
@@ -1130,6 +1210,39 @@ def setup_mcp_client() -> None:
             continue
 
         config_path = Path(config_path_str).expanduser()
+
+        # Claude Code's MCP config doesn't live in settings.json (that's
+        # Claude Desktop's file) — it's in ~/.claude.json, managed by
+        # `claude mcp add`. Use the supported CLI API for it.
+        if agent_name == "Claude Code":
+            _desc(f"{agent_name} — MCP config via 'claude mcp add' (user scope)")
+            if not _confirm(f"Auto-configure MCP for {agent_name}?", default=True):
+                click.echo()
+                continue
+
+            message, success = _register_claude_code_mcp(run_sh)
+            if success:
+                _ok(message)
+                any_configured = True
+                # Strip any legacy mcpServers block an older installer
+                # left in ~/.claude/settings.json.
+                _cleanup_legacy_claude_settings(config_path)
+                # Extras (CLAUDE.md, permissions, hooks) still live in
+                # settings.json and work correctly there.
+                _configure_claude_extras(config_path)
+                _add_action(
+                    f"Restart {agent_name}",
+                    f"{agent_name} picks up MCP config changes on its next session start.\n"
+                    f"     After restart, run '/mcp' inside {agent_name} to verify DevBrain tools are available.",
+                    condition=f"{agent_name} configured",
+                )
+            else:
+                _warn(message)
+                _info("Register manually with: "
+                      f"claude mcp add devbrain -s user {run_sh}")
+            click.echo()
+            continue
+
         _desc(f"{agent_name} — config file: {config_path}")
 
         if not _confirm(f"Auto-configure MCP for {agent_name}?", default=True):
@@ -1140,12 +1253,6 @@ def setup_mcp_client() -> None:
         if success:
             _ok(message)
             any_configured = True
-
-            # Claude Code supports CLAUDE.md, permissions.allow, and
-            # hooks.sessionStart. Offer those optional tie-ins now.
-            if agent_name == "Claude Code":
-                _configure_claude_extras(config_path)
-
             _add_action(
                 f"Restart {agent_name}",
                 f"{agent_name} picks up MCP config changes on its next session start.\n"
