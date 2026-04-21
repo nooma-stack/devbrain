@@ -1494,7 +1494,64 @@ install_pkrelay() {
         ok "PKRelay cloned to $PKRELAY_HOME"
     fi
 
-    if [[ -f "$PKRELAY_HOME/install.sh" ]]; then
+    # Two layouts in the wild:
+    #   v2: flat repo with install.sh + manifest.json at root
+    #   v3: split into extension/, mcp-server/, native-host/ subdirs; the
+    #       Chrome extension lives in extension/, the Node MCP server in
+    #       mcp-server/, and the native-host launcher + its install
+    #       script in native-host/. There is NO top-level install.sh.
+    local ext_dir=""
+    local is_v3=false
+    if [[ -d "$PKRELAY_HOME/native-host" && -d "$PKRELAY_HOME/extension" ]]; then
+        is_v3=true
+        ext_dir="$PKRELAY_HOME/extension"
+    elif [[ -f "$PKRELAY_HOME/manifest.json" ]]; then
+        ext_dir="$PKRELAY_HOME"
+    fi
+
+    if $is_v3; then
+        # Build the MCP server (provides the `pkrelay` binary via its
+        # bin field in package.json, which the native-host launcher
+        # spawns when Chrome opens a native-messaging port).
+        info "Building PKRelay mcp-server..."
+        if (cd "$PKRELAY_HOME/mcp-server" && npm install --silent && npm run build --silent 2>/dev/null); then
+            ok "PKRelay mcp-server built"
+        else
+            warn "PKRelay mcp-server build failed. DevBrain continues."
+            POST_ACTIONS+=("PKRelay mcp-server build failed — debug from $PKRELAY_HOME/mcp-server")
+        fi
+
+        # Expose `pkrelay` on PATH. `npm link` creates a symlink in
+        # the global prefix's bin dir pointing at mcp-server/dist/index.js.
+        # Silent-ish unless something's wrong.
+        info "Linking pkrelay binary to PATH..."
+        if (cd "$PKRELAY_HOME/mcp-server" && npm link --silent 2>/dev/null); then
+            if command -v pkrelay &>/dev/null; then
+                ok "pkrelay → $(command -v pkrelay)"
+            else
+                warn "npm link ran but 'pkrelay' isn't on PATH."
+                warn "Check \$(npm prefix -g)/bin is in your PATH."
+            fi
+        else
+            warn "npm link failed — native-host launcher won't find pkrelay."
+            POST_ACTIONS+=("Run 'cd $PKRELAY_HOME/mcp-server && npm link' to install the pkrelay binary")
+        fi
+
+        # Register the native messaging host manifest for each installed
+        # browser. Recent versions of native-host/install.sh auto-detect
+        # the extension ID from the browser's Secure Preferences, so if
+        # the user already loaded the unpacked extension from an earlier
+        # attempt this wires up fully. Otherwise the manifest gets a
+        # placeholder and the user re-runs after loading.
+        info "Registering PKRelay native-messaging host..."
+        if (cd "$PKRELAY_HOME/native-host" && bash install.sh); then
+            ok "PKRelay native host registered"
+        else
+            warn "PKRelay native-host install failed. DevBrain continues."
+            POST_ACTIONS+=("PKRelay native host — run 'cd $PKRELAY_HOME/native-host && bash install.sh'")
+        fi
+    elif [[ -f "$PKRELAY_HOME/install.sh" ]]; then
+        # v2 layout — flat repo, single install.sh handles everything.
         info "Running PKRelay installer..."
         if (cd "$PKRELAY_HOME" && bash install.sh); then
             ok "PKRelay installed"
@@ -1513,9 +1570,16 @@ install_pkrelay() {
         fi
     fi
 
-    POST_ACTIONS+=("Load PKRelay in Chrome: chrome://extensions → Enable Developer Mode → Load Unpacked → select $PKRELAY_HOME")
+    # Point users at the right directory for Chrome's "Load unpacked"
+    # dialog. v3's extension lives in the subdir; v2 uses the root.
+    local load_path="${ext_dir:-$PKRELAY_HOME}"
+    POST_ACTIONS+=("Load PKRelay in Chrome: chrome://extensions → Enable Developer Mode → Load Unpacked → select $load_path")
+    if $is_v3; then
+        POST_ACTIONS+=("After loading PKRelay in Chrome, re-run 'cd $PKRELAY_HOME/native-host && bash install.sh' so the native-host manifest picks up your extension ID")
+    fi
     echo ""
     info "PKRelay is a Chrome extension — it needs to be loaded manually."
+    info "Load unpacked from: $load_path"
     info "See the post-install actions below."
 }
 
