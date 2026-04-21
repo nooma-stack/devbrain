@@ -1102,6 +1102,21 @@ def _merge_mcp_into_json(config_path: Path, devbrain_entry: dict) -> tuple[str, 
         return (f"Updated existing devbrain MCP server in {config_path}", True)
 
 
+def _claude_desktop_config_path() -> str | None:
+    """Return the OS-specific path to Claude Desktop's MCP config, or None
+    if the platform doesn't have an established location.
+
+    - macOS:   ~/Library/Application Support/Claude/claude_desktop_config.json
+    - Linux:   ~/.config/Claude/claude_desktop_config.json
+    - Windows: not handled (the installer is bash/POSIX-only anyway).
+    """
+    if sys.platform == "darwin":
+        return "~/Library/Application Support/Claude/claude_desktop_config.json"
+    if sys.platform.startswith("linux"):
+        return "~/.config/Claude/claude_desktop_config.json"
+    return None
+
+
 def _register_claude_code_mcp(run_sh: Path) -> tuple[str, bool]:
     """Register DevBrain with Claude Code via its supported `claude mcp add`
     API (writes to ~/.claude.json at user scope).
@@ -1195,17 +1210,31 @@ def setup_mcp_client() -> None:
     run_sh = DEVBRAIN_HOME / "mcp-server" / "run.sh"
     devbrain_entry = {"command": str(run_sh)}
 
-    # (display name, config path, command to detect if CLI is installed)
+    # (display name, config path, detector). Detector is either a CLI
+    # command name (checked via shutil.which) or an absolute path
+    # (checked via Path.exists) — the latter is for GUI apps like
+    # Claude Desktop that have no CLI on PATH.
     agents = [
-        ("Claude Code", "~/.claude/settings.json", "claude"),
-        ("Codex CLI", "~/.codex/config.json", "codex"),
-        ("Gemini CLI", "~/.gemini/settings.json", "gemini"),
+        ("Claude Code",    "~/.claude/settings.json", "claude"),
+        ("Claude Desktop", _claude_desktop_config_path(), "/Applications/Claude.app"),
+        ("Codex CLI",      "~/.codex/config.json", "codex"),
+        ("Gemini CLI",     "~/.gemini/settings.json", "gemini"),
     ]
 
     any_configured = False
-    for agent_name, config_path_str, cli_cmd in agents:
-        if not shutil.which(cli_cmd):
-            _info(f"{agent_name}: CLI not installed — skipping MCP config")
+    for agent_name, config_path_str, detector in agents:
+        if not config_path_str:
+            _info(f"{agent_name}: unsupported on this platform — skipping")
+            click.echo()
+            continue
+        if detector.startswith("/"):
+            detected = Path(detector).exists()
+            missing_hint = f"{agent_name} not found at {detector}"
+        else:
+            detected = shutil.which(detector) is not None
+            missing_hint = f"{agent_name} CLI not installed"
+        if not detected:
+            _info(f"{agent_name}: {missing_hint} — skipping MCP config")
             click.echo()
             continue
 
