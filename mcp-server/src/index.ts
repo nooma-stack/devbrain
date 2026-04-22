@@ -813,6 +813,123 @@ server.tool(
   },
 )
 
+// ─── Tool: agent_remote_prompt ───────────────────────────────────────────────
+//
+// Talks to a remote agent-bus daemon (github.com/nooma-stack/agent-bus) over
+// HTTP. The daemon exposes an authenticated `claude -p` session on a remote
+// host, typically reached through an SSH tunnel. This tool lets this Claude
+// session drive another Claude session running on a different machine —
+// useful for multi-host orchestration, remote-runner dev loops, etc.
+//
+// Config lives at ~/.devbrain/agent-bus.yaml (override via
+// DEVBRAIN_AGENT_BUS_CONFIG):
+//
+//   targets:
+//     mac-studio:
+//       url: http://127.0.0.1:18900
+//       token: <bearer token from remote daemon's ~/.agent-bus/token>
+//
+// The URL is the tunnel-exposed loopback address on THIS machine — set up
+// the SSH tunnel separately (e.g., `ssh -L 18900:127.0.0.1:18900 mac-studio`).
+
+import { homedir } from 'os'
+import { readFileSync, existsSync } from 'fs'
+import YAML from 'yaml'
+
+interface AgentBusTarget {
+  url: string
+  token: string
+}
+
+function loadAgentBusConfig(): Record<string, AgentBusTarget> {
+  const configPath = process.env.DEVBRAIN_AGENT_BUS_CONFIG
+    ?? join(homedir(), '.devbrain', 'agent-bus.yaml')
+  if (!existsSync(configPath)) {
+    return {}
+  }
+  try {
+    const parsed = YAML.parse(readFileSync(configPath, 'utf-8'))
+    return (parsed?.targets ?? {}) as Record<string, AgentBusTarget>
+  } catch {
+    return {}
+  }
+}
+
+server.tool(
+  'agent_remote_prompt',
+  'Send a prompt to a remote Claude session via an agent-bus daemon. Preserves conversation context across calls when the same session_id is reused. Config: ~/.devbrain/agent-bus.yaml.',
+  {
+    target: z.string().describe('Target name from agent-bus.yaml (e.g., "mac-studio")'),
+    prompt: z.string().describe('Prompt to send to the remote Claude session'),
+    session_id: z.string().uuid().optional().describe('UUID for conversation continuity. Omit to start a new session (daemon generates one).'),
+    cwd: z.string().optional().describe('Working directory for the remote claude subprocess. Lets callers scope file access.'),
+  },
+  async ({ target, prompt, session_id, cwd }) => {
+    const targets = loadAgentBusConfig()
+    const cfg = targets[target]
+    if (!cfg) {
+      const available = Object.keys(targets)
+      const hint = available.length > 0
+        ? `Available targets: ${available.join(', ')}.`
+        : 'No agent-bus targets configured yet. See github.com/nooma-stack/agent-bus#use for provisioning.'
+      return { content: [{ type: 'text', text: `Target "${target}" not found in agent-bus config. ${hint}` }] }
+    }
+    if (!cfg.url || !cfg.token) {
+      return { content: [{ type: 'text', text: `Target "${target}" is missing url or token in agent-bus.yaml.` }] }
+    }
+
+    const body: Record<string, unknown> = { prompt }
+    if (session_id) body.session_id = session_id
+    if (cwd) body.cwd = cwd
+
+    let response: Response
+    try {
+      response = await fetch(`${cfg.url.replace(/\/$/, '')}/prompt`, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${cfg.token}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      })
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Network error reaching ${cfg.url}: ${err}. Is the SSH tunnel up and the daemon running?` }] }
+    }
+
+    const payload = await response.json().catch(() => null) as {
+      session_id?: string
+      result?: string
+      stderr?: string
+      exit_code?: number
+    } | null
+
+    if (!response.ok) {
+      const detail = payload ? JSON.stringify(payload) : await response.text().catch(() => '(no body)')
+      return { content: [{ type: 'text', text: `Daemon returned ${response.status}: ${detail}` }] }
+    }
+
+    if (!payload) {
+      return { content: [{ type: 'text', text: 'Daemon returned unparseable response.' }] }
+    }
+
+    if (payload.exit_code !== 0) {
+      return {
+        content: [{
+          type: 'text',
+          text: `Remote claude exited ${payload.exit_code}\nstderr: ${payload.stderr ?? '(empty)'}\nsession_id: ${payload.session_id ?? '(none)'}`,
+        }],
+      }
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: `[session: ${payload.session_id ?? 'unknown'}]\n\n${payload.result ?? '(empty response)'}`,
+      }],
+    }
+  },
+)
+
 // ─── Start server ────────────────────────────────────────────────────────────
 
 async function main() {
