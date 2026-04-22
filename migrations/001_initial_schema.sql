@@ -192,6 +192,19 @@ CREATE INDEX idx_factory_artifacts_job ON devbrain.factory_artifacts(job_id);
 CREATE INDEX idx_factory_artifacts_phase ON devbrain.factory_artifacts(phase);
 
 -- ─── Seed Projects ───────────────────────────────────────────────────────────
+-- ─── Factory runtime state ─────────────────────────────────────────────────
+-- Singleton-style key/value table for factory-wide flags. Currently used
+-- by factory/readiness.py to persist "not_ready" when the working tree
+-- or file_locks table is in a state the factory can't auto-repair.
+-- See migrations/007_factory_runtime_state.sql for full detail.
+
+CREATE TABLE IF NOT EXISTS devbrain.factory_runtime_state (
+    key         TEXT PRIMARY KEY,
+    reasons     JSONB NOT NULL DEFAULT '[]'::jsonb,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_by  TEXT
+);
+
 -- Only the self-reference 'devbrain' project is seeded. Add your own projects
 -- via the MCP `store` tool, the API, or by inserting rows here for an instance.
 

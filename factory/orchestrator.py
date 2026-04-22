@@ -23,6 +23,7 @@ from learning import extract_lessons, get_review_lessons
 from cleanup_agent import CleanupAgent
 from file_registry import FileRegistry
 from plan_parser import extract_files_from_plan
+from readiness import FactoryReadiness, ReadinessIssue
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,19 @@ class FactoryOrchestrator:
 
         cleanup = CleanupAgent(self.db)
         logger.info("Starting pipeline for job %s: %s", job_id[:8], job.title)
+
+        # Pre-job factory readiness check. Any dirty state discovered here
+        # is either auto-repaired or the job is blocked — we never start
+        # pipeline work on a contaminated factory, since that silently
+        # propagates bad state to downstream artifacts.
+        # Only run for jobs that are starting fresh (QUEUED); blocked
+        # jobs being resumed after user resolution have already passed
+        # this gate once, and re-running it would wipe the workspace
+        # they may need to inspect.
+        if job.status == JobStatus.QUEUED:
+            blocked = self._pre_job_readiness_check(job)
+            if blocked is not None:
+                return blocked
 
         while job.status not in (
             JobStatus.READY_FOR_APPROVAL,
@@ -165,6 +179,70 @@ class FactoryOrchestrator:
             cur.execute("SELECT root_path FROM devbrain.projects WHERE id = %s", (job.project_id,))
             row = cur.fetchone()
             return row[0] if row else "."
+
+    def _pre_job_readiness_check(self, job: FactoryJob) -> FactoryJob | None:
+        """Verify the factory is in a clean state before starting. If
+        auto-repair resolves everything, returns None and the caller
+        continues. Otherwise transitions the job to BLOCKED with a
+        structured block_reason and returns the blocked job so the
+        caller can early-exit.
+
+        Always runs a readiness check — even if the persisted flag is
+        unset — so drift that accumulated silently (outside a prior
+        post-check) is caught here.
+        """
+        project_root = self._get_project_root(job)
+        readiness = FactoryReadiness(self.db, project_root)
+        remaining = readiness.ensure_ready()
+        if not remaining:
+            return None
+
+        issues_payload = [i.to_dict() for i in remaining]
+        logger.warning(
+            "Pre-job readiness check failed for job %s: %d issue(s) remain after auto-repair: %s",
+            job.id[:8],
+            len(remaining),
+            "; ".join(i.message for i in remaining),
+        )
+        blocked = self.db.transition(
+            job.id,
+            JobStatus.BLOCKED,
+            metadata={
+                "block_reason": "factory_not_ready",
+                "readiness_issues": issues_payload,
+            },
+        )
+        self._notify_readiness_block(blocked, remaining)
+        return blocked
+
+    def _notify_readiness_block(self, job: FactoryJob, issues: list[ReadinessIssue]) -> None:
+        """Fire a needs_human notification so the block surfaces promptly."""
+        try:
+            from notifications.router import NotificationRouter, NotificationEvent
+            router = NotificationRouter(self.db)
+            if not job.submitted_by:
+                return
+            body_lines = [
+                "Factory readiness check failed before this job could start.",
+                "",
+                "Unresolved issues:",
+            ]
+            body_lines.extend(f"  - {i.message}" for i in issues)
+            body_lines.extend([
+                "",
+                "Run the factory readiness helper on the host to diagnose + fix,",
+                "then resubmit this job or call factory resolve with action='retry'.",
+            ])
+            router.send(NotificationEvent(
+                event_type="needs_human",
+                recipient_dev_id=job.submitted_by,
+                title=f"⚠ Factory not ready — job blocked: {job.title}",
+                body="\n".join(body_lines),
+                job_id=job.id,
+                metadata={"readiness_issues": [i.to_dict() for i in issues]},
+            ))
+        except Exception as exc:
+            logger.warning("readiness-block notification failed (non-blocking): %s", exc)
 
     def _get_cli(self, phase: str, job: FactoryJob) -> str:
         """Get the CLI to use for a phase."""

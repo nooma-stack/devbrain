@@ -212,7 +212,64 @@ class CleanupAgent:
                 job_id[:8], e,
             )
 
+        # Post-job factory readiness check. Verifies + auto-repairs git
+        # state and orphan locks so the next job starts clean. On failure
+        # to reach a clean state, the readiness module persists a
+        # not_ready flag that the NEXT job's pre-check will see and
+        # block on — this is how the cleanup/pre-check pair keeps bad
+        # state from silently propagating across jobs. We do NOT alter
+        # this job's terminal status here; the cleanup problem is
+        # separate from the job's own outcome.
+        try:
+            from readiness import FactoryReadiness
+            project_root = self._get_project_root(job)
+            readiness = FactoryReadiness(self.db, project_root)
+            remaining = readiness.ensure_ready()
+            if remaining:
+                logger.warning(
+                    "Post-cleanup readiness check: %d unresolved issue(s) "
+                    "after auto-repair for job %s: %s",
+                    len(remaining), job_id[:8],
+                    "; ".join(i.message for i in remaining),
+                )
+                self._fire_dirty_state_notification(job, remaining)
+        except Exception as e:
+            logger.warning(
+                "Post-cleanup readiness check failed for job %s: %s (non-blocking)",
+                job_id[:8], e,
+            )
+
         return report.to_dict()
+
+    def _fire_dirty_state_notification(self, job: FactoryJob, issues: list) -> None:
+        """Surface post-cleanup contamination to the submitter. The next
+        job's pre-check will also block on this state, but firing here
+        means the dev sees it immediately rather than discovering it on
+        the next submission."""
+        try:
+            if not job.submitted_by:
+                return
+            router = NotificationRouter(self.db)
+            body_lines = [
+                f"Post-cleanup readiness check detected {len(issues)} "
+                "issue(s) that could not be auto-repaired.",
+                "",
+                "The factory is now flagged not-ready; subsequent jobs will "
+                "block on pre-check until this is resolved.",
+                "",
+                "Issues:",
+            ]
+            body_lines.extend(f"  - {i.message}" for i in issues)
+            router.send(NotificationEvent(
+                event_type="needs_human",
+                recipient_dev_id=job.submitted_by,
+                title=f"⚠ Factory dirty after job {job.id[:8]} — subsequent jobs will block",
+                body="\n".join(body_lines),
+                job_id=job.id,
+                metadata={"readiness_issues": [i.to_dict() for i in issues]},
+            ))
+        except Exception as exc:
+            logger.warning("Dirty-state notification failed: %s", exc)
 
     def attempt_recovery(self, job: FactoryJob) -> CleanupReport:
         """Mode 2 — called before a job transitions to FAILED.
@@ -599,7 +656,20 @@ class CleanupAgent:
         )
 
     def _cleanup_branch(self, job: FactoryJob) -> None:
-        """Best-effort delete the git branch for failed/rejected jobs."""
+        """Clean up after a failed/rejected job: switch HEAD back to
+        main, force-discard any uncommitted changes the failed agent
+        left behind, and delete the now-stale factory branch.
+
+        Earlier versions of this method did only `git branch -d <branch>`
+        with no error check, which always logged "Cleaned up branch..."
+        regardless of what actually happened. Observed failure mode
+        (2026-04-22): when the implementer crashed mid-edit, HEAD was
+        still on the doomed branch with uncommitted edits. `git branch
+        -d` refused to delete the currently-checked-out branch (silent
+        non-zero exit), leaving every later job forking from the
+        contaminated state — those jobs then crashed in planning with
+        schema-mismatch errors caused by the partial edits.
+        """
         if not BRANCH_CLEANUP_ENABLED:
             logger.debug("Branch cleanup disabled by config for job %s", job.id[:8])
             return
@@ -610,17 +680,47 @@ class CleanupAgent:
             return
 
         project_root = self._get_project_root(job)
-        try:
-            subprocess.run(
-                ["git", "branch", "-d", branch],
-                cwd=project_root,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
+
+        def _git(args: list[str]) -> subprocess.CompletedProcess | None:
+            try:
+                return subprocess.run(
+                    ["git", *args],
+                    cwd=project_root,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            except Exception as exc:
+                logger.debug("git %s failed: %s", " ".join(args), exc)
+                return None
+
+        # 1. If HEAD is currently on the branch we're about to delete,
+        #    switch to main first. -f discards any uncommitted edits the
+        #    failed agent left in the working tree — those are dead work
+        #    by definition (the job hit a terminal failure state).
+        head = _git(["rev-parse", "--abbrev-ref", "HEAD"])
+        if head is not None and head.stdout.strip() == branch:
+            checkout = _git(["checkout", "-f", "main"])
+            if checkout is None or checkout.returncode != 0:
+                logger.warning(
+                    "Branch cleanup: could not switch HEAD to main for job %s "
+                    "(branch=%s). Leaving the branch in place.",
+                    job.id[:8], branch,
+                )
+                return
+
+        # 2. Force-delete the branch (-D) since it may have unmerged
+        #    commits — a failed job's commits are not supposed to land.
+        delete = _git(["branch", "-D", branch])
+        if delete is None:
+            return
+        if delete.returncode == 0:
             logger.info("Cleaned up branch %s for job %s", branch, job.id[:8])
-        except Exception as exc:
-            logger.debug("Branch cleanup failed (best-effort): %s", exc)
+        else:
+            logger.warning(
+                "Branch cleanup failed for job %s: `git branch -D %s` exited %d: %s",
+                job.id[:8], branch, delete.returncode, delete.stderr.strip(),
+            )
 
     def _build_human_questions(self, diagnosis: dict) -> str:
         """Generate questions for human review based on the diagnosis."""
