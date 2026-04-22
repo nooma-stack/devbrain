@@ -1093,7 +1093,9 @@ def version() -> None:
         tree_str = "git not available"
     else:
         commit_str = commit
-        branch_str = branch if branch is not None else "git not available"
+        # `--abbrev-ref HEAD` returns the literal "HEAD" in detached state
+        # (e.g. CI checkouts by SHA). Surface that as "(detached)".
+        branch_str = "(detached)" if branch in (None, "HEAD") else branch
         tree_str = "clean" if porcelain == "" else "dirty"
 
     click.echo(f"commit: {commit_str}")

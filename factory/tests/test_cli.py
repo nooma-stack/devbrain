@@ -98,6 +98,9 @@ def test_version_command(runner):
     assert "branch:" in result.output
     assert "working tree:" in result.output
     assert "DEVBRAIN_HOME:" in result.output
+    # Guard against silent field drops: each label appears exactly once.
+    for label in ("commit:", "branch:", "working tree:", "DEVBRAIN_HOME:"):
+        assert result.output.count(label) == 1, f"{label} should appear once"
 
 
 def test_version_help(runner):
