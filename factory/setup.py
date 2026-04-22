@@ -375,6 +375,44 @@ def setup_github() -> None:
         _info("Skipped — run 'gh auth login' later to enable factory push/PR features.")
 
 
+def _cli_is_authenticated(cmd: str) -> bool:
+    """Probe an AI CLI to see whether it's logged in / has a usable API key.
+
+    Tries to send a trivial prompt via the CLI's one-shot flag and inspects
+    the output for the known "not logged in" sentinel. Treats any other
+    result — even a refusal, timeout, or tool-use detour — as "authed,
+    don't bother the user." False negatives here just mean we re-prompt
+    someone who's already logged in; false positives would skip the
+    prompt when we shouldn't, which is worse.
+    """
+    if cmd == "claude":
+        flag = "-p"
+    elif cmd == "gemini":
+        flag = "-p"
+    elif cmd == "codex":
+        # Codex doesn't have a stable one-shot probe path; skip auto-detect.
+        return False
+    else:
+        return False
+    try:
+        result = subprocess.run(
+            [cmd, flag, "ping"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+    blob = (result.stdout + "\n" + result.stderr).lower()
+    # The canonical unauthed sentinel from Claude Code is
+    # "Not logged in · Please run /login". Keep the check loose.
+    if "not logged in" in blob or "please run /login" in blob:
+        return False
+    if "please log in" in blob or "auth required" in blob:
+        return False
+    # Non-zero exit without an explicit auth message → not a clear signal,
+    # treat as authed to avoid false-skip of the prompt.
+    return True
+
+
 def setup_ai_cli_logins() -> None:
     _header("AI CLI Auth")
     _desc(
@@ -425,14 +463,27 @@ def setup_ai_cli_logins() -> None:
         _desc(cli["desc"])
         _ok(f"Installed at {shutil.which(cli['cmd'])}")
 
-        # Show three-way choice
+        # Quick probe: is the CLI already logged in? If so, we can skip
+        # prompting. For claude, a `-p` one-shot exits non-zero with
+        # "Not logged in" on stderr when auth is missing.
+        already_authed = _cli_is_authenticated(cli["cmd"])
+        if already_authed:
+            _ok(f"{cli['name']} already authenticated — skipping prompt")
+            continue
+
+        # Show three-way choice. Default is 1 (OAuth) because hitting
+        # Enter through the prompt on a fresh install should land the
+        # user in the "log me in" flow, not silently skip it — the
+        # latter leaves factory subprocesses unable to run and only
+        # reveals itself later with "Not logged in · Please run /login"
+        # deep inside a factory job.
         click.echo()
-        click.echo(f"    1. OAuth — opens browser for subscription login")
+        click.echo(f"    1. OAuth — opens browser for subscription login  [default]")
         click.echo(f"    2. API key — paste a {cli['env_var']} for pay-as-you-go billing")
         click.echo(f"    3. Skip (configure later)")
         click.echo()
 
-        choice = _prompt(f"Auth method for {cli['name']} (1/2/3)", default="3").strip()
+        choice = _prompt(f"Auth method for {cli['name']} (1/2/3)", default="1").strip()
 
         if choice == "1":
             click.echo()

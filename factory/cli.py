@@ -775,7 +775,42 @@ def _run_devdoctor_checks() -> list[dict]:
         warn=True,
     )
 
-    # 9. Env vars (informational — never fails, just reports overrides)
+    # 9. AI CLI login status. A missing login is invisible until a factory
+    # subprocess fires off with `claude -p ...` and exits with "Not logged
+    # in · Please run /login", which only surfaces deep inside the
+    # orchestrator log. Surface it here so install-time or pre-flight
+    # devdoctor catches it.
+    import shutil as _shutil
+    import subprocess as _subprocess
+    for _ai_cli in ("claude", "gemini"):
+        if not _shutil.which(_ai_cli):
+            continue
+        login_flag = "-p"
+        try:
+            _res = _subprocess.run(
+                [_ai_cli, login_flag, "ping"],
+                capture_output=True, text=True, timeout=15,
+            )
+            _blob = (_res.stdout + "\n" + _res.stderr).lower()
+            _authed = not any(
+                s in _blob
+                for s in ("not logged in", "please run /login",
+                          "please log in", "auth required")
+            )
+            add(
+                f"ai_cli_logged_in:{_ai_cli}",
+                _authed,
+                "logged in" if _authed
+                else f"not logged in — run: {_ai_cli} /login",
+                warn=True,
+            )
+        except (_subprocess.TimeoutExpired, FileNotFoundError):
+            # Timeout usually means the CLI is in some interactive
+            # state — treat as non-fatal.
+            add(f"ai_cli_logged_in:{_ai_cli}", True,
+                "probe timed out (treating as authed)", warn=True)
+
+    # 10. Env vars (informational — never fails, just reports overrides)
     overrides = sorted(k for k in os.environ if k.startswith("DEVBRAIN_"))
     add(
         "env_overrides",
