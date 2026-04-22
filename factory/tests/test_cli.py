@@ -88,3 +88,19 @@ def test_dashboard_command_exists(runner):
     result = runner.invoke(cli, ["dashboard", "--help"])
     assert result.exit_code == 0
     assert "dashboard" in result.output.lower()
+
+
+def test_version_command(runner):
+    """devbrain version runs without error and prints all four fields."""
+    result = runner.invoke(cli, ["version"])
+    assert result.exit_code == 0
+    assert "commit:" in result.output
+    assert "branch:" in result.output
+    assert "working tree:" in result.output
+    assert "DEVBRAIN_HOME:" in result.output
+
+
+def test_version_help(runner):
+    """devbrain version --help works."""
+    result = runner.invoke(cli, ["version", "--help"])
+    assert result.exit_code == 0

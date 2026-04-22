@@ -1062,6 +1062,46 @@ def devdoctor(as_json: bool, fix: bool) -> None:
             click.echo("✅ All checks passed.")
 
 
+@cli.command(name="version")
+def version() -> None:
+    """Print DevBrain version info: git commit, branch, working tree, DEVBRAIN_HOME."""
+    import subprocess
+    from config import DEVBRAIN_HOME
+
+    def _git(args: list[str]) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=str(DEVBRAIN_HOME),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (FileNotFoundError, subprocess.SubprocessError):
+            return None
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip()
+
+    commit = _git(["rev-parse", "--short", "HEAD"])
+    branch = _git(["rev-parse", "--abbrev-ref", "HEAD"])
+    porcelain = _git(["status", "--porcelain"])
+
+    if commit is None:
+        commit_str = "git not available"
+        branch_str = "git not available"
+        tree_str = "git not available"
+    else:
+        commit_str = commit
+        branch_str = branch if branch is not None else "git not available"
+        tree_str = "clean" if porcelain == "" else "dirty"
+
+    click.echo(f"commit: {commit_str}")
+    click.echo(f"branch: {branch_str}")
+    click.echo(f"working tree: {tree_str}")
+    click.echo(f"DEVBRAIN_HOME: {DEVBRAIN_HOME}")
+
+
 @cli.command(name="doctor", hidden=True)
 @click.option("--json", "as_json", is_flag=True, help="Emit JSON instead of text")
 @click.option("--fix", is_flag=True, help="Interactively remediate WARN/FAIL items")
