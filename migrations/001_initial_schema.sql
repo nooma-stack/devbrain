@@ -184,6 +184,7 @@ CREATE TABLE devbrain.factory_artifacts (
     status          VARCHAR(50) DEFAULT 'created',
     findings_count  INT DEFAULT 0,
     blocking_count  INT DEFAULT 0,
+    warning_count   INT DEFAULT 0,
     metadata        JSONB DEFAULT '{}',
     created_at      TIMESTAMPTZ DEFAULT now()
 );

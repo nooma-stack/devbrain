@@ -95,6 +95,24 @@ def _extract_blocking_items(text: str) -> list[str]:
     return items
 
 
+def _count_warning(text: str) -> int:
+    """Count actual WARNING findings — look for the marker at start of line or list item."""
+    pattern = r'(?:^|\n)\s*(?:\d+\.\s*|\*\*?|-\s*)?WARNING\b'
+    return len(re.findall(pattern, text, re.IGNORECASE))
+
+
+def _extract_warning_items(text: str) -> list[str]:
+    """Extract individual WARNING finding texts."""
+    items = []
+    parts = re.split(r'(?:^|\n)\s*(?:\d+\.\s*|\*\*?|-\s*)?WARNING[:\s]*', text, flags=re.IGNORECASE)
+    for part in parts[1:]:
+        end = re.search(r'\n\s*(?:\d+\.\s*|\*\*?|-\s*)?(?:BLOCKING|NIT|WARNING)\b', part, re.IGNORECASE)
+        item = part[:end.start()].strip() if end else part.strip()
+        if item:
+            items.append(item)
+    return items
+
+
 class FactoryOrchestrator:
     """Orchestrates the dev factory pipeline."""
 
@@ -876,6 +894,7 @@ If this is a re-review round, explicitly state which prior findings are RESOLVED
                               phase="review_arch")
 
         blocking_count = _count_blocking(arch_result.stdout)
+        warning_count = _count_warning(arch_result.stdout)
         self.db.store_artifact(
             job_id=job.id,
             phase="review",
@@ -884,6 +903,7 @@ If this is a re-review round, explicitly state which prior findings are RESOLVED
             model_used=arch_cli,
             findings_count=arch_result.stdout.count("\n- ") + arch_result.stdout.count("\n1."),
             blocking_count=blocking_count,
+            warning_count=warning_count,
         )
 
         # Security/HIPAA review
@@ -932,6 +952,7 @@ Store any security issues found in DevBrain with type="issue" and category="secu
                              phase="review_security")
 
         sec_blocking = _count_blocking(sec_result.stdout)
+        sec_warning = _count_warning(sec_result.stdout)
         self.db.store_artifact(
             job_id=job.id,
             phase="review",
@@ -940,6 +961,7 @@ Store any security issues found in DevBrain with type="issue" and category="secu
             model_used=sec_cli,
             findings_count=sec_result.stdout.count("\n- ") + sec_result.stdout.count("\n1."),
             blocking_count=sec_blocking,
+            warning_count=sec_warning,
         )
 
         total_blocking = blocking_count + sec_blocking
