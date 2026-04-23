@@ -438,18 +438,6 @@ class FactoryOrchestrator:
                 prior.extend(items)
         return prior
 
-    def _get_prior_warning_findings(
-        self, job: FactoryJob, artifact_type: str
-    ) -> list[str]:
-        """Get WARNING findings from previous review rounds for fix context."""
-        artifacts = self.db.get_artifacts(job.id, phase="review")
-        prior = []
-        for art in artifacts:
-            if art["artifact_type"] == artifact_type and art["warning_count"] > 0:
-                items = _extract_warning_items(art["content"])
-                prior.extend(items)
-        return prior
-
     def _get_fix_history(self, job: FactoryJob) -> str:
         """Get summary of what was fixed in prior fix loops."""
         fix_artifacts = self.db.get_artifacts(job.id, phase="fix")
