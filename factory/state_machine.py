@@ -301,6 +301,7 @@ class FactoryDB:
         model_used: str | None = None,
         findings_count: int = 0,
         blocking_count: int = 0,
+        warning_count: int = 0,
         metadata: dict | None = None,
     ) -> str:
         """Store a factory artifact (plan, diff, review, QA report)."""
@@ -309,13 +310,13 @@ class FactoryDB:
                 """
                 INSERT INTO devbrain.factory_artifacts
                     (job_id, phase, artifact_type, content, model_used,
-                     findings_count, blocking_count, metadata)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                     findings_count, blocking_count, warning_count, metadata)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
                 (
                     job_id, phase, artifact_type, content, model_used,
-                    findings_count, blocking_count,
+                    findings_count, blocking_count, warning_count,
                     json.dumps(metadata or {}),
                 ),
             )
@@ -335,7 +336,8 @@ class FactoryDB:
             cur.execute(
                 f"""
                 SELECT id, phase, artifact_type, content, model_used,
-                       findings_count, blocking_count, metadata, created_at
+                       findings_count, blocking_count, warning_count,
+                       metadata, created_at
                 FROM devbrain.factory_artifacts
                 WHERE {' AND '.join(conditions)}
                 ORDER BY created_at ASC
@@ -347,7 +349,8 @@ class FactoryDB:
                     "id": str(r[0]), "phase": r[1], "artifact_type": r[2],
                     "content": r[3], "model_used": r[4],
                     "findings_count": r[5], "blocking_count": r[6],
-                    "metadata": r[7] or {}, "created_at": str(r[8]),
+                    "warning_count": r[7],
+                    "metadata": r[8] or {}, "created_at": str(r[9]),
                 }
                 for r in cur.fetchall()
             ]
