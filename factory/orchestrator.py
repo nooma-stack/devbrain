@@ -782,7 +782,10 @@ Store the final plan in DevBrain using the store tool with type="decision"."""
     def _run_implementation(self, job: FactoryJob) -> FactoryJob:
         """Implementation phase: write code and tests."""
         cli = self._get_cli("implementing", job)
-        project_root = self._get_project_root(job)
+        # Post-planning: run in the job's own worktree so the main checkout
+        # stays on main. Pre-worktree-refactor jobs fall back to main via
+        # _get_job_cwd's fallback.
+        project_root = self._get_job_cwd(job)
 
         # Get the plan artifact
         plans = self.db.get_artifacts(job.id, phase="planning")
@@ -862,7 +865,8 @@ IMPORTANT: Follow existing code patterns in the repo. Read similar files before 
         """Review phase: architecture + security/HIPAA review."""
         if job.status != JobStatus.REVIEWING:
             job = self.db.transition(job.id, JobStatus.REVIEWING)
-        project_root = self._get_project_root(job)
+        # Reviewer reads the branch's diff + files in the worktree.
+        project_root = self._get_job_cwd(job)
 
         # Get the diff for review
         try:
@@ -1028,7 +1032,8 @@ Store any security issues found in DevBrain with type="issue" and category="secu
         """QA phase: run full test suite, lint, type checks."""
         if job.status != JobStatus.QA:
             job = self.db.transition(job.id, JobStatus.QA)
-        project_root = self._get_project_root(job)
+        # QA runs tests against the branch — use the worktree cwd.
+        project_root = self._get_job_cwd(job)
 
         # Get project test/lint commands from DB
         with self.db._conn() as conn, conn.cursor() as cur:
@@ -1097,7 +1102,8 @@ Store any security issues found in DevBrain with type="issue" and category="secu
     def _run_fix(self, job: FactoryJob) -> FactoryJob:
         """Fix loop: address blocking findings from the most recent review round."""
         cli = self._get_cli("fix", job)
-        project_root = self._get_project_root(job)
+        # Fix-loop edits the same files the implementer edited — worktree.
+        project_root = self._get_job_cwd(job)
 
         # Get ONLY the most recent review artifacts (not all historical ones)
         all_artifacts = self.db.get_artifacts(job.id)
@@ -1166,7 +1172,9 @@ IMPORTANT: Fix ONLY the listed findings. Do not expand scope. Do not "improve" s
         if not job or job.status != JobStatus.READY_FOR_APPROVAL:
             raise ValueError(f"Job {job_id} is not ready for approval (status: {job.status.value if job else 'not found'})")
 
-        project_root = self._get_project_root(job)
+        # Push from the job's worktree. The branch ref lives in the
+        # shared .git dir so the push still updates origin correctly.
+        project_root = self._get_job_cwd(job)
 
         # Push the branch
         if job.branch_name:
