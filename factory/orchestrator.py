@@ -240,11 +240,30 @@ class FactoryOrchestrator:
         return job
 
     def _get_project_root(self, job: FactoryJob) -> str:
-        """Get the project root path."""
+        """Get the project root path (main checkout)."""
         with self.db._conn() as conn, conn.cursor() as cur:
             cur.execute("SELECT root_path FROM devbrain.projects WHERE id = %s", (job.project_id,))
             row = cur.fetchone()
             return row[0] if row else "."
+
+    def _get_job_cwd(self, job: FactoryJob) -> str:
+        """Return the cwd for subprocesses operating on a specific job.
+
+        Post-planning jobs run in their own git worktree at the path
+        returned by _worktree_path_for_job — this keeps each job's
+        HEAD / working tree isolated from every other job's.
+
+        Pre-worktree phases (planning itself, any call from before
+        _setup_implementation_branch fires) fall back to the main
+        checkout since the worktree doesn't exist yet. Jobs created
+        before the worktree refactor shipped also fall through since
+        their worktree was never provisioned.
+        """
+        if job.branch_name:
+            worktree = _worktree_path_for_job(job)
+            if Path(worktree).exists():
+                return worktree
+        return self._get_project_root(job)
 
     def _pre_job_readiness_check(self, job: FactoryJob) -> FactoryJob | None:
         """Verify the factory is in a clean state before starting. If
