@@ -331,60 +331,77 @@ class FactoryOrchestrator:
         may still be None if git invocation failed (matching prior behavior —
         the implementation phase proceeds on the current branch).
         """
+        worktree = _worktree_path_for_job(job)
+        # Ensure parent directory exists; `git worktree add` won't mkdir -p.
+        Path(worktree).parent.mkdir(parents=True, exist_ok=True)
+
         if job.branch_name:
             # Fail-closed validation before anything reaches git. The MCP
             # tool validates on submission, but direct DB writes or
             # migrations could set an unsafe value; this second check
             # ensures the orchestrator never passes attacker-controlled
-            # input to `git checkout`/`git push` as an unquoted positional.
+            # input to `git worktree add` / `git push` as an unquoted positional.
             fail = _validate_branch_name(job.branch_name)
             if fail:
                 return (None, fail)
             name = job.branch_name.strip()
 
-            checkout = None
+            # Verify the branch exists before attempting a worktree for it.
+            # `git worktree add <path> <ref>` without -b requires the ref
+            # to exist; with -b it creates a new branch at current HEAD.
+            # We use rev-parse --verify to distinguish, falling back to
+            # auto-create on missing branches (preserves prior semantics).
+            rev_parse = None
             try:
-                checkout = subprocess.run(
-                    ["git", "checkout", name],
+                rev_parse = subprocess.run(
+                    ["git", "rev-parse", "--verify", f"refs/heads/{name}"],
                     cwd=project_root, capture_output=True, text=True, timeout=10,
                 )
             except Exception as e:
                 logger.warning(
-                    "git checkout %s raised (%s) — falling back to auto-create",
+                    "git rev-parse %s raised (%s) — falling back to auto-create",
                     name, e,
                 )
 
-            if checkout is not None and checkout.returncode == 0:
+            if rev_parse is not None and rev_parse.returncode == 0:
+                # Branch exists — create a worktree checked out to it.
                 try:
-                    status = subprocess.run(
-                        ["git", "status", "--porcelain"],
-                        cwd=project_root, capture_output=True, text=True, timeout=10,
+                    result = subprocess.run(
+                        ["git", "worktree", "add", worktree, name],
+                        cwd=project_root, capture_output=True, text=True, timeout=30,
                     )
-                    if status.returncode == 0 and status.stdout.strip():
-                        logger.warning(
-                            "Branch '%s' has uncommitted changes — proceeding anyway",
-                            name,
+                    if result.returncode != 0:
+                        return (
+                            None,
+                            f"worktree creation failed for branch {name!r}: "
+                            f"{result.stderr.strip()[:400]}",
                         )
-                except Exception:
-                    pass
+                except Exception as e:
+                    return (None, f"worktree creation raised for branch {name!r}: {str(e)[:400]}")
+                logger.info("Created worktree for existing branch '%s' at %s", name, worktree)
                 return (name, None)
 
-            stderr = (checkout.stderr if checkout is not None else "").strip()
+            stderr = (rev_parse.stderr if rev_parse is not None else "").strip()
             logger.warning(
-                "Branch '%s' does not exist (%s) — falling back to auto-generated branch",
+                "Branch '%s' does not exist (%s) — falling back to auto-generated branch in a new worktree",
                 name, stderr[:200],
             )
 
+        # Auto-create a fresh factory branch in a dedicated worktree.
         slug = re.sub(r'[^a-z0-9-]', '-', job.title.lower())[:40].strip('-')
         branch = f"factory/{job.id[:8]}/{slug}"
         try:
-            subprocess.run(
-                ["git", "checkout", "-b", branch],
-                cwd=project_root, capture_output=True, timeout=10,
+            result = subprocess.run(
+                ["git", "worktree", "add", worktree, "-b", branch],
+                cwd=project_root, capture_output=True, text=True, timeout=30,
             )
+            if result.returncode != 0:
+                logger.warning("Worktree creation failed: %s", result.stderr.strip())
+                return (None, f"worktree creation failed: {result.stderr.strip()[:400]}")
         except Exception as e:
-            logger.warning("Branch creation failed: %s", e)
-            branch = None
+            logger.warning("Worktree creation raised: %s", e)
+            return (None, f"worktree creation raised: {str(e)[:400]}")
+        logger.info("Created worktree for job %s at %s (branch %s)", job.id[:8], worktree, branch)
         return (branch, None)
 
     def _get_cli(self, phase: str, job: FactoryJob) -> str:
