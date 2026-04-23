@@ -144,6 +144,14 @@ factory:
     auto_archive_after_hours: 24  # Archive completed jobs after 24h in context
     branch_cleanup: true          # Delete branches for failed/rejected jobs
 
+  # Fix-loop trigger tier. When true (default as of 2026-04-23), reviewer
+  # WARNING findings also route a job through FIX_LOOP alongside BLOCKING
+  # findings. Set false to restore the pre-2026-04-23 BLOCKING-only gate
+  # — useful if reviewer calibration leans too cautious on a given project.
+  # max_fix_loop_retries still caps total fix attempts either way.
+  fix_loop:
+    warnings_trigger_retry: true
+
   # What factory-spawned claude subprocesses are allowed to do.
   #   1 — Read-only audit: file reads, git log/diff/status only. Factory
   #       can observe but not modify anything. Use for dry runs, untrusted

@@ -37,6 +37,9 @@ _DEFAULTS: dict = {
     "factory": {
         "max_concurrent_jobs": 2,
         "max_fix_loop_retries": 5,
+        "fix_loop": {
+            "warnings_trigger_retry": True,
+        },
         "default_review_passes": ["architecture", "security_hipaa"],
         "cli_preferences": {},
         "cleanup": {
@@ -140,6 +143,14 @@ FACTORY_PERMISSIONS_EXTRA_TOOLS = list(
 )
 FACTORY_TIER_2_SUBCATEGORIES = dict(
     FACTORY_CONFIG.get("permissions_tier_2_subcategories", {})
+)
+
+# Fix-loop trigger tier. When True (default as of 2026-04-23), reviewer
+# WARNING findings also route a job through FIX_LOOP; when False the
+# pre-2026-04-23 behavior (BLOCKING-only) is preserved.
+_FIX_LOOP_CONFIG = FACTORY_CONFIG.get("fix_loop", {})
+FACTORY_FIX_LOOP_WARNINGS_TRIGGER_RETRY = bool(
+    _FIX_LOOP_CONFIG.get("warnings_trigger_retry", True)
 )
 
 # Per-phase --max-turns ceiling for claude subprocesses. Tuned empirically:
