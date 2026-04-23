@@ -88,3 +88,22 @@ def test_dashboard_command_exists(runner):
     result = runner.invoke(cli, ["dashboard", "--help"])
     assert result.exit_code == 0
     assert "dashboard" in result.output.lower()
+
+
+def test_version_command(runner):
+    """devbrain version runs without error and prints all four fields."""
+    result = runner.invoke(cli, ["version"])
+    assert result.exit_code == 0
+    assert "commit:" in result.output
+    assert "branch:" in result.output
+    assert "working tree:" in result.output
+    assert "DEVBRAIN_HOME:" in result.output
+    # Guard against silent field drops: each label appears exactly once.
+    for label in ("commit:", "branch:", "working tree:", "DEVBRAIN_HOME:"):
+        assert result.output.count(label) == 1, f"{label} should appear once"
+
+
+def test_version_help(runner):
+    """devbrain version --help works."""
+    result = runner.invoke(cli, ["version", "--help"])
+    assert result.exit_code == 0
