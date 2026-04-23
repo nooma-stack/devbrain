@@ -129,6 +129,46 @@ def _extract_warning_items(text: str) -> list[str]:
     return items
 
 
+def _finding_signature(text: str) -> str:
+    """Normalize a finding for cross-round comparison.
+
+    Lowercases, collapses runs of whitespace to single spaces, and
+    truncates to the first 80 chars. The truncation is intentional —
+    reviewers paraphrase tail context (paragraph wording, suggested
+    fix) round to round even when the underlying issue is identical,
+    so equality on the full string under-counts repeats.
+    """
+    collapsed = re.sub(r'\s+', ' ', text.strip().lower())
+    return collapsed[:80]
+
+
+def _findings_overlap(current: list[str], prior: list[str]) -> list[str]:
+    """Return current-round finding texts whose normalized signatures
+    also appear in the prior round.
+
+    Used by the WARNING oscillation guardrail: if any signature shows
+    up in both the most recent review round and the round before it,
+    the fix loop is not converging on those items. Signatures (see
+    `_finding_signature`) are used for matching because reviewers
+    paraphrase tail context round-to-round, but the ORIGINAL current-
+    round text flows out to metadata and human notifications — a
+    lowercased-truncated signature is the wrong thing to show a human.
+
+    Duplicate current-round findings with the same signature fold to
+    the first occurrence so the output order is stable and echoes the
+    reviewer's own ordering.
+    """
+    prior_sigs = {_finding_signature(t) for t in prior}
+    repeating: list[str] = []
+    seen: set[str] = set()
+    for item in current:
+        sig = _finding_signature(item)
+        if sig in prior_sigs and sig not in seen:
+            seen.add(sig)
+            repeating.append(item)
+    return repeating
+
+
 class FactoryOrchestrator:
     """Orchestrates the dev factory pipeline."""
 
@@ -330,6 +370,46 @@ class FactoryOrchestrator:
         except Exception as exc:
             logger.warning("readiness-block notification failed (non-blocking): %s", exc)
 
+    def _notify_warning_oscillation(
+        self, job: FactoryJob, repeating: list[str]
+    ) -> None:
+        """Fire a needs_human notification when the WARNING fix-loop fails
+        to converge — same WARNING signatures appeared in two
+        consecutive review rounds. Wrapped in try/except so a
+        notification failure cannot break the FAILED transition the
+        caller has already committed.
+        """
+        try:
+            from notifications.router import NotificationRouter, NotificationEvent
+            if not job.submitted_by:
+                return
+            router = NotificationRouter(self.db)
+            body_lines = [
+                f"Factory job FAILED after {job.error_count} fix round(s) — "
+                "the same WARNING findings keep coming back round after round.",
+                "",
+                "Repeating findings:",
+            ]
+            body_lines.extend(f"  - {r}" for r in repeating)
+            body_lines.extend([
+                "",
+                "Inspect the fix output and review artifacts to decide whether "
+                "to tighten the fix prompt, downgrade these to NIT, or split "
+                "the work into a follow-up job.",
+            ])
+            router.send(NotificationEvent(
+                event_type="needs_human",
+                recipient_dev_id=job.submitted_by,
+                title=f"⚠ Factory oscillation — job FAILED: {job.title}",
+                body="\n".join(body_lines),
+                job_id=job.id,
+                metadata={"repeating_warnings": list(repeating)},
+            ))
+        except Exception as exc:
+            logger.warning(
+                "warning-oscillation notification failed (non-blocking): %s", exc
+            )
+
     def _setup_implementation_branch(
         self, job: FactoryJob, project_root: str
     ) -> tuple[str | None, str | None]:
@@ -437,6 +517,28 @@ class FactoryOrchestrator:
                 items = _extract_blocking_items(art["content"])
                 prior.extend(items)
         return prior
+
+    def _get_last_round_warnings(self, job: FactoryJob) -> list[str]:
+        """Return WARNING items from the review round immediately before
+        the current one — input to the oscillation guardrail.
+
+        Each round produces two review artifacts (arch + security), so
+        the most recent round is `[-2:]` and the prior round is
+        `[-4:-2]`. The current round's artifacts are already persisted
+        by the time the post-review gate runs (store_artifact is called
+        synchronously after each reviewer completes), so we read prior
+        from the DB rather than threading state through call sites.
+
+        Returns `[]` when there are fewer than 4 review artifacts —
+        i.e., this is the first round and there is no prior to compare.
+        """
+        artifacts = self.db.get_artifacts(job.id, phase="review")
+        if len(artifacts) < 4:
+            return []
+        items: list[str] = []
+        for art in artifacts[-4:-2]:
+            items.extend(_extract_warning_items(art["content"]))
+        return items
 
     def _get_fix_history(self, job: FactoryJob) -> str:
         """Get summary of what was fixed in prior fix loops."""
@@ -1032,18 +1134,45 @@ Store any security issues found in DevBrain with type="issue" and category="secu
         warnings_trigger = (
             FACTORY_FIX_LOOP_WARNINGS_TRIGGER_RETRY and total_warning > 0
         )
-        if total_blocking > 0 or warnings_trigger:
-            return self.db.transition(
-                job.id,
-                JobStatus.FIX_LOOP,
-                metadata={
-                    "blocking_findings": total_blocking,
-                    "warning_findings": total_warning,
-                    "trigger_reason": "blocking" if total_blocking > 0 else "warning",
-                },
-            )
-        else:
+        should_fix = total_blocking > 0 or warnings_trigger
+        if not should_fix:
             return self.db.transition(job.id, JobStatus.QA)
+
+        # Oscillation guardrail: if BLOCKINGs are gone but WARNINGs are
+        # the same ones we already tried to fix in the prior round, the
+        # fix loop is not converging — escalate to a human instead of
+        # spending more rounds on findings the implementer keeps
+        # missing. BLOCKINGs always win: if a real bug is also present
+        # we stay in the loop.
+        if total_blocking == 0 and warnings_trigger and job.error_count >= 1:
+            current_warnings = (
+                _extract_warning_items(arch_result.stdout)
+                + _extract_warning_items(sec_result.stdout)
+            )
+            prior_warnings = self._get_last_round_warnings(job)
+            repeating = _findings_overlap(current_warnings, prior_warnings)
+            if repeating:
+                failed = self.db.transition(
+                    job.id,
+                    JobStatus.FAILED,
+                    metadata={
+                        "failure": "warning_oscillation",
+                        "repeating_warnings": repeating,
+                        "error_count_at_escalation": job.error_count,
+                    },
+                )
+                self._notify_warning_oscillation(failed, repeating)
+                return failed
+
+        return self.db.transition(
+            job.id,
+            JobStatus.FIX_LOOP,
+            metadata={
+                "blocking_findings": total_blocking,
+                "warning_findings": total_warning,
+                "trigger_reason": "blocking" if total_blocking > 0 else "warning",
+            },
+        )
 
     # ─── QA Phase ──────────────────────────────────────────────────────────
 
