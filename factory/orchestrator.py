@@ -933,14 +933,18 @@ If you find relevant past findings, check whether those same issues appear in th
 4. Error handling completeness
 5. Performance considerations
 
-## Output Format
+## Severity
 
-Output findings as a numbered list with severity:
-- **BLOCKING**: Must fix before merge — only for genuine bugs, broken functionality, or missing critical behavior
-- **WARNING**: Should fix but not blocking — code smell, missing edge case handling, suboptimal pattern
-- **NIT**: Style/preference suggestions
+Classify each finding. **Severity drives behavior**:
+- BLOCKING → must fix before merge, routes back to fix loop
+- WARNING  → fix-loop iterates on these automatically (each flag costs one implementer round); flag only when a human reviewer would genuinely push back
+- NIT      → reported but never iterated on; reserve for pure style / micro-optimizations / "considered alternatives"
 
-Be precise: include file paths and line numbers. Only use BLOCKING for issues that would cause runtime errors, data corruption, or security vulnerabilities. Architectural preferences are WARNING, not BLOCKING.
+Err toward NIT when the concern is stylistic or subjective.
+Err toward WARNING only when the code works but would annoy a careful reviewer (surprising behavior, missing edge case, silent error paths, etc.).
+Reserve BLOCKING for runtime bugs, data corruption, missing critical functionality — not architectural preferences.
+
+Be precise: include file paths and line numbers.
 
 If this is a re-review round, explicitly state which prior findings are RESOLVED vs still BLOCKING."""
 
@@ -989,14 +993,17 @@ If you find relevant past findings, check whether those same issues appear in th
 5. FERPA compliance (student data protection)
 6. Audit trail completeness for access control changes
 
-## Output Format
+## Severity
 
-Output findings as a numbered list with severity:
-- **BLOCKING**: Security/compliance issue that MUST be fixed — actual vulnerability, PHI exposure, missing auth check
-- **WARNING**: Potential concern that should be addressed — defense-in-depth suggestion, missing validation
-- **NIT**: Best practice suggestion
+Classify each finding. **Severity drives behavior**:
+- BLOCKING → actual vulnerability, PHI exposure, missing auth check; must fix before merge
+- WARNING  → defense-in-depth suggestion, narrow input validation gap, weak-but-not-absent auth — fix-loop iterates automatically (each flag costs one implementer round)
+- NIT      → best-practice suggestion with no concrete threat model; reported but not iterated on
 
-Be precise: include file paths and line numbers. Only use BLOCKING for actual security vulnerabilities or compliance violations, not theoretical concerns or defense-in-depth suggestions (those are WARNING).
+Err toward NIT for theoretical/defense-in-depth without a realistic attack path.
+Reserve BLOCKING for actual exploits or compliance violations (HIPAA, FERPA), not hypotheticals.
+
+Be precise: include file paths and line numbers.
 
 If this is a re-review round, explicitly state which prior findings are RESOLVED vs still BLOCKING.
 
