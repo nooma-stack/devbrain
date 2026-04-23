@@ -19,6 +19,7 @@ from pathlib import Path
 
 from state_machine import FactoryDB, FactoryJob, JobStatus
 from cli_executor import run_cli, notify_desktop, DEFAULT_CLI_ASSIGNMENTS
+from config import FACTORY_FIX_LOOP_WARNINGS_TRIGGER_RETRY
 from learning import extract_lessons, get_review_lessons
 from cleanup_agent import CleanupAgent
 from file_registry import FileRegistry
@@ -434,6 +435,18 @@ class FactoryOrchestrator:
         for art in artifacts:
             if art["artifact_type"] == artifact_type and art["blocking_count"] > 0:
                 items = _extract_blocking_items(art["content"])
+                prior.extend(items)
+        return prior
+
+    def _get_prior_warning_findings(
+        self, job: FactoryJob, artifact_type: str
+    ) -> list[str]:
+        """Get WARNING findings from previous review rounds for fix context."""
+        artifacts = self.db.get_artifacts(job.id, phase="review")
+        prior = []
+        for art in artifacts:
+            if art["artifact_type"] == artifact_type and art["warning_count"] > 0:
+                items = _extract_warning_items(art["content"])
                 prior.extend(items)
         return prior
 
@@ -1020,9 +1033,20 @@ Store any security issues found in DevBrain with type="issue" and category="secu
         )
 
         total_blocking = blocking_count + sec_blocking
-        if total_blocking > 0:
-            return self.db.transition(job.id, JobStatus.FIX_LOOP,
-                                      metadata={"blocking_findings": total_blocking})
+        total_warning = warning_count + sec_warning
+        warnings_trigger = (
+            FACTORY_FIX_LOOP_WARNINGS_TRIGGER_RETRY and total_warning > 0
+        )
+        if total_blocking > 0 or warnings_trigger:
+            return self.db.transition(
+                job.id,
+                JobStatus.FIX_LOOP,
+                metadata={
+                    "blocking_findings": total_blocking,
+                    "warning_findings": total_warning,
+                    "trigger_reason": "blocking" if total_blocking > 0 else "warning",
+                },
+            )
         else:
             return self.db.transition(job.id, JobStatus.QA)
 
@@ -1108,21 +1132,44 @@ Store any security issues found in DevBrain with type="issue" and category="secu
         # Get ONLY the most recent review artifacts (not all historical ones)
         all_artifacts = self.db.get_artifacts(job.id)
         latest_blocking = []
+        latest_warning = []
         for art in reversed(all_artifacts):
             if art["phase"] == "review" and art["blocking_count"] > 0:
                 items = _extract_blocking_items(art["content"])
                 latest_blocking.extend(items)
+            if (
+                FACTORY_FIX_LOOP_WARNINGS_TRIGGER_RETRY
+                and art["phase"] == "review"
+                and art["warning_count"] > 0
+            ):
+                items = _extract_warning_items(art["content"])
+                latest_warning.extend(items)
             # Stop once we've passed the most recent review round
             if art["phase"] == "fix":
                 break
 
-        if not latest_blocking:
+        if not latest_blocking and not latest_warning:
             # QA failures instead of review findings
             qa_artifacts = [a for a in all_artifacts if a["phase"] == "qa" and a["blocking_count"] > 0]
             if qa_artifacts:
                 latest_blocking.append(qa_artifacts[-1]["content"])
 
-        fix_prompt = f"""You are fixing blocking issues found during code review. You are part of an autonomous dev factory pipeline — fix ONLY what is listed below, nothing else.
+        blocking_section = (
+            chr(10).join(
+                f"{i+1}. {finding}" for i, finding in enumerate(latest_blocking)
+            )
+            if latest_blocking
+            else "(none in the most recent review round)"
+        )
+        warning_section = (
+            chr(10).join(
+                f"{i+1}. {finding}" for i, finding in enumerate(latest_warning)
+            )
+            if latest_warning
+            else "(none)"
+        )
+
+        fix_prompt = f"""You are fixing review findings from the most recent review round. You are part of an autonomous dev factory pipeline — fix ONLY what is listed below, nothing else.
 
 PROJECT: {job.project_slug}
 FEATURE: {job.title}
@@ -1131,7 +1178,11 @@ FIX ATTEMPT: {job.error_count + 1}/{job.max_retries}
 
 ## BLOCKING FINDINGS TO FIX
 
-{chr(10).join(f"{i+1}. {finding}" for i, finding in enumerate(latest_blocking))}
+{blocking_section}
+
+## Prior WARNING findings to address
+
+{warning_section}
 
 {DEVBRAIN_INSTRUCTIONS}
 
