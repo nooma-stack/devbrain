@@ -74,6 +74,21 @@ def _validate_branch_name(name: str) -> str | None:
     return None
 
 
+def _worktree_path_for_job(job) -> str:
+    """Return the per-job git worktree path. Deterministic from job.id
+    so callers can derive it without a DB lookup.
+
+    Each factory job operates in its own worktree at
+    ~/devbrain-worktrees/<job-id>/ so HEAD and working-tree state of
+    the main checkout are never touched during factory execution.
+    This is the foundation for concurrent job execution and for
+    multi-dev HOME-profile routing — without isolated worktrees two
+    jobs cannot run at the same time without clobbering each other's
+    branch state.
+    """
+    return str(Path.home() / "devbrain-worktrees" / job.id)
+
+
 def _count_blocking(text: str) -> int:
     """Count actual BLOCKING findings — look for the marker at start of line or list item."""
     # Match patterns like "BLOCKING:", "**BLOCKING**", "1. BLOCKING:", "- BLOCKING:"
@@ -225,11 +240,30 @@ class FactoryOrchestrator:
         return job
 
     def _get_project_root(self, job: FactoryJob) -> str:
-        """Get the project root path."""
+        """Get the project root path (main checkout)."""
         with self.db._conn() as conn, conn.cursor() as cur:
             cur.execute("SELECT root_path FROM devbrain.projects WHERE id = %s", (job.project_id,))
             row = cur.fetchone()
             return row[0] if row else "."
+
+    def _get_job_cwd(self, job: FactoryJob) -> str:
+        """Return the cwd for subprocesses operating on a specific job.
+
+        Post-planning jobs run in their own git worktree at the path
+        returned by _worktree_path_for_job — this keeps each job's
+        HEAD / working tree isolated from every other job's.
+
+        Pre-worktree phases (planning itself, any call from before
+        _setup_implementation_branch fires) fall back to the main
+        checkout since the worktree doesn't exist yet. Jobs created
+        before the worktree refactor shipped also fall through since
+        their worktree was never provisioned.
+        """
+        if job.branch_name:
+            worktree = _worktree_path_for_job(job)
+            if Path(worktree).exists():
+                return worktree
+        return self._get_project_root(job)
 
     def _pre_job_readiness_check(self, job: FactoryJob) -> FactoryJob | None:
         """Verify the factory is in a clean state before starting. If
@@ -316,60 +350,77 @@ class FactoryOrchestrator:
         may still be None if git invocation failed (matching prior behavior —
         the implementation phase proceeds on the current branch).
         """
+        worktree = _worktree_path_for_job(job)
+        # Ensure parent directory exists; `git worktree add` won't mkdir -p.
+        Path(worktree).parent.mkdir(parents=True, exist_ok=True)
+
         if job.branch_name:
             # Fail-closed validation before anything reaches git. The MCP
             # tool validates on submission, but direct DB writes or
             # migrations could set an unsafe value; this second check
             # ensures the orchestrator never passes attacker-controlled
-            # input to `git checkout`/`git push` as an unquoted positional.
+            # input to `git worktree add` / `git push` as an unquoted positional.
             fail = _validate_branch_name(job.branch_name)
             if fail:
                 return (None, fail)
             name = job.branch_name.strip()
 
-            checkout = None
+            # Verify the branch exists before attempting a worktree for it.
+            # `git worktree add <path> <ref>` without -b requires the ref
+            # to exist; with -b it creates a new branch at current HEAD.
+            # We use rev-parse --verify to distinguish, falling back to
+            # auto-create on missing branches (preserves prior semantics).
+            rev_parse = None
             try:
-                checkout = subprocess.run(
-                    ["git", "checkout", name],
+                rev_parse = subprocess.run(
+                    ["git", "rev-parse", "--verify", f"refs/heads/{name}"],
                     cwd=project_root, capture_output=True, text=True, timeout=10,
                 )
             except Exception as e:
                 logger.warning(
-                    "git checkout %s raised (%s) — falling back to auto-create",
+                    "git rev-parse %s raised (%s) — falling back to auto-create",
                     name, e,
                 )
 
-            if checkout is not None and checkout.returncode == 0:
+            if rev_parse is not None and rev_parse.returncode == 0:
+                # Branch exists — create a worktree checked out to it.
                 try:
-                    status = subprocess.run(
-                        ["git", "status", "--porcelain"],
-                        cwd=project_root, capture_output=True, text=True, timeout=10,
+                    result = subprocess.run(
+                        ["git", "worktree", "add", worktree, name],
+                        cwd=project_root, capture_output=True, text=True, timeout=30,
                     )
-                    if status.returncode == 0 and status.stdout.strip():
-                        logger.warning(
-                            "Branch '%s' has uncommitted changes — proceeding anyway",
-                            name,
+                    if result.returncode != 0:
+                        return (
+                            None,
+                            f"worktree creation failed for branch {name!r}: "
+                            f"{result.stderr.strip()[:400]}",
                         )
-                except Exception:
-                    pass
+                except Exception as e:
+                    return (None, f"worktree creation raised for branch {name!r}: {str(e)[:400]}")
+                logger.info("Created worktree for existing branch '%s' at %s", name, worktree)
                 return (name, None)
 
-            stderr = (checkout.stderr if checkout is not None else "").strip()
+            stderr = (rev_parse.stderr if rev_parse is not None else "").strip()
             logger.warning(
-                "Branch '%s' does not exist (%s) — falling back to auto-generated branch",
+                "Branch '%s' does not exist (%s) — falling back to auto-generated branch in a new worktree",
                 name, stderr[:200],
             )
 
+        # Auto-create a fresh factory branch in a dedicated worktree.
         slug = re.sub(r'[^a-z0-9-]', '-', job.title.lower())[:40].strip('-')
         branch = f"factory/{job.id[:8]}/{slug}"
         try:
-            subprocess.run(
-                ["git", "checkout", "-b", branch],
-                cwd=project_root, capture_output=True, timeout=10,
+            result = subprocess.run(
+                ["git", "worktree", "add", worktree, "-b", branch],
+                cwd=project_root, capture_output=True, text=True, timeout=30,
             )
+            if result.returncode != 0:
+                logger.warning("Worktree creation failed: %s", result.stderr.strip())
+                return (None, f"worktree creation failed: {result.stderr.strip()[:400]}")
         except Exception as e:
-            logger.warning("Branch creation failed: %s", e)
-            branch = None
+            logger.warning("Worktree creation raised: %s", e)
+            return (None, f"worktree creation raised: {str(e)[:400]}")
+        logger.info("Created worktree for job %s at %s (branch %s)", job.id[:8], worktree, branch)
         return (branch, None)
 
     def _get_cli(self, phase: str, job: FactoryJob) -> str:
@@ -731,7 +782,10 @@ Store the final plan in DevBrain using the store tool with type="decision"."""
     def _run_implementation(self, job: FactoryJob) -> FactoryJob:
         """Implementation phase: write code and tests."""
         cli = self._get_cli("implementing", job)
-        project_root = self._get_project_root(job)
+        # Post-planning: run in the job's own worktree so the main checkout
+        # stays on main. Pre-worktree-refactor jobs fall back to main via
+        # _get_job_cwd's fallback.
+        project_root = self._get_job_cwd(job)
 
         # Get the plan artifact
         plans = self.db.get_artifacts(job.id, phase="planning")
@@ -811,7 +865,8 @@ IMPORTANT: Follow existing code patterns in the repo. Read similar files before 
         """Review phase: architecture + security/HIPAA review."""
         if job.status != JobStatus.REVIEWING:
             job = self.db.transition(job.id, JobStatus.REVIEWING)
-        project_root = self._get_project_root(job)
+        # Reviewer reads the branch's diff + files in the worktree.
+        project_root = self._get_job_cwd(job)
 
         # Get the diff for review
         try:
@@ -977,7 +1032,8 @@ Store any security issues found in DevBrain with type="issue" and category="secu
         """QA phase: run full test suite, lint, type checks."""
         if job.status != JobStatus.QA:
             job = self.db.transition(job.id, JobStatus.QA)
-        project_root = self._get_project_root(job)
+        # QA runs tests against the branch — use the worktree cwd.
+        project_root = self._get_job_cwd(job)
 
         # Get project test/lint commands from DB
         with self.db._conn() as conn, conn.cursor() as cur:
@@ -1046,7 +1102,8 @@ Store any security issues found in DevBrain with type="issue" and category="secu
     def _run_fix(self, job: FactoryJob) -> FactoryJob:
         """Fix loop: address blocking findings from the most recent review round."""
         cli = self._get_cli("fix", job)
-        project_root = self._get_project_root(job)
+        # Fix-loop edits the same files the implementer edited — worktree.
+        project_root = self._get_job_cwd(job)
 
         # Get ONLY the most recent review artifacts (not all historical ones)
         all_artifacts = self.db.get_artifacts(job.id)
@@ -1115,7 +1172,9 @@ IMPORTANT: Fix ONLY the listed findings. Do not expand scope. Do not "improve" s
         if not job or job.status != JobStatus.READY_FOR_APPROVAL:
             raise ValueError(f"Job {job_id} is not ready for approval (status: {job.status.value if job else 'not found'})")
 
-        project_root = self._get_project_root(job)
+        # Push from the job's worktree. The branch ref lives in the
+        # shared .git dir so the push still updates origin correctly.
+        project_root = self._get_job_cwd(job)
 
         # Push the branch
         if job.branch_name:

@@ -76,7 +76,8 @@ def _make_job(db: FactoryDB, title: str, branch_name: str | None = None):
 
 
 def test_no_branch_set_auto_creates_factory_branch(orch, db, monkeypatch):
-    """Regression: branch_name unset → auto-create factory/<id>/<slug>."""
+    """Regression (post-worktree refactor): branch_name unset → worktree
+    add with -b and the auto-generated factory/<id>/<slug> branch."""
     job = _make_job(db, f"{TEST_TITLE_PREFIX}auto_create")
     calls: list[list[str]] = []
 
@@ -91,11 +92,14 @@ def test_no_branch_set_auto_creates_factory_branch(orch, db, monkeypatch):
     assert fail_msg is None
     assert branch is not None
     assert branch.startswith(f"factory/{job.id[:8]}/")
-    assert calls == [["git", "checkout", "-b", branch]]
+    assert len(calls) == 1
+    assert calls[0][:3] == ["git", "worktree", "add"]
+    assert "-b" in calls[0]
+    assert branch in calls[0]
 
 
-def test_existing_branch_is_checked_out(orch, db, monkeypatch):
-    """branch_name set + branch exists → checkout it, return its name."""
+def test_existing_branch_creates_worktree_for_it(orch, db, monkeypatch):
+    """branch_name set + branch exists → worktree add (no -b)."""
     job = _make_job(
         db, f"{TEST_TITLE_PREFIX}existing", branch_name="feature/existing-x"
     )
@@ -103,8 +107,9 @@ def test_existing_branch_is_checked_out(orch, db, monkeypatch):
 
     def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
-        # checkout succeeds; status reports clean working tree
-        return _FakeCompleted(returncode=0, stdout="", stderr="")
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
+            return _FakeCompleted(returncode=0, stdout="abc123\n")
+        return _FakeCompleted(returncode=0)
 
     monkeypatch.setattr(orchestrator_module.subprocess, "run", fake_run)
 
@@ -112,10 +117,11 @@ def test_existing_branch_is_checked_out(orch, db, monkeypatch):
 
     assert fail_msg is None
     assert branch == "feature/existing-x"
-    # First invocation checks out the requested branch (no -b).
-    assert calls[0] == ["git", "checkout", "feature/existing-x"]
-    # No auto-create fallback should have fired.
-    assert not any("-b" in c for c in calls)
+    assert calls[0][:3] == ["git", "rev-parse", "--verify"]
+    wt_calls = [c for c in calls if c[:3] == ["git", "worktree", "add"]]
+    assert len(wt_calls) == 1
+    assert "feature/existing-x" in wt_calls[0]
+    assert "-b" not in wt_calls[0]
 
 
 def test_missing_branch_falls_back_with_warning(orch, db, monkeypatch, caplog):
@@ -127,13 +133,10 @@ def test_missing_branch_falls_back_with_warning(orch, db, monkeypatch, caplog):
 
     def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
-        if cmd[:3] == ["git", "checkout", "feature/does-not-exist"]:
+        if cmd[:3] == ["git", "rev-parse", "--verify"]:
             return _FakeCompleted(
-                returncode=1,
-                stderr=(
-                    "error: pathspec 'feature/does-not-exist' did not match "
-                    "any file(s) known to git"
-                ),
+                returncode=128,
+                stderr="fatal: Needed a single revision",
             )
         return _FakeCompleted(returncode=0)
 
@@ -145,9 +148,10 @@ def test_missing_branch_falls_back_with_warning(orch, db, monkeypatch, caplog):
     assert fail_msg is None
     assert branch is not None
     assert branch.startswith(f"factory/{job.id[:8]}/")
-    # Both the failed checkout and the auto-create should have happened.
-    assert ["git", "checkout", "feature/does-not-exist"] in calls
-    assert any(c[:3] == ["git", "checkout", "-b"] for c in calls)
+    assert any(c[:3] == ["git", "rev-parse", "--verify"] for c in calls)
+    wt_calls = [c for c in calls if c[:3] == ["git", "worktree", "add"]]
+    assert len(wt_calls) == 1, f"expected one worktree add, got: {wt_calls}"
+    assert "-b" in wt_calls[0]
     assert any("does not exist" in m for m in caplog.messages)
 
 
@@ -269,4 +273,6 @@ def test_safe_branch_names_pass_validation(orch, db, monkeypatch):
         branch, fail_msg = orch._setup_implementation_branch(job, "/tmp")
         assert fail_msg is None, f"rejected valid name {name!r}: {fail_msg}"
         assert branch == name
-        assert calls and calls[0][:2] == ["git", "checkout"]
+        # Post-worktree: first call probes ref, then worktree add fires.
+        assert calls and calls[0][:2] == ["git", "rev-parse"]
+        assert any(c[:3] == ["git", "worktree", "add"] for c in calls)
