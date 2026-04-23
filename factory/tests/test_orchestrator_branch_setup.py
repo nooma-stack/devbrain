@@ -188,3 +188,85 @@ def test_master_branch_is_refused_case_insensitive(orch, db, monkeypatch):
     assert fail_msg is not None
     assert "MASTER" in fail_msg
     assert calls == []
+
+
+# ─── Injection-shape guards ────────────────────────────────────────────────
+# The following cases cover branch names that would be parsed by git as
+# flags or refspecs if passed through without validation. Each must
+# fail-closed BEFORE any subprocess call — the assertion on `calls == []`
+# is the real security check.
+
+@pytest.mark.parametrize(
+    "name,reason",
+    [
+        ("--help", "leading '-' → git flag"),
+        ("--receive-pack=echo", "leading '-' with = → RCE on push"),
+        ("-feature", "single leading '-'"),
+        ("feature:refs/heads/main", "refspec form → main bypass"),
+        ("feat with space", "whitespace → shell metachar"),
+        ("feat~1", "git refspec shorthand"),
+        ("feat^", "git refspec shorthand"),
+        ("..escape", "leading dots"),
+        (".hidden", "leading dot"),
+        ("feat\\back", "backslash"),
+        ("feat[glob", "brackets"),
+        ("feat*star", "glob"),
+        ("   ", "whitespace only"),
+        # Note: branch_name == "" falls through `if job.branch_name:` as
+        # falsy, taking the auto-create path — that's the "no branch
+        # provided" case, not an injection attempt. Empty is handled by
+        # the existing no-branch test, not here.
+    ],
+)
+def test_unsafe_branch_names_refused_without_running_git(
+    orch, db, monkeypatch, name, reason
+):
+    """Every unsafe branch shape must fail validation BEFORE any
+    subprocess call — the zod layer catches fresh submissions, this
+    protects the orchestrator from direct-DB bypasses."""
+    job = _make_job(
+        db, f"{TEST_TITLE_PREFIX}unsafe_{hash(name) & 0xffffff:x}",
+        branch_name=name,
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return _FakeCompleted(returncode=0)
+
+    monkeypatch.setattr(orchestrator_module.subprocess, "run", fake_run)
+
+    branch, fail_msg = orch._setup_implementation_branch(job, "/tmp")
+
+    assert branch is None, f"expected refusal for {name!r} ({reason})"
+    assert fail_msg is not None
+    # Critical: no git invocation should have fired for any of these.
+    assert calls == [], f"git was called with unsafe branch {name!r}: {calls}"
+
+
+def test_safe_branch_names_pass_validation(orch, db, monkeypatch):
+    """Sanity check: ordinary branch names still work post-hardening."""
+    safe_names = [
+        "feature/my-work",
+        "factory/abc12345/some-title",
+        "user_fix_123",
+        "release-1.2.3",
+        "fix/ABC-42",
+    ]
+    for name in safe_names:
+        job = _make_job(
+            db, f"{TEST_TITLE_PREFIX}safe_{hash(name) & 0xffffff:x}",
+            branch_name=name,
+        )
+        calls: list[list[str]] = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(list(cmd))
+            return _FakeCompleted(returncode=0)
+
+        monkeypatch.setattr(orchestrator_module.subprocess, "run", fake_run)
+
+        branch, fail_msg = orch._setup_implementation_branch(job, "/tmp")
+        assert fail_msg is None, f"rejected valid name {name!r}: {fail_msg}"
+        assert branch == name
+        assert calls and calls[0][:2] == ["git", "checkout"]

@@ -41,6 +41,39 @@ Search DevBrain BEFORE assuming anything about architecture, past decisions, or 
 """
 
 
+# Branch-name safety regex. Mirrors SAFE_BRANCH_RE in
+# mcp-server/src/index.ts — defense in depth for the case where
+# job.branch_name was set outside the MCP tool's zod validator
+# (direct SQL writes, migrations, API bypasses). Rejects shapes
+# that would let a crafted value reach git as an option flag
+# (leading "-"), a refspec (contains ":"), or shell metachars.
+SAFE_BRANCH_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_./-]{0,254}$')
+
+
+def _validate_branch_name(name: str) -> str | None:
+    """Return None if the branch name is safe to pass to git subprocess
+    calls, else a human-readable failure message describing why.
+
+    Runs the same checks the MCP factory_plan tool applies at submission
+    time (see SAFE_BRANCH_RE), plus the main/master guard. Keep the two
+    validators in sync when updating either.
+    """
+    stripped = name.strip()
+    if not stripped:
+        return "branch name is empty or whitespace"
+    if not SAFE_BRANCH_RE.match(stripped):
+        return (
+            f"branch name has unsafe characters: {name!r} — only "
+            "[A-Za-z0-9_./-] allowed, cannot start with '-' or '.'"
+        )
+    if stripped.lower() in ("main", "master"):
+        return (
+            f"Refusing to run factory job on '{stripped}' — factory jobs "
+            "operate on feature branches only."
+        )
+    return None
+
+
 def _count_blocking(text: str) -> int:
     """Count actual BLOCKING findings — look for the marker at start of line or list item."""
     # Match patterns like "BLOCKING:", "**BLOCKING**", "1. BLOCKING:", "- BLOCKING:"
@@ -266,13 +299,15 @@ class FactoryOrchestrator:
         the implementation phase proceeds on the current branch).
         """
         if job.branch_name:
+            # Fail-closed validation before anything reaches git. The MCP
+            # tool validates on submission, but direct DB writes or
+            # migrations could set an unsafe value; this second check
+            # ensures the orchestrator never passes attacker-controlled
+            # input to `git checkout`/`git push` as an unquoted positional.
+            fail = _validate_branch_name(job.branch_name)
+            if fail:
+                return (None, fail)
             name = job.branch_name.strip()
-            if name.lower() in ("main", "master"):
-                return (
-                    None,
-                    f"Refusing to run factory job on '{name}' — factory jobs "
-                    "operate on feature branches only.",
-                )
 
             checkout = None
             try:
