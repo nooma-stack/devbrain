@@ -694,10 +694,37 @@ class CleanupAgent:
                 logger.debug("git %s failed: %s", " ".join(args), exc)
                 return None
 
-        # 1. If HEAD is currently on the branch we're about to delete,
-        #    switch to main first. -f discards any uncommitted edits the
-        #    failed agent left in the working tree — those are dead work
-        #    by definition (the job hit a terminal failure state).
+        # 1. Remove the job's worktree if it exists. Post-worktree
+        #    refactor (2026-04-23) every job runs in
+        #    ~/devbrain-worktrees/<job-id>/ with its own checkout and
+        #    the branch checked out there. Remove it first so `git
+        #    branch -D` can succeed — git refuses to delete a branch
+        #    that's still checked out in a worktree. --force discards
+        #    uncommitted edits (dead work by definition for a
+        #    terminal-state job). Pre-refactor jobs have no worktree;
+        #    the Path.exists check skips this step cleanly.
+        from pathlib import Path as _Path
+        worktree = str(_Path.home() / "devbrain-worktrees" / job.id)
+        if _Path(worktree).exists():
+            remove = _git(["worktree", "remove", worktree, "--force"])
+            if remove is not None and remove.returncode == 0:
+                logger.info(
+                    "Removed worktree for job %s at %s",
+                    job.id[:8], worktree,
+                )
+            else:
+                stderr = remove.stderr.strip() if remove else "(no output)"
+                logger.warning(
+                    "Worktree removal failed for job %s (%s) — continuing "
+                    "to branch cleanup, may fail if the branch is still "
+                    "checked out somewhere.",
+                    job.id[:8], stderr[:200],
+                )
+
+        # 2. Legacy fallback: if HEAD of the main checkout is on the
+        #    branch (pre-worktree jobs, or edge cases), switch to main
+        #    first. Post-worktree, main HEAD never leaves main, so
+        #    this is a no-op safety net.
         head = _git(["rev-parse", "--abbrev-ref", "HEAD"])
         if head is not None and head.stdout.strip() == branch:
             checkout = _git(["checkout", "-f", "main"])
@@ -709,7 +736,7 @@ class CleanupAgent:
                 )
                 return
 
-        # 2. Force-delete the branch (-D) since it may have unmerged
+        # 3. Force-delete the branch (-D) since it may have unmerged
         #    commits — a failed job's commits are not supposed to land.
         delete = _git(["branch", "-D", branch])
         if delete is None:
