@@ -143,15 +143,30 @@ def _finding_signature(text: str) -> str:
 
 
 def _findings_overlap(current: list[str], prior: list[str]) -> list[str]:
-    """Return the sorted intersection of normalized finding signatures.
+    """Return current-round finding texts whose normalized signatures
+    also appear in the prior round.
 
     Used by the WARNING oscillation guardrail: if any signature shows
     up in both the most recent review round and the round before it,
-    the fix loop is not converging on those items.
+    the fix loop is not converging on those items. Signatures (see
+    `_finding_signature`) are used for matching because reviewers
+    paraphrase tail context round-to-round, but the ORIGINAL current-
+    round text flows out to metadata and human notifications — a
+    lowercased-truncated signature is the wrong thing to show a human.
+
+    Duplicate current-round findings with the same signature fold to
+    the first occurrence so the output order is stable and echoes the
+    reviewer's own ordering.
     """
-    current_sigs = {_finding_signature(t) for t in current}
     prior_sigs = {_finding_signature(t) for t in prior}
-    return sorted(current_sigs & prior_sigs)
+    repeating: list[str] = []
+    seen: set[str] = set()
+    for item in current:
+        sig = _finding_signature(item)
+        if sig in prior_sigs and sig not in seen:
+            seen.add(sig)
+            repeating.append(item)
+    return repeating
 
 
 class FactoryOrchestrator:

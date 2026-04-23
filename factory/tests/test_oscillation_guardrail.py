@@ -140,26 +140,36 @@ def _make_job_in_fix_cycle(
 
 # ─── Unit test ────────────────────────────────────────────────────────────
 
-def test_findings_overlap_normalizes_case_and_whitespace():
-    """`_findings_overlap` is signature-based: case and runs of whitespace
-    do not affect equality, but truly different findings do not match."""
-    # Same finding, different case + whitespace → matches
+def test_findings_overlap_matches_on_signature_returns_original():
+    """`_findings_overlap` matches on normalized signatures (case-
+    insensitive, whitespace-collapsed, prefix-truncated) but returns
+    the original current-round text — never the signature — so that
+    humans read the reviewer's own words in the notification and
+    job metadata, not a lowercased stub."""
+    # Same finding, different case + whitespace → returns current original
     current = ["WARNING: missing null check at x.py:42"]
     prior = ["warning:   missing  null check  at x.py:42"]
     assert _findings_overlap(current, prior) == [
-        "warning: missing null check at x.py:42"
+        "WARNING: missing null check at x.py:42"
     ]
 
     # Different findings → empty intersection
     assert _findings_overlap(["foo"], ["bar"]) == []
 
-    # Truncation at 80 chars — same prefix matches even when suffixes diverge
+    # Truncation at 80 chars — same prefix matches even when suffixes
+    # diverge; the returned text is the full original current item.
     long_prefix = "warning: identical first eighty chars of finding text padding xxxxxxxxxxxxxxxxxxxxxx"
     assert len(long_prefix) >= 80
+    current_item = long_prefix + " distinct suffix one"
     assert _findings_overlap(
-        [long_prefix + " distinct suffix one"],
+        [current_item],
         [long_prefix + " entirely different suffix two"],
-    )
+    ) == [current_item]
+
+    # Duplicate current-round findings with the same signature fold to
+    # the first occurrence — stable, reviewer-ordered output.
+    dup = "WARNING: same thing at z.py:1"
+    assert _findings_overlap([dup, dup], [dup]) == [dup]
 
 
 # ─── Gate behavior ────────────────────────────────────────────────────────
@@ -270,3 +280,104 @@ def test_first_round_no_prior_state_does_not_escalate(orch, db, monkeypatch):
     assert result.status == JobStatus.FIX_LOOP
     assert result.metadata.get("trigger_reason") == "warning"
     assert "failure" not in result.metadata
+
+
+# ─── Notification side-effect ────────────────────────────────────────────
+# `_notify_warning_oscillation` is wrapped in a silently-swallowing
+# try/except so a body-format bug (wrong field name, KeyError) would
+# never surface in prod. These two tests are the only thing that would
+# catch that rot — they stub NotificationRouter at its import site and
+# assert on the captured event.
+
+class _FakeRouter:
+    """Captures NotificationEvent instances sent via .send(). One
+    instance per test — reset via the `sent_events` class attribute
+    inside each test."""
+    sent_events: list = []
+
+    def __init__(self, db, *args, **kwargs):
+        pass
+
+    def send(self, event):
+        type(self).sent_events.append(event)
+
+
+def _stub_notification_router(monkeypatch):
+    """Patch NotificationRouter at its source module. The orchestrator
+    imports it lazily inside `_notify_warning_oscillation`, so we patch
+    where it is defined — `factory.notifications.router` — not where
+    it is referenced."""
+    from notifications import router as router_module
+
+    _FakeRouter.sent_events = []
+    monkeypatch.setattr(router_module, "NotificationRouter", _FakeRouter)
+
+
+def test_oscillation_notification_fires_with_correct_payload(orch, db, monkeypatch):
+    """The FAILED transition's side-effect notification fires with
+    event_type=needs_human, carries the job id and repeating findings
+    in metadata, and renders the original reviewer text (not a
+    lowercased signature) into the body."""
+    monkeypatch.setattr(orch_mod, "FACTORY_FIX_LOOP_WARNINGS_TRIGGER_RETRY", True)
+    _stub_notification_router(monkeypatch)
+
+    job = _make_job_in_fix_cycle(
+        db,
+        f"{TEST_TITLE_PREFIX}notify_fires",
+        prior_arch_text="1. WARNING: Missing Null Check at X.py:42",
+    )
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE devbrain.factory_jobs SET submitted_by = %s WHERE id = %s",
+            ("test-dev", job.id),
+        )
+        conn.commit()
+    job = db.get_job(job.id)
+
+    _stub_review_env(
+        monkeypatch,
+        arch_stdout="1. WARNING: Missing Null Check at X.py:42",
+        sec_stdout="(no findings)",
+    )
+
+    result = orch._run_review(job)
+
+    assert result.status == JobStatus.FAILED
+    assert len(_FakeRouter.sent_events) == 1
+    event = _FakeRouter.sent_events[0]
+    assert event.event_type == "needs_human"
+    assert event.recipient_dev_id == "test-dev"
+    assert event.job_id == job.id
+    assert event.metadata.get("repeating_warnings")
+    # Original reviewer text — preserves case — reaches metadata + body.
+    assert any(
+        "Missing Null Check" in r for r in event.metadata["repeating_warnings"]
+    )
+    assert "Missing Null Check" in event.body
+
+
+def test_oscillation_notification_skips_when_no_submitted_by(orch, db, monkeypatch):
+    """When job.submitted_by is None there is nobody to notify — the
+    early-return branch fires before any NotificationEvent is built.
+    The FAILED transition itself still commits."""
+    monkeypatch.setattr(orch_mod, "FACTORY_FIX_LOOP_WARNINGS_TRIGGER_RETRY", True)
+    _stub_notification_router(monkeypatch)
+
+    # _make_job_in_fix_cycle leaves submitted_by=NULL by default.
+    job = _make_job_in_fix_cycle(
+        db,
+        f"{TEST_TITLE_PREFIX}notify_no_submitter",
+        prior_arch_text="1. WARNING: same issue at w.py:1",
+    )
+    assert job.submitted_by is None
+
+    _stub_review_env(
+        monkeypatch,
+        arch_stdout="1. WARNING: same issue at w.py:1",
+        sec_stdout="(no findings)",
+    )
+
+    result = orch._run_review(job)
+
+    assert result.status == JobStatus.FAILED
+    assert _FakeRouter.sent_events == []
