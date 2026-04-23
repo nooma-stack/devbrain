@@ -10,6 +10,39 @@ def db():
     return FactoryDB(DATABASE_URL)
 
 
+@pytest.fixture(autouse=True)
+def cleanup(db):
+    yield
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM devbrain.factory_jobs WHERE title = ANY(%s)",
+            ([
+                "Test BLOCKED transition",
+                "Resolution field test",
+                "Set/clear resolution test",
+                "Invalid resolution test",
+            ],),
+        )
+        ids = [r[0] for r in cur.fetchall()]
+        if ids:
+            cur.execute(
+                "DELETE FROM devbrain.factory_cleanup_reports "
+                "WHERE job_id = ANY(%s)", (ids,),
+            )
+            cur.execute(
+                "DELETE FROM devbrain.factory_artifacts "
+                "WHERE job_id = ANY(%s)", (ids,),
+            )
+            cur.execute(
+                "UPDATE devbrain.factory_jobs SET blocked_by_job_id = NULL "
+                "WHERE blocked_by_job_id = ANY(%s)", (ids,),
+            )
+            cur.execute(
+                "DELETE FROM devbrain.factory_jobs WHERE id = ANY(%s)", (ids,),
+            )
+        conn.commit()
+
+
 def test_blocked_status_exists():
     assert JobStatus.BLOCKED == "blocked"
 
