@@ -16,14 +16,8 @@ def cleanup(db):
     yield
     with db._conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT id FROM devbrain.factory_jobs WHERE title = ANY(%s)",
-            ([
-                "Test approved job",
-                "Test failed job",
-                "Recovery test job",
-                "Lock release test task6",
-                "No locks task6",
-            ],),
+            "SELECT id FROM devbrain.factory_jobs WHERE title LIKE %s",
+            ("cleanup_agent_test_%",),
         )
         ids = [r[0] for r in cur.fetchall()]
         if ids:
@@ -55,7 +49,7 @@ def approved_job(db):
     """Simulate a job that went through the full happy path to APPROVED."""
     job_id = db.create_job(
         project_slug="devbrain",
-        title="Test approved job",
+        title="cleanup_agent_test_approved_job",
         spec="Implement widget feature",
     )
     # Walk through the pipeline
@@ -77,7 +71,7 @@ def failed_job(db):
     """Simulate a job that hit blocking review findings and eventually failed."""
     job_id = db.create_job(
         project_slug="devbrain",
-        title="Test failed job",
+        title="cleanup_agent_test_failed_job",
         spec="Implement broken feature",
         metadata={"branch": "factory/broken-feature"},
     )
@@ -175,7 +169,7 @@ class TestAttemptRecovery:
         """attempt_recovery returns a CleanupReport dataclass."""
         job_id = db.create_job(
             project_slug="devbrain",
-            title="Recovery test job",
+            title="cleanup_agent_test_recovery_job",
             spec="Test spec for recovery",
         )
         db.transition(job_id, JobStatus.PLANNING)
@@ -205,7 +199,7 @@ def test_post_cleanup_releases_file_locks(db, agent):
     registry = FileRegistry(db)
 
     # Create a failed job
-    job_id = db.create_job(project_slug="devbrain", title="Lock release test task6", spec="Test")
+    job_id = db.create_job(project_slug="devbrain", title="cleanup_agent_test_lock_release_task6", spec="Test")
     db.transition(job_id, JobStatus.PLANNING)
     db.transition(job_id, JobStatus.FAILED)
 
@@ -229,7 +223,7 @@ def test_post_cleanup_releases_file_locks(db, agent):
 
 def test_cleanup_handles_jobs_with_no_locks(db, agent):
     """Cleanup agent handles jobs that don't have any locks (no crash)."""
-    job_id = db.create_job(project_slug="devbrain", title="No locks task6", spec="Test")
+    job_id = db.create_job(project_slug="devbrain", title="cleanup_agent_test_no_locks_task6", spec="Test")
     db.transition(job_id, JobStatus.PLANNING)
     db.transition(job_id, JobStatus.FAILED)
 

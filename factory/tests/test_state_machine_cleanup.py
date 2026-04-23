@@ -16,11 +16,8 @@ def cleanup(db):
     yield
     with db._conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT id FROM devbrain.factory_jobs WHERE title = ANY(%s)",
-            ([
-                "Test cleanup job",
-                "Test active job",
-            ],),
+            "SELECT id FROM devbrain.factory_jobs WHERE title LIKE %s",
+            ("state_machine_cleanup_test_%",),
         )
         ids = [r[0] for r in cur.fetchall()]
         if ids:
@@ -45,7 +42,7 @@ def cleanup(db):
 @pytest.fixture
 def test_job(db):
     """Create a test job in FAILED state for cleanup testing."""
-    job_id = db.create_job(project_slug="devbrain", title="Test cleanup job", spec="Test spec")
+    job_id = db.create_job(project_slug="devbrain", title="state_machine_cleanup_test_job", spec="Test spec")
     db.transition(job_id, JobStatus.PLANNING)
     db.transition(job_id, JobStatus.FAILED)
     return job_id
@@ -61,7 +58,7 @@ def test_archive_job(db, test_job):
 
 def test_archive_non_terminal_job_raises(db):
     """Cannot archive a job that isn't in a terminal state."""
-    job_id = db.create_job(project_slug="devbrain", title="Test active job", spec="Test spec")
+    job_id = db.create_job(project_slug="devbrain", title="state_machine_cleanup_test_active_job", spec="Test spec")
     with pytest.raises(ValueError, match="Cannot archive"):
         db.archive_job(job_id)
 
