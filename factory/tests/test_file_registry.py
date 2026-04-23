@@ -14,11 +14,8 @@ def cleanup(db):
     yield
     with db._conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT id FROM devbrain.factory_jobs WHERE title = ANY(%s)",
-            ([
-                "Test job 1",
-                "Test job 2",
-            ],),
+            "SELECT id FROM devbrain.factory_jobs WHERE title LIKE %s",
+            ("file_registry_test_%",),
         )
         ids = [r[0] for r in cur.fetchall()]
         if ids:
@@ -45,12 +42,12 @@ def registry(db):
 
 @pytest.fixture
 def job1(db):
-    job_id = db.create_job(project_slug="devbrain", title="Test job 1", spec="Test")
+    job_id = db.create_job(project_slug="devbrain", title="file_registry_test_job_1", spec="Test")
     return db.get_job(job_id)
 
 @pytest.fixture
 def job2(db):
-    job_id = db.create_job(project_slug="devbrain", title="Test job 2", spec="Test")
+    job_id = db.create_job(project_slug="devbrain", title="file_registry_test_job_2", spec="Test")
     return db.get_job(job_id)
 
 def test_acquire_locks_no_conflicts(registry, job1):

@@ -16,13 +16,8 @@ def cleanup(db):
     yield
     with db._conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT id FROM devbrain.factory_jobs WHERE title = ANY(%s)",
-            ([
-                "Recovery API test",
-                "Orchestrator cleanup integration test",
-                "Orchestrator cleanup approved test",
-                "Recovery store test",
-            ],),
+            "SELECT id FROM devbrain.factory_jobs WHERE title LIKE %s",
+            ("orchestrator_cleanup_test_%",),
         )
         ids = [r[0] for r in cur.fetchall()]
         if ids:
@@ -75,7 +70,7 @@ class TestCleanupAgentMethods:
         """attempt_recovery should return a CleanupReport dataclass."""
         job_id = db.create_job(
             project_slug="devbrain",
-            title="Recovery API test",
+            title="orchestrator_cleanup_test_recovery_api",
             spec="Test spec",
         )
         db.transition(job_id, JobStatus.PLANNING)
@@ -102,7 +97,7 @@ class TestOrchestratorCleanupIntegration:
     def test_post_cleanup_creates_report_for_failed_job(self, db, agent):
         job_id = db.create_job(
             project_slug="devbrain",
-            title="Orchestrator cleanup integration test",
+            title="orchestrator_cleanup_test_integration",
             spec="Test that post-cleanup stores a report",
         )
         # Walk to FAILED
@@ -132,7 +127,7 @@ class TestOrchestratorCleanupIntegration:
     def test_post_cleanup_creates_report_for_approved_job(self, db, agent):
         job_id = db.create_job(
             project_slug="devbrain",
-            title="Orchestrator cleanup approved test",
+            title="orchestrator_cleanup_test_approved",
             spec="Test that post-cleanup stores a report for success",
         )
         # Walk to APPROVED
@@ -165,7 +160,7 @@ class TestOrchestratorCleanupIntegration:
         """Simulate what orchestrator does: call attempt_recovery, store the report."""
         job_id = db.create_job(
             project_slug="devbrain",
-            title="Recovery store test",
+            title="orchestrator_cleanup_test_recovery_store",
             spec="Test that recovery reports are persisted",
         )
         db.transition(job_id, JobStatus.PLANNING)

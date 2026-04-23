@@ -15,13 +15,8 @@ def cleanup(db):
     yield
     with db._conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT id FROM devbrain.factory_jobs WHERE title = ANY(%s)",
-            ([
-                "Test BLOCKED transition",
-                "Resolution field test",
-                "Set/clear resolution test",
-                "Invalid resolution test",
-            ],),
+            "SELECT id FROM devbrain.factory_jobs WHERE title LIKE %s",
+            ("state_machine_blocked_test_%",),
         )
         ids = [r[0] for r in cur.fetchall()]
         if ids:
@@ -75,7 +70,7 @@ def test_blocked_can_fail_as_safety_net():
 
 
 def test_transition_planning_to_blocked(db):
-    job_id = db.create_job(project_slug="devbrain", title="Test BLOCKED transition", spec="Test")
+    job_id = db.create_job(project_slug="devbrain", title="state_machine_blocked_test_blocked_transition", spec="Test")
     db.transition(job_id, JobStatus.PLANNING)
     job = db.transition(job_id, JobStatus.BLOCKED)
     assert job.status == JobStatus.BLOCKED
@@ -83,14 +78,14 @@ def test_transition_planning_to_blocked(db):
 
 def test_factory_job_has_blocked_resolution_field(db):
     """FactoryJob has blocked_resolution field, defaults to None."""
-    job_id = db.create_job(project_slug="devbrain", title="Resolution field test", spec="Test")
+    job_id = db.create_job(project_slug="devbrain", title="state_machine_blocked_test_resolution_field", spec="Test")
     job = db.get_job(job_id)
     assert hasattr(job, "blocked_resolution")
     assert job.blocked_resolution is None
 
 
 def test_set_and_clear_blocked_resolution(db):
-    job_id = db.create_job(project_slug="devbrain", title="Set/clear resolution test", spec="Test")
+    job_id = db.create_job(project_slug="devbrain", title="state_machine_blocked_test_set_clear_resolution", spec="Test")
     db.set_blocked_resolution(job_id, "proceed")
     job = db.get_job(job_id)
     assert job.blocked_resolution == "proceed"
@@ -100,6 +95,6 @@ def test_set_and_clear_blocked_resolution(db):
 
 
 def test_set_invalid_resolution_raises(db):
-    job_id = db.create_job(project_slug="devbrain", title="Invalid resolution test", spec="Test")
+    job_id = db.create_job(project_slug="devbrain", title="state_machine_blocked_test_invalid_resolution", spec="Test")
     with pytest.raises(ValueError, match="Invalid resolution"):
         db.set_blocked_resolution(job_id, "bogus")
