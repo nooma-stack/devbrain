@@ -33,6 +33,23 @@ def _phase_progress(status: str) -> tuple[int, int]:
     return idx, len(phases)
 
 
+def _humanize_age(seconds: int) -> str:
+    """Format an integer second count as a two-unit human-readable age.
+
+    Bands: <1m → "Ns"; <1h → "Nm Ss"; <1d → "Nh Mm"; ≥1d → "Nd Hh".
+    Negative inputs (clock skew) clamp to "0s".
+    """
+    if seconds < 0:
+        seconds = 0
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    if seconds < 86400:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+    return f"{seconds // 86400}d {(seconds % 86400) // 3600}h"
+
+
 def _format_age(updated_at) -> str:
     """Format a timestamp as a human-readable age."""
     if updated_at is None:
@@ -41,14 +58,7 @@ def _format_age(updated_at) -> str:
         if updated_at.tzinfo is None:
             updated_at = updated_at.replace(tzinfo=timezone.utc)
         delta = datetime.now(timezone.utc) - updated_at
-        seconds = int(delta.total_seconds())
-        if seconds < 60:
-            return f"{seconds}s"
-        if seconds < 3600:
-            return f"{seconds // 60}m"
-        if seconds < 86400:
-            return f"{seconds // 3600}h"
-        return f"{seconds // 86400}d"
+        return _humanize_age(int(delta.total_seconds()))
     except Exception:
         return "?"
 

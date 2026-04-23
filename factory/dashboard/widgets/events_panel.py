@@ -46,7 +46,7 @@ class RecentEventsPanel(Vertical):
 
     def compose(self):
         yield Static("━━━ Recent Events ━━━", classes="panel-title")
-        log = RichLog(id="events-log", highlight=True, wrap=False, max_lines=100)
+        log = RichLog(id="events-log", highlight=True, markup=True, wrap=False, max_lines=100)
         yield log
 
     def update_events(self, events: list[dict]) -> None:
