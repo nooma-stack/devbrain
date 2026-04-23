@@ -133,8 +133,13 @@ def _build_claude_extra_args(
     Tier 1 and 2 pass --allowedTools entries derived from the tier's
     allowlist (tier 2 composed from subcategory toggles) plus any
     user-provided extras. Tier 3 uses --dangerously-skip-permissions.
+
+    NOTE: `--max-turns` is NOT included here — it's per-phase and gets
+    appended at call time in `run_cli()` based on the phase kwarg. A
+    single global cap was too tight for implementing (heavy edits + test
+    iterations) and too loose for review phases (read-only audit).
     """
-    base = ["--output-format", "text", "--max-turns", "50"]
+    base = ["--output-format", "text"]
     if tier >= 3:
         return base + ["--dangerously-skip-permissions"]
     if tier == 2:
@@ -198,10 +203,17 @@ def run_cli(
     prompt: str,
     cwd: str | None = None,
     env_override: dict | None = None,
+    phase: str | None = None,
 ) -> CLIResult:
     """Run a CLI tool with a prompt and return the result.
 
     The CLI runs under its own subscription — no API keys needed.
+
+    When `phase` is provided and the CLI is claude, `--max-turns <N>` is
+    appended with the per-phase ceiling from config (see
+    factory.config.get_max_turns_for_phase). Pass the same phase name
+    used in cli_preferences (planning, implementing, review_arch,
+    review_security, qa, fix). Omitting phase uses the tightest default.
     """
     config = CLI_CONFIGS.get(cli_name)
     if not config:
@@ -220,7 +232,15 @@ def run_cli(
 
     cmd = [config["command"], config["flag"], prompt] + config["extra_args"]
 
-    logger.info("Running %s (no timeout, cwd=%s)", cli_name, cwd)
+    # Claude-only: append --max-turns based on the calling phase. Codex
+    # and Gemini don't have a stable cross-version equivalent of this
+    # flag, so we leave them as-is and rely on their own internal caps.
+    if cli_name == "claude":
+        from config import get_max_turns_for_phase  # local import avoids cycle at module load
+        max_turns = get_max_turns_for_phase(phase)
+        cmd += ["--max-turns", str(max_turns)]
+
+    logger.info("Running %s (phase=%s, cwd=%s)", cli_name, phase or "default", cwd)
 
     import os
     env = os.environ.copy()

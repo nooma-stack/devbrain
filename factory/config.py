@@ -141,3 +141,34 @@ FACTORY_PERMISSIONS_EXTRA_TOOLS = list(
 FACTORY_TIER_2_SUBCATEGORIES = dict(
     FACTORY_CONFIG.get("permissions_tier_2_subcategories", {})
 )
+
+# Per-phase --max-turns ceiling for claude subprocesses. Tuned empirically:
+# implementing needs headroom for reads/edits/test iterations; planning and
+# reviews are tighter. These defaults fire only on yaml-less installs — see
+# config/devbrain.yaml.example for the documented knobs.
+_FACTORY_MAX_TURNS_DEFAULTS = {
+    "planning": 50,
+    "implementing": 150,
+    "review_arch": 60,
+    "review_security": 60,
+    "qa": 50,
+    "fix": 100,
+}
+_FACTORY_MAX_TURNS = FACTORY_CONFIG.get("max_turns") or {}
+
+
+def get_max_turns_for_phase(phase: str | None) -> int:
+    """Return the --max-turns ceiling for a factory phase.
+
+    Unknown phases fall back to the planning default (the tightest) so
+    accidental misspellings in call sites fail-closed rather than quietly
+    granting a high ceiling. Pass None for a safe generic default.
+    """
+    if not phase:
+        return _FACTORY_MAX_TURNS_DEFAULTS["planning"]
+    if phase in _FACTORY_MAX_TURNS:
+        try:
+            return int(_FACTORY_MAX_TURNS[phase])
+        except (TypeError, ValueError):
+            pass  # fall through to default for malformed yaml
+    return _FACTORY_MAX_TURNS_DEFAULTS.get(phase, _FACTORY_MAX_TURNS_DEFAULTS["planning"])

@@ -119,6 +119,24 @@ factory:
     review_security: claude   # Security/HIPAA review
     fix: claude               # Fix loop
     # qa: local — QA runs lint/test commands directly, no LLM
+
+  # Per-phase tool-use ceiling passed to `claude -p --max-turns`.
+  # Acts as a runaway-protection / wall-clock cap for each phase, NOT
+  # a speed limit for normal work. Too low → false failures on legit
+  # jobs. Too high → stuck agents burn subscription quota before
+  # surfacing. Tune per phase based on the work each actually does:
+  #   planning    — reads + DevBrain search + plan write (tight)
+  #   implementing — reads + edits + test iterations (needs headroom)
+  #   review_*    — read-only audit (tight is fine)
+  #   qa          — read-only status check
+  #   fix         — between planning and implementing in scope
+  max_turns:
+    planning: 50
+    implementing: 150
+    review_arch: 60
+    review_security: 60
+    qa: 50
+    fix: 100
   cleanup:
     soft_timer_seconds: 600       # 10 min — triggers self-assessment
     extension_seconds: 300        # 5 min per extension

@@ -341,7 +341,8 @@ Store the final plan in DevBrain using the store tool with type="decision"."""
 
         logger.info("Planning with %s...", cli)
         result = run_cli(cli, prompt, cwd=project_root,
-                         env_override={"DEVBRAIN_PROJECT": job.project_slug})
+                         env_override={"DEVBRAIN_PROJECT": job.project_slug},
+                         phase="planning")
 
         self.db.store_artifact(
             job_id=job.id,
@@ -652,7 +653,8 @@ IMPORTANT: Follow existing code patterns in the repo. Read similar files before 
 
         logger.info("Implementing with %s...", cli)
         result = run_cli(cli, prompt, cwd=project_root,
-                         env_override={"DEVBRAIN_PROJECT": job.project_slug})
+                         env_override={"DEVBRAIN_PROJECT": job.project_slug},
+                         phase="implementing")
 
         self.db.store_artifact(
             job_id=job.id,
@@ -769,7 +771,8 @@ If this is a re-review round, explicitly state which prior findings are RESOLVED
 
         logger.info("Architecture review with %s...", arch_cli)
         arch_result = run_cli(arch_cli, arch_prompt, cwd=project_root,
-                              env_override={"DEVBRAIN_PROJECT": job.project_slug})
+                              env_override={"DEVBRAIN_PROJECT": job.project_slug},
+                              phase="review_arch")
 
         blocking_count = _count_blocking(arch_result.stdout)
         self.db.store_artifact(
@@ -824,7 +827,8 @@ Store any security issues found in DevBrain with type="issue" and category="secu
 
         logger.info("Security review with %s...", sec_cli)
         sec_result = run_cli(sec_cli, sec_prompt, cwd=project_root,
-                             env_override={"DEVBRAIN_PROJECT": job.project_slug})
+                             env_override={"DEVBRAIN_PROJECT": job.project_slug},
+                             phase="review_security")
 
         sec_blocking = _count_blocking(sec_result.stdout)
         self.db.store_artifact(
@@ -966,7 +970,8 @@ IMPORTANT: Fix ONLY the listed findings. Do not expand scope. Do not "improve" s
 
         logger.info("Fix loop attempt %d with %s...", job.error_count + 1, cli)
         result = run_cli(cli, fix_prompt, cwd=project_root,
-                         env_override={"DEVBRAIN_PROJECT": job.project_slug})
+                         env_override={"DEVBRAIN_PROJECT": job.project_slug},
+                         phase="fix")
 
         self.db.store_artifact(
             job_id=job.id,
