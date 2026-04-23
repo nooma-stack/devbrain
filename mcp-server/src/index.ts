@@ -415,8 +415,9 @@ server.tool(
     priority: z.number().optional().default(0).describe('Priority (higher = more urgent)'),
     assigned_cli: z.string().optional().describe('CLI to use: claude, codex, gemini (default: claude)'),
     submitted_by: z.string().optional().describe('Dev identifier (SSH user) who submitted this job'),
+    branch: z.string().optional().describe('Optional existing branch to continue work on. If unset, factory creates factory/<id>/<slug>. Refuses main/master; falls back to auto-create with a warning if the branch does not exist.'),
   },
-  async ({ project, title, spec, priority, assigned_cli, submitted_by }) => {
+  async ({ project, title, spec, priority, assigned_cli, submitted_by, branch }) => {
     const projectId = await resolveProjectId(project)
     if (!projectId) {
       return { content: [{ type: 'text', text: `Project "${project}" not found.` }] }
@@ -424,10 +425,10 @@ server.tool(
 
     const result = await query<{ id: string }>(
       `INSERT INTO devbrain.factory_jobs
-          (project_id, title, spec, status, priority, current_phase, assigned_cli, max_retries, submitted_by)
-       VALUES ($1, $2, $3, 'queued', $4, 'queued', $5, 5, $6)
+          (project_id, title, spec, status, priority, current_phase, assigned_cli, max_retries, submitted_by, branch_name)
+       VALUES ($1, $2, $3, 'queued', $4, 'queued', $5, 5, $6, $7)
        RETURNING id`,
-      [projectId, title, spec, priority, assigned_cli ?? 'claude', submitted_by ?? process.env.USER ?? null],
+      [projectId, title, spec, priority, assigned_cli ?? 'claude', submitted_by ?? process.env.USER ?? null, branch ?? null],
     )
 
     const jobId = result.rows[0].id
