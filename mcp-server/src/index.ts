@@ -2,7 +2,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
-import { spawn } from 'child_process'
+import { spawn, spawnSync } from 'child_process'
 import { writeFileSync, unlinkSync } from 'fs'
 import { tmpdir } from 'os'
 import { join, resolve } from 'path'
@@ -524,34 +524,96 @@ server.tool(
 
 server.tool(
   'factory_approve',
-  'Approve or reject a dev factory job that is ready for review. Shows the plan, review findings, and QA results.',
+  'Approve, reject, or request changes on a dev factory job that is ready for review. On approve, pushes the job\'s branch to origin; on push failure, reverts status so the caller can retry after fixing auth/network.',
   {
     job_id: z.string().describe('Job ID to approve/reject'),
     action: z.enum(['approve', 'reject', 'request_changes']).describe('Action to take'),
     notes: z.string().optional().describe('Optional notes for the decision'),
   },
   async ({ job_id, action, notes }) => {
-    const job = await query(
-      'SELECT status, title FROM devbrain.factory_jobs WHERE id = $1',
+    // Fetch everything we need in one query — the branch to push and
+    // the project root to push from.
+    const jobQuery = await query<{
+      status: string
+      title: string
+      branch_name: string | null
+      root_path: string | null
+    }>(
+      `SELECT fj.status, fj.title, fj.branch_name, p.root_path
+       FROM devbrain.factory_jobs fj
+       JOIN devbrain.projects p ON p.id = fj.project_id
+       WHERE fj.id = $1`,
       [job_id],
     )
 
-    if (job.rows.length === 0) {
+    if (jobQuery.rows.length === 0) {
       return { content: [{ type: 'text', text: `Job ${job_id} not found.` }] }
     }
 
-    const status = job.rows[0].status as string
-    const title = job.rows[0].title as string
+    const { status, title, branch_name, root_path } = jobQuery.rows[0]
 
     if (action === 'approve') {
       if (status !== 'ready_for_approval') {
         return { content: [{ type: 'text', text: `Job is not ready for approval (status: ${status}).` }] }
       }
+
+      // Transition to APPROVED first. If the subsequent push fails we
+      // revert — this makes the state reflect reality at every point
+      // (previously the UPDATE went through unconditionally, so the DB
+      // said "approved" even when nothing left the machine).
       await query(
         "UPDATE devbrain.factory_jobs SET status = 'approved', current_phase = 'approved', updated_at = now() WHERE id = $1",
         [job_id],
       )
-      return { content: [{ type: 'text', text: `Job "${title}" APPROVED. Branch is ready to push.` }] }
+
+      if (!branch_name) {
+        return { content: [{ type: 'text', text: `Job "${title}" APPROVED, but the job has no branch_name on record — nothing to push. Push any commits manually.` }] }
+      }
+      if (!root_path) {
+        return { content: [{ type: 'text', text: `Job "${title}" APPROVED, but the project has no root_path on record — can't locate the git worktree. Push branch '${branch_name}' manually.` }] }
+      }
+
+      // Now actually push. 60s is plenty for a single-branch push;
+      // anything longer is a stuck auth prompt or network hang we want
+      // to surface, not wait on.
+      const push = spawnSync('git', ['push', '-u', 'origin', branch_name], {
+        cwd: root_path,
+        encoding: 'utf-8',
+        timeout: 60_000,
+      })
+
+      if (push.error) {
+        // Couldn't even spawn git (missing binary, bad cwd, signal).
+        await query(
+          "UPDATE devbrain.factory_jobs SET status = 'ready_for_approval', current_phase = 'ready_for_approval', updated_at = now() WHERE id = $1",
+          [job_id],
+        )
+        return { content: [{ type: 'text', text: `Job "${title}" approval PUSH FAILED: ${push.error.message}. Status reverted to ready_for_approval.` }] }
+      }
+
+      if (push.status === 0) {
+        // Post-push success — trim any warnings from stdout/stderr for the caller.
+        const trimmedStderr = (push.stderr ?? '').trim()
+        const hint = trimmedStderr ? `\n\n(git output:\n${trimmedStderr.slice(-512)})` : ''
+        return { content: [{ type: 'text', text: `Job "${title}" APPROVED and PUSHED to origin/${branch_name}.\n\nNext: create a PR with \`gh pr create --base main --head ${branch_name}\`.${hint}` }] }
+      }
+
+      // Non-zero exit — auth failure, diverged ref, network, etc.
+      // Revert the DB so the user can retry after fixing the underlying
+      // issue. Include the tail of stderr (capped at ~2KB) so the
+      // specific error surfaces to the caller.
+      await query(
+        "UPDATE devbrain.factory_jobs SET status = 'ready_for_approval', current_phase = 'ready_for_approval', updated_at = now() WHERE id = $1",
+        [job_id],
+      )
+      const combined = `${push.stderr ?? ''}${push.stdout ?? ''}`.trim()
+      const tail = combined.slice(-2048)
+      return {
+        content: [{
+          type: 'text',
+          text: `Job "${title}" approval PUSH FAILED (exit ${push.status}). Status reverted to ready_for_approval so you can retry after fixing the underlying issue.\n\ngit output tail:\n${tail || '(empty)'}\n\nOnce fixed, re-run factory_approve to retry.`,
+        }],
+      }
     } else if (action === 'reject') {
       await query(
         "UPDATE devbrain.factory_jobs SET status = 'rejected', current_phase = 'rejected', updated_at = now() WHERE id = $1",
