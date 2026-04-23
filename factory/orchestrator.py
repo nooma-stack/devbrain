@@ -74,6 +74,21 @@ def _validate_branch_name(name: str) -> str | None:
     return None
 
 
+def _worktree_path_for_job(job) -> str:
+    """Return the per-job git worktree path. Deterministic from job.id
+    so callers can derive it without a DB lookup.
+
+    Each factory job operates in its own worktree at
+    ~/devbrain-worktrees/<job-id>/ so HEAD and working-tree state of
+    the main checkout are never touched during factory execution.
+    This is the foundation for concurrent job execution and for
+    multi-dev HOME-profile routing — without isolated worktrees two
+    jobs cannot run at the same time without clobbering each other's
+    branch state.
+    """
+    return str(Path.home() / "devbrain-worktrees" / job.id)
+
+
 def _count_blocking(text: str) -> int:
     """Count actual BLOCKING findings — look for the marker at start of line or list item."""
     # Match patterns like "BLOCKING:", "**BLOCKING**", "1. BLOCKING:", "- BLOCKING:"
