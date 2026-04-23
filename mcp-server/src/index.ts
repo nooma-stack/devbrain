@@ -405,6 +405,48 @@ server.tool(
 
 // ─── Tool: factory_plan ──────────────────────────────────────────────────────
 
+// Branch-name validation.
+//
+// A user-supplied branch string eventually reaches `git checkout <name>` and
+// `git push -u origin <name>` inside the orchestrator. Without validation
+// two concrete attacks work:
+//
+// 1. Leading "-" → git parses as flag.
+//    `branch: "--help"` turns `git checkout -- help` effectively no-op;
+//    worse, `branch: "--receive-pack=<cmd>"` on a later push invokes the
+//    attacker's command on the remote (genuine RCE on servers that honor
+//    the flag). Valid git refnames never begin with `-`.
+//
+// 2. Refspec form → bypasses main/master guard.
+//    `branch: "feature:refs/heads/main"` is a valid git refspec. A naive
+//    `name.toLowerCase() in {"main","master"}` check doesn't match, but
+//    `git push origin feature:refs/heads/main` happily pushes onto main.
+//    Safe refnames don't contain `:`.
+//
+// The regex below matches plain git refnames only: starts with an
+// alphanumeric or underscore (so "-" and "." are excluded up front),
+// then safe chars only. This is stricter than git's own `check-ref-format`
+// but deliberately so — we'd rather reject an exotic-but-valid name than
+// accept any of the attack shapes above.
+const SAFE_BRANCH_RE = /^[A-Za-z0-9_][A-Za-z0-9_./-]{0,254}$/
+const branchSchema = z
+  .string()
+  .trim()
+  .min(1, 'branch must not be empty or whitespace-only')
+  .max(255)
+  .regex(
+    SAFE_BRANCH_RE,
+    'branch has unsafe characters — only [A-Za-z0-9_./-] allowed, cannot start with "-" or "."',
+  )
+  .refine(
+    (v) => v.toLowerCase() !== 'main' && v.toLowerCase() !== 'master',
+    { message: 'branch must not be main or master — factory operates on feature branches only' },
+  )
+  .optional()
+  .describe(
+    'Optional existing branch to continue work on. If unset, factory creates factory/<id>/<slug>. Refuses main/master and unsafe refnames synchronously; falls back to auto-create with a warning if the (validated) branch does not exist.',
+  )
+
 server.tool(
   'factory_plan',
   'Submit a feature to the dev factory for autonomous implementation. Creates a job that will be planned, implemented, reviewed, QA tested, and staged for your approval.',
@@ -415,8 +457,9 @@ server.tool(
     priority: z.number().optional().default(0).describe('Priority (higher = more urgent)'),
     assigned_cli: z.string().optional().describe('CLI to use: claude, codex, gemini (default: claude)'),
     submitted_by: z.string().optional().describe('Dev identifier (SSH user) who submitted this job'),
+    branch: branchSchema,
   },
-  async ({ project, title, spec, priority, assigned_cli, submitted_by }) => {
+  async ({ project, title, spec, priority, assigned_cli, submitted_by, branch }) => {
     const projectId = await resolveProjectId(project)
     if (!projectId) {
       return { content: [{ type: 'text', text: `Project "${project}" not found.` }] }
@@ -424,10 +467,10 @@ server.tool(
 
     const result = await query<{ id: string }>(
       `INSERT INTO devbrain.factory_jobs
-          (project_id, title, spec, status, priority, current_phase, assigned_cli, max_retries, submitted_by)
-       VALUES ($1, $2, $3, 'queued', $4, 'queued', $5, 5, $6)
+          (project_id, title, spec, status, priority, current_phase, assigned_cli, max_retries, submitted_by, branch_name)
+       VALUES ($1, $2, $3, 'queued', $4, 'queued', $5, 5, $6, $7)
        RETURNING id`,
-      [projectId, title, spec, priority, assigned_cli ?? 'claude', submitted_by ?? process.env.USER ?? null],
+      [projectId, title, spec, priority, assigned_cli ?? 'claude', submitted_by ?? process.env.USER ?? null, branch ?? null],
     )
 
     const jobId = result.rows[0].id

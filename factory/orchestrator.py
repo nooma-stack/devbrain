@@ -41,6 +41,39 @@ Search DevBrain BEFORE assuming anything about architecture, past decisions, or 
 """
 
 
+# Branch-name safety regex. Mirrors SAFE_BRANCH_RE in
+# mcp-server/src/index.ts — defense in depth for the case where
+# job.branch_name was set outside the MCP tool's zod validator
+# (direct SQL writes, migrations, API bypasses). Rejects shapes
+# that would let a crafted value reach git as an option flag
+# (leading "-"), a refspec (contains ":"), or shell metachars.
+SAFE_BRANCH_RE = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_./-]{0,254}$')
+
+
+def _validate_branch_name(name: str) -> str | None:
+    """Return None if the branch name is safe to pass to git subprocess
+    calls, else a human-readable failure message describing why.
+
+    Runs the same checks the MCP factory_plan tool applies at submission
+    time (see SAFE_BRANCH_RE), plus the main/master guard. Keep the two
+    validators in sync when updating either.
+    """
+    stripped = name.strip()
+    if not stripped:
+        return "branch name is empty or whitespace"
+    if not SAFE_BRANCH_RE.match(stripped):
+        return (
+            f"branch name has unsafe characters: {name!r} — only "
+            "[A-Za-z0-9_./-] allowed, cannot start with '-' or '.'"
+        )
+    if stripped.lower() in ("main", "master"):
+        return (
+            f"Refusing to run factory job on '{stripped}' — factory jobs "
+            "operate on feature branches only."
+        )
+    return None
+
+
 def _count_blocking(text: str) -> int:
     """Count actual BLOCKING findings — look for the marker at start of line or list item."""
     # Match patterns like "BLOCKING:", "**BLOCKING**", "1. BLOCKING:", "- BLOCKING:"
@@ -244,6 +277,83 @@ class FactoryOrchestrator:
         except Exception as exc:
             logger.warning("readiness-block notification failed (non-blocking): %s", exc)
 
+    def _setup_implementation_branch(
+        self, job: FactoryJob, project_root: str
+    ) -> tuple[str | None, str | None]:
+        """Resolve the git branch implementation should run on.
+
+        If ``job.branch_name`` is set:
+          - main/master (case-insensitive) → return ``(None, fail_msg)`` so the
+            caller can transition the job to FAILED. Factory jobs must operate
+            on feature branches; running them on shared trunk is unsafe.
+          - existing branch → ``git checkout`` it. Dirty tree is warned but not
+            blocking — the user opted in by naming the branch explicitly.
+          - missing branch → log a warning and fall through to auto-create.
+
+        Otherwise auto-create ``factory/<job-id>/<slug>`` (the original
+        no-branch behavior).
+
+        Returns ``(branch_name, fail_msg)`` where exactly one is non-None on
+        the failure path; on success ``fail_msg`` is None and ``branch_name``
+        may still be None if git invocation failed (matching prior behavior —
+        the implementation phase proceeds on the current branch).
+        """
+        if job.branch_name:
+            # Fail-closed validation before anything reaches git. The MCP
+            # tool validates on submission, but direct DB writes or
+            # migrations could set an unsafe value; this second check
+            # ensures the orchestrator never passes attacker-controlled
+            # input to `git checkout`/`git push` as an unquoted positional.
+            fail = _validate_branch_name(job.branch_name)
+            if fail:
+                return (None, fail)
+            name = job.branch_name.strip()
+
+            checkout = None
+            try:
+                checkout = subprocess.run(
+                    ["git", "checkout", name],
+                    cwd=project_root, capture_output=True, text=True, timeout=10,
+                )
+            except Exception as e:
+                logger.warning(
+                    "git checkout %s raised (%s) — falling back to auto-create",
+                    name, e,
+                )
+
+            if checkout is not None and checkout.returncode == 0:
+                try:
+                    status = subprocess.run(
+                        ["git", "status", "--porcelain"],
+                        cwd=project_root, capture_output=True, text=True, timeout=10,
+                    )
+                    if status.returncode == 0 and status.stdout.strip():
+                        logger.warning(
+                            "Branch '%s' has uncommitted changes — proceeding anyway",
+                            name,
+                        )
+                except Exception:
+                    pass
+                return (name, None)
+
+            stderr = (checkout.stderr if checkout is not None else "").strip()
+            logger.warning(
+                "Branch '%s' does not exist (%s) — falling back to auto-generated branch",
+                name, stderr[:200],
+            )
+
+        slug = re.sub(r'[^a-z0-9-]', '-', job.title.lower())[:40].strip('-')
+        branch = f"factory/{job.id[:8]}/{slug}"
+        try:
+            subprocess.run(
+                ["git", "checkout", "-b", branch],
+                cwd=project_root, capture_output=True, timeout=10,
+            )
+        except Exception as e:
+            logger.warning("Branch creation failed: %s", e)
+            branch = None
+        return (branch, None)
+
     def _get_cli(self, phase: str, job: FactoryJob) -> str:
         """Get the CLI to use for a phase."""
         return job.assigned_cli or DEFAULT_CLI_ASSIGNMENTS.get(phase, "claude")
@@ -439,18 +549,13 @@ Store the final plan in DevBrain using the store tool with type="decision"."""
 
                 return blocked_job
 
-            # No conflicts — create branch and proceed
-            slug = re.sub(r'[^a-z0-9-]', '-', job.title.lower())[:40].strip('-')
-            branch = f"factory/{job.id[:8]}/{slug}"
-            try:
-                subprocess.run(
-                    ["git", "checkout", "-b", branch],
-                    cwd=project_root, capture_output=True, timeout=10,
+            # No conflicts — set up branch (auto-create or use job.branch_name)
+            branch, fail_msg = self._setup_implementation_branch(job, project_root)
+            if fail_msg:
+                return self.db.transition(
+                    job.id, JobStatus.FAILED,
+                    metadata={"failure": fail_msg},
                 )
-            except Exception as e:
-                logger.warning("Branch creation failed: %s", e)
-                branch = None
-
             return self.db.transition(job.id, JobStatus.IMPLEMENTING, branch_name=branch)
         else:
             return self.db.transition(job.id, JobStatus.FAILED,
@@ -552,18 +657,14 @@ Store the final plan in DevBrain using the store tool with type="decision"."""
             )
             conn.commit()
 
-        # Create branch (same logic as _run_planning success path)
+        # Set up branch (auto-create or use job.branch_name)
         project_root = self._get_project_root(job)
-        slug = re.sub(r'[^a-z0-9-]', '-', job.title.lower())[:40].strip('-')
-        branch = f"factory/{job.id[:8]}/{slug}"
-        try:
-            subprocess.run(
-                ["git", "checkout", "-b", branch],
-                cwd=project_root, capture_output=True, timeout=10,
+        branch, fail_msg = self._setup_implementation_branch(job, project_root)
+        if fail_msg:
+            return self.db.transition(
+                job.id, JobStatus.FAILED,
+                metadata={"failure": fail_msg},
             )
-        except Exception as e:
-            logger.warning("Branch creation failed: %s", e)
-            branch = None
 
         # Fire unblocked notification
         self._fire_unblocked_notification(job)
