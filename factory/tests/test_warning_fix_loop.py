@@ -177,51 +177,26 @@ def test_warning_skipped_when_flag_false(orch, db, monkeypatch):
     assert result.status == JobStatus.QA
 
 
-def test_prior_warning_findings_extracted(orch, db):
-    """_get_prior_warning_findings skips artifacts with warning_count=0
-    and extracts items from those with warning_count>0, mirroring the
-    BLOCKING helper's behavior."""
-    job_id = db.create_job(
-        project_slug="devbrain",
-        title=f"{TEST_TITLE_PREFIX}helper_extracts_warnings",
-        spec="test",
-    )
-    db.transition(job_id, JobStatus.PLANNING)
-    job = db.get_job(job_id)
+def test_extract_warning_items_from_review_content(orch, db):
+    """_extract_warning_items extracts individual WARNING items from
+    review-artifact content. This exercises the same extraction path
+    _run_fix uses inline when collecting prior warning findings for
+    the fix prompt (see orchestrator.py _run_fix around the
+    `latest_warning` loop).
+    """
+    from orchestrator import _extract_warning_items
 
-    db.store_artifact(
-        job_id=job.id,
-        phase="review",
-        artifact_type="arch_review",
-        content="(no issues)",
-        blocking_count=0,
-        warning_count=0,
+    text = (
+        "1. WARNING: first warning at a.py:1\n"
+        "2. WARNING: second warning at b.py:2\n"
+        "3. BLOCKING: some blocking issue at c.py:3\n"
     )
-    db.store_artifact(
-        job_id=job.id,
-        phase="review",
-        artifact_type="arch_review",
-        content=(
-            "1. WARNING: first warning at a.py:1\n"
-            "2. WARNING: second warning at b.py:2\n"
-        ),
-        blocking_count=0,
-        warning_count=2,
-    )
-    db.store_artifact(
-        job_id=job.id,
-        phase="review",
-        artifact_type="security_review",
-        content="1. WARNING: security warning at c.py:3",
-        blocking_count=0,
-        warning_count=1,
-    )
+    items = _extract_warning_items(text)
+    assert len(items) == 2
+    assert "first warning" in items[0]
+    assert "second warning" in items[1]
 
-    arch_items = orch._get_prior_warning_findings(job, "arch_review")
-    sec_items = orch._get_prior_warning_findings(job, "security_review")
-
-    assert len(arch_items) == 2
-    assert "first warning" in arch_items[0]
-    assert "second warning" in arch_items[1]
+    sec_text = "1. WARNING: security warning at c.py:3"
+    sec_items = _extract_warning_items(sec_text)
     assert len(sec_items) == 1
     assert "security warning" in sec_items[0]
