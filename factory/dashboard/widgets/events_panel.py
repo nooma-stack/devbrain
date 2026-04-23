@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from rich.markup import escape as _escape_markup
 from textual.widgets import RichLog, Static
 from textual.containers import Vertical
 
@@ -62,7 +63,15 @@ class RecentEventsPanel(Vertical):
             color = EVENT_COLORS.get(event["artifact_type"], "white")
             time_str = _format_time(event["timestamp"])
             job_short = event["job_id"][:8]
-            job_title = event["job_title"][:30]
-            summary = event["summary"]
+            # job_title (user-supplied via factory_plan) and summary
+            # (LLM-generated artifact text) can contain literal square
+            # brackets — e.g. "Fix [E1234]" or "Added [type] annotations"
+            # — which Rich parses as markup tags now that markup=True is
+            # set. Unescaped, stray tags either raise MarkupError (line
+            # silently dropped) or corrupt the rendered output. Escape
+            # them; leave the dashboard-controlled wrapping markup
+            # ([dim], [{color}]) intact since those are hardcoded here.
+            job_title = _escape_markup(event["job_title"][:30])
+            summary = _escape_markup(event["summary"])
             line = f"[dim]{time_str}[/dim] [{color}]{job_short}[/{color}] {job_title} — {summary}"
             log.write(line)
