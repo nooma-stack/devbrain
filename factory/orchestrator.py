@@ -92,8 +92,11 @@ def _worktree_path_for_job(job) -> str:
 
 def _count_blocking(text: str) -> int:
     """Count actual BLOCKING findings — look for the marker at start of line or list item."""
-    # Match patterns like "BLOCKING:", "**BLOCKING**", "1. BLOCKING:", "- BLOCKING:"
-    pattern = r'(?:^|\n)\s*(?:\d+\.\s*|\*\*?|-\s*)?BLOCKING\b'
+    # Match patterns like "BLOCKING:", "**BLOCKING**", "1. BLOCKING:", "- BLOCKING:",
+    # and stacked combos like "**1. BLOCKING" or "- **BLOCKING**" that reviewers
+    # produce when nesting bold/list/number prefixes. {0,4} is bounded — each
+    # alternative consumes ≥1 char so there is no catastrophic backtracking.
+    pattern = r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}BLOCKING\b'
     return len(re.findall(pattern, text, re.IGNORECASE))
 
 
@@ -101,10 +104,10 @@ def _extract_blocking_items(text: str) -> list[str]:
     """Extract individual BLOCKING finding texts."""
     items = []
     # Split on BLOCKING markers and capture the text after each
-    parts = re.split(r'(?:^|\n)\s*(?:\d+\.\s*|\*\*?|-\s*)?BLOCKING[:\s]*', text, flags=re.IGNORECASE)
+    parts = re.split(r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}BLOCKING[:\s]*', text, flags=re.IGNORECASE)
     for part in parts[1:]:  # Skip text before first BLOCKING
         # Take text until next severity marker or end
-        end = re.search(r'\n\s*(?:\d+\.\s*|\*\*?|-\s*)?(?:WARNING|NIT|BLOCKING)\b', part, re.IGNORECASE)
+        end = re.search(r'\n\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}(?:WARNING|NIT|BLOCKING)\b', part, re.IGNORECASE)
         item = part[:end.start()].strip() if end else part.strip()
         if item:
             items.append(item)
@@ -113,16 +116,16 @@ def _extract_blocking_items(text: str) -> list[str]:
 
 def _count_warning(text: str) -> int:
     """Count actual WARNING findings — look for the marker at start of line or list item."""
-    pattern = r'(?:^|\n)\s*(?:\d+\.\s*|\*\*?|-\s*)?WARNING\b'
+    pattern = r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}WARNING\b'
     return len(re.findall(pattern, text, re.IGNORECASE))
 
 
 def _extract_warning_items(text: str) -> list[str]:
     """Extract individual WARNING finding texts."""
     items = []
-    parts = re.split(r'(?:^|\n)\s*(?:\d+\.\s*|\*\*?|-\s*)?WARNING[:\s]*', text, flags=re.IGNORECASE)
+    parts = re.split(r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}WARNING[:\s]*', text, flags=re.IGNORECASE)
     for part in parts[1:]:
-        end = re.search(r'\n\s*(?:\d+\.\s*|\*\*?|-\s*)?(?:BLOCKING|NIT|WARNING)\b', part, re.IGNORECASE)
+        end = re.search(r'\n\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}(?:BLOCKING|NIT|WARNING)\b', part, re.IGNORECASE)
         item = part[:end.start()].strip() if end else part.strip()
         if item:
             items.append(item)
