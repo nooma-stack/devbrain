@@ -269,6 +269,19 @@ class FactoryDB:
         logger.info("Job %s: %s → %s", job_id[:8], job.status.value, new_status.value)
         return self.get_job(job_id)
 
+    def update_metadata(self, job_id: str, metadata: dict) -> None:
+        """Merge the given dict into a job's metadata JSONB without
+        changing status. Used when we need to attach diagnostic info
+        (e.g., approve_sync_error) but the state must not advance."""
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devbrain.factory_jobs "
+                "SET metadata = metadata || %s::jsonb, updated_at = now() "
+                "WHERE id = %s",
+                (json.dumps(metadata), job_id),
+            )
+            conn.commit()
+
     def set_blocked_resolution(self, job_id: str, resolution: str) -> None:
         """Set the dev's resolution for a blocked job.
 

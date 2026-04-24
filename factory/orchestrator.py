@@ -1345,17 +1345,88 @@ IMPORTANT: Fix ONLY the listed findings. Do not expand scope. Do not "improve" s
     # ─── Approval ──────────────────────────────────────────────────────────
 
     def approve_job(self, job_id: str, notes: str | None = None) -> FactoryJob:
-        """Approve a job — pushes the branch."""
+        """Approve a job — syncs the worktree with origin, then pushes."""
         job = self.db.get_job(job_id)
         if not job or job.status != JobStatus.READY_FOR_APPROVAL:
-            raise ValueError(f"Job {job_id} is not ready for approval (status: {job.status.value if job else 'not found'})")
+            raise ValueError(
+                f"Job {job_id} is not ready for approval "
+                f"(status: {job.status.value if job else 'not found'})"
+            )
 
         # Push from the job's worktree. The branch ref lives in the
         # shared .git dir so the push still updates origin correctly.
         project_root = self._get_job_cwd(job)
 
-        # Push the branch
         if job.branch_name:
+            # Sync the worktree with origin BEFORE pushing. If a human
+            # pushed hand-fix commits to this branch from another machine
+            # between factory completion and approval, our worktree is
+            # behind origin — an unsynced push gets rejected as
+            # non-fast-forward. Fetch + ff-only merge catches that case
+            # silently, and fails loud on genuine history divergence.
+            fetch_result = None
+            try:
+                fetch_result = subprocess.run(
+                    ["git", "fetch", "origin", job.branch_name],
+                    cwd=project_root, capture_output=True, timeout=30,
+                )
+            except Exception as e:
+                # spawn/timeout — treat as a missed fetch; proceed to push.
+                logger.warning("Pre-push fetch failed: %s", e)
+
+            if fetch_result is not None and fetch_result.returncode == 0:
+                # Fetch succeeded — origin has the branch. Try to ff-merge.
+                # Both branches below funnel into `merge_error` so the
+                # subprocess-raised case (TimeoutExpired, OSError) also
+                # bails out instead of silently falling through to push
+                # from a worktree fetch already told us is behind origin.
+                merge_error: str | None = None
+                try:
+                    merge_result = subprocess.run(
+                        ["git", "merge", "--ff-only",
+                         f"origin/{job.branch_name}"],
+                        cwd=project_root, capture_output=True, timeout=30,
+                    )
+                    if merge_result.returncode != 0:
+                        combined = (
+                            (merge_result.stderr or b"")
+                            + (merge_result.stdout or b"")
+                        )
+                        merge_error = (
+                            combined.decode("utf-8", errors="replace").strip()
+                        )[-2048:] or "(no git output)"
+                except Exception as e:
+                    # Fetch already confirmed origin is ahead; pushing
+                    # from this worktree now would silently advance to
+                    # stale tips. Record and bail — same contract as the
+                    # non-zero returncode branch above.
+                    merge_error = f"merge subprocess failed: {e}"
+                    logger.warning(
+                        "Pre-push ff-merge failed to spawn: %s", e
+                    )
+
+                if merge_error is not None:
+                    # Divergent history OR merge subprocess died — either
+                    # way, leave status at READY_FOR_APPROVAL so a human
+                    # can inspect and decide.
+                    self.db.update_metadata(
+                        job.id,
+                        {"approve_sync_error": merge_error},
+                    )
+                    logger.warning(
+                        "Approve-sync ff-only failed for job %s: %s",
+                        job.id[:8],
+                        merge_error.splitlines()[0],
+                    )
+                    return self.db.get_job(job.id)
+            # Else: fetch failed (origin has no branch yet, network, auth
+            # on fetch) — swallow silently and let the push surface any
+            # real problem. This is the "first push" case where origin
+            # doesn't have the branch yet; fetch of a nonexistent ref is
+            # the only non-error signal for that state.
+
+            # Push. Keeps the existing behavior (non-zero exit is logged
+            # but swallowed; only spawn/timeout raises).
             try:
                 subprocess.run(
                     ["git", "push", "-u", "origin", job.branch_name],
@@ -1364,8 +1435,10 @@ IMPORTANT: Fix ONLY the listed findings. Do not expand scope. Do not "improve" s
             except Exception as e:
                 logger.warning("Push failed: %s", e)
 
-        job = self.db.transition(job.id, JobStatus.APPROVED,
-                                 metadata={"approved_at": "now", "notes": notes or ""})
+        job = self.db.transition(
+            job.id, JobStatus.APPROVED,
+            metadata={"approved_at": "now", "notes": notes or ""},
+        )
         notify_desktop("DevBrain Factory", f"Approved: {job.title}")
         return job
 
