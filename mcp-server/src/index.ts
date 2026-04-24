@@ -3,8 +3,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { spawn, spawnSync } from 'child_process'
-import { writeFileSync, unlinkSync } from 'fs'
-import { tmpdir } from 'os'
+import { existsSync, writeFileSync, unlinkSync } from 'fs'
+import { homedir, tmpdir } from 'os'
 import { join, resolve } from 'path'
 import { z } from 'zod'
 import { query } from './db.js'
@@ -616,11 +616,63 @@ server.tool(
         return { content: [{ type: 'text', text: `Job "${title}" APPROVED, but the project has no root_path on record — can't locate the git worktree. Push branch '${branch_name}' manually.` }] }
       }
 
+      // Worktree-aware cwd: factory jobs run in per-job worktrees at
+      // ~/devbrain-worktrees/<job_id>/. Mirrors Python's _get_job_cwd.
+      // Falls back to root_path for pre-worktree jobs or planning-only.
+      const worktreeDir = join(homedir(), 'devbrain-worktrees', job_id)
+      const gitCwd = existsSync(worktreeDir) ? worktreeDir : root_path
+
+      // Sync the worktree with origin before pushing. If a human
+      // pushed commits to this branch from another machine between
+      // factory completion and approval, our worktree is behind
+      // origin and `git push` would be rejected as non-fast-forward.
+      // Fetch + ff-only merge catches that silently; divergent
+      // history fails loud so we can surface it.
+      const fetchResult = spawnSync(
+        'git',
+        ['fetch', 'origin', branch_name],
+        { cwd: gitCwd, encoding: 'utf-8', timeout: 30_000 },
+      )
+
+      // Only attempt ff-merge when fetch succeeded. A fetch miss
+      // (e.g. origin has no such branch yet — first push) falls
+      // through to the push; the push itself will surface any real
+      // problem.
+      if (!fetchResult.error && fetchResult.status === 0) {
+        const mergeResult = spawnSync(
+          'git',
+          ['merge', '--ff-only', `origin/${branch_name}`],
+          { cwd: gitCwd, encoding: 'utf-8', timeout: 30_000 },
+        )
+
+        if (mergeResult.error || mergeResult.status !== 0) {
+          // Divergent history — revert status, record the detail in
+          // the job's metadata so the human can inspect, and return.
+          const combined = `${mergeResult.stderr ?? ''}${mergeResult.stdout ?? ''}`.trim()
+          const detail = (combined || mergeResult.error?.message || '(no git output)').slice(-2048)
+          await query(
+            "UPDATE devbrain.factory_jobs "
+            + "SET status = 'ready_for_approval', "
+            + "    current_phase = 'ready_for_approval', "
+            + "    metadata = metadata || $2::jsonb, "
+            + "    updated_at = now() "
+            + "WHERE id = $1",
+            [job_id, JSON.stringify({ approve_sync_error: detail })],
+          )
+          return {
+            content: [{
+              type: 'text',
+              text: `Job "${title}" approval SYNC FAILED (worktree diverged from origin/${branch_name}). Status reverted to ready_for_approval.\n\ngit output tail:\n${detail}\n\nResolve the divergence in the worktree (rebase or reset to origin) then re-run factory_approve.`,
+            }],
+          }
+        }
+      }
+
       // Now actually push. 60s is plenty for a single-branch push;
       // anything longer is a stuck auth prompt or network hang we want
       // to surface, not wait on.
       const push = spawnSync('git', ['push', '-u', 'origin', branch_name], {
-        cwd: root_path,
+        cwd: gitCwd,
         encoding: 'utf-8',
         timeout: 60_000,
       })
@@ -937,8 +989,7 @@ server.tool(
 // The URL is the tunnel-exposed loopback address on THIS machine — set up
 // the SSH tunnel separately (e.g., `ssh -L 18900:127.0.0.1:18900 mac-studio`).
 
-import { homedir } from 'os'
-import { readFileSync, existsSync } from 'fs'
+import { readFileSync } from 'fs'
 import YAML from 'yaml'
 
 interface AgentBusTarget {
