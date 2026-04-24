@@ -192,8 +192,13 @@ def _count_blocking(text: str, return_fallback: bool = False):
         count = sum(1 for f in findings if f["severity"] == "BLOCKING")
         used_fallback = False
     else:
-        # Stacked-prefix tolerant, bounded {0,4} (PR #32).
-        pattern = r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}BLOCKING\b'
+        # Stacked-prefix tolerant, bounded {0,4} (PR #32). Negative
+        # lookahead `(?!\s*→)` skips rubric-echo lines of the form
+        # `- BLOCKING → <explanation>` that the prompts use to define
+        # severity; a reviewer quoting the prompt back plus emitting
+        # two JSON blocks would otherwise have echoed rubric counted
+        # as real findings.
+        pattern = r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}BLOCKING\b(?!\s*→)'
         count = len(re.findall(pattern, text, re.IGNORECASE))
         used_fallback = True
     return (count, used_fallback) if return_fallback else count
@@ -212,13 +217,15 @@ def _extract_blocking_items(text: str, return_fallback: bool = False):
         used_fallback = False
     else:
         items = []
+        # Split on BLOCKING markers but skip rubric-echo `BLOCKING → ...`
+        # lines (see _count_blocking for why).
         parts = re.split(
-            r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}BLOCKING[:\s]*',
+            r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}BLOCKING\b(?!\s*→)[:\s]*',
             text, flags=re.IGNORECASE,
         )
         for part in parts[1:]:
             end = re.search(
-                r'\n\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}(?:WARNING|NIT|BLOCKING)\b',
+                r'\n\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}(?:WARNING|NIT|BLOCKING)\b(?!\s*→)',
                 part, re.IGNORECASE,
             )
             item = part[:end.start()].strip() if end else part.strip()
@@ -241,7 +248,8 @@ def _count_warning(text: str, return_fallback: bool = False):
         count = sum(1 for f in findings if f["severity"] == "WARNING")
         used_fallback = False
     else:
-        pattern = r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}WARNING\b'
+        # See _count_blocking for why the `(?!\s*→)` lookahead is here.
+        pattern = r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}WARNING\b(?!\s*→)'
         count = len(re.findall(pattern, text, re.IGNORECASE))
         used_fallback = True
     return (count, used_fallback) if return_fallback else count
@@ -260,13 +268,14 @@ def _extract_warning_items(text: str, return_fallback: bool = False):
         used_fallback = False
     else:
         items = []
+        # See _count_blocking for why the `(?!\s*→)` lookahead is here.
         parts = re.split(
-            r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}WARNING[:\s]*',
+            r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}WARNING\b(?!\s*→)[:\s]*',
             text, flags=re.IGNORECASE,
         )
         for part in parts[1:]:
             end = re.search(
-                r'\n\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}(?:BLOCKING|NIT|WARNING)\b',
+                r'\n\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}(?:BLOCKING|NIT|WARNING)\b(?!\s*→)',
                 part, re.IGNORECASE,
             )
             item = part[:end.start()].strip() if end else part.strip()
@@ -1288,7 +1297,7 @@ If this is a re-review round, explicitly state which prior findings are RESOLVED
 
 ## Required output format
 
-**Emit EXACTLY ONE `` ```json findings `` block at the end of your review.** The pipeline reads this block to count BLOCKING/WARNING/NIT findings; missing, malformed, or multiple blocks trigger a regex fallback and flag the artifact as malformed. Always include the block, even when there are no findings (use an empty list). Do not draft-and-revise — edit your block in place before submitting. Do not paste diff context, examples, or quoted prior reviews that contain additional `` ```json findings `` fences; two or more blocks will be rejected with `multiple_findings_blocks:N`.
+**Emit EXACTLY ONE `` ```json findings `` block at the end of your review.** The pipeline reads this block to count BLOCKING/WARNING/NIT findings; missing, malformed, or multiple blocks trigger a regex fallback and flag the artifact as malformed. Always include the block, even when there are no findings (use an empty list). Do not draft-and-revise — edit your block in place before submitting. Do not paste diff context, examples, or quoted prior reviews that contain additional `` ```json findings `` fences; two or more blocks will be rejected with `multiple_findings_blocks:N`. Do not quote the severity rubric above back in your prose — if the JSON block is malformed, the regex fallback would count each echoed `- BLOCKING` / `- WARNING` line as a real finding.
 
 ```json findings
 {{"findings": [
@@ -1393,7 +1402,7 @@ Store any security issues found in DevBrain with type="issue" and category="secu
 
 ## Required output format
 
-**Emit EXACTLY ONE `` ```json findings `` block at the end of your review.** The pipeline reads this block to count BLOCKING/WARNING/NIT findings; missing, malformed, or multiple blocks trigger a regex fallback and flag the artifact as malformed. Always include the block, even when there are no findings (use an empty list). Do not draft-and-revise — edit your block in place before submitting. Do not paste diff context, examples, or quoted prior reviews that contain additional `` ```json findings `` fences; two or more blocks will be rejected with `multiple_findings_blocks:N`.
+**Emit EXACTLY ONE `` ```json findings `` block at the end of your review.** The pipeline reads this block to count BLOCKING/WARNING/NIT findings; missing, malformed, or multiple blocks trigger a regex fallback and flag the artifact as malformed. Always include the block, even when there are no findings (use an empty list). Do not draft-and-revise — edit your block in place before submitting. Do not paste diff context, examples, or quoted prior reviews that contain additional `` ```json findings `` fences; two or more blocks will be rejected with `multiple_findings_blocks:N`. Do not quote the severity rubric above back in your prose — if the JSON block is malformed, the regex fallback would count each echoed `- BLOCKING` / `- WARNING` line as a real finding.
 
 ```json findings
 {{"findings": [
@@ -1454,7 +1463,37 @@ The prose above the block is what humans read; the block is the machine contract
         warnings_trigger = (
             FACTORY_FIX_LOOP_WARNINGS_TRIGGER_RETRY and total_warning > 0
         )
-        should_fix = total_blocking > 0 or warnings_trigger
+        # Silent-suppression guardrail: when a reviewer emits multiple
+        # JSON findings blocks (rejected by _parse_findings_json with
+        # `multiple_findings_blocks:N`) AND the regex fallback surfaces
+        # zero findings, the counts cannot be trusted — a legitimate
+        # finding in either block would otherwise be silently swallowed
+        # and the job would auto-promote to READY_FOR_APPROVAL. Force a
+        # re-review cycle so the reviewer gets another chance to emit
+        # a single clean block.
+        arch_multi_silent = bool(
+            arch_parse_err
+            and arch_parse_err.startswith("multiple_findings_blocks")
+            and blocking_count == 0
+            and warning_count == 0
+        )
+        sec_multi_silent = bool(
+            sec_parse_err
+            and sec_parse_err.startswith("multiple_findings_blocks")
+            and sec_blocking == 0
+            and sec_warning == 0
+        )
+        reviewer_malformed_silent = arch_multi_silent or sec_multi_silent
+        if reviewer_malformed_silent:
+            logger.warning(
+                "Reviewer emitted multiple JSON findings blocks with zero "
+                "regex-fallback findings for job %s — forcing re-review to "
+                "avoid silent auto-promotion (arch=%s, sec=%s)",
+                job.id[:8], arch_parse_err, sec_parse_err,
+            )
+        should_fix = (
+            total_blocking > 0 or warnings_trigger or reviewer_malformed_silent
+        )
         if not should_fix:
             return self.db.transition(job.id, JobStatus.QA)
 
@@ -1484,14 +1523,22 @@ The prose above the block is what humans read; the block is the machine contract
                 self._notify_warning_oscillation(failed, repeating)
                 return failed
 
+        trigger_reason = (
+            "blocking" if total_blocking > 0
+            else "warning" if warnings_trigger
+            else "reviewer_malformed"
+        )
+        fix_loop_metadata = {
+            "blocking_findings": total_blocking,
+            "warning_findings": total_warning,
+            "trigger_reason": trigger_reason,
+        }
+        if reviewer_malformed_silent:
+            fix_loop_metadata["reviewer_malformed"] = True
         return self.db.transition(
             job.id,
             JobStatus.FIX_LOOP,
-            metadata={
-                "blocking_findings": total_blocking,
-                "warning_findings": total_warning,
-                "trigger_reason": "blocking" if total_blocking > 0 else "warning",
-            },
+            metadata=fix_loop_metadata,
         )
 
     # ─── QA Phase ──────────────────────────────────────────────────────────

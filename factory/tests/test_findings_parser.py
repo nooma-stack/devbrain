@@ -163,6 +163,55 @@ def test_diff_echo_attack_does_not_suppress_findings():
     assert count == 1
 
 
+# 5d. Diff-echo-via-rubric: reviewer quotes the severity rubric from
+# the prompt (lines of the form `- BLOCKING → ...`) AND emits two JSON
+# blocks (forcing multi-block rejection → regex fallback). Without the
+# `(?!\s*→)` negative lookahead added in PR #37, the fallback would
+# count each echoed rubric line as a real finding and incorrectly
+# route the job to fix-loop.
+def test_rubric_echo_with_two_blocks_is_not_miscounted():
+    text = (
+        "# My review\n\n"
+        "Severity rubric (echoed from prompt):\n"
+        "- BLOCKING → actual vulnerability, PHI exposure, missing auth check\n"
+        "- WARNING  → defense-in-depth suggestion, narrow input gap\n"
+        "- NIT      → best-practice suggestion\n\n"
+        "## Findings\n\n"
+        '```json findings\n{"findings": []}\n```\n\n'
+        "## Draft (forgot to delete)\n\n"
+        '```json findings\n{"findings": []}\n```\n'
+    )
+    # Two blocks → multi-block rejection → regex fallback.
+    findings, err = _parse_findings_json(text)
+    assert findings is None
+    assert err.startswith("multiple_findings_blocks")
+    # Fallback must not count the echoed rubric lines.
+    b_count, b_fb = _count_blocking(text, return_fallback=True)
+    w_count, w_fb = _count_warning(text, return_fallback=True)
+    assert b_fb is True and w_fb is True
+    assert b_count == 0
+    assert w_count == 0
+    assert _extract_blocking_items(text) == []
+    assert _extract_warning_items(text) == []
+
+
+# 5e. Sanity check: a real `- BLOCKING: ...` finding in the prose
+# (the shape reviewers actually produce when they fall back to
+# regex) must still be counted by the fallback. The negative
+# lookahead only excludes the `→` rubric form.
+def test_real_dash_prefixed_findings_still_counted_by_fallback():
+    text = (
+        "- BLOCKING: null deref at x.py:42\n"
+        "- WARNING: suboptimal pattern at y.py:10\n"
+    )
+    assert _count_blocking(text) == 1
+    assert _count_warning(text) == 1
+    blockings = _extract_blocking_items(text)
+    warnings = _extract_warning_items(text)
+    assert len(blockings) == 1 and "null deref" in blockings[0]
+    assert len(warnings) == 1 and "suboptimal pattern" in warnings[0]
+
+
 # 6. Malformed JSON — fallback used, error mentions JSONDecodeError
 def test_malformed_json_falls_back():
     text = "```json findings\n{not valid json\n```\n"
