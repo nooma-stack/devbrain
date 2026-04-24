@@ -145,7 +145,21 @@ def _parse_findings_json(text: str) -> tuple[list[dict] | None, str | None]:
             return (None, f"missing_keys:{sorted(missing)}")
         sev = str(item["severity"]).upper()
         if sev not in _VALID_SEVERITIES:
-            dropped_severities.append(item["severity"])
+            dropped_severities.append(str(item["severity"])[:64])
+            continue
+        # Title and body must be strings. A reviewer emitting a
+        # dict/list/int for either would crash _signature_for_finding
+        # (title.strip()) or _notify_warning_oscillation (body render)
+        # deeper in the pipeline — fail fast here instead.
+        if not isinstance(item["title"], str):
+            dropped_severities.append(
+                f"non_string_title:{type(item['title']).__name__}"
+            )
+            continue
+        if not isinstance(item["body"], str):
+            dropped_severities.append(
+                f"non_string_body:{type(item['body']).__name__}"
+            )
             continue
         normalized = dict(item)
         normalized["severity"] = sev
@@ -301,26 +315,47 @@ def _finding_signature(text: str) -> str:
     return collapsed[:80]
 
 
-def _signature_for_finding(item) -> str:
-    """Compute the cross-round comparison signature for a finding.
+def _signature_for_finding(item) -> frozenset[str]:
+    """Compute the cross-round comparison signature set for a finding.
 
-    Dispatches on input shape:
-      - dict with truthy ``title`` → normalize the title (lower,
-        collapse whitespace). Titles are short by contract so we do
-        NOT truncate — equality on titles is the whole point of the
-        JSON contract, immune to reviewer paraphrasing of bodies.
-      - dict with None/empty title (regex-fallback synthetic) → fall
-        back to the body-based signature.
-      - str → existing ``_finding_signature`` behavior (back-compat
-        for callers that still pass plain strings).
+    Returns a non-empty frozenset of 1 or 2 normalized signatures so two
+    findings match when they share ANY signature. This absorbs the
+    JSON↔regex-fallback asymmetry: a reviewer who emits compliant JSON
+    in round 1 and falls back to prose in round 2 (or vice versa) would
+    otherwise produce incomparable signatures — one title-based, one
+    body-prefix-based — and the oscillation guardrail would miss the
+    repeat. Carrying both when available gives both paths common
+    ground.
+
+    Shape dispatch:
+      - dict with string ``title`` → {title-sig, body-sig} when body
+        is also present; {title-sig} otherwise.
+      - dict with None/missing title (regex-fallback synthetic) →
+        {body-sig}. Matches a JSON round that has body content.
+      - str → {body-sig} via the existing ``_finding_signature``
+        heuristic (back-compat for callers that still pass strings).
+
+    title-sig: full normalized title (no truncation — titles are short
+    by contract so equality on the full string is what we want).
+    body-sig: 80-char lowercased whitespace-collapsed prefix (see
+    ``_finding_signature``) — survives reviewer paraphrasing of tails.
     """
     if isinstance(item, dict):
+        sigs: set[str] = set()
         title = item.get("title")
-        if title:
-            return re.sub(r'\s+', ' ', title.strip().lower())
-        body = item.get("body") or ""
-        return _finding_signature(body)
-    return _finding_signature(item)
+        if isinstance(title, str) and title.strip():
+            sigs.add(re.sub(r'\s+', ' ', title.strip().lower()))
+        body = item.get("body")
+        if isinstance(body, str) and body.strip():
+            sigs.add(_finding_signature(body))
+        if not sigs:
+            # Defensive: a finding with neither usable title nor body
+            # can't participate in oscillation detection. Return a
+            # synthetic sig so the frozenset is never empty (callers
+            # assume non-empty and use set-intersection semantics).
+            sigs.add("__empty__")
+        return frozenset(sigs)
+    return frozenset({_finding_signature(item)})
 
 
 def _findings_overlap(current, prior) -> list[str]:
@@ -340,13 +375,18 @@ def _findings_overlap(current, prior) -> list[str]:
     the first occurrence so output order is stable and echoes the
     reviewer's own ordering.
     """
-    prior_sigs = {_signature_for_finding(t) for t in prior}
+    # Flatten prior sig-sets into one lookup set. A current finding
+    # matches when ANY of its signatures appears in the prior set —
+    # absorbs the JSON↔regex-fallback asymmetry when rounds mix.
+    prior_sigs: set[str] = set()
+    for p in prior:
+        prior_sigs.update(_signature_for_finding(p))
     repeating: list[str] = []
-    seen: set[str] = set()
+    seen_keys: set[frozenset[str]] = set()
     for item in current:
-        sig = _signature_for_finding(item)
-        if sig in prior_sigs and sig not in seen:
-            seen.add(sig)
+        sigs = _signature_for_finding(item)
+        if sigs & prior_sigs and sigs not in seen_keys:
+            seen_keys.add(sigs)
             if isinstance(item, dict):
                 repeating.append(item.get("body") or item.get("title") or "")
             else:

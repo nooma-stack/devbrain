@@ -11,6 +11,7 @@ from orchestrator import (
     _count_warning,
     _extract_blocking_items,
     _extract_warning_items,
+    _findings_overlap,
     _parse_findings_json,
     _signature_for_finding,
 )
@@ -150,27 +151,86 @@ def test_case_insensitive_severity():
     assert _count_blocking(text) == 1
 
 
-# 10. Signature uses title field, not body truncation
-def test_signature_uses_title_field():
+# 10. Signature set includes title and body so JSON↔regex-fallback mix still matches
+def test_signature_includes_title_and_body_for_cross_path_matching():
+    """Post-PR #34 contract: `_signature_for_finding` returns a
+    FROZENSET of 1 or 2 signatures (title + body) so two findings
+    match when they share ANY signature — not when their full sets
+    are equal. Solves the JSON-round-vs-regex-round asymmetry flagged
+    in the arch review of job a51efc39."""
     finding = {
         "severity": "WARNING",
         "title": "off-by-one",
-        "body": (
-            "A long rambling explanation of the off-by-one error "
-            "that sprawls across multiple lines and reviewer "
-            "paraphrases between rounds "
-        ) * 3,
+        "body": "A long rambling explanation of the off-by-one error "
+                "that sprawls across multiple lines",
     }
-    assert _signature_for_finding(finding) == "off-by-one"
+    sigs = _signature_for_finding(finding)
+    assert isinstance(sigs, frozenset)
+    assert "off-by-one" in sigs
+    # Body signature is also present (80-char lowercased prefix).
+    assert any("off-by-one error" in s for s in sigs)
 
-    # Same title, different body → same signature (the point of the contract).
+    # Same title, different body → sig SETS overlap (share title) but
+    # are not equal (bodies differ). Overlap is the matching contract.
     finding2 = dict(finding)
-    finding2["body"] = "completely different wording"
-    assert _signature_for_finding(finding) == _signature_for_finding(finding2)
+    finding2["body"] = "completely different wording here"
+    sigs2 = _signature_for_finding(finding2)
+    assert sigs & sigs2  # non-empty intersection — will match in oscillation
+    assert sigs != sigs2  # not identical — body sigs differ
 
-    # Dict without title falls back to body-based signature.
+    # Dict with None title → only body-sig in the set.
     finding3 = {"severity": "WARNING", "title": None, "body": "Just A Body"}
-    assert _signature_for_finding(finding3) == "just a body"
+    sigs3 = _signature_for_finding(finding3)
+    assert sigs3 == frozenset({"just a body"})
 
-    # Plain string still works (back-compat).
-    assert _signature_for_finding("Just A Body") == "just a body"
+    # Plain string → single body-sig, back-compat.
+    assert _signature_for_finding("Just A Body") == frozenset({"just a body"})
+
+
+# 11. _findings_overlap matches across JSON↔regex-fallback round boundary
+def test_findings_overlap_bridges_json_and_regex_rounds():
+    """Round 1 emits JSON with title+body; round 2 reviewer ignores
+    the contract and falls back to regex (title=None, body=extracted
+    text). If both rounds reference the same issue via shared body
+    prefix, the guardrail should still see the repeat. This is the
+    arch-review WARNING on job a51efc39 — before fix, these two
+    signature paths were incomparable and the repeat was missed."""
+    # Shared body prefix long enough for the 80-char body-sig to match.
+    shared_body = (
+        "The increment at line 42 skips the last element of the array, "
+        "causing an off-by-one error in the iterator consumer downstream"
+    )
+    prior_json = [{
+        "severity": "WARNING", "title": "off-by-one",
+        "body": shared_body,
+    }]
+    # Same issue, but a regex-fallback synthetic dict (title=None,
+    # body carries the same extracted text).
+    current_fallback = [{
+        "severity": "WARNING", "title": None,
+        "body": shared_body + " (reviewer added extra commentary)",
+    }]
+    matches = _findings_overlap(current_fallback, prior_json)
+    assert len(matches) == 1
+
+
+# 12. Non-string title/body dropped with partial-parse flag
+def test_non_string_title_or_body_is_dropped():
+    """Addresses the security-review NIT on job a51efc39: a reviewer
+    emitting `{"title": {...}}` or `{"body": 42}` used to pass
+    validation and then crash `_signature_for_finding`'s `.strip()`
+    deeper in the pipeline. Parser now drops these findings at
+    normalization time, keeps the valid ones, and flags the artifact
+    via the partial-parse error detail."""
+    text = _wrap(_json.dumps({"findings": [
+        {"severity": "WARNING", "title": {"not": "a string"},
+         "body": "has a body"},
+        {"severity": "WARNING", "title": "ok", "body": 42},
+        {"severity": "WARNING", "title": "real", "body": "real-body"},
+    ]}))
+    findings, err = _parse_findings_json(text)
+    assert findings is not None
+    assert len(findings) == 1
+    assert findings[0]["title"] == "real"
+    assert err is not None
+    assert "non_string_title" in err or "non_string_body" in err
