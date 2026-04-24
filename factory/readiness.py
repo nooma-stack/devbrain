@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ReadinessIssue:
     """A single concrete reason the factory is not ready."""
-    kind: str                    # "head_not_main" | "dirty_working_tree" | "orphan_lock"
+    kind: str                    # "head_not_main" | "behind_origin" | "dirty_working_tree" | "orphan_lock"
     message: str                 # short human-readable summary
     auto_repairable: bool = True
     details: dict = field(default_factory=dict)
@@ -76,9 +76,17 @@ class FactoryReadiness:
     # ─── Public API ───────────────────────────────────────────────────
 
     def verify(self) -> list[ReadinessIssue]:
-        """Return the current list of readiness issues (empty = ready)."""
+        """Return the current list of readiness issues (empty = ready).
+
+        Ordering: head_not_main → behind_origin → dirty_working_tree →
+        orphan_lock. This reads as "checkout main → sync with origin →
+        reset working tree → release orphan locks", which is also the
+        logical order of the repair actions.
+        """
         issues: list[ReadinessIssue] = []
-        issues.extend(self._check_git_state())
+        issues.extend(self._check_head_on_base())
+        issues.extend(self._check_behind_origin())
+        issues.extend(self._check_dirty_working_tree())
         issues.extend(self._check_orphan_locks())
         return issues
 
@@ -93,6 +101,8 @@ class FactoryReadiness:
             try:
                 if issue.kind == "head_not_main":
                     self._repair_head()
+                elif issue.kind == "behind_origin":
+                    self._repair_working_tree()
                 elif issue.kind == "dirty_working_tree":
                     self._repair_working_tree()
                 elif issue.kind == "orphan_lock":
@@ -103,11 +113,17 @@ class FactoryReadiness:
                 logger.warning("Repair of %s failed: %s", issue.kind, exc)
 
     def ensure_ready(self) -> list[ReadinessIssue]:
-        """Verify → repair → verify. Returns the list of issues that
-        could not be auto-repaired (empty list means the factory is
-        ready). Side effect: persists or clears the not_ready flag
-        in devbrain.factory_runtime_state to match the final state.
+        """Fetch-origin → verify → repair → verify. Returns the list of
+        issues that could not be auto-repaired (empty list means the
+        factory is ready). Side effect: persists or clears the not_ready
+        flag in devbrain.factory_runtime_state to match the final state.
+
+        The fetch is best-effort and informational — its return value is
+        deliberately ignored so an offline factory-host still runs local
+        code. The behind_origin check that follows will simply report 0
+        commits behind if the fetch couldn't refresh origin refs.
         """
+        self._fetch_origin()
         issues = self.verify()
         if not issues:
             self._clear_flag()
@@ -167,31 +183,55 @@ class FactoryReadiness:
 
     # ─── Checks ───────────────────────────────────────────────────────
 
-    def _check_git_state(self) -> list[ReadinessIssue]:
-        issues: list[ReadinessIssue] = []
-
-        # HEAD must be on base_branch (usually main).
+    def _check_head_on_base(self) -> list[ReadinessIssue]:
         head = self._run_git(["rev-parse", "--abbrev-ref", "HEAD"])
         if head is not None and head != self.base_branch:
-            issues.append(ReadinessIssue(
+            return [ReadinessIssue(
                 kind="head_not_main",
                 message=f"HEAD is on '{head}' (expected '{self.base_branch}')",
                 details={"current_head": head, "expected": self.base_branch},
-            ))
+            )]
+        return []
 
+    def _check_behind_origin(self) -> list[ReadinessIssue]:
+        """Emit a behind_origin issue if HEAD is behind origin/<base_branch>.
+        Fail-safe: any parse error or git failure returns [] (no false
+        alarm). Runs AFTER _fetch_origin() at the ensure_ready() entry
+        point so the comparison is against freshly-fetched origin refs.
+        """
+        out = self._run_git(
+            ["rev-list", "--count", f"HEAD..origin/{self.base_branch}"],
+            allow_fail=True,
+        )
+        if out is None:
+            return []
+        try:
+            count = int(out.strip())
+        except ValueError:
+            return []
+        if count <= 0:
+            return []
+        return [ReadinessIssue(
+            kind="behind_origin",
+            message=f"HEAD is {count} commit(s) behind origin/{self.base_branch}",
+            details={"commits_behind": count},
+        )]
+
+    def _check_dirty_working_tree(self) -> list[ReadinessIssue]:
         # Working tree must be clean (no uncommitted modifications, no
         # untracked files). We cap entries in the reason payload so a
         # very dirty tree doesn't explode the metadata blob.
         porcelain = self._run_git(["status", "--porcelain"])
-        if porcelain:
-            lines = [ln for ln in porcelain.split("\n") if ln.strip()]
-            if lines:
-                issues.append(ReadinessIssue(
-                    kind="dirty_working_tree",
-                    message=f"Working tree has {len(lines)} dirty/untracked entries",
-                    details={"entries": lines[:20], "truncated": len(lines) > 20},
-                ))
-        return issues
+        if not porcelain:
+            return []
+        lines = [ln for ln in porcelain.split("\n") if ln.strip()]
+        if not lines:
+            return []
+        return [ReadinessIssue(
+            kind="dirty_working_tree",
+            message=f"Working tree has {len(lines)} dirty/untracked entries",
+            details={"entries": lines[:20], "truncated": len(lines) > 20},
+        )]
 
     def _check_orphan_locks(self) -> list[ReadinessIssue]:
         """File locks whose owning job is in a terminal state and should
@@ -217,6 +257,40 @@ class FactoryReadiness:
             message=f"{len(rows)} file lock(s) held by terminal jobs",
             details={"count": len(rows), "sample": sample, "truncated": len(rows) >= 50},
         )]
+
+    # ─── Sync ─────────────────────────────────────────────────────────
+
+    def _fetch_origin(self) -> bool:
+        """Best-effort `git fetch origin <base_branch>` at the start of
+        ensure_ready(). Returns True on success, False on any failure
+        (timeout, git missing, non-zero exit). NEVER raises and NEVER
+        emits a readiness issue — an offline factory-host must still be
+        able to run local code. The subsequent behind_origin check will
+        simply report 0 commits behind if origin couldn't be refreshed.
+        """
+        try:
+            result = subprocess.run(
+                ["git", "fetch", "origin", self.base_branch],
+                cwd=self.project_root,
+                capture_output=True,
+                timeout=30,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning(
+                "git fetch origin %s failed (exception): %s",
+                self.base_branch, exc,
+            )
+            return False
+        if result.returncode != 0:
+            logger.warning(
+                "git fetch origin %s returned %d: %s",
+                self.base_branch,
+                result.returncode,
+                result.stderr.decode("utf-8", "replace").strip(),
+            )
+            return False
+        logger.info("Fetched origin/%s", self.base_branch)
+        return True
 
     # ─── Repair actions ───────────────────────────────────────────────
 
