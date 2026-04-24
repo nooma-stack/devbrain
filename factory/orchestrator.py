@@ -117,14 +117,21 @@ def _parse_findings_json(text: str) -> tuple[list[dict] | None, str | None]:
         severity was dropped but the rest was valid) — callers should
         still flag the artifact as malformed.
 
-    Reviewers occasionally write multiple blocks (draft + final). The
-    LAST block is authoritative — re.findall returns matches in order
-    and we take [-1].
+    Exactly one ``` ```json findings ``` block is required. Two or more
+    blocks are rejected with ``multiple_findings_blocks:N`` so the
+    regex fallback fires and the artifact is flagged malformed (PR #36).
+    A prior "last block wins" heuristic made the pipeline vulnerable
+    to diff-echo attacks — a reviewer emitting real findings could be
+    silenced by echoing diff context that happened to contain another
+    ``` ```json findings ``` fence further down the output. Strict
+    single-block contract + fallback eliminates that class of bug.
     """
     matches = _FINDINGS_FENCE_RE.findall(text)
-    if not matches:
+    if len(matches) == 0:
         return (None, "no_findings_block")
-    raw = matches[-1]
+    if len(matches) > 1:
+        return (None, f"multiple_findings_blocks:{len(matches)}")
+    raw = matches[0]
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as e:
@@ -1281,7 +1288,7 @@ If this is a re-review round, explicitly state which prior findings are RESOLVED
 
 ## Required output format
 
-After your prose review, end your response with a fenced JSON findings block. The pipeline reads this block to count BLOCKING/WARNING/NIT findings; missing or malformed JSON triggers a regex fallback and flags the artifact as malformed. Always include the block, even when there are no findings (use an empty list).
+**Emit EXACTLY ONE `` ```json findings `` block at the end of your review.** The pipeline reads this block to count BLOCKING/WARNING/NIT findings; missing, malformed, or multiple blocks trigger a regex fallback and flag the artifact as malformed. Always include the block, even when there are no findings (use an empty list). Do not draft-and-revise — edit your block in place before submitting. Do not paste diff context, examples, or quoted prior reviews that contain additional `` ```json findings `` fences; two or more blocks will be rejected with `multiple_findings_blocks:N`.
 
 ```json findings
 {{"findings": [
@@ -1386,7 +1393,7 @@ Store any security issues found in DevBrain with type="issue" and category="secu
 
 ## Required output format
 
-After your prose review, end your response with a fenced JSON findings block. The pipeline reads this block to count BLOCKING/WARNING/NIT findings; missing or malformed JSON triggers a regex fallback and flags the artifact as malformed. Always include the block, even when there are no findings (use an empty list).
+**Emit EXACTLY ONE `` ```json findings `` block at the end of your review.** The pipeline reads this block to count BLOCKING/WARNING/NIT findings; missing, malformed, or multiple blocks trigger a regex fallback and flag the artifact as malformed. Always include the block, even when there are no findings (use an empty list). Do not draft-and-revise — edit your block in place before submitting. Do not paste diff context, examples, or quoted prior reviews that contain additional `` ```json findings `` fences; two or more blocks will be rejected with `multiple_findings_blocks:N`.
 
 ```json findings
 {{"findings": [
