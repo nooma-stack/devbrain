@@ -128,6 +128,50 @@ def test_fetch_timeout_does_not_raise_or_emit_issue(
     ), f"expected a fetch-related WARNING, got: {[r.message for r in caplog.records]}"
 
 
+# ─── 2b. Fetch non-zero returncode (auth/DNS/missing-remote) ────────────
+# The more common offline failure mode than TimeoutExpired: git returns
+# a non-zero status (fatal: unable to access, DNS, auth rejection, etc.)
+# rather than raising. Must log + preserve readiness semantics same as
+# the timeout case — no issue emitted, local code still runs.
+
+def test_fetch_non_zero_returncode_logs_but_does_not_emit_issue(
+    readiness, monkeypatch, caplog,
+):
+    """Fetch returns non-zero with stderr (auth failure, DNS, missing
+    remote). ensure_ready() must NOT raise, must NOT emit a readiness
+    issue for the fetch failure, and must log a WARNING including the
+    git stderr so the operator can diagnose."""
+    caplog.set_level(logging.WARNING, logger="readiness")
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] == ["git", "fetch"]:
+            return _FakeCompleted(
+                returncode=128,
+                stdout=b"",
+                stderr=b"fatal: unable to access 'https://example/': DNS lookup failed",
+            )
+        return _default_git_response(cmd)
+
+    monkeypatch.setattr(readiness_module.subprocess, "run", fake_run)
+
+    remaining = readiness.ensure_ready()
+
+    assert remaining == []
+    # WARNING log should include the stderr tail so diagnosis is possible.
+    fetch_warnings = [
+        rec for rec in caplog.records
+        if "fetch" in rec.message.lower()
+    ]
+    assert fetch_warnings, (
+        f"expected a fetch-related WARNING; got: "
+        f"{[r.message for r in caplog.records]}"
+    )
+    assert any(
+        "DNS lookup failed" in rec.message or "unable to access" in rec.message
+        for rec in fetch_warnings
+    ), f"expected stderr detail in WARNING; got: {[r.message for r in fetch_warnings]}"
+
+
 # ─── 3. behind_origin emitted when HEAD is behind ───────────────────────
 
 def test_behind_origin_issue_emitted_when_count_positive(
@@ -165,6 +209,57 @@ def test_up_to_date_emits_no_behind_origin_issue(readiness, monkeypatch):
 
     assert all(i.kind != "behind_origin" for i in issues), (
         f"expected no behind_origin issue; got: {[i.kind for i in issues]}"
+    )
+
+
+# ─── 4b. behind_origin fail-safe branches ───────────────────────────────
+# `_check_behind_origin` has two explicit defensive branches that return
+# [] rather than emit a false-alarm issue: (a) rev-list fails with a
+# non-zero exit (allow_fail=True → _run_git returns None), (b) rev-list
+# returns non-numeric stdout (int() raises ValueError). The plan called
+# these out as load-bearing fail-safe semantics — lock them in.
+
+def test_behind_origin_fail_safe_when_rev_list_fails(readiness, monkeypatch):
+    """rev-list returns a non-zero status (e.g. fresh clone with no
+    origin/<base> ref yet) → _run_git(allow_fail=True) returns None →
+    _check_behind_origin returns [] (no false alarm)."""
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["git", "rev-list", "--count"]:
+            return _FakeCompleted(
+                returncode=128,
+                stdout="",
+                stderr="fatal: ambiguous argument 'HEAD..origin/main'",
+            )
+        return _default_git_response(cmd)
+
+    monkeypatch.setattr(readiness_module.subprocess, "run", fake_run)
+
+    issues = readiness.verify()
+
+    assert all(i.kind != "behind_origin" for i in issues), (
+        f"rev-list failure must not emit behind_origin; got: "
+        f"{[i.kind for i in issues]}"
+    )
+
+
+def test_behind_origin_fail_safe_on_non_numeric_output(readiness, monkeypatch):
+    """rev-list returns non-numeric stdout (corrupt / unexpected output)
+    → int() raises ValueError → _check_behind_origin returns []
+    (no false alarm)."""
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["git", "rev-list", "--count"]:
+            return _FakeCompleted(
+                returncode=0, stdout="not-a-number\n", stderr="",
+            )
+        return _default_git_response(cmd)
+
+    monkeypatch.setattr(readiness_module.subprocess, "run", fake_run)
+
+    issues = readiness.verify()
+
+    assert all(i.kind != "behind_origin" for i in issues), (
+        f"non-numeric rev-list output must not emit behind_origin; got: "
+        f"{[i.kind for i in issues]}"
     )
 
 
