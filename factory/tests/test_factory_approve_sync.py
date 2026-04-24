@@ -261,3 +261,49 @@ def test_push_fail_after_sync_preserves_existing_behavior(
     assert len(fetch_calls) == 1
     assert len(merge_calls) == 1
     assert len(push_calls) == 1
+
+
+# ─── 5. Merge subprocess exception: must not silently fall through to push
+#
+# Addresses the PR #33 arch-review WARNING: when `subprocess.run` raises
+# (TimeoutExpired, OSError) on the merge call, fetch already confirmed
+# origin is ahead — pushing anyway would silently advance to stale tips
+# and the existing push-swallow would mark the job APPROVED with no
+# diagnostic. The fix funnels the exception into the same bail-out path
+# as a non-zero returncode.
+
+def test_merge_subprocess_exception_reverts_and_records_error(
+    orch, db, monkeypatch,
+):
+    """Regression for the merge-exception silent-fallthrough bug.
+    If `git merge --ff-only` raises after fetch confirmed origin is
+    ahead, the job must stay at READY_FOR_APPROVAL with
+    approve_sync_error set and push must NOT run."""
+    branch = "feature/approve-sync-merge-exception"
+    job = _walk_to_ready(
+        db, f"{TEST_TITLE_PREFIX}merge_exception", branch_name=branch,
+    )
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[:2] == ["git", "fetch"]:
+            return _FakeCompleted(returncode=0)
+        if cmd[:3] == ["git", "merge", "--ff-only"]:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=30)
+        # push — must NOT be reached
+        return _FakeCompleted(returncode=0)
+
+    monkeypatch.setattr(orch_mod.subprocess, "run", fake_run)
+
+    result = orch.approve_job(job.id)
+
+    assert result.status == JobStatus.READY_FOR_APPROVAL, (
+        "merge subprocess exception must leave job at READY_FOR_APPROVAL"
+    )
+    assert "approve_sync_error" in result.metadata
+    assert "merge subprocess failed" in result.metadata["approve_sync_error"]
+    push_calls = [c for c in calls if c[:3] == ["git", "push", "-u"]]
+    assert push_calls == [], (
+        f"push must not run when merge subprocess raised; got: {push_calls}"
+    )

@@ -1376,35 +1376,47 @@ IMPORTANT: Fix ONLY the listed findings. Do not expand scope. Do not "improve" s
 
             if fetch_result is not None and fetch_result.returncode == 0:
                 # Fetch succeeded — origin has the branch. Try to ff-merge.
-                merge_result = None
+                # Both branches below funnel into `merge_error` so the
+                # subprocess-raised case (TimeoutExpired, OSError) also
+                # bails out instead of silently falling through to push
+                # from a worktree fetch already told us is behind origin.
+                merge_error: str | None = None
                 try:
                     merge_result = subprocess.run(
                         ["git", "merge", "--ff-only",
                          f"origin/{job.branch_name}"],
                         cwd=project_root, capture_output=True, timeout=30,
                     )
+                    if merge_result.returncode != 0:
+                        combined = (
+                            (merge_result.stderr or b"")
+                            + (merge_result.stdout or b"")
+                        )
+                        merge_error = (
+                            combined.decode("utf-8", errors="replace").strip()
+                        )[-2048:] or "(no git output)"
                 except Exception as e:
-                    logger.warning("Pre-push ff-merge failed to spawn: %s", e)
-
-                if merge_result is not None and merge_result.returncode != 0:
-                    # Divergent history — refuse to advance. Record the
-                    # git output so the human can see exactly what went
-                    # wrong, leave status at READY_FOR_APPROVAL, and bail.
-                    combined = (
-                        (merge_result.stderr or b"")
-                        + (merge_result.stdout or b"")
+                    # Fetch already confirmed origin is ahead; pushing
+                    # from this worktree now would silently advance to
+                    # stale tips. Record and bail — same contract as the
+                    # non-zero returncode branch above.
+                    merge_error = f"merge subprocess failed: {e}"
+                    logger.warning(
+                        "Pre-push ff-merge failed to spawn: %s", e
                     )
-                    error_detail = (
-                        combined.decode("utf-8", errors="replace").strip()
-                    )[-2048:] or "(no git output)"
+
+                if merge_error is not None:
+                    # Divergent history OR merge subprocess died — either
+                    # way, leave status at READY_FOR_APPROVAL so a human
+                    # can inspect and decide.
                     self.db.update_metadata(
                         job.id,
-                        {"approve_sync_error": error_detail},
+                        {"approve_sync_error": merge_error},
                     )
                     logger.warning(
                         "Approve-sync ff-only failed for job %s: %s",
                         job.id[:8],
-                        error_detail.splitlines()[0] if error_detail else "",
+                        merge_error.splitlines()[0],
                     )
                     return self.db.get_job(job.id)
             # Else: fetch failed (origin has no branch yet, network, auth
