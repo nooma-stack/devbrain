@@ -1,0 +1,319 @@
+"""Tests for factory readiness: fetch-origin + behind_origin detection.
+
+These tests cover the auto-pull behavior added so the factory-host
+checkout is synced to origin/<base_branch> before every job runs. The
+motivating incident: factory job a51efc39 (PR #34) ran with
+orchestrator.py at commit d2593c9 because no one had pulled; the
+updated parser it was testing was never actually executed.
+
+Pattern: stub `readiness.subprocess.run` via monkeypatch with a
+_FakeCompleted helper, and mock _check_orphan_locks to return [] so
+the dev DB's file_locks state can't pollute assertions. No real git.
+Autouse cleanup handles any factory_runtime_state rows the flag-
+persistence path writes.
+"""
+from __future__ import annotations
+
+import logging
+import subprocess
+
+import pytest
+
+import readiness as readiness_module
+from readiness import FactoryReadiness, ReadinessIssue
+from state_machine import FactoryDB
+from config import DATABASE_URL
+
+TEST_PROJECT_ROOT = "/tmp/readiness_test_root"
+
+
+@pytest.fixture
+def db():
+    return FactoryDB(DATABASE_URL)
+
+
+@pytest.fixture(autouse=True)
+def cleanup(db):
+    """Clear the not_ready flag row before and after each test so flag
+    persistence from one test can't leak into the next."""
+    yield
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM devbrain.factory_runtime_state WHERE key = 'not_ready'"
+        )
+        conn.commit()
+
+
+@pytest.fixture
+def readiness(db, monkeypatch):
+    """FactoryReadiness with _check_orphan_locks stubbed to []. Tests
+    that need a custom base_branch build their own instance."""
+    r = FactoryReadiness(db, TEST_PROJECT_ROOT)
+    monkeypatch.setattr(r, "_check_orphan_locks", lambda: [])
+    return r
+
+
+class _FakeCompleted:
+    """Mirror the _FakeCompleted helper in test_factory_approve_sync.py.
+    stdout defaults to bytes because _fetch_origin calls subprocess.run
+    WITHOUT text=True, while _run_git uses text=True. Tests decide which
+    form to return based on the command dispatched in the stub.
+    """
+    def __init__(self, returncode: int = 0, stdout=b"", stderr=b""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _default_git_response(cmd):
+    """Return a happy-path _FakeCompleted for the given git command.
+    Bytes for fetch (no text=True), strings for _run_git (text=True).
+    """
+    if cmd[:2] == ["git", "fetch"]:
+        return _FakeCompleted(returncode=0, stdout=b"", stderr=b"")
+    if cmd[:3] == ["git", "rev-parse", "--abbrev-ref"]:
+        return _FakeCompleted(returncode=0, stdout="main\n", stderr="")
+    if cmd[:2] == ["git", "status"]:
+        return _FakeCompleted(returncode=0, stdout="", stderr="")
+    if cmd[:3] == ["git", "rev-list", "--count"]:
+        return _FakeCompleted(returncode=0, stdout="0\n", stderr="")
+    return _FakeCompleted(returncode=0, stdout="", stderr="")
+
+
+# ─── 1. Fetch runs first ────────────────────────────────────────────────
+
+def test_fetch_is_first_subprocess_call(readiness, monkeypatch):
+    """`git fetch origin main` must be the very first subprocess call
+    ensure_ready() issues — before any verify step. This guarantees
+    the behind_origin check that follows compares against fresh refs.
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return _default_git_response(cmd)
+
+    monkeypatch.setattr(readiness_module.subprocess, "run", fake_run)
+
+    remaining = readiness.ensure_ready()
+
+    assert remaining == []
+    assert len(calls) >= 1
+    assert calls[0][:4] == ["git", "fetch", "origin", "main"]
+
+
+# ─── 2. Fetch timeout is best-effort ────────────────────────────────────
+
+def test_fetch_timeout_does_not_raise_or_emit_issue(
+    readiness, monkeypatch, caplog,
+):
+    """Offline factory-host: fetch raises TimeoutExpired. ensure_ready()
+    must NOT raise, must NOT emit a readiness issue for the fetch
+    failure, and must log a WARNING. Local code still runs.
+    """
+    caplog.set_level(logging.WARNING, logger="readiness")
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] == ["git", "fetch"]:
+            raise subprocess.TimeoutExpired(cmd=cmd, timeout=30)
+        return _default_git_response(cmd)
+
+    monkeypatch.setattr(readiness_module.subprocess, "run", fake_run)
+
+    remaining = readiness.ensure_ready()
+
+    assert remaining == []
+    assert any(
+        "fetch" in rec.message.lower() for rec in caplog.records
+    ), f"expected a fetch-related WARNING, got: {[r.message for r in caplog.records]}"
+
+
+# ─── 2b. Fetch non-zero returncode (auth/DNS/missing-remote) ────────────
+# The more common offline failure mode than TimeoutExpired: git returns
+# a non-zero status (fatal: unable to access, DNS, auth rejection, etc.)
+# rather than raising. Must log + preserve readiness semantics same as
+# the timeout case — no issue emitted, local code still runs.
+
+def test_fetch_non_zero_returncode_logs_but_does_not_emit_issue(
+    readiness, monkeypatch, caplog,
+):
+    """Fetch returns non-zero with stderr (auth failure, DNS, missing
+    remote). ensure_ready() must NOT raise, must NOT emit a readiness
+    issue for the fetch failure, and must log a WARNING including the
+    git stderr so the operator can diagnose."""
+    caplog.set_level(logging.WARNING, logger="readiness")
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] == ["git", "fetch"]:
+            return _FakeCompleted(
+                returncode=128,
+                stdout=b"",
+                stderr=b"fatal: unable to access 'https://example/': DNS lookup failed",
+            )
+        return _default_git_response(cmd)
+
+    monkeypatch.setattr(readiness_module.subprocess, "run", fake_run)
+
+    remaining = readiness.ensure_ready()
+
+    assert remaining == []
+    # WARNING log should include the stderr tail so diagnosis is possible.
+    fetch_warnings = [
+        rec for rec in caplog.records
+        if "fetch" in rec.message.lower()
+    ]
+    assert fetch_warnings, (
+        f"expected a fetch-related WARNING; got: "
+        f"{[r.message for r in caplog.records]}"
+    )
+    assert any(
+        "DNS lookup failed" in rec.message or "unable to access" in rec.message
+        for rec in fetch_warnings
+    ), f"expected stderr detail in WARNING; got: {[r.message for r in fetch_warnings]}"
+
+
+# ─── 3. behind_origin emitted when HEAD is behind ───────────────────────
+
+def test_behind_origin_issue_emitted_when_count_positive(
+    readiness, monkeypatch,
+):
+    """rev-list --count returns a positive number → behind_origin issue
+    with commits_behind detail and auto_repairable=True.
+    """
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["git", "rev-list", "--count"]:
+            return _FakeCompleted(returncode=0, stdout="3\n", stderr="")
+        return _default_git_response(cmd)
+
+    monkeypatch.setattr(readiness_module.subprocess, "run", fake_run)
+
+    issues = readiness.verify()
+    kinds = [i.kind for i in issues]
+
+    assert "behind_origin" in kinds, f"expected behind_origin; got: {kinds}"
+    bo = next(i for i in issues if i.kind == "behind_origin")
+    assert bo.details == {"commits_behind": 3}
+    assert bo.auto_repairable is True
+
+
+# ─── 4. Up-to-date emits no behind_origin ───────────────────────────────
+
+def test_up_to_date_emits_no_behind_origin_issue(readiness, monkeypatch):
+    """rev-list --count returns 0 → no behind_origin issue."""
+    def fake_run(cmd, **kwargs):
+        return _default_git_response(cmd)
+
+    monkeypatch.setattr(readiness_module.subprocess, "run", fake_run)
+
+    issues = readiness.verify()
+
+    assert all(i.kind != "behind_origin" for i in issues), (
+        f"expected no behind_origin issue; got: {[i.kind for i in issues]}"
+    )
+
+
+# ─── 4b. behind_origin fail-safe branches ───────────────────────────────
+# `_check_behind_origin` has two explicit defensive branches that return
+# [] rather than emit a false-alarm issue: (a) rev-list fails with a
+# non-zero exit (allow_fail=True → _run_git returns None), (b) rev-list
+# returns non-numeric stdout (int() raises ValueError). The plan called
+# these out as load-bearing fail-safe semantics — lock them in.
+
+def test_behind_origin_fail_safe_when_rev_list_fails(readiness, monkeypatch):
+    """rev-list returns a non-zero status (e.g. fresh clone with no
+    origin/<base> ref yet) → _run_git(allow_fail=True) returns None →
+    _check_behind_origin returns [] (no false alarm)."""
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["git", "rev-list", "--count"]:
+            return _FakeCompleted(
+                returncode=128,
+                stdout="",
+                stderr="fatal: ambiguous argument 'HEAD..origin/main'",
+            )
+        return _default_git_response(cmd)
+
+    monkeypatch.setattr(readiness_module.subprocess, "run", fake_run)
+
+    issues = readiness.verify()
+
+    assert all(i.kind != "behind_origin" for i in issues), (
+        f"rev-list failure must not emit behind_origin; got: "
+        f"{[i.kind for i in issues]}"
+    )
+
+
+def test_behind_origin_fail_safe_on_non_numeric_output(readiness, monkeypatch):
+    """rev-list returns non-numeric stdout (corrupt / unexpected output)
+    → int() raises ValueError → _check_behind_origin returns []
+    (no false alarm)."""
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["git", "rev-list", "--count"]:
+            return _FakeCompleted(
+                returncode=0, stdout="not-a-number\n", stderr="",
+            )
+        return _default_git_response(cmd)
+
+    monkeypatch.setattr(readiness_module.subprocess, "run", fake_run)
+
+    issues = readiness.verify()
+
+    assert all(i.kind != "behind_origin" for i in issues), (
+        f"non-numeric rev-list output must not emit behind_origin; got: "
+        f"{[i.kind for i in issues]}"
+    )
+
+
+# ─── 5. behind_origin repair runs reset + clean ─────────────────────────
+
+def test_behind_origin_repair_runs_reset_and_clean(readiness, monkeypatch):
+    """attempt_repair for a behind_origin issue must run
+    `git reset --hard origin/main` + `git clean -fd` (shared primitive
+    with dirty_working_tree).
+    """
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return _default_git_response(cmd)
+
+    monkeypatch.setattr(readiness_module.subprocess, "run", fake_run)
+
+    issue = ReadinessIssue(
+        kind="behind_origin",
+        message="HEAD is 5 commit(s) behind origin/main",
+        details={"commits_behind": 5},
+    )
+    readiness.attempt_repair([issue])
+
+    reset_calls = [c for c in calls if c[:3] == ["git", "reset", "--hard"]]
+    clean_calls = [c for c in calls if c[:3] == ["git", "clean", "-fd"]]
+    assert len(reset_calls) == 1, f"expected one reset; got: {reset_calls}"
+    assert reset_calls[0][-1] == "origin/main"
+    assert len(clean_calls) == 1, f"expected one clean; got: {clean_calls}"
+
+
+# ─── 6. Configured base_branch flows through ────────────────────────────
+
+def test_fetch_uses_configured_base_branch(db, monkeypatch):
+    """A FactoryReadiness built with base_branch="develop" must fetch
+    origin/develop and compare HEAD..origin/develop — not main.
+    """
+    r = FactoryReadiness(db, TEST_PROJECT_ROOT, base_branch="develop")
+    monkeypatch.setattr(r, "_check_orphan_locks", lambda: [])
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[:3] == ["git", "rev-parse", "--abbrev-ref"]:
+            return _FakeCompleted(returncode=0, stdout="develop\n", stderr="")
+        return _default_git_response(cmd)
+
+    monkeypatch.setattr(readiness_module.subprocess, "run", fake_run)
+
+    r.ensure_ready()
+
+    fetch_calls = [c for c in calls if c[:2] == ["git", "fetch"]]
+    revlist_calls = [c for c in calls if c[:3] == ["git", "rev-list", "--count"]]
+    assert fetch_calls[0] == ["git", "fetch", "origin", "develop"]
+    assert revlist_calls[0][-1] == "HEAD..origin/develop"
