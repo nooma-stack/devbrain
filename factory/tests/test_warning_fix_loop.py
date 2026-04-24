@@ -9,6 +9,8 @@ We exercise it end-to-end by stubbing `run_cli` (no actual claude call)
 and `subprocess.run` (no `git diff main...HEAD`) and reading back the
 post-review job status.
 """
+import json as _json
+
 import pytest
 
 import orchestrator as orch_mod
@@ -17,6 +19,18 @@ from state_machine import FactoryDB, JobStatus
 from config import DATABASE_URL
 
 TEST_TITLE_PREFIX = "warning_fix_loop_test_"
+
+
+def _with_json(prose: str, findings: list[dict]) -> str:
+    """Append a JSON findings block to a prose review body. Used to
+    exercise the JSON-path of the post-PR-21b1b68a parser; the prose
+    side stays in place so fallback regex counts would still match
+    the same numbers (parity check for the parser swap).
+    """
+    return (
+        f"{prose}\n\n```json findings\n"
+        f"{_json.dumps({'findings': findings})}\n```\n"
+    )
 
 
 @pytest.fixture
@@ -116,8 +130,12 @@ def test_blocking_triggers_fix_loop_regardless_of_config(orch, db, monkeypatch):
 
     _stub_review_env(
         monkeypatch,
-        arch_stdout="1. BLOCKING: missing null check at x.py:42",
-        sec_stdout="(no findings)",
+        arch_stdout=_with_json(
+            "1. BLOCKING: missing null check at x.py:42",
+            [{"severity": "BLOCKING", "title": "null-check",
+              "body": "missing null check at x.py:42"}],
+        ),
+        sec_stdout=_with_json("(no findings)", []),
     )
 
     result = orch._run_review(job)
@@ -138,11 +156,17 @@ def test_warning_triggers_fix_loop_when_flag_true(orch, db, monkeypatch):
 
     _stub_review_env(
         monkeypatch,
-        arch_stdout=(
+        arch_stdout=_with_json(
             "1. WARNING: suboptimal pattern at a.py:10\n"
-            "2. WARNING: missing docstring at b.py:5\n"
+            "2. WARNING: missing docstring at b.py:5\n",
+            [
+                {"severity": "WARNING", "title": "suboptimal-pattern",
+                 "body": "suboptimal pattern at a.py:10"},
+                {"severity": "WARNING", "title": "missing-docstring",
+                 "body": "missing docstring at b.py:5"},
+            ],
         ),
-        sec_stdout="(no findings)",
+        sec_stdout=_with_json("(no findings)", []),
     )
 
     result = orch._run_review(job)
@@ -165,11 +189,17 @@ def test_warning_skipped_when_flag_false(orch, db, monkeypatch):
 
     _stub_review_env(
         monkeypatch,
-        arch_stdout=(
+        arch_stdout=_with_json(
             "1. WARNING: suboptimal pattern at a.py:10\n"
-            "2. WARNING: missing docstring at b.py:5\n"
+            "2. WARNING: missing docstring at b.py:5\n",
+            [
+                {"severity": "WARNING", "title": "suboptimal-pattern",
+                 "body": "suboptimal pattern at a.py:10"},
+                {"severity": "WARNING", "title": "missing-docstring",
+                 "body": "missing docstring at b.py:5"},
+            ],
         ),
-        sec_stdout="(no findings)",
+        sec_stdout=_with_json("(no findings)", []),
     )
 
     result = orch._run_review(job)
@@ -178,11 +208,15 @@ def test_warning_skipped_when_flag_false(orch, db, monkeypatch):
 
 
 def test_extract_warning_items_from_review_content(orch, db):
-    """_extract_warning_items extracts individual WARNING items from
-    review-artifact content. This exercises the same extraction path
-    _run_fix uses inline when collecting prior warning findings for
-    the fix prompt (see orchestrator.py _run_fix around the
-    `latest_warning` loop).
+    """Regex-fallback canary — this case intentionally has NO JSON
+    block so the helpers exercise the PR #32 fallback path. Don't
+    add a JSON block here; that would mask a regression in the
+    fallback contract reviewers land on when they don't comply
+    with the JSON format.
+
+    Matches the same extraction path _run_fix uses inline when
+    collecting prior warning findings for the fix prompt (see
+    orchestrator.py _run_fix around the `latest_warning` loop).
     """
     from orchestrator import _extract_warning_items
 

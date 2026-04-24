@@ -100,6 +100,9 @@ def test_arch_prompt_contains_severity_cost_guidance(orch, db, monkeypatch):
     assert "each flag costs one implementer round" in arch_prompt
     assert "Err toward NIT" in arch_prompt
     assert "RESOLVED vs still BLOCKING" in arch_prompt
+    # JSON findings contract — added 2026-04-24 (PR 21b1b68a).
+    assert "## Required output format" in arch_prompt
+    assert "```json findings" in arch_prompt
 
 
 def test_security_prompt_contains_severity_cost_guidance(orch, db, monkeypatch):
@@ -116,3 +119,5 @@ def test_security_prompt_contains_severity_cost_guidance(orch, db, monkeypatch):
     assert "Err toward NIT" in sec_prompt
     assert "defense-in-depth" in sec_prompt
     assert "RESOLVED vs still BLOCKING" in sec_prompt
+    assert "## Required output format" in sec_prompt
+    assert "```json findings" in sec_prompt

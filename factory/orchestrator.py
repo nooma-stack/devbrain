@@ -90,46 +90,202 @@ def _worktree_path_for_job(job) -> str:
     return str(Path.home() / "devbrain-worktrees" / job.id)
 
 
-def _count_blocking(text: str) -> int:
-    """Count actual BLOCKING findings — look for the marker at start of line or list item."""
-    # Match patterns like "BLOCKING:", "**BLOCKING**", "1. BLOCKING:", "- BLOCKING:",
-    # and stacked combos like "**1. BLOCKING" or "- **BLOCKING**" that reviewers
-    # produce when nesting bold/list/number prefixes. {0,4} is bounded — each
-    # alternative consumes ≥1 char so there is no catastrophic backtracking.
-    pattern = r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}BLOCKING\b'
-    return len(re.findall(pattern, text, re.IGNORECASE))
+# JSON findings block — reviewers append a fenced block of the form
+#   ```json findings
+#   {"findings": [{"severity": "BLOCKING", "title": "...", "body": "...",
+#                  "file": "path/x.py", "line": 42}, ...]}
+#   ```
+# (See _run_review's "Required output format" section appended to both
+# review prompts.) The block is the addendum; the prose above it is what
+# humans read. The pipeline reads the JSON.
+_FINDINGS_FENCE_RE = re.compile(
+    r"```json\s+findings\s*\n(.*?)\n```",
+    re.DOTALL | re.IGNORECASE,
+)
+_VALID_SEVERITIES = {"BLOCKING", "WARNING", "NIT"}
+_REQUIRED_FINDING_KEYS = {"severity", "title", "body"}
 
 
-def _extract_blocking_items(text: str) -> list[str]:
-    """Extract individual BLOCKING finding texts."""
-    items = []
-    # Split on BLOCKING markers and capture the text after each
-    parts = re.split(r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}BLOCKING[:\s]*', text, flags=re.IGNORECASE)
-    for part in parts[1:]:  # Skip text before first BLOCKING
-        # Take text until next severity marker or end
-        end = re.search(r'\n\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}(?:WARNING|NIT|BLOCKING)\b', part, re.IGNORECASE)
-        item = part[:end.start()].strip() if end else part.strip()
-        if item:
-            items.append(item)
-    return items
+def _parse_findings_json(text: str) -> tuple[list[dict] | None, str | None]:
+    """Parse the reviewer's structured findings block.
+
+    Returns (findings, error):
+      - (parsed_list, None)         on success (empty list is valid)
+      - (None, "no_findings_block") if no fenced block is present
+      - (None, "<reason>")          on malformed JSON or wrong shape
+      - (filtered_list, "<reason>") on partial parse (e.g. an unknown
+        severity was dropped but the rest was valid) — callers should
+        still flag the artifact as malformed.
+
+    Reviewers occasionally write multiple blocks (draft + final). The
+    LAST block is authoritative — re.findall returns matches in order
+    and we take [-1].
+    """
+    matches = _FINDINGS_FENCE_RE.findall(text)
+    if not matches:
+        return (None, "no_findings_block")
+    raw = matches[-1]
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as e:
+        return (None, f"JSONDecodeError: {e.msg}")
+    if not isinstance(parsed, dict) or "findings" not in parsed:
+        return (None, "missing_findings_key")
+    findings = parsed["findings"]
+    if not isinstance(findings, list):
+        return (None, "findings_not_a_list")
+
+    valid: list[dict] = []
+    dropped_severities: list[str] = []
+    for item in findings:
+        if not isinstance(item, dict):
+            return (None, "finding_not_a_dict")
+        if not _REQUIRED_FINDING_KEYS.issubset(item.keys()):
+            missing = _REQUIRED_FINDING_KEYS - item.keys()
+            return (None, f"missing_keys:{sorted(missing)}")
+        sev = str(item["severity"]).upper()
+        if sev not in _VALID_SEVERITIES:
+            dropped_severities.append(item["severity"])
+            continue
+        normalized = dict(item)
+        normalized["severity"] = sev
+        normalized.setdefault("file", None)
+        normalized.setdefault("line", None)
+        valid.append(normalized)
+
+    if dropped_severities:
+        return (valid, f"invalid_severity:{dropped_severities[0]}")
+    return (valid, None)
 
 
-def _count_warning(text: str) -> int:
-    """Count actual WARNING findings — look for the marker at start of line or list item."""
-    pattern = r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}WARNING\b'
-    return len(re.findall(pattern, text, re.IGNORECASE))
+def _count_blocking(text: str, return_fallback: bool = False):
+    """Count BLOCKING findings. Prefers the JSON findings block; falls
+    back to the stacked-prefix regex on missing/malformed JSON.
+
+    When return_fallback=True, returns (count, used_fallback: bool)
+    instead of bare count. Default False keeps the scalar contract that
+    existing callers and tests rely on.
+    """
+    findings, _err = _parse_findings_json(text)
+    if findings is not None:
+        count = sum(1 for f in findings if f["severity"] == "BLOCKING")
+        used_fallback = False
+    else:
+        # Stacked-prefix tolerant, bounded {0,4} (PR #32).
+        pattern = r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}BLOCKING\b'
+        count = len(re.findall(pattern, text, re.IGNORECASE))
+        used_fallback = True
+    return (count, used_fallback) if return_fallback else count
 
 
-def _extract_warning_items(text: str) -> list[str]:
-    """Extract individual WARNING finding texts."""
-    items = []
-    parts = re.split(r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}WARNING[:\s]*', text, flags=re.IGNORECASE)
-    for part in parts[1:]:
-        end = re.search(r'\n\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}(?:BLOCKING|NIT|WARNING)\b', part, re.IGNORECASE)
-        item = part[:end.start()].strip() if end else part.strip()
-        if item:
-            items.append(item)
-    return items
+def _extract_blocking_items(text: str, return_fallback: bool = False):
+    """Return BLOCKING finding bodies as list[str].
+
+    JSON path: each finding's ``body`` field.
+    Regex fallback: the original split-on-marker behavior (PR #32).
+    Returns (items, used_fallback) when return_fallback=True.
+    """
+    findings, _err = _parse_findings_json(text)
+    if findings is not None:
+        items = [f["body"] for f in findings if f["severity"] == "BLOCKING"]
+        used_fallback = False
+    else:
+        items = []
+        parts = re.split(
+            r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}BLOCKING[:\s]*',
+            text, flags=re.IGNORECASE,
+        )
+        for part in parts[1:]:
+            end = re.search(
+                r'\n\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}(?:WARNING|NIT|BLOCKING)\b',
+                part, re.IGNORECASE,
+            )
+            item = part[:end.start()].strip() if end else part.strip()
+            if item:
+                items.append(item)
+        used_fallback = True
+    return (items, used_fallback) if return_fallback else items
+
+
+def _count_warning(text: str, return_fallback: bool = False):
+    """Count WARNING findings. Prefers the JSON findings block; falls
+    back to the stacked-prefix regex on missing/malformed JSON.
+
+    When return_fallback=True, returns (count, used_fallback: bool)
+    instead of bare count. Default False keeps the scalar contract that
+    existing callers and tests rely on.
+    """
+    findings, _err = _parse_findings_json(text)
+    if findings is not None:
+        count = sum(1 for f in findings if f["severity"] == "WARNING")
+        used_fallback = False
+    else:
+        pattern = r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}WARNING\b'
+        count = len(re.findall(pattern, text, re.IGNORECASE))
+        used_fallback = True
+    return (count, used_fallback) if return_fallback else count
+
+
+def _extract_warning_items(text: str, return_fallback: bool = False):
+    """Return WARNING finding bodies as list[str].
+
+    JSON path: each finding's ``body`` field.
+    Regex fallback: the original split-on-marker behavior (PR #32).
+    Returns (items, used_fallback) when return_fallback=True.
+    """
+    findings, _err = _parse_findings_json(text)
+    if findings is not None:
+        items = [f["body"] for f in findings if f["severity"] == "WARNING"]
+        used_fallback = False
+    else:
+        items = []
+        parts = re.split(
+            r'(?:^|\n)\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}WARNING[:\s]*',
+            text, flags=re.IGNORECASE,
+        )
+        for part in parts[1:]:
+            end = re.search(
+                r'\n\s*(?:(?:\d+\.\s*|\*\*?|-\s*)\s*){0,4}(?:BLOCKING|NIT|WARNING)\b',
+                part, re.IGNORECASE,
+            )
+            item = part[:end.start()].strip() if end else part.strip()
+            if item:
+                items.append(item)
+        used_fallback = True
+    return (items, used_fallback) if return_fallback else items
+
+
+def _extract_blocking_findings(text: str) -> list[dict]:
+    """Return BLOCKING findings as full dicts.
+
+    Used by callers that need the ``title`` field for signature
+    comparison (oscillation guardrail). On the JSON path, returns the
+    validated finding dicts as-is. On the regex fallback, synthesizes
+    minimal dicts so downstream code sees one shape:
+      {"severity": "BLOCKING", "title": None, "body": <body>,
+       "file": None, "line": None}
+    A None title signals "fall back to body-truncation signature".
+    """
+    findings, _err = _parse_findings_json(text)
+    if findings is not None:
+        return [f for f in findings if f["severity"] == "BLOCKING"]
+    return [
+        {"severity": "BLOCKING", "title": None, "body": body,
+         "file": None, "line": None}
+        for body in _extract_blocking_items(text)
+    ]
+
+
+def _extract_warning_findings(text: str) -> list[dict]:
+    """WARNING twin of ``_extract_blocking_findings``. See that docstring."""
+    findings, _err = _parse_findings_json(text)
+    if findings is not None:
+        return [f for f in findings if f["severity"] == "WARNING"]
+    return [
+        {"severity": "WARNING", "title": None, "body": body,
+         "file": None, "line": None}
+        for body in _extract_warning_items(text)
+    ]
 
 
 def _finding_signature(text: str) -> str:
@@ -145,30 +301,56 @@ def _finding_signature(text: str) -> str:
     return collapsed[:80]
 
 
-def _findings_overlap(current: list[str], prior: list[str]) -> list[str]:
-    """Return current-round finding texts whose normalized signatures
-    also appear in the prior round.
+def _signature_for_finding(item) -> str:
+    """Compute the cross-round comparison signature for a finding.
 
-    Used by the WARNING oscillation guardrail: if any signature shows
-    up in both the most recent review round and the round before it,
-    the fix loop is not converging on those items. Signatures (see
-    `_finding_signature`) are used for matching because reviewers
-    paraphrase tail context round-to-round, but the ORIGINAL current-
-    round text flows out to metadata and human notifications — a
-    lowercased-truncated signature is the wrong thing to show a human.
+    Dispatches on input shape:
+      - dict with truthy ``title`` → normalize the title (lower,
+        collapse whitespace). Titles are short by contract so we do
+        NOT truncate — equality on titles is the whole point of the
+        JSON contract, immune to reviewer paraphrasing of bodies.
+      - dict with None/empty title (regex-fallback synthetic) → fall
+        back to the body-based signature.
+      - str → existing ``_finding_signature`` behavior (back-compat
+        for callers that still pass plain strings).
+    """
+    if isinstance(item, dict):
+        title = item.get("title")
+        if title:
+            return re.sub(r'\s+', ' ', title.strip().lower())
+        body = item.get("body") or ""
+        return _finding_signature(body)
+    return _finding_signature(item)
+
+
+def _findings_overlap(current, prior) -> list[str]:
+    """Return display strings for current-round findings whose
+    signatures also appear in the prior round.
+
+    Both ``current`` and ``prior`` may be lists of finding dicts or
+    plain strings (back-compat for tests that still pass strings).
+    Matching is done via ``_signature_for_finding``; the output is
+    always a list of human-readable display strings — dict bodies
+    (falling back to titles when body is empty), or the str itself
+    for string inputs — so the wire format flowing into job metadata
+    and the notification body (``_notify_warning_oscillation``) is
+    unchanged.
 
     Duplicate current-round findings with the same signature fold to
-    the first occurrence so the output order is stable and echoes the
+    the first occurrence so output order is stable and echoes the
     reviewer's own ordering.
     """
-    prior_sigs = {_finding_signature(t) for t in prior}
+    prior_sigs = {_signature_for_finding(t) for t in prior}
     repeating: list[str] = []
     seen: set[str] = set()
     for item in current:
-        sig = _finding_signature(item)
+        sig = _signature_for_finding(item)
         if sig in prior_sigs and sig not in seen:
             seen.add(sig)
-            repeating.append(item)
+            if isinstance(item, dict):
+                repeating.append(item.get("body") or item.get("title") or "")
+            else:
+                repeating.append(item)
     return repeating
 
 
@@ -521,9 +703,10 @@ class FactoryOrchestrator:
                 prior.extend(items)
         return prior
 
-    def _get_last_round_warnings(self, job: FactoryJob) -> list[str]:
-        """Return WARNING items from the review round immediately before
-        the current one — input to the oscillation guardrail.
+    def _get_last_round_warnings(self, job: FactoryJob) -> list[dict]:
+        """Return WARNING findings (as dicts) from the review round
+        immediately before the current one — input to the oscillation
+        guardrail.
 
         Each round produces two review artifacts (arch + security), so
         the most recent round is `[-2:]` and the prior round is
@@ -532,15 +715,18 @@ class FactoryOrchestrator:
         synchronously after each reviewer completes), so we read prior
         from the DB rather than threading state through call sites.
 
-        Returns `[]` when there are fewer than 4 review artifacts —
-        i.e., this is the first round and there is no prior to compare.
+        Returns finding dicts (via ``_extract_warning_findings``) so
+        ``_signature_for_finding`` can prefer titles over body-prefix
+        truncation. Returns ``[]`` when there are fewer than 4 review
+        artifacts — i.e., this is the first round and there is no
+        prior to compare.
         """
         artifacts = self.db.get_artifacts(job.id, phase="review")
         if len(artifacts) < 4:
             return []
-        items: list[str] = []
+        items: list[dict] = []
         for art in artifacts[-4:-2]:
-            items.extend(_extract_warning_items(art["content"]))
+            items.extend(_extract_warning_findings(art["content"]))
         return items
 
     def _get_fix_history(self, job: FactoryJob) -> str:
@@ -1051,15 +1237,58 @@ Reserve BLOCKING for runtime bugs, data corruption, missing critical functionali
 
 Be precise: include file paths and line numbers.
 
-If this is a re-review round, explicitly state which prior findings are RESOLVED vs still BLOCKING."""
+If this is a re-review round, explicitly state which prior findings are RESOLVED vs still BLOCKING.
+
+## Required output format
+
+After your prose review, end your response with a fenced JSON findings block. The pipeline reads this block to count BLOCKING/WARNING/NIT findings; missing or malformed JSON triggers a regex fallback and flags the artifact as malformed. Always include the block, even when there are no findings (use an empty list).
+
+```json findings
+{{"findings": [
+  {{"severity": "BLOCKING", "title": "short one-liner key", "body": "human-readable detail", "file": "path/to/x.py", "line": 42}},
+  {{"severity": "WARNING",  "title": "another short key", "body": "detail", "file": "path/to/y.py", "line": null}},
+  {{"severity": "NIT",      "title": "style nit key", "body": "detail", "file": null, "line": null}}
+]}}
+```
+
+Field rules:
+- `severity`: one of BLOCKING, WARNING, NIT (case-insensitive on parse).
+- `title`: short distinctive one-liner — used as the cross-round equality key for oscillation detection. Keep it stable across re-reviews of the same finding.
+- `body`: full human-readable detail. Can be multi-line.
+- `file`, `line`: optional, repo-relative path / integer or null.
+
+The prose above the block is what humans read; the block is the machine contract."""
 
         logger.info("Architecture review with %s...", arch_cli)
         arch_result = run_cli(arch_cli, arch_prompt, cwd=project_root,
                               env_override={"DEVBRAIN_PROJECT": job.project_slug},
                               phase="review_arch")
 
-        blocking_count = _count_blocking(arch_result.stdout)
-        warning_count = _count_warning(arch_result.stdout)
+        # Parse the JSON findings block once for the artifact flag AND
+        # derived counts. Partial-parses (invalid_severity dropped from
+        # an otherwise-valid block) also get flagged so rot doesn't
+        # hide.
+        arch_findings, arch_parse_err = _parse_findings_json(arch_result.stdout)
+        if arch_findings is not None:
+            blocking_count = sum(1 for f in arch_findings if f["severity"] == "BLOCKING")
+            warning_count = sum(1 for f in arch_findings if f["severity"] == "WARNING")
+            arch_used_fallback = False
+        else:
+            blocking_count = _count_blocking(arch_result.stdout)
+            warning_count = _count_warning(arch_result.stdout)
+            arch_used_fallback = True
+            logger.warning(
+                "Architecture reviewer output for job %s missing/malformed "
+                "JSON findings block — falling back to regex parse: %s",
+                job.id[:8], arch_parse_err,
+            )
+
+        arch_metadata = (
+            {"reviewer_output_malformed": True, "parse_error": arch_parse_err}
+            if arch_used_fallback or arch_parse_err
+            else None
+        )
+
         self.db.store_artifact(
             job_id=job.id,
             phase="review",
@@ -1069,6 +1298,7 @@ If this is a re-review round, explicitly state which prior findings are RESOLVED
             findings_count=arch_result.stdout.count("\n- ") + arch_result.stdout.count("\n1."),
             blocking_count=blocking_count,
             warning_count=warning_count,
+            metadata=arch_metadata,
         )
 
         # Security/HIPAA review
@@ -1112,15 +1342,54 @@ Be precise: include file paths and line numbers.
 
 If this is a re-review round, explicitly state which prior findings are RESOLVED vs still BLOCKING.
 
-Store any security issues found in DevBrain with type="issue" and category="security"."""
+Store any security issues found in DevBrain with type="issue" and category="security".
+
+## Required output format
+
+After your prose review, end your response with a fenced JSON findings block. The pipeline reads this block to count BLOCKING/WARNING/NIT findings; missing or malformed JSON triggers a regex fallback and flags the artifact as malformed. Always include the block, even when there are no findings (use an empty list).
+
+```json findings
+{{"findings": [
+  {{"severity": "BLOCKING", "title": "short one-liner key", "body": "human-readable detail", "file": "path/to/x.py", "line": 42}},
+  {{"severity": "WARNING",  "title": "another short key", "body": "detail", "file": "path/to/y.py", "line": null}},
+  {{"severity": "NIT",      "title": "style nit key", "body": "detail", "file": null, "line": null}}
+]}}
+```
+
+Field rules:
+- `severity`: one of BLOCKING, WARNING, NIT (case-insensitive on parse).
+- `title`: short distinctive one-liner — used as the cross-round equality key for oscillation detection. Keep it stable across re-reviews of the same finding.
+- `body`: full human-readable detail. Can be multi-line.
+- `file`, `line`: optional, repo-relative path / integer or null.
+
+The prose above the block is what humans read; the block is the machine contract."""
 
         logger.info("Security review with %s...", sec_cli)
         sec_result = run_cli(sec_cli, sec_prompt, cwd=project_root,
                              env_override={"DEVBRAIN_PROJECT": job.project_slug},
                              phase="review_security")
 
-        sec_blocking = _count_blocking(sec_result.stdout)
-        sec_warning = _count_warning(sec_result.stdout)
+        sec_findings, sec_parse_err = _parse_findings_json(sec_result.stdout)
+        if sec_findings is not None:
+            sec_blocking = sum(1 for f in sec_findings if f["severity"] == "BLOCKING")
+            sec_warning = sum(1 for f in sec_findings if f["severity"] == "WARNING")
+            sec_used_fallback = False
+        else:
+            sec_blocking = _count_blocking(sec_result.stdout)
+            sec_warning = _count_warning(sec_result.stdout)
+            sec_used_fallback = True
+            logger.warning(
+                "Security reviewer output for job %s missing/malformed "
+                "JSON findings block — falling back to regex parse: %s",
+                job.id[:8], sec_parse_err,
+            )
+
+        sec_metadata = (
+            {"reviewer_output_malformed": True, "parse_error": sec_parse_err}
+            if sec_used_fallback or sec_parse_err
+            else None
+        )
+
         self.db.store_artifact(
             job_id=job.id,
             phase="review",
@@ -1130,6 +1399,7 @@ Store any security issues found in DevBrain with type="issue" and category="secu
             findings_count=sec_result.stdout.count("\n- ") + sec_result.stdout.count("\n1."),
             blocking_count=sec_blocking,
             warning_count=sec_warning,
+            metadata=sec_metadata,
         )
 
         total_blocking = blocking_count + sec_blocking
@@ -1149,8 +1419,8 @@ Store any security issues found in DevBrain with type="issue" and category="secu
         # we stay in the loop.
         if total_blocking == 0 and warnings_trigger and job.error_count >= 1:
             current_warnings = (
-                _extract_warning_items(arch_result.stdout)
-                + _extract_warning_items(sec_result.stdout)
+                _extract_warning_findings(arch_result.stdout)
+                + _extract_warning_findings(sec_result.stdout)
             )
             prior_warnings = self._get_last_round_warnings(job)
             repeating = _findings_overlap(current_warnings, prior_warnings)

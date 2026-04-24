@@ -13,6 +13,8 @@ normal FIX_LOOP transition. We exercise it end-to-end by stubbing
 `git diff main...HEAD`) and reading back the post-review job
 status + metadata.
 """
+import json as _json
+
 import pytest
 
 import orchestrator as orch_mod
@@ -24,6 +26,21 @@ from state_machine import FactoryDB, JobStatus
 from config import DATABASE_URL
 
 TEST_TITLE_PREFIX = "oscillation_test_"
+
+
+def _arch_text_with_warning(title: str, body: str) -> str:
+    """Build a review body with a single-WARNING JSON findings block.
+
+    The JSON block is what the post-21b1b68a parser reads — matching
+    titles round-to-round is what drives the oscillation signal.
+    Prose on the line above is there so ``_extract_warning_items``
+    still produces human-readable output for display strings.
+    """
+    prose = f"1. WARNING: {body}"
+    block = _json.dumps(
+        {"findings": [{"severity": "WARNING", "title": title, "body": body}]}
+    )
+    return f"{prose}\n\n```json findings\n{block}\n```\n"
 
 
 @pytest.fixture
@@ -182,12 +199,16 @@ def test_repeating_warnings_escalate_to_failed(orch, db, monkeypatch):
     job = _make_job_in_fix_cycle(
         db,
         f"{TEST_TITLE_PREFIX}escalate",
-        prior_arch_text="1. WARNING: missing null check at x.py:42",
+        prior_arch_text=_arch_text_with_warning(
+            "missing-null-check", "missing null check at x.py:42"
+        ),
     )
 
     _stub_review_env(
         monkeypatch,
-        arch_stdout="1. WARNING: missing null check at x.py:42",
+        arch_stdout=_arch_text_with_warning(
+            "missing-null-check", "missing null check at x.py:42"
+        ),
         sec_stdout="(no findings)",
     )
 
@@ -209,14 +230,23 @@ def test_blocking_findings_bypass_oscillation_guardrail(orch, db, monkeypatch):
     job = _make_job_in_fix_cycle(
         db,
         f"{TEST_TITLE_PREFIX}blocking_wins",
-        prior_arch_text="1. WARNING: same warning persisting at y.py:1",
+        prior_arch_text=_arch_text_with_warning(
+            "same-warning", "same warning persisting at y.py:1"
+        ),
     )
 
+    mixed_block = _json.dumps({"findings": [
+        {"severity": "WARNING", "title": "same-warning",
+         "body": "same warning persisting at y.py:1"},
+        {"severity": "BLOCKING", "title": "actual-exploit",
+         "body": "actual exploit at y.py:5"},
+    ]})
     _stub_review_env(
         monkeypatch,
         arch_stdout=(
             "1. WARNING: same warning persisting at y.py:1\n"
-            "2. BLOCKING: actual exploit at y.py:5\n"
+            "2. BLOCKING: actual exploit at y.py:5\n\n"
+            f"```json findings\n{mixed_block}\n```\n"
         ),
         sec_stdout="(no findings)",
     )
@@ -236,12 +266,17 @@ def test_different_warnings_do_not_escalate(orch, db, monkeypatch):
     job = _make_job_in_fix_cycle(
         db,
         f"{TEST_TITLE_PREFIX}different",
-        prior_arch_text="1. WARNING: old warning at a.py:1",
+        prior_arch_text=_arch_text_with_warning(
+            "old-warning-title", "old warning at a.py:1"
+        ),
     )
 
     _stub_review_env(
         monkeypatch,
-        arch_stdout="1. WARNING: brand new completely different warning at b.py:2",
+        arch_stdout=_arch_text_with_warning(
+            "brand-new-warning-title",
+            "brand new completely different warning at b.py:2",
+        ),
         sec_stdout="(no findings)",
     )
 
@@ -271,7 +306,9 @@ def test_first_round_no_prior_state_does_not_escalate(orch, db, monkeypatch):
 
     _stub_review_env(
         monkeypatch,
-        arch_stdout="1. WARNING: any warning at a.py:1",
+        arch_stdout=_arch_text_with_warning(
+            "any-warning-title", "any warning at a.py:1"
+        ),
         sec_stdout="(no findings)",
     )
 
@@ -324,7 +361,9 @@ def test_oscillation_notification_fires_with_correct_payload(orch, db, monkeypat
     job = _make_job_in_fix_cycle(
         db,
         f"{TEST_TITLE_PREFIX}notify_fires",
-        prior_arch_text="1. WARNING: Missing Null Check at X.py:42",
+        prior_arch_text=_arch_text_with_warning(
+            "missing-null-check", "Missing Null Check at X.py:42"
+        ),
     )
     with db._conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -336,7 +375,9 @@ def test_oscillation_notification_fires_with_correct_payload(orch, db, monkeypat
 
     _stub_review_env(
         monkeypatch,
-        arch_stdout="1. WARNING: Missing Null Check at X.py:42",
+        arch_stdout=_arch_text_with_warning(
+            "missing-null-check", "Missing Null Check at X.py:42"
+        ),
         sec_stdout="(no findings)",
     )
 
@@ -367,13 +408,17 @@ def test_oscillation_notification_skips_when_no_submitted_by(orch, db, monkeypat
     job = _make_job_in_fix_cycle(
         db,
         f"{TEST_TITLE_PREFIX}notify_no_submitter",
-        prior_arch_text="1. WARNING: same issue at w.py:1",
+        prior_arch_text=_arch_text_with_warning(
+            "same-issue", "same issue at w.py:1"
+        ),
     )
     assert job.submitted_by is None
 
     _stub_review_env(
         monkeypatch,
-        arch_stdout="1. WARNING: same issue at w.py:1",
+        arch_stdout=_arch_text_with_warning(
+            "same-issue", "same issue at w.py:1"
+        ),
         sec_stdout="(no findings)",
     )
 
@@ -381,3 +426,44 @@ def test_oscillation_notification_skips_when_no_submitted_by(orch, db, monkeypat
 
     assert result.status == JobStatus.FAILED
     assert _FakeRouter.sent_events == []
+
+
+# ─── Title-keyed signature (JSON path) ───────────────────────────────────
+# The regex fallback signs findings by body-prefix (see
+# _finding_signature). The JSON path — added 2026-04-24 by PR
+# 21b1b68a — signs by `title` when present. This test locks in that
+# behavior: same title, deliberately different body → same signature
+# → oscillation fires even though reviewers paraphrased the body
+# between rounds.
+
+def test_signature_uses_title_specifically(orch, db, monkeypatch):
+    """Two findings with the same title but completely different bodies
+    must fold to the same signature. Proves the JSON-path signature is
+    title-keyed, not body-keyed — the core reason for the JSON contract
+    over the bare regex: reviewer paraphrasing of bodies between rounds
+    does not break oscillation detection."""
+    monkeypatch.setattr(orch_mod, "FACTORY_FIX_LOOP_WARNINGS_TRIGGER_RETRY", True)
+
+    # Round 1: title="dup-key", original body wording.
+    job = _make_job_in_fix_cycle(
+        db,
+        f"{TEST_TITLE_PREFIX}title_keyed",
+        prior_arch_text=_arch_text_with_warning(
+            "dup-key", "Original body text round one"
+        ),
+    )
+
+    # Round 2: SAME title, COMPLETELY different body — should still match.
+    _stub_review_env(
+        monkeypatch,
+        arch_stdout=_arch_text_with_warning(
+            "dup-key",
+            "Reviewer paraphrased it entirely round two with new prose",
+        ),
+        sec_stdout="(no findings)",
+    )
+
+    result = orch._run_review(job)
+
+    assert result.status == JobStatus.FAILED
+    assert result.metadata.get("failure") == "warning_oscillation"
