@@ -1607,7 +1607,29 @@ The prose above the block is what humans read; the block is the machine contract
         )
 
         if all_passed:
-            return self.db.transition(job.id, JobStatus.READY_FOR_APPROVAL)
+            ready = self.db.transition(job.id, JobStatus.READY_FOR_APPROVAL)
+            # Fire job_ready notification — pipeline converged, awaiting approval.
+            # Symmetric counterpart to the job_started emit at the top of
+            # _run_planning. Wrapped in try/except so a notification failure
+            # cannot roll back the committed READY_FOR_APPROVAL transition.
+            try:
+                from notifications.router import NotificationRouter, NotificationEvent
+                if ready.submitted_by:
+                    router = NotificationRouter(self.db)
+                    router.send(NotificationEvent(
+                        event_type="job_ready",
+                        recipient_dev_id=ready.submitted_by,
+                        title=f"✅ Job ready for approval: {ready.title}",
+                        body=(
+                            f"Pipeline converged. Run `factory_approve {ready.id}` "
+                            f"to push the branch and merge, or inspect "
+                            f"`factory_status {ready.id}` for the diff and reviews."
+                        ),
+                        job_id=ready.id,
+                    ))
+            except Exception as e:
+                logger.warning("job_ready notification failed: %s", e)
+            return ready
         else:
             return self.db.transition(job.id, JobStatus.FIX_LOOP,
                                       metadata={"qa_failures": [r["check"] for r in results if not r["passed"]]})
