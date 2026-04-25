@@ -552,6 +552,30 @@ def setup_identity() -> str:
     return dev_id
 
 
+def install_identity(dev_id: str | None = None) -> str | None:
+    """Non-interactive default dev registration. Called from install.sh.
+
+    Resolves dev_id from the argument or `$USER`. If no row exists for the
+    dev_id, INSERTs one with empty channels; if a row already exists, leaves
+    it alone so re-running install.sh does not clobber channels or event
+    subscriptions the user may have customized. Returns the resolved dev_id,
+    or None if neither argument nor $USER was set (silent skip — unattended
+    container builds must not fail here).
+    """
+    resolved = dev_id or os.environ.get("USER", "").strip()
+    if not resolved:
+        click.echo("install-identity: no --dev-id and $USER unset; skipping")
+        return None
+
+    db = FactoryDB(DATABASE_URL)
+    if db.get_dev(resolved):
+        click.echo(f"install-identity: dev '{resolved}' already registered")
+    else:
+        db.register_dev(dev_id=resolved, full_name=None, channels=[])
+        click.echo(f"install-identity: registered default dev '{resolved}'")
+    return resolved
+
+
 def setup_projects() -> None:
     _header("Projects")
     _desc(

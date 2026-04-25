@@ -62,6 +62,17 @@ def register(dev_id, name, channels):
         click.echo(f"   • {c['type']}: {c['address']}")
 
 
+@cli.command(name="install-identity")
+@click.option(
+    "--dev-id", default=None,
+    help="Dev id to register (defaults to $USER). Skips silently if neither is set.",
+)
+def install_identity_cmd(dev_id):
+    """Non-interactive default dev registration. Called from install.sh."""
+    from setup import install_identity as _install_identity
+    _install_identity(dev_id=dev_id)
+
+
 @cli.command(name="add-channel")
 @click.option("--dev-id", default=None)
 @click.option("--channel", "channel_spec", required=True, help="TYPE:ADDRESS")

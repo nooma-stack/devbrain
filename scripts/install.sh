@@ -1315,6 +1315,19 @@ apply_migrations() {
     fi
 }
 
+register_default_dev() {
+    step "Default dev registration"
+    desc "Insert a row in devbrain.devs for \$USER so the notification router"
+    desc "can attribute jobs and stop logging 'Dev <name> not registered'"
+    desc "warnings. Safe to re-run: an existing row is left untouched so any"
+    desc "channels or event subscriptions you've customized are preserved."
+    if ! _run "Registering default dev (\$USER)" \
+        "$DEVBRAIN_HOME/bin/devbrain" install-identity; then
+        warn "install-identity failed — run './bin/devbrain register --dev-id \$USER' later"
+        return
+    fi
+}
+
 pull_models() {
     step "Ollama models"
     desc "DevBrain needs two local models:"
@@ -1779,6 +1792,7 @@ main() {
     setup_venvs
     start_postgres
     apply_migrations
+    register_default_dev
 
     # Phase 5: Heavy downloads + builds (~10-20 min unattended)
     install_ollama
