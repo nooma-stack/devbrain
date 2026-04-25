@@ -153,17 +153,22 @@ FACTORY_FIX_LOOP_WARNINGS_TRIGGER_RETRY = bool(
     _FIX_LOOP_CONFIG.get("warnings_trigger_retry", True)
 )
 
-# Per-phase --max-turns ceiling for claude subprocesses. Tuned empirically:
-# implementing needs headroom for reads/edits/test iterations; planning and
-# reviews are tighter. These defaults fire only on yaml-less installs — see
-# config/devbrain.yaml.example for the documented knobs.
+# Per-phase --max-turns ceiling for claude subprocesses. Bumped to 200
+# uniformly on 2026-04-25 after factory job f4fdab6a (P2.a unified memory
+# table) failed at the 50-turn planning ceiling — the planner had spent
+# turns on legitimate deep_search lookups that the previous, tighter
+# limits couldn't accommodate. 200 across all phases gives every agent
+# enough headroom to finish a real-sized job without being blindsided
+# mid-thought; runaway protection is still in place via the wall-clock
+# timeout in cli_executor. These defaults fire only on yaml-less
+# installs — see config/devbrain.yaml.example for the documented knobs.
 _FACTORY_MAX_TURNS_DEFAULTS = {
-    "planning": 50,
-    "implementing": 150,
-    "review_arch": 60,
-    "review_security": 60,
-    "qa": 50,
-    "fix": 100,
+    "planning": 200,
+    "implementing": 200,
+    "review_arch": 200,
+    "review_security": 200,
+    "qa": 200,
+    "fix": 200,
 }
 _FACTORY_MAX_TURNS = FACTORY_CONFIG.get("max_turns") or {}
 
