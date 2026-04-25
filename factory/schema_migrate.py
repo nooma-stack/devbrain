@@ -32,8 +32,12 @@ _LOCK_KEY = 4720250424
 def list_pending(db, migrations_dir: Path) -> list[Path]:
     """Return the migrations on disk that are not yet recorded as applied.
 
-    If the schema_migrations table itself doesn't exist yet (fresh install
-    before 009 has run), every file on disk is pending.
+    If the schema_migrations table itself doesn't exist yet (upgrade from
+    a pre-009 install), only 009_schema_migrations.sql is treated as
+    pending — applying it both creates the tracking table AND backfills
+    001-008 via its trailing ON CONFLICT INSERT, so the runner won't
+    re-execute those files (most of which don't use IF NOT EXISTS and
+    would error on an existing DB).
     """
     all_files = sorted(migrations_dir.glob("*.sql"))
     try:
@@ -41,6 +45,12 @@ def list_pending(db, migrations_dir: Path) -> list[Path]:
             cur.execute("SELECT filename FROM devbrain.schema_migrations")
             applied = {r[0] for r in cur.fetchall()}
     except psycopg2.errors.UndefinedTable:
+        bootstrap = [f for f in all_files if f.name == "009_schema_migrations.sql"]
+        if bootstrap:
+            return bootstrap
+        # 009 isn't on disk (e.g. tests with a custom migrations_dir) —
+        # fall through to "everything is pending" so the runner still
+        # works in that case.
         return all_files
     on_disk = {f.name for f in all_files}
     for missing in sorted(applied - on_disk):
@@ -105,12 +115,23 @@ def migrate(db, migrations_dir: Path | None = None, dry_run: bool = False) -> li
 
         # Re-list under the lock — closes the tiny race window where two
         # callers both observed the same pending set just before one
-        # grabbed the lock.
-        pending = list_pending(db, migrations_dir)
+        # grabbed the lock. The while loop handles the bootstrap case:
+        # when schema_migrations was missing, list_pending returns just
+        # [009], applying it creates the table and backfills 001-008, and
+        # the next pass picks up anything numbered ≥ 010.
         applied: list[str] = []
-        for path in pending:
-            apply_one(db, path)
-            applied.append(path.name)
+        applied_set: set[str] = set()
+        while True:
+            pending = [
+                p for p in list_pending(db, migrations_dir)
+                if p.name not in applied_set
+            ]
+            if not pending:
+                break
+            for path in pending:
+                apply_one(db, path)
+                applied.append(path.name)
+                applied_set.add(path.name)
         return applied
     finally:
         try:

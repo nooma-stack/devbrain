@@ -246,3 +246,89 @@ def test_migrate_after_file_deleted_logs_warning(db, tmp_path, caplog):
         "no longer on disk" in rec.message and ghost_filename in rec.message
         for rec in caplog.records
     )
+
+
+# ─── 9. migrate — end-to-end against a DB with no tracking table ─────────────
+
+
+def test_migrate_end_to_end_when_tracking_table_missing(db):
+    """Simulates the pre-009 upgrade path: drop devbrain.schema_migrations,
+    run migrate() against the real migrations/ directory, and verify the
+    table is rebuilt with 001-009 backfilled — without re-running 001
+    (which would error on the already-existing devbrain.projects table
+    since most of its CREATE TABLE statements lack IF NOT EXISTS).
+    """
+    from config import DEVBRAIN_HOME
+
+    real_migrations = DEVBRAIN_HOME / "migrations"
+    assert (real_migrations / "009_schema_migrations.sql").exists(), (
+        "test prerequisite: 009_schema_migrations.sql must exist on disk"
+    )
+
+    # Snapshot the state we'll restore on failure.
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS devbrain.schema_migrations")
+        conn.commit()
+        # Sanity check: table is gone, but devbrain.projects (from 001)
+        # still exists — that's the upgrade scenario.
+        cur.execute("SELECT to_regclass('devbrain.schema_migrations')")
+        assert cur.fetchone()[0] is None
+        cur.execute("SELECT to_regclass('devbrain.projects')")
+        assert cur.fetchone()[0] is not None
+
+    try:
+        applied = schema_migrate.migrate(db, migrations_dir=real_migrations)
+
+        # 009 must be in the applied list — it's the bootstrap file the
+        # runner ran. Anything ≥ 010 on disk also gets applied; 001-008
+        # do NOT (the bootstrap INSERT marks them).
+        assert "009_schema_migrations.sql" in applied
+        for old in (
+            "001_initial_schema.sql",
+            "002_create_vector_indexes.sql",
+            "003_cleanup_agent.sql",
+            "004_file_registry.sql",
+            "005_notifications.sql",
+            "006_blocked_state.sql",
+            "007_factory_runtime_state.sql",
+            "008_artifact_warning_count.sql",
+        ):
+            assert old not in applied, (
+                f"{old} should NOT be re-applied on upgrade — its CREATE "
+                f"TABLE statements would error on the existing schema"
+            )
+
+        # Tracking table is rebuilt and backfilled.
+        with db._conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('devbrain.schema_migrations')")
+            assert cur.fetchone()[0] is not None
+            cur.execute(
+                "SELECT filename FROM devbrain.schema_migrations "
+                "WHERE filename LIKE '00%_%.sql' ORDER BY filename"
+            )
+            recorded = [r[0] for r in cur.fetchall()]
+        for expected in (
+            "001_initial_schema.sql",
+            "002_create_vector_indexes.sql",
+            "003_cleanup_agent.sql",
+            "004_file_registry.sql",
+            "005_notifications.sql",
+            "006_blocked_state.sql",
+            "007_factory_runtime_state.sql",
+            "008_artifact_warning_count.sql",
+            "009_schema_migrations.sql",
+        ):
+            assert expected in recorded, f"{expected} not in {recorded}"
+
+        # The pre-existing schema is intact (i.e., 001 wasn't re-run).
+        with db._conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('devbrain.projects')")
+            assert cur.fetchone()[0] is not None
+    except Exception:
+        # If the test fails partway, ensure schema_migrations is restored
+        # so subsequent tests aren't broken.
+        with db._conn() as conn, conn.cursor() as cur:
+            sql_text = (real_migrations / "009_schema_migrations.sql").read_text()
+            cur.execute(sql_text)
+            conn.commit()
+        raise
