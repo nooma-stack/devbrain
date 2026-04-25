@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import sys
@@ -13,6 +14,7 @@ from pathlib import Path
 import click
 import yaml
 
+import schema_migrate
 from config import DATABASE_URL, NL_MODEL, OLLAMA_URL
 from state_machine import FactoryDB
 
@@ -1586,6 +1588,47 @@ def upgrade(
         "      (their MCP subprocesses still hold the pre-upgrade state).",
         fg="yellow",
     )
+
+
+@cli.command(name="migrate")
+@click.option("--dry-run", is_flag=True, help="List pending migrations without applying.")
+@click.option(
+    "--migrations-dir",
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    default=None,
+    help="Override the migrations directory (defaults to $DEVBRAIN_HOME/migrations).",
+)
+def migrate(dry_run: bool, migrations_dir: Path | None) -> None:
+    """Apply pending DB schema migrations.
+
+    Idempotent: only files not yet recorded in devbrain.schema_migrations
+    are run, and concurrent invocations coordinate via a Postgres
+    advisory lock.
+    """
+    # Surface the per-file [migrate] applied X.sql (Yms) lines from
+    # schema_migrate.logger to stdout. basicConfig is a no-op if logging
+    # is already configured (e.g. inside a test harness), so this is
+    # safe to call at command entry.
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
+    db = get_db()
+    try:
+        result = schema_migrate.migrate(
+            db, migrations_dir=migrations_dir, dry_run=dry_run,
+        )
+    except Exception as exc:
+        click.echo(f"[migrate] FAILED: {exc}", err=True)
+        sys.exit(1)
+
+    if dry_run:
+        if result:
+            click.echo("[migrate] pending migrations:")
+            for name in result:
+                click.echo(f"  {name}")
+        else:
+            click.echo("[migrate] no pending migrations")
+    elif not result:
+        click.echo("[migrate] no pending migrations")
 
 
 if __name__ == "__main__":

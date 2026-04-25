@@ -1303,6 +1303,18 @@ start_postgres() {
     ok "PostgreSQL running on port ${DEVBRAIN_DB_HOST_PORT:-5433}"
 }
 
+apply_migrations() {
+    step "Database migrations"
+    desc "Apply any new schema files in migrations/ that aren't yet recorded"
+    desc "in devbrain.schema_migrations. Idempotent — fresh installs apply"
+    desc "every file, upgrades only run the new ones."
+    if ! _run "Applying pending DB migrations" \
+        "$DEVBRAIN_HOME/bin/devbrain" migrate; then
+        fail "Migration runner failed — DB may be in an inconsistent state"
+        return
+    fi
+}
+
 pull_models() {
     step "Ollama models"
     desc "DevBrain needs two local models:"
@@ -1766,6 +1778,7 @@ main() {
     setup_config
     setup_venvs
     start_postgres
+    apply_migrations
 
     # Phase 5: Heavy downloads + builds (~10-20 min unattended)
     install_ollama
