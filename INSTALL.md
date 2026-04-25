@@ -94,6 +94,24 @@ git --version
 psql --version
 ```
 
+### AI CLI authentication
+
+The factory shells out to whichever AI CLIs are on `$PATH`. Install one
+or more, then complete each tool's auth flow before running the wizard
+so the factory can spawn them without prompting:
+
+```bash
+claude login              # Anthropic Claude Code (OAuth)
+codex login               # OpenAI Codex (OAuth)
+gemini auth login         # Google Gemini CLI (OAuth)
+```
+
+API-key alternatives are also supported — drop `ANTHROPIC_API_KEY`,
+`OPENAI_API_KEY`, or `GEMINI_API_KEY` into `.env` and the wizard will
+pick them up. At least one CLI is required for `factory_plan`; the
+wizard prompts for the rest. If you skip this step, the factory falls
+back to whichever credential set is wired up at first invocation.
+
 ---
 
 ## 2. Quick start (TL;DR)
@@ -484,6 +502,24 @@ Smoke-test the server by hand:
 # Exits immediately on EOF; confirms the binary is runnable.
 ```
 
+### 5.1 Optional: Agent Bus
+
+DevBrain integrates with **PKRelay**, a companion browser bus that lets
+agents see and interact with web pages over MCP. Skip if you only need
+local memory and the factory.
+
+```bash
+git clone https://github.com/nooma-stack/pkrelay.git ~/pkrelay
+(cd ~/pkrelay/mcp-server && npm install && npm run build && npm link)
+(cd ~/pkrelay/native-host && bash install.sh)
+```
+
+This installs a `pkrelay` binary on PATH, registers a Chrome
+native-messaging host, and exposes browser tools (page snapshots,
+clicks, form fills) to any MCP client. The DevBrain installer offers
+the same flow under "PKRelay (optional)" — opt out with
+`--no-pkrelay` if scripting an unattended install.
+
 ---
 
 ## 6. Platform notes
@@ -531,6 +567,26 @@ Each row maps a `devbrain doctor` failure to its fix.
 | `ingest_venv` | Skipped Step 7 | `cd ingest && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt` |
 | `config_file` | YAML parse error | Indentation — replace tabs with spaces, align keys |
 | `config_file` | File missing | `cp config/devbrain.yaml.example config/devbrain.yaml` |
+
+### Postgres password drift
+
+If `devbrain doctor` reports `postgres_reachable` failing with
+`password authentication failed` after the container ran fine
+previously, the Postgres role's password has drifted from the value in
+`.env` / `config/devbrain.yaml`. This typically happens after restoring
+from a different `.env`, switching branches that ship a different
+default credential, or running `docker compose down -v` partway.
+
+The dev-doctor variant resolves this interactively — it prompts for
+the live container password (or rotates it) and rewrites both
+`.env` and the YAML in one step:
+
+```bash
+./bin/devbrain devdoctor --fix
+```
+
+Re-run `./bin/devbrain doctor` afterwards; `postgres_reachable` should
+flip to PASS without any manual SQL.
 
 ### Common non-doctor issues
 

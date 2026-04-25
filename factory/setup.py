@@ -552,6 +552,26 @@ def setup_identity() -> str:
     return dev_id
 
 
+def install_identity(dev_id: str | None = None) -> str | None:
+    """Non-interactive default dev registration. Called from install.sh.
+
+    Resolves dev_id from the argument or `$USER` and UPSERTs a row into
+    devbrain.devs with empty channels. Idempotent (register_dev is an
+    UPSERT). Returns the dev_id that was registered, or None if neither
+    argument nor $USER was set (silent skip — unattended container builds
+    must not fail here).
+    """
+    resolved = dev_id or os.environ.get("USER", "").strip()
+    if not resolved:
+        click.echo("install-identity: no --dev-id and $USER unset; skipping")
+        return None
+
+    db = FactoryDB(DATABASE_URL)
+    db.register_dev(dev_id=resolved, full_name=None, channels=[])
+    click.echo(f"install-identity: registered default dev '{resolved}'")
+    return resolved
+
+
 def setup_projects() -> None:
     _header("Projects")
     _desc(
