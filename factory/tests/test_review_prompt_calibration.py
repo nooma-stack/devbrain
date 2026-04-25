@@ -103,6 +103,8 @@ def test_arch_prompt_contains_severity_cost_guidance(orch, db, monkeypatch):
     # JSON findings contract — added 2026-04-24 (PR 21b1b68a).
     assert "## Required output format" in arch_prompt
     assert "```json findings" in arch_prompt
+    # PR #36: single-block contract communicated to reviewer.
+    assert "EXACTLY ONE" in arch_prompt
 
 
 def test_security_prompt_contains_severity_cost_guidance(orch, db, monkeypatch):
@@ -121,3 +123,5 @@ def test_security_prompt_contains_severity_cost_guidance(orch, db, monkeypatch):
     assert "RESOLVED vs still BLOCKING" in sec_prompt
     assert "## Required output format" in sec_prompt
     assert "```json findings" in sec_prompt
+    # PR #36: single-block contract communicated to reviewer.
+    assert "EXACTLY ONE" in sec_prompt

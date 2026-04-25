@@ -207,6 +207,97 @@ def test_warning_skipped_when_flag_false(orch, db, monkeypatch):
     assert result.status == JobStatus.QA
 
 
+def test_multi_block_silent_suppression_routes_to_fix_loop(orch, db, monkeypatch):
+    """Reviewer emits two JSON findings blocks with no prose-level
+    severity markers. The parser rejects with `multiple_findings_blocks`
+    and the regex fallback scores 0 on both reviews. Without the silent-
+    suppression guardrail (PR #37) this would auto-promote to QA →
+    READY_FOR_APPROVAL even though any real finding in either block was
+    silently swallowed. The guardrail must route to FIX_LOOP with
+    `reviewer_malformed=True` so a re-review round runs.
+    """
+    monkeypatch.setattr(
+        orch_mod, "FACTORY_FIX_LOOP_WARNINGS_TRIGGER_RETRY", True
+    )
+    job = _make_implementing_job(
+        db, f"{TEST_TITLE_PREFIX}multi_block_silent"
+    )
+
+    # Two blocks, one with an empty list, one with an empty list → after
+    # multi-block rejection the fallback regex has nothing to match since
+    # there are no prose-level BLOCKING/WARNING markers anywhere.
+    two_empty_blocks = (
+        "Prose-only review body with no severity markers in text.\n\n"
+        '```json findings\n{"findings": []}\n```\n\n'
+        "Draft copy I forgot to delete:\n\n"
+        '```json findings\n{"findings": []}\n```\n'
+    )
+
+    _stub_review_env(
+        monkeypatch,
+        arch_stdout=two_empty_blocks,
+        sec_stdout=two_empty_blocks,
+    )
+
+    result = orch._run_review(job)
+
+    assert result.status == JobStatus.FIX_LOOP
+    assert result.metadata.get("reviewer_malformed") is True
+    assert result.metadata.get("trigger_reason") == "reviewer_malformed"
+    assert result.metadata.get("blocking_findings") == 0
+    assert result.metadata.get("warning_findings") == 0
+
+    # The review artifacts themselves must also carry the parse_error
+    # so the metadata is durable even across future routing changes.
+    artifacts = db.get_artifacts(job.id, phase="review")
+    assert any(
+        a["metadata"].get("reviewer_output_malformed") is True
+        and str(a["metadata"].get("parse_error", "")).startswith(
+            "multiple_findings_blocks"
+        )
+        for a in artifacts
+    )
+
+
+def test_multi_block_with_prose_findings_still_uses_fallback_counts(
+    orch, db, monkeypatch
+):
+    """Multi-block rejection + prose-level BLOCKING marker: the regex
+    fallback rescues the real finding, so routing goes to FIX_LOOP as
+    `blocking` (not `reviewer_malformed`). This is the diff-echo
+    defence-in-depth path — confirms the silent-suppression guardrail
+    only fires when the fallback also returns zero.
+    """
+    monkeypatch.setattr(
+        orch_mod, "FACTORY_FIX_LOOP_WARNINGS_TRIGGER_RETRY", True
+    )
+    job = _make_implementing_job(
+        db, f"{TEST_TITLE_PREFIX}multi_block_with_prose"
+    )
+
+    arch_with_prose_marker = (
+        "1. BLOCKING: unescaped input at db.py:42\n\n"
+        '```json findings\n{"findings": [{"severity": "BLOCKING", '
+        '"title": "sql injection", "body": "unescaped input at db.py:42"}]}\n```\n\n'
+        "Diff context echoed below:\n"
+        '```json findings\n{"findings": []}\n```\n'
+    )
+
+    _stub_review_env(
+        monkeypatch,
+        arch_stdout=arch_with_prose_marker,
+        sec_stdout=_with_json("(no findings)", []),
+    )
+
+    result = orch._run_review(job)
+
+    assert result.status == JobStatus.FIX_LOOP
+    assert result.metadata.get("trigger_reason") == "blocking"
+    # Silent-suppression flag must NOT fire when regex fallback found
+    # a real finding.
+    assert result.metadata.get("reviewer_malformed") is not True
+
+
 def test_extract_warning_items_from_review_content(orch, db):
     """Regex-fallback canary — this case intentionally has NO JSON
     block so the helpers exercise the PR #32 fallback path. Don't
