@@ -18,6 +18,7 @@ def test_install_identity_registers_with_explicit_id(monkeypatch):
         return "row-id"
 
     monkeypatch.setattr(FactoryDB, "register_dev", fake_register_dev)
+    monkeypatch.setattr(FactoryDB, "get_dev", lambda self, dev_id: None)
     monkeypatch.delenv("USER", raising=False)
 
     result = setup.install_identity(dev_id="test_install_identity_explicit")
@@ -39,6 +40,7 @@ def test_install_identity_falls_back_to_user_env(monkeypatch):
         return "row-id"
 
     monkeypatch.setattr(FactoryDB, "register_dev", fake_register_dev)
+    monkeypatch.setattr(FactoryDB, "get_dev", lambda self, dev_id: None)
     monkeypatch.setenv("USER", "test_install_identity_envuser")
 
     result = setup.install_identity(dev_id=None)
@@ -62,6 +64,37 @@ def test_install_identity_skips_when_no_id_and_no_user(monkeypatch):
 
     assert result is None
     assert called == []
+
+
+def test_install_identity_preserves_existing_row(monkeypatch):
+    """If a row already exists for dev_id, register_dev is NOT called.
+
+    This protects user-customized channels and event_subscriptions from
+    being overwritten on re-runs of install.sh.
+    """
+    register_calls = []
+
+    def fake_register_dev(self, *args, **kwargs):
+        register_calls.append((args, kwargs))
+        return "row-id"
+
+    existing = {
+        "id": "row-id",
+        "dev_id": "test_install_identity_existing",
+        "full_name": "Existing User",
+        "channels": [{"type": "slack", "target": "#alerts"}],
+        "event_subscriptions": ["job_blocked"],
+    }
+    monkeypatch.setattr(FactoryDB, "register_dev", fake_register_dev)
+    monkeypatch.setattr(
+        FactoryDB, "get_dev",
+        lambda self, dev_id: existing if dev_id == existing["dev_id"] else None,
+    )
+
+    result = setup.install_identity(dev_id="test_install_identity_existing")
+
+    assert result == "test_install_identity_existing"
+    assert register_calls == []
 
 
 # ─── Integration tests (real DB) ───────────────────────────────────────────
