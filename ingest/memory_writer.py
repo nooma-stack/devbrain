@@ -61,8 +61,12 @@ def record_memory(
             (the partial unique index has WHERE provenance_id IS NOT
             NULL so two NULL-prov rows can both insert).
     """
-    cur.execute(f"SAVEPOINT {_SAVEPOINT_NAME}")
+    # SAVEPOINT itself is inside the try: if the caller's transaction is
+    # already InFailedSqlTransaction, even SAVEPOINT raises — and the
+    # docstring's best-effort guarantee must hold regardless of caller-
+    # side transaction state.
     try:
+        cur.execute(f"SAVEPOINT {_SAVEPOINT_NAME}")
         cur.execute(
             """
             INSERT INTO devbrain.memory
@@ -75,8 +79,13 @@ def record_memory(
         )
         cur.execute(f"RELEASE SAVEPOINT {_SAVEPOINT_NAME}")
     except Exception as exc:
-        cur.execute(f"ROLLBACK TO SAVEPOINT {_SAVEPOINT_NAME}")
-        cur.execute(f"RELEASE SAVEPOINT {_SAVEPOINT_NAME}")
+        try:
+            cur.execute(f"ROLLBACK TO SAVEPOINT {_SAVEPOINT_NAME}")
+            cur.execute(f"RELEASE SAVEPOINT {_SAVEPOINT_NAME}")
+        except Exception:
+            # SAVEPOINT was never established (or already gone) — nothing
+            # to roll back. Swallow so the helper stays best-effort.
+            pass
         logger.warning(
             "devbrain.memory dual-write failed (kind=%s, provenance_id=%s): %s",
             kind, provenance_id, exc,
