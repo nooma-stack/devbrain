@@ -349,16 +349,23 @@ def attribute_orphan_sessions(
         # One UPDATE per row so cur.rowcount cleanly distinguishes a
         # real write (==1) from an idempotency-skip (==0, e.g. a
         # concurrent attributor beat us between SELECT and UPDATE).
+        # Accumulate deltas locally and fold into counts only after
+        # commit() returns — otherwise a mid-flush failure rolls back
+        # the writes but leaves the counters overstated.
+        batch_attributed = 0
+        batch_fallback = 0
         try:
             with db._conn() as conn, conn.cursor() as cur:
                 for row_id, pid, used_fallback in resolved:
                     cur.execute(update_sql, (pid, row_id))
                     if cur.rowcount == 1:
                         if used_fallback:
-                            counts["fallback_to_default"] += 1
+                            batch_fallback += 1
                         else:
-                            counts["attributed"] += 1
+                            batch_attributed += 1
                 conn.commit()
+            counts["attributed"] += batch_attributed
+            counts["fallback_to_default"] += batch_fallback
         except Exception as exc:
             logger.warning(
                 "attribute_orphan_sessions batch UPDATE failed "
@@ -467,13 +474,18 @@ def attribute_orphan_chunks(
                 break
             continue
 
+        # Accumulate batch delta locally and fold into counts only
+        # after commit() returns — otherwise a mid-flush failure rolls
+        # back the writes but leaves the counter overstated.
+        batch_attributed = 0
         try:
             with db._conn() as conn, conn.cursor() as cur:
                 for chunk_id, pid in resolved:
                     cur.execute(update_sql, (pid, chunk_id))
                     if cur.rowcount == 1:
-                        counts["attributed"] += 1
+                        batch_attributed += 1
                 conn.commit()
+            counts["attributed"] += batch_attributed
         except Exception as exc:
             logger.warning(
                 "attribute_orphan_chunks batch UPDATE failed "
