@@ -79,11 +79,37 @@ server.tool(
       return { content: [{ type: 'text', text: `Project "${slug}" not found in DevBrain.` }] }
     }
 
+    // P2.d.i: decisions/issues/patterns now read from devbrain.memory.
+    // The legacy tables (decisions/issues/patterns) carry richer
+    // schemas (status, rationale, category, fix_applied, name) that
+    // the unified memory table does not — return null for unmapped
+    // fields per spec, preserving the response shape so downstream
+    // consumers don't crash on missing keys. P2.d.ii will drop the
+    // legacy tables once a soak period confirms no readers regress.
     const [projectInfo, decisions, issues, patterns, activeJobs, inactiveJobs, lockCount] = await Promise.all([
       query('SELECT name, description, root_path, constraints, tech_stack FROM devbrain.projects WHERE id = $1', [projectId]),
-      query('SELECT title, decision, rationale, created_at FROM devbrain.decisions WHERE project_id = $1 AND status = \'active\' ORDER BY created_at DESC LIMIT 5', [projectId]),
-      query('SELECT title, category, description, fix_applied, created_at FROM devbrain.issues WHERE project_id = $1 ORDER BY created_at DESC LIMIT 5', [projectId]),
-      query('SELECT name, category, description FROM devbrain.patterns WHERE project_id = $1 ORDER BY created_at DESC LIMIT 5', [projectId]),
+      query(
+        `SELECT title, content AS decision, NULL AS rationale, created_at
+         FROM devbrain.memory
+         WHERE project_id = $1 AND kind = 'decision' AND archived_at IS NULL
+         ORDER BY created_at DESC LIMIT 5`,
+        [projectId],
+      ),
+      query(
+        `SELECT title, NULL AS category, content AS description,
+                NULL AS fix_applied, created_at
+         FROM devbrain.memory
+         WHERE project_id = $1 AND kind = 'issue' AND archived_at IS NULL
+         ORDER BY created_at DESC LIMIT 5`,
+        [projectId],
+      ),
+      query(
+        `SELECT title AS name, NULL AS category, content AS description
+         FROM devbrain.memory
+         WHERE project_id = $1 AND kind = 'pattern' AND archived_at IS NULL
+         ORDER BY created_at DESC LIMIT 5`,
+        [projectId],
+      ),
       query('SELECT title, status, current_phase, branch_name FROM devbrain.factory_jobs WHERE project_id = $1 AND status NOT IN (\'approved\', \'rejected\', \'deployed\', \'failed\') AND archived_at IS NULL ORDER BY created_at DESC LIMIT 5', [projectId]),
       query('SELECT title, status, current_phase, branch_name, error_count, archived_at FROM devbrain.factory_jobs WHERE project_id = $1 AND status IN (\'deployed\', \'failed\', \'approved\', \'rejected\') AND (archived_at IS NULL OR archived_at > now() - interval \'24 hours\') ORDER BY updated_at DESC LIMIT 5', [projectId]),
       query(`SELECT COUNT(*) as count FROM devbrain.file_locks
@@ -126,77 +152,260 @@ server.tool(
     const queryEmbedding = await embed(searchQuery)
     const vectorStr = toSqlVector(queryEmbedding)
 
-    let whereClause = ''
-    const params: unknown[] = [vectorStr, limit]
-    let paramIdx = 3
+    // P2.d.i read-path switch.
+    //
+    // Reads now come from devbrain.memory. Each chunk-kind memory row
+    // is the dual-write of a legacy devbrain.chunks row (provenance_id
+    // points back to chunks.id), so we LEFT JOIN to recover the legacy
+    // chunk's source_type/source_id/line range — needed both to mimic
+    // the pre-switch response shape AND to drive the raw_sessions
+    // drill-down (raw_content was not migrated to memory).
+    //
+    // The codebase source_type does not live in devbrain.memory because
+    // codebase_index ingest was never wired through memory_writer (see
+    // P2.e). When the caller asks for source_types including 'codebase'
+    // (or omits the filter), we run a second query against legacy
+    // chunks WHERE source_type='codebase' and merge the candidate sets
+    // before re-ranking on score.
+    //
+    // source_types maps to memory.kind:
+    //   'session'   → kind='chunk' AND chunks.source_type='session', plus kind='session_summary'
+    //   'decision'  → kind='decision'
+    //   'pattern'   → kind='pattern'
+    //   'issue'     → kind='issue'
+    //   'codebase'  → legacy fallback only (see above)
 
+    let projectId: string | null = null
     if (!cross_project) {
       const slug = project ?? DEFAULT_PROJECT
       if (slug) {
-        const projectId = await resolveProjectId(slug)
-        if (projectId) {
-          whereClause += ` AND c.project_id = $${paramIdx}`
-          params.push(projectId)
-          paramIdx++
+        projectId = await resolveProjectId(slug)
+      }
+    }
+
+    // Build the kind-filter list from the user-supplied source_types.
+    // 'session' covers BOTH chunk-kind memory rows whose underlying
+    // legacy chunk has source_type='session' AND raw session_summary
+    // memory rows; we OR those two together at the SQL level.
+    let kindFilter: string[] | null = null
+    let includeCodebase = true
+    let restrictChunkSourceTypes: string[] | null = null
+    if (source_types && source_types.length > 0) {
+      includeCodebase = source_types.includes('codebase')
+      const kinds = new Set<string>()
+      const chunkSourceTypes = new Set<string>()
+      for (const st of source_types) {
+        if (st === 'session') {
+          kinds.add('chunk')
+          kinds.add('session_summary')
+          chunkSourceTypes.add('session')
+        } else if (st === 'decision' || st === 'pattern' || st === 'issue') {
+          kinds.add(st)
+        }
+        // 'codebase' is handled by the legacy fallback below.
+      }
+      if (kinds.size > 0) {
+        kindFilter = [...kinds]
+        // Only apply chunks.source_type filter when the caller's filter
+        // included 'session' but NOT a wildcard catch-all, so that
+        // chunk-kind rows from non-session legacy sources don't leak.
+        restrictChunkSourceTypes = chunkSourceTypes.size > 0 ? [...chunkSourceTypes] : null
+      } else if (!includeCodebase) {
+        // Caller filtered to source_types we have no mapping for —
+        // return empty rather than a wide-open scan.
+        return {
+          content: [{
+            type: 'text',
+            text: JSON.stringify({ results: [], hint: 'No matching source_types.' }, null, 2),
+          }],
         }
       }
     }
 
-    if (source_types && source_types.length > 0) {
-      whereClause += ` AND c.source_type = ANY($${paramIdx})`
-      params.push(source_types)
-      paramIdx++
+    type Candidate = {
+      chunk_id: string
+      content: string
+      score: number
+      source_type: string
+      source_id: string | null
+      source_line_start: number | null
+      source_line_end: number | null
+      project: string
+      memory_id: string
+      memory_kind: string
     }
 
-    const sql = `
-      SELECT
-        c.id as chunk_id,
-        c.content,
-        1 - (c.embedding <=> $1::vector) as score,
-        c.source_type,
-        c.source_id,
-        c.source_line_start,
-        c.source_line_end,
-        c.metadata,
-        p.slug as project
-      FROM devbrain.chunks c
-      JOIN devbrain.projects p ON c.project_id = p.id
-      WHERE c.embedding IS NOT NULL ${whereClause}
-      ORDER BY c.embedding <=> $1::vector
-      LIMIT $2
-    `
+    const candidates: Candidate[] = []
 
-    const result = await query(sql, params)
+    // 1. Memory query — runs unless the caller filtered ONLY to codebase.
+    const runMemoryQuery = kindFilter !== null || (source_types ?? []).length === 0
+    if (runMemoryQuery) {
+      const memoryParams: unknown[] = [vectorStr, limit]
+      let memoryWhere = ''
+      let pIdx = 3
+      if (projectId) {
+        memoryWhere += ` AND m.project_id = $${pIdx}`
+        memoryParams.push(projectId)
+        pIdx++
+      }
+      if (kindFilter) {
+        memoryWhere += ` AND m.kind = ANY($${pIdx})`
+        memoryParams.push(kindFilter)
+        pIdx++
+      }
+      if (restrictChunkSourceTypes) {
+        // chunk-kind rows must match the requested chunks.source_type;
+        // non-chunk kinds (decision/pattern/issue/session_summary) pass
+        // through this filter unaffected.
+        memoryWhere += ` AND (m.kind <> 'chunk' OR c.source_type = ANY($${pIdx}))`
+        memoryParams.push(restrictChunkSourceTypes)
+        pIdx++
+      }
+
+      const memorySql = `
+        SELECT
+          m.id as memory_id,
+          m.kind as memory_kind,
+          m.content,
+          1 - (m.embedding <=> $1::vector) as score,
+          c.id as legacy_chunk_id,
+          c.source_type as chunk_source_type,
+          c.source_id as chunk_source_id,
+          c.source_line_start as chunk_line_start,
+          c.source_line_end as chunk_line_end,
+          p.slug as project
+        FROM devbrain.memory m
+        JOIN devbrain.projects p ON m.project_id = p.id
+        LEFT JOIN devbrain.chunks c
+          ON m.kind = 'chunk' AND c.id = m.provenance_id
+        WHERE m.embedding IS NOT NULL
+          AND m.archived_at IS NULL
+          ${memoryWhere}
+        ORDER BY m.embedding <=> $1::vector
+        LIMIT $2
+      `
+
+      const memoryResult = await query(memorySql, memoryParams)
+
+      // Drift detector: empty memory + non-empty legacy is a signal that
+      // the dual-write fell behind. Logged for operators; does NOT
+      // trigger a fallback (the legacy fallback is for codebase only).
+      if (memoryResult.rows.length === 0 && projectId) {
+        const legacyCount = await query<{ count: string }>(
+          `SELECT COUNT(*)::text as count FROM devbrain.chunks
+           WHERE project_id = $1 AND embedding IS NOT NULL`,
+          [projectId],
+        )
+        if (Number(legacyCount.rows[0]?.count ?? 0) > 0) {
+          console.error(
+            `[deep_search] WARNING: dual-write drift — devbrain.memory empty for project ${projectId} but legacy devbrain.chunks has rows. Run backfill-memory.`,
+          )
+        }
+      }
+
+      for (const row of memoryResult.rows) {
+        const isChunk = row.memory_kind === 'chunk'
+        const chunkId = isChunk && row.legacy_chunk_id ? String(row.legacy_chunk_id) : String(row.memory_id)
+        const sourceType = isChunk && row.chunk_source_type
+          ? String(row.chunk_source_type)
+          : String(row.memory_kind)
+        candidates.push({
+          chunk_id: chunkId,
+          content: String(row.content),
+          score: Number(row.score),
+          source_type: sourceType,
+          source_id: row.chunk_source_id != null ? String(row.chunk_source_id) : null,
+          source_line_start: row.chunk_line_start != null ? Number(row.chunk_line_start) : null,
+          source_line_end: row.chunk_line_end != null ? Number(row.chunk_line_end) : null,
+          project: String(row.project),
+          memory_id: String(row.memory_id),
+          memory_kind: String(row.memory_kind),
+        })
+      }
+    }
+
+    // 2. Codebase fallback — legacy chunks WHERE source_type='codebase'.
+    // codebase_index ingest never landed in P2.b's dual-write, so this
+    // remains a legacy-only read until P2.e consolidates it.
+    if (includeCodebase) {
+      const codebaseParams: unknown[] = [vectorStr, limit]
+      let codebaseWhere = ''
+      if (projectId) {
+        codebaseWhere += ` AND c.project_id = $3`
+        codebaseParams.push(projectId)
+      }
+
+      const codebaseSql = `
+        SELECT
+          c.id as chunk_id,
+          c.content,
+          1 - (c.embedding <=> $1::vector) as score,
+          c.source_type,
+          c.source_id,
+          c.source_line_start,
+          c.source_line_end,
+          p.slug as project
+        FROM devbrain.chunks c
+        JOIN devbrain.projects p ON c.project_id = p.id
+        WHERE c.embedding IS NOT NULL
+          AND c.source_type = 'codebase'
+          ${codebaseWhere}
+        ORDER BY c.embedding <=> $1::vector
+        LIMIT $2
+      `
+      const codebaseResult = await query(codebaseSql, codebaseParams)
+      for (const row of codebaseResult.rows) {
+        candidates.push({
+          chunk_id: String(row.chunk_id),
+          content: String(row.content),
+          score: Number(row.score),
+          source_type: String(row.source_type),
+          source_id: row.source_id != null ? String(row.source_id) : null,
+          source_line_start: row.source_line_start != null ? Number(row.source_line_start) : null,
+          source_line_end: row.source_line_end != null ? Number(row.source_line_end) : null,
+          project: String(row.project),
+          memory_id: '',
+          memory_kind: 'codebase',
+        })
+      }
+    }
+
+    // Re-rank merged candidates by descending score, then slice.
+    candidates.sort((a, b) => b.score - a.score)
+    const top = candidates.slice(0, limit)
 
     const results = await Promise.all(
-      result.rows.map(async (row) => {
+      top.map(async (cand) => {
         const r: Record<string, unknown> = {
-          chunk_id: row.chunk_id,
-          content: row.content,
-          score: Number(Number(row.score).toFixed(4)),
-          source_type: row.source_type,
-          source_ref: row.source_id
-            ? `${row.source_type}_${String(row.source_id).slice(0, 8)}:${row.source_line_start ?? '?'}-${row.source_line_end ?? '?'}`
+          chunk_id: cand.chunk_id,
+          content: cand.content,
+          score: Number(cand.score.toFixed(4)),
+          source_type: cand.source_type,
+          source_ref: cand.source_id
+            ? `${cand.source_type}_${cand.source_id.slice(0, 8)}:${cand.source_line_start ?? '?'}-${cand.source_line_end ?? '?'}`
             : null,
-          project: row.project,
-          has_full_context: row.source_type === 'session' && row.source_id != null,
+          project: cand.project,
+          has_full_context: cand.source_type === 'session' && cand.source_id != null,
         }
 
-        // Auto drill-down: fetch raw context for top results if depth is full or auto with high scores
+        // Auto drill-down: fetch raw context for top results if depth is
+        // full or auto with high scores. Drill-down still uses the
+        // legacy raw_sessions table — raw_content was not migrated to
+        // memory in P2.b/c.
         if (
-          (depth === 'full' || (depth === 'auto' && Number(row.score) > 0.6)) &&
-          row.source_type === 'session' &&
-          row.source_id
+          (depth === 'full' || (depth === 'auto' && cand.score > 0.6)) &&
+          cand.source_type === 'session' &&
+          cand.source_id
         ) {
           const rawResult = await query(
             'SELECT raw_content FROM devbrain.raw_sessions WHERE id = $1',
-            [row.source_id],
+            [cand.source_id],
           )
           if (rawResult.rows[0]) {
             const raw = rawResult.rows[0].raw_content as string
             const lines = raw.split('\n')
-            const start = Math.max(0, (Number(row.source_line_start) || 0) - 25)
-            const end = Math.min(lines.length, (Number(row.source_line_end) || lines.length) + 25)
+            const start = Math.max(0, (cand.source_line_start ?? 0) - 25)
+            const end = Math.min(lines.length, (cand.source_line_end ?? lines.length) + 25)
             r.full_context = lines.slice(start, end).join('\n')
           }
         }
@@ -220,6 +429,14 @@ server.tool(
 )
 
 // ─── Tool: get_source_context ────────────────────────────────────────────────
+//
+// P2.d.i note: this tool intentionally still reads from devbrain.chunks
+// + devbrain.raw_sessions. raw_content was NOT migrated to
+// devbrain.memory in P2.b/c (the unified table holds the chunk's
+// embedded text but not the full transcript), so the drill-down here
+// has no memory-side equivalent. deep_search returns the legacy
+// chunks.id for chunk-kind hits precisely so this tool keeps working
+// after the read-path switch.
 
 server.tool(
   'get_source_context',
@@ -420,6 +637,90 @@ server.tool(
     })
 
     return { content: [{ type: 'text', text: `Session summary stored for project "${project}".` }] }
+  },
+)
+
+// ─── Tool: health_check ──────────────────────────────────────────────────────
+//
+// P2.d.i observability surface for the dual-write soak period. Reports
+// row counts in devbrain.memory (broken down by kind) alongside the
+// matching legacy tables (chunks/decisions/patterns/issues + raw_sessions).
+// Operators compare the two columns to detect dual-write drift before
+// P2.d.ii drops the legacy tables. Optional `project` filter scopes
+// counts to a single project; omit for cluster-wide totals.
+
+server.tool(
+  'health_check',
+  'Report DevBrain storage row counts in devbrain.memory (by kind) alongside legacy tables. Use to verify dual-write parity during the P2 soak period.',
+  {
+    project: z.string().optional().describe('Project slug to scope counts (omit for all projects).'),
+  },
+  async ({ project }) => {
+    const slug = project ?? null
+    let projectId: string | null = null
+    if (slug) {
+      projectId = await resolveProjectId(slug)
+      if (!projectId) {
+        return { content: [{ type: 'text', text: `Project "${slug}" not found.` }] }
+      }
+    }
+
+    // Build per-table count SQL with an optional project filter. We
+    // run the queries in parallel — none of them mutate state.
+    const memoryFilter = projectId ? 'AND project_id = $1' : ''
+    const legacyFilter = projectId ? 'WHERE project_id = $1' : ''
+    const params: unknown[] = projectId ? [projectId] : []
+
+    const [
+      memChunks,
+      memDecisions,
+      memPatterns,
+      memIssues,
+      memSessionSummaries,
+      legChunks,
+      legDecisions,
+      legPatterns,
+      legIssues,
+      legRawSessions,
+    ] = await Promise.all([
+      query<{ count: string }>(`SELECT COUNT(*)::text as count FROM devbrain.memory WHERE kind = 'chunk' ${memoryFilter}`, params),
+      query<{ count: string }>(`SELECT COUNT(*)::text as count FROM devbrain.memory WHERE kind = 'decision' ${memoryFilter}`, params),
+      query<{ count: string }>(`SELECT COUNT(*)::text as count FROM devbrain.memory WHERE kind = 'pattern' ${memoryFilter}`, params),
+      query<{ count: string }>(`SELECT COUNT(*)::text as count FROM devbrain.memory WHERE kind = 'issue' ${memoryFilter}`, params),
+      query<{ count: string }>(`SELECT COUNT(*)::text as count FROM devbrain.memory WHERE kind = 'session_summary' ${memoryFilter}`, params),
+      query<{ count: string }>(`SELECT COUNT(*)::text as count FROM devbrain.chunks ${legacyFilter}`, params),
+      query<{ count: string }>(`SELECT COUNT(*)::text as count FROM devbrain.decisions ${legacyFilter}`, params),
+      query<{ count: string }>(`SELECT COUNT(*)::text as count FROM devbrain.patterns ${legacyFilter}`, params),
+      query<{ count: string }>(`SELECT COUNT(*)::text as count FROM devbrain.issues ${legacyFilter}`, params),
+      query<{ count: string }>(`SELECT COUNT(*)::text as count FROM devbrain.raw_sessions ${legacyFilter}`, params),
+    ])
+
+    const num = (r: { rows: { count: string }[] }) => Number(r.rows[0]?.count ?? 0)
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          project: slug,
+          storage: {
+            memory: {
+              chunks: num(memChunks),
+              decisions: num(memDecisions),
+              patterns: num(memPatterns),
+              issues: num(memIssues),
+              session_summaries: num(memSessionSummaries),
+            },
+            legacy: {
+              chunks: num(legChunks),
+              decisions: num(legDecisions),
+              patterns: num(legPatterns),
+              issues: num(legIssues),
+              raw_sessions: num(legRawSessions),
+            },
+          },
+        }, null, 2),
+      }],
+    }
   },
 )
 
