@@ -14,6 +14,7 @@ from pathlib import Path
 import click
 import yaml
 
+import attribute_orphans
 import backfill_memory
 import schema_migrate
 from config import DATABASE_URL, NL_MODEL, OLLAMA_URL
@@ -1717,6 +1718,90 @@ def backfill_memory_cmd(dry_run: bool, batch_size: int, only: str | None) -> Non
     except RuntimeError as exc:
         click.echo(f"[backfill] FAILED: {exc}", err=True)
         sys.exit(1)
+
+    if total_failures > 0:
+        sys.exit(1)
+
+
+def _print_attribute_counts_line(label: str, c: dict, *, dry_run: bool) -> None:
+    """Render one summary line for an attribute-orphans counts dict.
+
+    Sessions branch carries ``unrecoverable`` and (optionally)
+    ``fallback_to_default``; chunks branch carries ``parent_still_null``.
+    Counters with value 0 are omitted from the optional section to keep
+    the common-case output terse. ``[dry-run]`` prefix replaces
+    ``[attribute]`` when --dry-run was passed so it's obvious nothing
+    was written.
+    """
+    prefix = "[dry-run]" if dry_run else "[attribute]"
+    if "unrecoverable" in c:
+        body = (
+            f"{c['scanned']} scanned, {c['attributed']} attributed, "
+            f"{c['unrecoverable']} unrecoverable"
+        )
+        if c.get("fallback_to_default", 0):
+            body += f", {c['fallback_to_default']} fallback_to_default"
+    else:
+        body = (
+            f"{c['scanned']} scanned, {c['attributed']} attributed, "
+            f"{c['parent_still_null']} parent_still_null"
+        )
+    if c.get("batch_failures", 0):
+        body += f", {c['batch_failures']} batch_failures"
+    click.echo(f"{prefix} {label:<8}: {body} ({c['duration_s']}s)")
+
+
+@cli.command(name="attribute-orphans")
+@click.option(
+    "--dry-run", is_flag=True,
+    help="Print counts without writing project_id to any row.",
+)
+@click.option(
+    "--batch-size", type=int, default=1000, show_default=True,
+    help="Rows per batch for keyset-paged scans.",
+)
+@click.option(
+    "--default-project", "default_project_slug", default=None,
+    help="Fallback project slug for rows whose source_path can't be "
+         "decoded or matches no configured project. Off by default; "
+         "fails loud if the slug isn't in devbrain.projects.",
+)
+def attribute_orphans_cmd(
+    dry_run: bool, batch_size: int, default_project_slug: str | None,
+) -> None:
+    """Attribute orphan claude_code raw_sessions + chunks via source_path.
+
+    Decodes claude_code source_paths back to project directories and
+    matches them against ``factory.project_paths`` in devbrain.yaml.
+    Idempotent — re-running is safe; the SELECT filters
+    ``project_id IS NULL`` and the UPDATE re-asserts the same predicate.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    db = get_db()
+
+    try:
+        results = attribute_orphans.attribute_all(
+            db,
+            batch_size=batch_size,
+            dry_run=dry_run,
+            default_project_slug=default_project_slug,
+        )
+    except (RuntimeError, ValueError) as exc:
+        click.echo(f"[attribute] FAILED: {exc}", err=True)
+        sys.exit(1)
+
+    _print_attribute_counts_line("sessions", results["sessions"], dry_run=dry_run)
+    _print_attribute_counts_line("chunks", results["chunks"], dry_run=dry_run)
+
+    total_failures = (
+        results["sessions"]["batch_failures"]
+        + results["chunks"]["batch_failures"]
+    )
+    if not dry_run:
+        click.echo(
+            "[attribute] DONE — re-run `devbrain backfill-memory` to "
+            "migrate the newly-attributed rows."
+        )
 
     if total_failures > 0:
         sys.exit(1)
