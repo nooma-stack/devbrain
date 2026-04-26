@@ -6,6 +6,7 @@ import psycopg2
 import psycopg2.extras
 
 from config import DATABASE_URL
+from memory_writer import record_memory
 
 psycopg2.extras.register_uuid()
 
@@ -139,8 +140,22 @@ def insert_chunk(
             ),
         )
         row = cur.fetchone()
+        chunk_id = str(row[0]) if row else ""
+        # P2.b dual-write: skip when project_id is None (chunks.project_id
+        # is nullable but devbrain.memory.project_id is NOT NULL). The
+        # SAVEPOINT inside record_memory keeps a memory failure from
+        # poisoning this transaction's commit of the legacy chunk row.
+        if chunk_id and project_id is not None:
+            record_memory(
+                cur,
+                project_id=project_id,
+                kind="chunk",
+                content=content,
+                embedding_sql=vector_str,
+                provenance_id=chunk_id,
+            )
         conn.commit()
-        return str(row[0]) if row else ""
+        return chunk_id
 
 
 def delete_chunks_for_session(session_id: str) -> int:
