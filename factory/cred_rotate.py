@@ -63,10 +63,18 @@ class RotationContext:
     env_path: Path
     yaml_path: Path
 
-    def url(self, password: str) -> str:
-        return (
-            f"postgresql://{self.user}:{password}"
-            f"@{self.host}:{self.port}/{self.database}"
+    def connect_kwargs(self, password: str) -> dict:
+        """Keyword form for psycopg2.connect.
+
+        Avoids URL-style ``postgresql://user:password@host:...`` strings:
+        passwords containing ``@``, ``:``, ``/``, ``?``, ``#``, ``%``
+        break libpq URL parsing, and the malformed URL — still containing
+        the secret — would surface in OperationalError messages echoed to
+        the operator.
+        """
+        return dict(
+            host=self.host, port=self.port,
+            user=self.user, password=password, dbname=self.database,
         )
 
 
@@ -99,28 +107,46 @@ def precheck_baseline(dependents: list[dict]) -> list[DependentCheck]:
     baseline to compare against post-reload.
 
     For ``manual_restart`` dependents this is always healthy=True
-    (they're informational, not verifiable).
+    (they're informational, not verifiable). Pre-flight passes
+    ``lookback=True`` so the verifier scans the tail of the existing log
+    — that's what catches a daemon that's been silently retrying with
+    stale creds for hours/days, which would otherwise only register if a
+    retry happened to land inside the verify window.
     """
-    return [verify_dependent(dep) for dep in dependents]
+    return [verify_dependent(dep, lookback=True) for dep in dependents]
 
 
-def verify_dependent(dep: dict) -> DependentCheck:
-    """Dispatch on ``dep['verify']``."""
+def verify_dependent(dep: dict, *, lookback: bool = False) -> DependentCheck:
+    """Dispatch on ``dep['verify']``.
+
+    ``lookback`` is set by pre-flight only — the post-reload verify path
+    must not scan pre-rotation log content (it would always find the old
+    auth-failure churn and reject every rotation).
+    """
     if dep.get("type") == "manual_restart":
         return DependentCheck(id=dep["id"], type="manual_restart", healthy=True)
     verify = dep.get("verify", "tail_log_no_auth_errors")
     if verify == "tail_log_no_auth_errors":
-        return _verify_tail_log_no_auth_errors(dep)
+        return _verify_tail_log_no_auth_errors(dep, lookback=lookback)
     if verify == "connect_via_proxy":
-        logger.info("verify connect_via_proxy not yet implemented for %s", dep["id"])
-        return DependentCheck(id=dep["id"], type=dep.get("type", "?"), healthy=True)
+        # Fail closed: returning healthy=True for an unimplemented verifier
+        # would silently green-light rotations whose dependents may still
+        # be auth-failing — exactly the integrity guarantee this feature
+        # is meant to provide.
+        return DependentCheck(
+            id=dep["id"], type=dep.get("type", "?"), healthy=False,
+            error="verify mode 'connect_via_proxy' is not implemented yet — "
+                  "remove the dependent or pick a supported verify mode",
+        )
     return DependentCheck(
         id=dep["id"], type=dep.get("type", "?"), healthy=False,
         error=f"unknown verify mode: {verify}",
     )
 
 
-def _verify_tail_log_no_auth_errors(dep: dict) -> DependentCheck:
+def _verify_tail_log_no_auth_errors(
+    dep: dict, *, lookback: bool = False,
+) -> DependentCheck:
     log_path = Path(dep.get("verify_log", "")).expanduser()
     window = int(dep.get("verify_window_seconds", 10))
     if not log_path.exists():
@@ -143,8 +169,34 @@ def _verify_tail_log_no_auth_errors(dep: dict) -> DependentCheck:
             error=f"could not stat verify_log: {exc}",
         )
 
-    deadline = time.monotonic() + window
     pattern = re.compile(r"authentication failed", re.IGNORECASE)
+
+    # Pre-flight only: scan the tail of the EXISTING log so a daemon
+    # that's been silently retrying with stale creds for hours/days is
+    # caught even if no retry lands inside the verify_window_seconds.
+    if lookback:
+        lookback_bytes = int(dep.get("verify_lookback_bytes", 65536))
+        try:
+            with log_path.open("rb") as f:
+                if start_offset > lookback_bytes:
+                    f.seek(start_offset - lookback_bytes)
+                tail = f.read(start_offset if start_offset <= lookback_bytes
+                              else lookback_bytes)
+        except OSError as exc:
+            return DependentCheck(
+                id=dep["id"], type=dep.get("type", "?"), healthy=False,
+                error=f"could not read verify_log: {exc}",
+            )
+        if pattern.search(tail.decode("utf-8", errors="replace")):
+            return DependentCheck(
+                id=dep["id"], type=dep.get("type", "?"), healthy=False,
+                error=f"saw 'authentication failed' in last "
+                      f"{lookback_bytes} bytes of {log_path} (pre-existing "
+                      f"churn — fix the dependent first or rotate with "
+                      f"--no-require-all-healthy)",
+            )
+
+    deadline = time.monotonic() + window
     while time.monotonic() < deadline:
         try:
             with log_path.open("rb") as f:
@@ -257,7 +309,9 @@ def _alter_user_password(ctx: RotationContext, current_password: str,
     """Issue ALTER USER. Connects with current_password (so rollback can
     pass new_password as 'current' and old_password as 'new').
     """
-    conn = psycopg2.connect(ctx.url(current_password), connect_timeout=5)
+    conn = psycopg2.connect(
+        **ctx.connect_kwargs(current_password), connect_timeout=5,
+    )
     try:
         with conn:
             with conn.cursor() as cur:
@@ -317,21 +371,21 @@ def rotate_with_dependents(
 
     # 3) Sanity check with new creds -------------------------------------
     try:
-        psycopg2.connect(ctx.url(new_password), connect_timeout=5).close()
+        psycopg2.connect(
+            **ctx.connect_kwargs(new_password), connect_timeout=5,
+        ).close()
     except psycopg2.Error as exc:
         # New creds don't connect — roll the DB back; restore files.
-        _alter_user_password(ctx, new_password, ctx.old_password)
-        _restore_file(ctx.env_path, env_snapshot)
-        _restore_file(ctx.yaml_path, yaml_snapshot)
-        return {
-            "rolled_back": True,
-            "reason": f"sanity check connect failed: {exc}",
-            "failed": [],
-            "reloaded": [],
-        }
+        return _rollback(
+            ctx, new_password,
+            env_snapshot=env_snapshot, yaml_snapshot=yaml_snapshot,
+            reloaded=[], reloaded_deps=[], failed=[],
+            reason=f"sanity check connect failed: {exc}",
+        )
 
     # 4) Reload + verify each dependent ----------------------------------
     reloaded: list[DependentCheck] = []
+    reloaded_deps: list[dict] = []  # parallel list — needed to re-reload on rollback
     manual: list[DependentCheck] = []
     failed: list[DependentCheck] = []
     for dep in dependents:
@@ -351,21 +405,19 @@ def rotate_with_dependents(
         check = verify_dependent(dep)
         if check.healthy:
             reloaded.append(check)
+            reloaded_deps.append(dep)
         else:
             failed.append(check)
             break
 
     # 5) Roll back if any dependent failed -------------------------------
     if failed:
-        _alter_user_password(ctx, new_password, ctx.old_password)
-        _restore_file(ctx.env_path, env_snapshot)
-        _restore_file(ctx.yaml_path, yaml_snapshot)
-        return {
-            "rolled_back": True,
-            "reason": f"dependent verification failed: {failed[0].id}",
-            "failed": failed,
-            "reloaded": reloaded,
-        }
+        return _rollback(
+            ctx, new_password,
+            env_snapshot=env_snapshot, yaml_snapshot=yaml_snapshot,
+            reloaded=reloaded, reloaded_deps=reloaded_deps, failed=failed,
+            reason=f"dependent verification failed: {failed[0].id}",
+        )
 
     # 6) Success ---------------------------------------------------------
     return {
@@ -374,6 +426,67 @@ def rotate_with_dependents(
         "manual": manual,
         "skipped": skip_dependents,
     }
+
+
+def _rollback(
+    ctx: RotationContext,
+    new_password: str,
+    *,
+    env_snapshot: bytes | None,
+    yaml_snapshot: bytes,
+    reloaded: list[DependentCheck],
+    reloaded_deps: list[dict],
+    failed: list[DependentCheck],
+    reason: str,
+) -> dict:
+    """Revert DB password + .env + yaml, then re-reload any dependents
+    that already picked up the new (now-reverted) creds.
+
+    Returns ``rollback_failed=True`` if the ALTER USER itself raises —
+    the operator needs an actionable error rather than a stack trace,
+    since at that point .env/yaml are still in their post-write state
+    and the live DB password is in an unknown state.
+    """
+    rollback_errors: list[str] = []
+    try:
+        _alter_user_password(ctx, new_password, ctx.old_password)
+    except Exception as exc:  # noqa: BLE001 — any failure here is operator-actionable
+        # .env/yaml are still showing the new password but the live DB
+        # may or may not have been reverted. Surface this distinctly so
+        # the operator doesn't trust the "old creds remain authoritative"
+        # message.
+        return {
+            "rolled_back": False,
+            "rollback_failed": True,
+            "reason": reason,
+            "rollback_error": f"ALTER USER rollback failed: {exc}",
+            "failed": failed,
+            "reloaded": reloaded,
+        }
+
+    _restore_file(ctx.env_path, env_snapshot)
+    _restore_file(ctx.yaml_path, yaml_snapshot)
+
+    # Re-reload every dependent that already picked up the (now reverted)
+    # new .env. Without this, processes loaded in the failed window keep
+    # running with the new password against a DB reverted to the old one
+    # — recreating the very 'daemon stuck on wrong creds' state this
+    # feature exists to prevent.
+    for dep in reloaded_deps:
+        try:
+            reload_dependent(dep)
+        except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+            rollback_errors.append(f"{dep.get('id', '?')}: {exc}")
+
+    result: dict = {
+        "rolled_back": True,
+        "reason": reason,
+        "failed": failed,
+        "reloaded": reloaded,
+    }
+    if rollback_errors:
+        result["reload_rollback_errors"] = rollback_errors
+    return result
 
 
 def _restore_file(path: Path, snapshot: bytes | None) -> None:

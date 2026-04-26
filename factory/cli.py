@@ -1182,11 +1182,16 @@ def doctor_alias(ctx: click.Context, as_json: bool, fix: bool) -> None:
 )
 @click.option(
     "--current-password",
-    default=None,
-    help="Use this value as the CURRENT DB password (instead of reading "
-         "from .env/yaml). Useful after an ALTER USER that left config "
-         "and the live DB out of sync — pass the live password here and "
-         "rotation will sync config to match on success.",
+    "current_password_prompt",
+    is_flag=True,
+    default=False,
+    help="Recovery mode: securely prompt for the live DB password "
+         "instead of reading from .env/yaml. Use after a manual ALTER "
+         "USER left config out of sync with the live DB. Set env var "
+         "DEVBRAIN_CURRENT_DB_PASSWORD to skip the prompt for scripted "
+         "use. WARNING: never pass the password as a command argument — "
+         "it would appear in 'ps aux', shell history, and process "
+         "monitoring captures.",
 )
 @click.option(
     "--skip-dependents",
@@ -1206,7 +1211,7 @@ def doctor_alias(ctx: click.Context, as_json: bool, fix: bool) -> None:
 def rotate_db_password(
     yes: bool,
     recreate: bool,
-    current_password: str | None,
+    current_password_prompt: bool,
     skip_dependents: bool,
     require_all_healthy: bool,
 ) -> None:
@@ -1251,8 +1256,20 @@ def rotate_db_password(
     db_name = db_cfg.get("database", "devbrain")
     db_host = db_cfg.get("host", "localhost")
     db_port = db_cfg.get("port", 5433)
+    # Recovery mode: env var > interactive prompt > config. The flag never
+    # accepts a value on the command line, so the password cannot leak via
+    # `ps aux`, shell history, or process-monitoring captures.
+    recovery_password: str | None = None
+    if current_password_prompt:
+        recovery_password = os.environ.get("DEVBRAIN_CURRENT_DB_PASSWORD")
+        if not recovery_password:
+            recovery_password = click.prompt(
+                "Live DB password (input hidden)",
+                hide_input=True,
+                confirmation_prompt=False,
+            )
     old_password = (
-        current_password if current_password is not None
+        recovery_password if recovery_password is not None
         else db_cfg.get("password", "")
     )
     env_path = DEVBRAIN_HOME / ".env"
@@ -1265,7 +1282,7 @@ def rotate_db_password(
     click.echo(f"  Database: {db_name}")
     click.echo(f"  .env:     {env_path}")
     click.echo(f"  yaml:     {yaml_path}")
-    if current_password is not None:
+    if recovery_password is not None:
         click.echo("  Source:   --current-password flag (recovery mode)")
     click.echo()
 
@@ -1274,11 +1291,13 @@ def rotate_db_password(
         return
 
     # Verify the current password actually works before generating a new one.
+    # Use keyword form (host=, port=, ...) so the password never appears in
+    # the connection string libpq echoes back in OperationalError messages.
     click.echo("→ Connecting with current password...", nl=False)
     try:
         psycopg2.connect(
-            f"postgresql://{db_user}:{old_password}"
-            f"@{db_host}:{db_port}/{db_name}",
+            host=db_host, port=db_port,
+            user=db_user, password=old_password, dbname=db_name,
             connect_timeout=5,
         ).close()
     except psycopg2.Error as exc:
@@ -1286,7 +1305,8 @@ def rotate_db_password(
         hint = (
             "If the config drifted from the live DB (e.g. someone ran "
             "ALTER USER manually), retry with:\n"
-            "    devbrain rotate-db-password --current-password '<live-pw>'\n"
+            "    devbrain rotate-db-password --current-password\n"
+            "(you'll be prompted securely for the live password)\n"
             "Or run 'devbrain devdoctor --fix' to interactively recover."
         )
         raise click.ClickException(
@@ -1328,6 +1348,20 @@ def rotate_db_password(
         )
         sys.exit(1)
 
+    if result.get("rollback_failed"):
+        click.echo(f"[rotate] FAILED — {result['reason']}", err=True)
+        click.echo(
+            f"[rotate] ROLLBACK ALSO FAILED — {result['rollback_error']}",
+            err=True,
+        )
+        click.echo(
+            "[rotate] Live DB password state is UNKNOWN. .env and yaml "
+            "still reflect the new password. Check the DB manually before "
+            "retrying — do NOT assume old creds are authoritative.",
+            err=True,
+        )
+        sys.exit(2)
+
     if result.get("rolled_back"):
         click.echo(f"[rotate] FAILED — {result['reason']}", err=True)
         click.echo(
@@ -1335,6 +1369,11 @@ def rotate_db_password(
             err=True,
         )
         click.echo("[rotate] Old creds remain authoritative.", err=True)
+        for err in result.get("reload_rollback_errors", []):
+            click.echo(
+                f"[rotate] WARNING: re-reload during rollback failed: {err}",
+                err=True,
+            )
         for c in result.get("failed", []):
             click.echo(
                 f"[rotate] Investigate {c.id} manually before retrying.",
@@ -1357,9 +1396,9 @@ def rotate_db_password(
         f"{n_manual} need manual restart."
     )
 
-    new_url = (
-        f"postgresql://{db_user}:{new_password}"
-        f"@{db_host}:{db_port}/{db_name}"
+    new_conn_kwargs = dict(
+        host=db_host, port=db_port,
+        user=db_user, password=new_password, dbname=db_name,
     )
 
     # Optional container recreate so docker-compose.yml changes (e.g.,
@@ -1400,7 +1439,7 @@ def rotate_db_password(
             click.echo("→ Waiting for Postgres to accept connections...", nl=False)
             for _ in range(30):
                 try:
-                    psycopg2.connect(new_url, connect_timeout=1).close()
+                    psycopg2.connect(**new_conn_kwargs, connect_timeout=1).close()
                     click.echo(" ✅")
                     break
                 except psycopg2.Error:
