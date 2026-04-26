@@ -588,6 +588,26 @@ the live container password (or rotates it) and rewrites both
 Re-run `./bin/devbrain doctor` afterwards; `postgres_reachable` should
 flip to PASS without any manual SQL.
 
+### Credential rotation
+
+Run `devbrain rotate-db-password` to rotate the DevBrain Postgres password.
+The command auto-reloads registered cred-dependent processes (ingest
+daemon, etc.) and verifies they re-authenticated. If any reload fails,
+the rotation rolls back atomically — old creds remain authoritative.
+
+Manual-restart dependents (Claude Desktop MCP servers, running shells
+with `DEVBRAIN_DB_PASSWORD` exported) cannot be programmatically reloaded.
+The rotation will print which ones need manual action.
+
+To register a custom cred-dependent process, add an entry to
+`factory.cred_dependents` in `config/devbrain.yaml`. See the example
+template for the schema.
+
+Flags:
+- `--skip-dependents` — bypass the registry (legacy single-step behavior).
+- `--no-require-all-healthy` — rotate even if some dependents are
+  already broken (won't make things worse).
+
 ### Common non-doctor issues
 
 - **`./bin/devbrain: command not found`** — you are not in the repo root.
