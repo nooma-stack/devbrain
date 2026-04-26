@@ -9,6 +9,7 @@ import { join, resolve } from 'path'
 import { z } from 'zod'
 import { query } from './db.js'
 import { embed, toSqlVector } from './embeddings.js'
+import { recordMemory } from './memory.js'
 import { summarizeSession } from './summarize.js'
 
 // Factory orchestrator runner path
@@ -323,7 +324,9 @@ server.tool(
       )
       recordId = result.rows[0].id
     } else {
-      // Generic note stored as a chunk
+      // Generic note stored as a chunk. P2.b does NOT dual-write notes:
+      // 'note' isn't in the devbrain.memory.kind CHECK constraint, and
+      // notes already land in chunks where P2.c backfill will pick them up.
       const result = await query<{ id: string }>(
         `INSERT INTO devbrain.chunks (project_id, source_type, content, embedding, metadata)
          VALUES ($1, 'note', $2, $3::vector, $4) RETURNING id`,
@@ -333,7 +336,24 @@ server.tool(
       return { content: [{ type: 'text', text: `Stored note "${title}" (${recordId.slice(0, 8)}).` }] }
     }
 
-    // Also create an embedded chunk for the record
+    // P2.b dual-write: decision/pattern/issue → devbrain.memory.
+    // Reuses the embedding computed above; provenance_id is the legacy
+    // row's UUID so the partial unique index dedupes concurrent retries.
+    // We dual-write here (the canonical legacy row) — NOT the
+    // auxiliary chunk insert below — so each store() lands exactly one
+    // memory row per logical entity.
+    await recordMemory({
+      projectId,
+      kind: type,
+      title,
+      content: `${title}\n\n${content}`,
+      embeddingSql: vectorStr,
+      provenanceId: recordId,
+    })
+
+    // Also create an embedded chunk for the record. Kept for legacy
+    // search compatibility; no dual-write from here (would duplicate
+    // the memory row created above).
     await query(
       `INSERT INTO devbrain.chunks (project_id, source_type, source_id, content, embedding)
        VALUES ($1, $2, $3, $4, $5::vector)`,
@@ -372,11 +392,13 @@ server.tool(
     ].filter(Boolean).join('\n')
 
     const embedding = await embed(fullContent)
+    const vectorStr = toSqlVector(embedding)
 
-    await query(
+    const chunkResult = await query<{ id: string }>(
       `INSERT INTO devbrain.chunks (project_id, source_type, content, embedding, metadata)
-       VALUES ($1, 'session_summary', $2, $3::vector, $4)`,
-      [projectId, fullContent, toSqlVector(embedding), JSON.stringify({
+       VALUES ($1, 'session_summary', $2, $3::vector, $4)
+       RETURNING id`,
+      [projectId, fullContent, vectorStr, JSON.stringify({
         decisions_made: decisions_made ?? [],
         files_changed: files_changed ?? [],
         issues_found: issues_found ?? [],
@@ -384,6 +406,18 @@ server.tool(
         timestamp: new Date().toISOString(),
       })],
     )
+
+    // P2.b dual-write: session_summary → devbrain.memory. The MCP
+    // end_session tool doesn't write to raw_sessions in the current
+    // code path, so we anchor provenance_id to the chunks row we just
+    // created (deduplicates against concurrent end_session retries).
+    await recordMemory({
+      projectId,
+      kind: 'session_summary',
+      content: fullContent,
+      embeddingSql: vectorStr,
+      provenanceId: chunkResult.rows[0]?.id ?? null,
+    })
 
     return { content: [{ type: 'text', text: `Session summary stored for project "${project}".` }] }
   },

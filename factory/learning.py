@@ -20,7 +20,11 @@ logger = logging.getLogger(__name__)
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# ingest/ is a sibling of factory/ — extend sys.path so memory_writer
+# (the canonical Python dual-write helper for P2.b) is importable.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "ingest"))
 from config import DATABASE_URL, SUMMARIZE_MODEL, load_config  # noqa: E402
+from memory_writer import record_memory  # noqa: E402
 
 _config = load_config()
 OLLAMA_URL = _config.get("embedding", {}).get("url", _config["summarization"]["url"])
@@ -221,6 +225,7 @@ def _store_lessons(
         # Store as pattern + chunk
         vector_str = f"[{','.join(str(x) for x in embedding)}]"
 
+        description = f"{text}\n\nContext: {context}"
         with conn.cursor() as cur:
             cur.execute(
                 """INSERT INTO devbrain.patterns
@@ -231,11 +236,26 @@ def _store_lessons(
                     project_id,
                     text[:100],
                     "factory_review",
-                    f"{text}\n\nContext: {context}",
+                    description,
                     json.dumps([category, "factory_learning"]),
                 ),
             )
             pattern_id = str(cur.fetchone()[0])
+
+            # P2.b dual-write: pattern row → devbrain.memory. We dual-write
+            # the pattern (not the auxiliary chunk insert below) so each
+            # logical lesson lands as exactly one memory row. SAVEPOINT
+            # inside record_memory keeps a memory failure from rolling
+            # back the pattern + chunk legacy commit.
+            record_memory(
+                cur,
+                project_id=project_id,
+                kind="pattern",
+                content=description,
+                title=text[:100],
+                embedding_sql=vector_str,
+                provenance_id=pattern_id,
+            )
 
             cur.execute(
                 """INSERT INTO devbrain.chunks
@@ -244,7 +264,7 @@ def _store_lessons(
                 (
                     project_id,
                     pattern_id,
-                    f"{text}\n\nContext: {context}",
+                    description,
                     vector_str,
                     json.dumps({
                         "category": category,
