@@ -192,6 +192,23 @@ factory:
   # Use Tool(pattern) syntax, e.g. "Bash(terraform:*)".
   permissions_extra_allowed_tools: []
 
+  # Long-running processes that hold cached database credentials.
+  # rotate-db-password reloads each one after the rotation lands and
+  # verifies it can authenticate; if any verification fails, the
+  # rotation rolls back. Add custom entries here for forks/integrations.
+  cred_dependents:
+    - id: ingest_daemon
+      type: launchagent
+      label: com.devbrain.ingest
+      plist: ~/Library/LaunchAgents/com.devbrain.ingest.plist
+      verify: tail_log_no_auth_errors
+      verify_log: ~/devbrain/logs/ingest.err.log
+      verify_window_seconds: 10
+    # Future: factory dashboard, codebase indexer, etc. as they become
+    # daemonized. MCP servers spawned by Claude Desktop are intentionally
+    # NOT registerable — Claude Desktop owns the lifecycle, so rotation
+    # prints a "please restart Claude Desktop" tail message instead.
+
 notifications:
   notify_events:
     - job_started

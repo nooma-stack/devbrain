@@ -18,6 +18,10 @@ import attribute_orphans
 import backfill_memory
 import schema_migrate
 from config import DATABASE_URL, NL_MODEL, OLLAMA_URL
+from cred_rotate import (
+    rewrite_env_password as _rewrite_env_password,
+    rewrite_yaml_db_password as _rewrite_yaml_db_password,
+)
 from state_machine import FactoryDB
 
 
@@ -1168,50 +1172,6 @@ def doctor_alias(ctx: click.Context, as_json: bool, fix: bool) -> None:
     ctx.invoke(devdoctor, as_json=as_json, fix=fix)
 
 
-def _rewrite_env_password(env_path: Path, new_password: str) -> None:
-    """Replace (or append) DEVBRAIN_DB_PASSWORD in a .env file."""
-    if env_path.exists():
-        lines = [
-            ln for ln in env_path.read_text().splitlines()
-            if not ln.startswith("DEVBRAIN_DB_PASSWORD=")
-        ]
-    else:
-        lines = []
-    lines.append("")
-    lines.append(f"# Database password — rotated {time.strftime('%Y-%m-%d')}")
-    lines.append(f"DEVBRAIN_DB_PASSWORD={new_password}")
-    env_path.write_text("\n".join(lines) + "\n")
-
-
-def _rewrite_yaml_db_password(yaml_path: Path, new_password: str) -> None:
-    """Replace password: under database: in config/devbrain.yaml.
-
-    Line-based rewrite instead of round-tripping through PyYAML (which
-    would strip comments and re-order keys). Scope is limited to the
-    database: block to avoid touching notification-channel passwords.
-    """
-    out: list[str] = []
-    in_db_block = False
-    replaced = False
-    for line in yaml_path.read_text().splitlines():
-        if re.match(r"^database:", line):
-            in_db_block = True
-            out.append(line)
-            continue
-        if in_db_block and re.match(r"^  password:", line):
-            out.append(f"  password: {new_password}")
-            replaced = True
-            continue
-        if re.match(r"^[^\s#]", line):
-            in_db_block = False
-        out.append(line)
-    if not replaced:
-        raise click.ClickException(
-            f"Could not find 'password:' under 'database:' in {yaml_path}"
-        )
-    yaml_path.write_text("\n".join(out) + "\n")
-
-
 @cli.command(name="rotate-db-password")
 @click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
 @click.option(
@@ -1228,14 +1188,36 @@ def _rewrite_yaml_db_password(yaml_path: Path, new_password: str) -> None:
          "and the live DB out of sync — pass the live password here and "
          "rotation will sync config to match on success.",
 )
+@click.option(
+    "--skip-dependents",
+    is_flag=True,
+    default=False,
+    help="Bypass the cred_dependents registry + post-reload verification. "
+         "Restores the legacy single-step rotation. Use for emergencies "
+         "or when rotating in single-user contexts.",
+)
+@click.option(
+    "--require-all-healthy/--no-require-all-healthy",
+    default=True,
+    help="Abort rotation if any dependent fails the pre-flight baseline "
+         "check. Pass --no-require-all-healthy to rotate even when some "
+         "dependents are already broken (won't make things worse).",
+)
 def rotate_db_password(
-    yes: bool, recreate: bool, current_password: str | None,
+    yes: bool,
+    recreate: bool,
+    current_password: str | None,
+    skip_dependents: bool,
+    require_all_healthy: bool,
 ) -> None:
     """Rotate the Postgres password, preserving data.
 
     Generates a new random password, applies it inside the running
     container via ALTER USER, then syncs the new value to .env and
-    config/devbrain.yaml. Optionally recreates the container so updated
+    config/devbrain.yaml. Reloads every dependent process registered in
+    factory.cred_dependents and verifies each one re-authenticated.
+    On any failure, rolls back atomically — old creds remain
+    authoritative. Optionally recreates the container so updated
     docker-compose settings (e.g., loopback-only port binding) take effect.
 
     Use --current-password when .env/yaml drifted from the live DB
@@ -1246,9 +1228,13 @@ def rotate_db_password(
     import subprocess
 
     import psycopg2
-    from psycopg2 import sql
 
-    from config import CONFIG_PATH, DEVBRAIN_HOME, build_database_url, load_config
+    from config import CONFIG_PATH, DEVBRAIN_HOME, load_config
+    from cred_rotate import (
+        RotationContext,
+        list_dependents,
+        rotate_with_dependents,
+    )
 
     # Refuse to run if DEVBRAIN_DATABASE_URL overrides the config — the
     # user wired credentials up explicitly and this command wouldn't help.
@@ -1265,15 +1251,10 @@ def rotate_db_password(
     db_name = db_cfg.get("database", "devbrain")
     db_host = db_cfg.get("host", "localhost")
     db_port = db_cfg.get("port", 5433)
-    if current_password is not None:
-        # User-supplied recovery password — build a URL with it instead
-        # of trusting config, which may be out of sync with the live DB.
-        current_url = (
-            f"postgresql://{db_user}:{current_password}"
-            f"@{db_host}:{db_port}/{db_name}"
-        )
-    else:
-        current_url = build_database_url(cfg)
+    old_password = (
+        current_password if current_password is not None
+        else db_cfg.get("password", "")
+    )
     env_path = DEVBRAIN_HOME / ".env"
     yaml_path = CONFIG_PATH
 
@@ -1292,11 +1273,14 @@ def rotate_db_password(
         click.echo("Aborted.")
         return
 
-    # Step 1: verify the current password actually works. If it doesn't,
-    # there's no point generating a new one — we couldn't apply it.
+    # Verify the current password actually works before generating a new one.
     click.echo("→ Connecting with current password...", nl=False)
     try:
-        verify_conn = psycopg2.connect(current_url, connect_timeout=5)
+        psycopg2.connect(
+            f"postgresql://{db_user}:{old_password}"
+            f"@{db_host}:{db_port}/{db_name}",
+            connect_timeout=5,
+        ).close()
     except psycopg2.Error as exc:
         click.echo(" ❌")
         hint = (
@@ -1310,70 +1294,77 @@ def rotate_db_password(
         )
     click.echo(" ✅")
 
-    # Step 2: generate and apply new password. ALTER USER takes effect
-    # immediately for new connections; existing ones keep working until
-    # they disconnect.
     new_password = secrets.token_hex(32)
-    click.echo("→ Applying new password via ALTER USER...", nl=False)
-    try:
-        with verify_conn:
-            with verify_conn.cursor() as cur:
-                cur.execute(
-                    sql.SQL("ALTER USER {user} PASSWORD {pw}").format(
-                        user=sql.Identifier(db_user),
-                        pw=sql.Literal(new_password),
-                    )
-                )
-    except psycopg2.Error as exc:
-        click.echo(" ❌")
-        verify_conn.close()
-        raise click.ClickException(f"ALTER USER failed: {exc}")
-    verify_conn.close()
-    click.echo(" ✅")
+    ctx = RotationContext(
+        user=db_user, host=db_host, port=db_port, database=db_name,
+        old_password=old_password, env_path=env_path, yaml_path=yaml_path,
+    )
 
-    # Step 3: verify we can connect with the NEW password before writing
-    # it to .env/yaml. If this fails, the DB has a password we can't
-    # recover from config, so print it loudly so the user can paste it in.
-    click.echo("→ Verifying new password...", nl=False)
+    if not skip_dependents:
+        deps = list_dependents(cfg)
+        click.echo(f"[rotate] Pre-flight: {len(deps)} dependents registered")
+    else:
+        click.echo("[rotate] --skip-dependents: registry bypassed")
+
+    click.echo("→ Rotating + reloading dependents...")
+    result = rotate_with_dependents(
+        ctx, new_password,
+        config=cfg,
+        require_all_healthy=require_all_healthy,
+        skip_dependents=skip_dependents,
+    )
+
+    if result.get("aborted_baseline"):
+        click.echo(
+            "[rotate] ABORTED — some dependents are already unhealthy:",
+            err=True,
+        )
+        for c in result["unhealthy"]:
+            click.echo(f"  • {c.id}: {c.error}", err=True)
+        click.echo(
+            "[rotate] Fix them first, or pass --no-require-all-healthy to "
+            "rotate anyway.",
+            err=True,
+        )
+        sys.exit(1)
+
+    if result.get("rolled_back"):
+        click.echo(f"[rotate] FAILED — {result['reason']}", err=True)
+        click.echo(
+            "[rotate] ROLLING BACK ALTER USER + .env + yaml... done.",
+            err=True,
+        )
+        click.echo("[rotate] Old creds remain authoritative.", err=True)
+        for c in result.get("failed", []):
+            click.echo(
+                f"[rotate] Investigate {c.id} manually before retrying.",
+                err=True,
+            )
+        sys.exit(1)
+
+    # Success: report dependent status.
+    for c in result.get("reloaded", []):
+        click.echo(f"  • {c.id} ({c.type}): reloaded, verified ✓")
+    for c in result.get("manual", []):
+        click.echo(
+            f"  • {c.id} (manual_restart): MANUAL ACTION REQUIRED — "
+            f"please restart this dependent to pick up new creds"
+        )
+    n_auto = len(result.get("reloaded", []))
+    n_manual = len(result.get("manual", []))
+    click.echo(
+        f"[rotate] DONE — {n_auto} dependents auto-reloaded, "
+        f"{n_manual} need manual restart."
+    )
+
     new_url = (
         f"postgresql://{db_user}:{new_password}"
         f"@{db_host}:{db_port}/{db_name}"
     )
-    try:
-        psycopg2.connect(new_url, connect_timeout=5).close()
-    except psycopg2.Error as exc:
-        click.echo(" ❌")
-        click.echo(
-            f"\nALTER USER succeeded but the new password doesn't connect: {exc}",
-            err=True,
-        )
-        click.echo(
-            "\nThe database now has this password (NOT yet written to disk):",
-            err=True,
-        )
-        click.echo(f"\n  {new_password}\n", err=True)
-        click.echo(
-            "Update .env (DEVBRAIN_DB_PASSWORD) and config/devbrain.yaml "
-            "(database.password) manually, then re-run 'devbrain doctor'.",
-            err=True,
-        )
-        sys.exit(1)
-    click.echo(" ✅")
 
-    # Step 4: write to .env and yaml. Order: .env first (smaller blast
-    # radius if the process dies between them — re-running this command
-    # will pick up .env and sync yaml).
-    click.echo("→ Writing DEVBRAIN_DB_PASSWORD to .env...", nl=False)
-    _rewrite_env_password(env_path, new_password)
-    click.echo(" ✅")
-
-    click.echo("→ Updating config/devbrain.yaml...", nl=False)
-    _rewrite_yaml_db_password(yaml_path, new_password)
-    click.echo(" ✅")
-
-    # Step 5: optionally recreate the container so docker-compose.yml
-    # changes (port binding, etc.) take effect. Password rotation alone
-    # doesn't require a recreate — ALTER USER already applied it.
+    # Optional container recreate so docker-compose.yml changes (e.g.,
+    # loopback-only port binding) take effect. Password rotation alone
+    # doesn't require this — ALTER USER already applied it.
     if recreate:
         if subprocess.run(
             ["docker", "--version"], capture_output=True

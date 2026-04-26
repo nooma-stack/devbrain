@@ -50,6 +50,22 @@ _DEFAULTS: dict = {
             "branch_cleanup": True,
         },
         "project_paths": {},
+        # Long-running processes that hold cached database credentials.
+        # rotate-db-password reloads each one after the rotation lands
+        # and verifies it can authenticate; if any verification fails
+        # the rotation rolls back. See config/devbrain.yaml.example for
+        # the schema of each entry.
+        "cred_dependents": [
+            {
+                "id": "ingest_daemon",
+                "type": "launchagent",
+                "label": "com.devbrain.ingest",
+                "plist": "~/Library/LaunchAgents/com.devbrain.ingest.plist",
+                "verify": "tail_log_no_auth_errors",
+                "verify_log": "~/devbrain/logs/ingest.err.log",
+                "verify_window_seconds": 10,
+            },
+        ],
         # Permissions tier controls what factory-spawned claude subprocesses
         # are allowed to do. 1 = read-only audit, 2 = guarded dev (curated
         # allowlist), 3 = unrestricted (--dangerously-skip-permissions).
@@ -144,6 +160,7 @@ FACTORY_PERMISSIONS_EXTRA_TOOLS = list(
 FACTORY_TIER_2_SUBCATEGORIES = dict(
     FACTORY_CONFIG.get("permissions_tier_2_subcategories", {})
 )
+FACTORY_CRED_DEPENDENTS = list(FACTORY_CONFIG.get("cred_dependents", []))
 
 # Fix-loop trigger tier. When True (default as of 2026-04-23), reviewer
 # WARNING findings also route a job through FIX_LOOP; when False the
