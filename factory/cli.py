@@ -887,7 +887,14 @@ def _offer_devdoctor_fixes(checks: list[dict]) -> None:
             click.echo("   Fix: generate a new password, ALTER USER inside the")
             click.echo("        container, sync .env + yaml, recreate the container.")
             if click.confirm("   Rotate DB password now?", default=True):
-                ctx.invoke(rotate_db_password, yes=False, recreate=True)
+                # devdoctor --fix runs against a known-bad system; pre-flight
+                # baseline failures here are expected, not a reason to abort.
+                ctx.invoke(
+                    rotate_db_password,
+                    yes=False,
+                    recreate=True,
+                    require_all_healthy=False,
+                )
                 click.secho(
                     "   → After this runs, open a new terminal (and restart "
                     "any Claude Code sessions) before using DevBrain MCP tools.",
@@ -1011,7 +1018,15 @@ def _offer_devdoctor_fixes(checks: list[dict]) -> None:
                     "container (applies loopback binding)?",
                     default=True,
                 ):
-                    ctx.invoke(rotate_db_password, yes=False, recreate=True)
+                    # Recovery flow: dependents may still be unhealthy from
+                    # the drift we just fixed. Don't let baseline failures
+                    # abort the rotation the operator just opted into.
+                    ctx.invoke(
+                        rotate_db_password,
+                        yes=False,
+                        recreate=True,
+                        require_all_healthy=False,
+                    )
                     click.secho(
                         "   → Restart any Claude Code sessions using "
                         "DevBrain MCP so their subprocesses reload.",
@@ -1029,10 +1044,14 @@ def _offer_devdoctor_fixes(checks: list[dict]) -> None:
                     "   Skipped — no recovery action taken. If you know"
                 )
                 click.echo(
-                    "   the live DB password, you can also pass it to"
+                    "   the live DB password, you can re-run with"
                 )
                 click.echo(
-                    f"   {click.style('devbrain rotate-db-password --current-password ...', fg='cyan')}"
+                    f"   {click.style('devbrain rotate-db-password --current-password', fg='cyan')}"
+                )
+                click.echo(
+                    "   (you'll be prompted securely; or set "
+                    "DEVBRAIN_CURRENT_DB_PASSWORD for scripted use)."
                 )
 
         elif name.startswith("ollama_model:"):
@@ -1581,7 +1600,14 @@ def upgrade(
                 "   (This recreates the devbrain-db container with the"
                 " loopback-only port binding.)"
             )
-            ctx.invoke(rotate_db_password, yes=yes, recreate=True)
+            # upgrade auto-rotates a weak/default password; a stale
+            # dependent shouldn't block fixing a known-weak credential.
+            ctx.invoke(
+                rotate_db_password,
+                yes=yes,
+                recreate=True,
+                require_all_healthy=False,
+            )
         else:
             click.echo("   ✓ custom password in use")
 
