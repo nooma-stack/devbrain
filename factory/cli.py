@@ -14,6 +14,7 @@ from pathlib import Path
 import click
 import yaml
 
+import backfill_memory
 import schema_migrate
 from config import DATABASE_URL, NL_MODEL, OLLAMA_URL
 from state_machine import FactoryDB
@@ -1640,6 +1641,85 @@ def migrate(dry_run: bool, migrations_dir: Path | None) -> None:
             click.echo("[migrate] no pending migrations")
     elif not result:
         click.echo("[migrate] no pending migrations")
+
+
+def _print_counts_line(label: str, c: dict, *, dry_run: bool) -> None:
+    """Render one summary line for a backfill counts dict.
+
+    Format: ``[backfill] {label}: {scanned} scanned, {inserted} inserted,
+    {skipped_dup} dup[, N no_project][, N no_summary][, N batch_failures]
+    ({duration_s}s)``. Skip-counters with value 0 are omitted to keep the
+    common-case output terse. ``[dry-run]`` prefix replaces ``[backfill]``
+    when --dry-run was passed so it's obvious nothing was written.
+    """
+    prefix = "[dry-run]" if dry_run else "[backfill]"
+    extras = []
+    if c.get("skipped_no_project", 0):
+        extras.append(f", {c['skipped_no_project']} no_project")
+    if c.get("skipped_no_summary", 0):
+        extras.append(f", {c['skipped_no_summary']} no_summary")
+    if c.get("batch_failures", 0):
+        extras.append(f", {c['batch_failures']} batch_failures")
+    click.echo(
+        f"{prefix} {label}: {c['scanned']} scanned, "
+        f"{c['inserted']} inserted, {c['skipped_dup']} dup"
+        f"{''.join(extras)} ({c['duration_s']}s)"
+    )
+
+
+@cli.command(name="backfill-memory")
+@click.option(
+    "--dry-run", is_flag=True,
+    help="Print counts without inserting any memory rows.",
+)
+@click.option(
+    "--batch-size", type=int, default=1000, show_default=True,
+    help="Rows per batch for keyset-paged scans.",
+)
+@click.option(
+    "--only",
+    type=click.Choice(
+        ["chunks", "decisions", "patterns", "issues", "raw_sessions"]
+    ),
+    default=None,
+    help="Backfill only one legacy table (default: all five).",
+)
+def backfill_memory_cmd(dry_run: bool, batch_size: int, only: str | None) -> None:
+    """Backfill historical legacy rows into devbrain.memory (P2.c).
+
+    Idempotent — re-running is safe; existing memory rows are preserved
+    via the partial unique index from migration 011. Run AFTER P2.b
+    dual-writes are deployed.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    db = get_db()
+
+    try:
+        if only is None:
+            results = backfill_memory.backfill_all(
+                db, batch_size=batch_size, dry_run=dry_run,
+            )
+            for label, _fn in backfill_memory._BACKFILLS:
+                _print_counts_line(label, results[label], dry_run=dry_run)
+            _print_counts_line("TOTAL", results["TOTAL"], dry_run=dry_run)
+            total_failures = results["TOTAL"]["batch_failures"]
+        else:
+            fn = {
+                "chunks": backfill_memory.backfill_chunks,
+                "decisions": backfill_memory.backfill_decisions,
+                "patterns": backfill_memory.backfill_patterns,
+                "issues": backfill_memory.backfill_issues,
+                "raw_sessions": backfill_memory.backfill_raw_sessions,
+            }[only]
+            counts = fn(db, batch_size=batch_size, dry_run=dry_run)
+            _print_counts_line(only, counts, dry_run=dry_run)
+            total_failures = counts["batch_failures"]
+    except RuntimeError as exc:
+        click.echo(f"[backfill] FAILED: {exc}", err=True)
+        sys.exit(1)
+
+    if total_failures > 0:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
