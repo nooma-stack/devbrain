@@ -89,9 +89,16 @@ class CleanupAgent:
         self.db = db
 
     def _event_type_for_status(self, status: JobStatus) -> str | None:
-        """Map a terminal status to a notification event_type. Returns None for silent transitions."""
+        """Map a terminal status to a notification event_type. Returns None for silent transitions.
+
+        Intentionally omits READY_FOR_APPROVAL: the orchestrator's _run_qa
+        emits the job_ready event itself on the QA → READY_FOR_APPROVAL
+        transition (factory/orchestrator.py:_run_qa). Mapping it here too
+        produced a duplicate notification ~176ms later when run_post_cleanup
+        fired on the same terminal state. FAILED is kept because there is
+        no orchestrator-side job_failed emit — this is the sole source.
+        """
         return {
-            JobStatus.READY_FOR_APPROVAL: "job_ready",
             JobStatus.FAILED: "job_failed",
         }.get(status)
 

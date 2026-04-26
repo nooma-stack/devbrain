@@ -83,9 +83,14 @@ def test_cleanup_agent_fires_job_failed_notification(db):
     assert any("integ_notif_failing_job" in n["title"] for n in notifs)
 
 
-# ─── Test 2: Cleanup agent fires job_ready notification ──────────────
+# ─── Test 2: Cleanup agent does NOT fire job_ready (orchestrator owns it) ──
 
-def test_cleanup_agent_fires_job_ready_notification(db):
+def test_cleanup_agent_does_not_fire_job_ready_notification(db):
+    """The job_ready event is emitted by orchestrator._run_qa on the
+    QA → READY_FOR_APPROVAL transition. run_post_cleanup must NOT fire
+    a second job_ready for the same job — that produced the duplicate
+    notification ~176ms apart that this test now locks against.
+    """
     db.register_dev(
         dev_id="test_integ_bob",
         channels=[{"type": "tmux", "address": "test_integ_bob"}],
@@ -110,7 +115,10 @@ def test_cleanup_agent_fires_job_ready_notification(db):
         agent.run_post_cleanup(job_id)
 
     notifs = db.get_notifications(recipient_dev_id="test_integ_bob", limit=5)
-    assert any(n["event_type"] == "job_ready" for n in notifs)
+    assert not any(n["event_type"] == "job_ready" for n in notifs), (
+        f"cleanup_agent must not emit job_ready (orchestrator owns that "
+        f"event). Got: {[n['event_type'] for n in notifs]}"
+    )
 
 
 # ─── Test 3: Lock conflict notifies both devs ────────────────────────

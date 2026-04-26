@@ -1545,6 +1545,21 @@ The prose above the block is what humans read; the block is the machine contract
 
     def _run_qa(self, job: FactoryJob) -> FactoryJob:
         """QA phase: run full test suite, lint, type checks."""
+        # Re-entry guard: if a caller invokes _run_qa directly on a job
+        # that has already converged (READY_FOR_APPROVAL) or otherwise
+        # reached a terminal state, return without re-running QA. The
+        # run_job loop will not enter this branch because READY_FOR_APPROVAL
+        # is in its terminal set, but a direct call from a regression
+        # test or a future caller could re-fire the job_ready notification
+        # at the bottom of this method. Defense in depth.
+        if job.status in (
+            JobStatus.READY_FOR_APPROVAL,
+            JobStatus.APPROVED,
+            JobStatus.REJECTED,
+            JobStatus.DEPLOYED,
+            JobStatus.FAILED,
+        ):
+            return job
         if job.status != JobStatus.QA:
             job = self.db.transition(job.id, JobStatus.QA)
         # QA runs tests against the branch — use the worktree cwd.
