@@ -54,6 +54,7 @@ dump multi-megabyte transcripts into `memory.content`.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 
@@ -62,8 +63,9 @@ logger = logging.getLogger(__name__)
 
 _INSERT_MEMORY_SQL = """
     INSERT INTO devbrain.memory
-        (project_id, kind, title, content, embedding, provenance_id, created_at)
-    VALUES (%s, %s, %s, %s, %s::vector, %s, %s)
+        (project_id, kind, title, content, embedding, provenance_id,
+         created_at, applies_when)
+    VALUES (%s, %s, %s, %s, %s::vector, %s, %s, %s::jsonb)
     ON CONFLICT (provenance_id, kind) WHERE provenance_id IS NOT NULL
     DO NOTHING
 """
@@ -215,7 +217,7 @@ def _run_batched_backfill(
             and ordered `id ASC`. Must return rows whose first column is
             the legacy id (used to advance `last_id`).
         row_to_insert_args: callable(row, counts) -> tuple|None.
-            Returns the args tuple for `_INSERT_MEMORY_SQL` (7 values),
+            Returns the args tuple for `_INSERT_MEMORY_SQL` (8 values),
             or None to skip this row (e.g., NULL project / NULL summary).
             Also responsible for incrementing skip counters in `counts`.
         batch_size: rows per batch.
@@ -359,7 +361,7 @@ def backfill_chunks(
             return None
         return (
             str(project_id), "chunk", None, content, embedding_text,
-            str(chunk_id), created_at,
+            str(chunk_id), created_at, None,
         )
 
     return _run_batched_backfill(
@@ -402,7 +404,7 @@ def backfill_decisions(
             return None
         return (
             str(project_id), "decision", title, decision_text, None,
-            str(decision_id), created_at,
+            str(decision_id), created_at, None,
         )
 
     return _run_batched_backfill(
@@ -423,14 +425,42 @@ def backfill_patterns(
     """Backfill kind='pattern' from devbrain.patterns.
 
     title = name[:80] (legacy `name` is varchar(255)); content =
-    description.
+    description. legacy `category` (e.g. 'factory_review') is mirrored
+    into `applies_when = {"category": <category>}` so the canonical
+    Phase-3 filter in factory/learning.py (get_review_lessons /
+    _store_lessons dedup) selects exactly the rows it would have
+    selected against the legacy `patterns.category` column. Without
+    this, every pre-P2.b factory_review pattern (and any pattern
+    dual-written before applies_when was added) lands with
+    applies_when=NULL and is invisible to the new filter — and
+    re-running backfill won't rescue them because ON CONFLICT DO
+    NOTHING leaves the untagged row in place.
     """
     _ensure_schema(db)
     if dry_run:
         return _dry_run_counts(db, table="patterns", kind="pattern")
 
+    # One-shot recovery for memory rows already backfilled (or
+    # dual-written) before applies_when was being propagated. Scoped
+    # tightly: only fills rows where applies_when IS NULL and the
+    # legacy patterns row has a non-null category — never overwrites
+    # an existing tag.
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE devbrain.memory m
+               SET applies_when = jsonb_build_object('category', p.category)
+              FROM devbrain.patterns p
+             WHERE m.kind = 'pattern'
+               AND m.provenance_id = p.id
+               AND m.applies_when IS NULL
+               AND p.category IS NOT NULL
+            """
+        )
+        conn.commit()
+
     select_sql = """
-        SELECT id, project_id, name, description, created_at
+        SELECT id, project_id, name, description, created_at, category
         FROM devbrain.patterns
         WHERE id > %s
         ORDER BY id
@@ -438,14 +468,19 @@ def backfill_patterns(
     """
 
     def to_args(row, counts):
-        pattern_id, project_id, name, description, created_at = row
+        (
+            pattern_id, project_id, name, description, created_at, category,
+        ) = row
         if project_id is None:
             counts["skipped_no_project"] += 1
             return None
         title = (name or "")[:80] or None
+        applies_when = (
+            json.dumps({"category": category}) if category else None
+        )
         return (
             str(project_id), "pattern", title, description, None,
-            str(pattern_id), created_at,
+            str(pattern_id), created_at, applies_when,
         )
 
     return _run_batched_backfill(
@@ -486,7 +521,7 @@ def backfill_issues(
             return None
         return (
             str(project_id), "issue", title, description, None,
-            str(issue_id), created_at,
+            str(issue_id), created_at, None,
         )
 
     return _run_batched_backfill(
@@ -539,7 +574,7 @@ def backfill_raw_sessions(
         title = summary[:80]
         return (
             str(project_id), "session_summary", title, summary, None,
-            str(session_id), created_at,
+            str(session_id), created_at, None,
         )
 
     return _run_batched_backfill(
