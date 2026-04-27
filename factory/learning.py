@@ -183,14 +183,23 @@ def _store_lessons(
     """Store lessons as patterns, deduplicating by semantic similarity."""
     stored = []
 
-    # Get existing factory_review pattern embeddings for comparison
+    # P2.d.i read switch: existing-pattern dedup reads embeddings from
+    # devbrain.memory (kind='pattern') instead of the chunks JOIN
+    # patterns shape used pre-switch. applies_when->>'category' is set
+    # by the dual-write below so the canonical filter selects exactly
+    # the factory_review lessons — no content-LIKE fallback needed
+    # (which would false-positive on any user-stored pattern containing
+    # the word "Context:" and silently drop a real lesson via the
+    # similarity dedup loop).
     with conn.cursor() as cur:
         cur.execute(
-            """SELECT c.embedding::text, c.content
-               FROM devbrain.chunks c
-               JOIN devbrain.patterns p ON c.source_id = p.id AND c.source_type = 'pattern'
-               WHERE p.project_id = %s AND p.category = 'factory_review'
-               AND c.embedding IS NOT NULL""",
+            """SELECT embedding::text, content
+               FROM devbrain.memory
+               WHERE project_id = %s
+                 AND kind = 'pattern'
+                 AND archived_at IS NULL
+                 AND embedding IS NOT NULL
+                 AND applies_when->>'category' = 'factory_review'""",
             (project_id,),
         )
         existing = []
@@ -201,6 +210,25 @@ def _store_lessons(
                     "embedding": [float(x) for x in vec_str.split(",")],
                     "content": row[1],
                 })
+
+        # Dual-write drift detector: if memory returned nothing but the
+        # legacy patterns table has factory_review rows, the dual-write
+        # has fallen behind for this project. Surface as WARNING so
+        # operators can rerun backfill before P2.d.ii drops legacy.
+        if not existing:
+            cur.execute(
+                """SELECT 1 FROM devbrain.patterns
+                   WHERE project_id = %s AND category = 'factory_review'
+                   LIMIT 1""",
+                (project_id,),
+            )
+            if cur.fetchone() is not None:
+                logger.warning(
+                    "dual-write drift: devbrain.memory returned 0 "
+                    "factory_review patterns for project %s but legacy "
+                    "devbrain.patterns has rows — run backfill-memory",
+                    project_id,
+                )
 
     for lesson in lessons:
         text = lesson["lesson"]
@@ -246,7 +274,9 @@ def _store_lessons(
             # the pattern (not the auxiliary chunk insert below) so each
             # logical lesson lands as exactly one memory row. SAVEPOINT
             # inside record_memory keeps a memory failure from rolling
-            # back the pattern + chunk legacy commit.
+            # back the pattern + chunk legacy commit. applies_when tags
+            # the row as a factory_review lesson — that's the canonical
+            # filter the dedup query and get_review_lessons select on.
             record_memory(
                 cur,
                 project_id=project_id,
@@ -255,6 +285,7 @@ def _store_lessons(
                 title=text[:100],
                 embedding_sql=vector_str,
                 provenance_id=pattern_id,
+                applies_when={"category": "factory_review"},
             )
 
             cur.execute(
@@ -282,18 +313,46 @@ def _store_lessons(
 
 
 def get_review_lessons(project_id: str, limit: int = 10) -> list[str]:
-    """Get stored review lessons for a project, for injection into planning prompts."""
+    """Get stored review lessons for a project, for injection into planning prompts.
+
+    P2.d.i: reads from devbrain.memory (kind='pattern') instead of the
+    legacy patterns table. applies_when->>'category' is the canonical
+    Phase-3 marker, set by _store_lessons on dual-write so this filter
+    selects exactly the factory_review lessons. Returns content from
+    the memory row (P2.b dual-write writes the same description).
+    """
     conn = psycopg2.connect(DATABASE_URL)
     try:
         with conn.cursor() as cur:
             cur.execute(
-                """SELECT p.description
-                   FROM devbrain.patterns p
-                   WHERE p.project_id = %s AND p.category = 'factory_review'
-                   ORDER BY p.created_at DESC
+                """SELECT content
+                   FROM devbrain.memory
+                   WHERE project_id = %s
+                     AND kind = 'pattern'
+                     AND archived_at IS NULL
+                     AND applies_when->>'category' = 'factory_review'
+                   ORDER BY created_at DESC
                    LIMIT %s""",
                 (project_id, limit),
             )
-            return [row[0] for row in cur.fetchall()]
+            results = [row[0] for row in cur.fetchall()]
+
+            # Dual-write drift detector — see _store_lessons for context.
+            if not results:
+                cur.execute(
+                    """SELECT 1 FROM devbrain.patterns
+                       WHERE project_id = %s AND category = 'factory_review'
+                       LIMIT 1""",
+                    (project_id,),
+                )
+                if cur.fetchone() is not None:
+                    logger.warning(
+                        "dual-write drift: devbrain.memory returned 0 "
+                        "factory_review lessons for project %s but legacy "
+                        "devbrain.patterns has rows — run backfill-memory",
+                        project_id,
+                    )
+
+            return results
     finally:
         conn.close()

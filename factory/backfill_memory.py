@@ -54,6 +54,7 @@ dump multi-megabyte transcripts into `memory.content`.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 
@@ -62,8 +63,9 @@ logger = logging.getLogger(__name__)
 
 _INSERT_MEMORY_SQL = """
     INSERT INTO devbrain.memory
-        (project_id, kind, title, content, embedding, provenance_id, created_at)
-    VALUES (%s, %s, %s, %s, %s::vector, %s, %s)
+        (project_id, kind, title, content, embedding, provenance_id,
+         created_at, applies_when)
+    VALUES (%s, %s, %s, %s, %s::vector, %s, %s, %s::jsonb)
     ON CONFLICT (provenance_id, kind) WHERE provenance_id IS NOT NULL
     DO NOTHING
 """
@@ -123,6 +125,7 @@ def _dry_run_counts(
     table: str,
     kind: str,
     extra_skip_predicate: str = "",
+    scan_where: str = "",
 ) -> dict:
     """Read-only counts that approximate what a real backfill would do.
 
@@ -138,23 +141,32 @@ def _dry_run_counts(
         extra_skip_predicate: optional extra WHERE clause for the
             "rows we would skip" branch (raw_sessions uses this for
             the summary-NULL guard).
+        scan_where: optional WHERE clause that restricts every count in
+            this dry-run to the same row population the live SELECT
+            would fetch (used by chunks to exclude auxiliary
+            source_types). Applied to scanned, skipped_no_project,
+            skipped_no_summary, and would_insert.
     """
     counts = _new_counts()
     fq_table = f"devbrain.{table}"
+    scan_clause = f" WHERE {scan_where}" if scan_where else ""
+    scan_and = f" AND {scan_where}" if scan_where else ""
 
     with db._conn() as conn, conn.cursor() as cur:
-        cur.execute(f"SELECT count(*) FROM {fq_table}")
+        cur.execute(f"SELECT count(*) FROM {fq_table}{scan_clause}")
         counts["scanned"] = int(cur.fetchone()[0])
 
         cur.execute(
-            f"SELECT count(*) FROM {fq_table} WHERE project_id IS NULL"
+            f"SELECT count(*) FROM {fq_table} "
+            f"WHERE project_id IS NULL{scan_and}"
         )
         counts["skipped_no_project"] = int(cur.fetchone()[0])
 
         if extra_skip_predicate:
             cur.execute(
                 f"SELECT count(*) FROM {fq_table} "
-                f"WHERE project_id IS NOT NULL AND ({extra_skip_predicate})"
+                f"WHERE project_id IS NOT NULL AND "
+                f"({extra_skip_predicate}){scan_and}"
             )
             counts["skipped_no_summary"] = int(cur.fetchone()[0])
 
@@ -164,7 +176,7 @@ def _dry_run_counts(
         cur.execute(
             f"""
             SELECT count(*) FROM {fq_table} t
-            WHERE t.project_id IS NOT NULL{anti_join_extra}
+            WHERE t.project_id IS NOT NULL{anti_join_extra}{scan_and}
               AND NOT EXISTS (
                   SELECT 1 FROM devbrain.memory m
                   WHERE m.provenance_id = t.id AND m.kind = %s
@@ -205,7 +217,7 @@ def _run_batched_backfill(
             and ordered `id ASC`. Must return rows whose first column is
             the legacy id (used to advance `last_id`).
         row_to_insert_args: callable(row, counts) -> tuple|None.
-            Returns the args tuple for `_INSERT_MEMORY_SQL` (7 values),
+            Returns the args tuple for `_INSERT_MEMORY_SQL` (8 values),
             or None to skip this row (e.g., NULL project / NULL summary).
             Also responsible for incrementing skip counters in `counts`.
         batch_size: rows per batch.
@@ -297,6 +309,21 @@ def _run_batched_backfill(
 # ─── Per-table backfills ─────────────────────────────────────────────────────
 
 
+# Auxiliary chunk rows that store()/_store_lessons()/end_session insert
+# alongside a primary entity. Excluded from the chunks→memory backfill
+# because each already has a primary memory row via the P2.b dual-write
+# (decision/pattern/issue from store(), session_summary from
+# end_session); inserting a kind='chunk' row from the auxiliary chunks
+# row would create a second memory row with the same content but a
+# different (provenance_id, kind) tuple — the unique index can't
+# collapse them, so deep_search would surface both and eat its LIMIT
+# budget.
+_CHUNK_BACKFILL_WHERE = (
+    "(source_type IS NULL OR source_type NOT IN "
+    "('decision','pattern','issue','session_summary'))"
+)
+
+
 def backfill_chunks(
     db,
     *,
@@ -306,16 +333,23 @@ def backfill_chunks(
     """Backfill kind='chunk' from devbrain.chunks.
 
     Reuses the legacy embedding via `embedding::text` → `%s::vector`.
-    Skips rows with project_id IS NULL.
+    Skips rows with project_id IS NULL and rows whose source_type
+    indicates an auxiliary insert (see _CHUNK_BACKFILL_WHERE).
     """
     _ensure_schema(db)
     if dry_run:
-        return _dry_run_counts(db, table="chunks", kind="chunk")
+        return _dry_run_counts(
+            db,
+            table="chunks",
+            kind="chunk",
+            scan_where=_CHUNK_BACKFILL_WHERE,
+        )
 
-    select_sql = """
+    select_sql = f"""
         SELECT id, project_id, content, embedding::text, created_at
         FROM devbrain.chunks
         WHERE id > %s
+          AND {_CHUNK_BACKFILL_WHERE}
         ORDER BY id
         LIMIT %s
     """
@@ -327,7 +361,7 @@ def backfill_chunks(
             return None
         return (
             str(project_id), "chunk", None, content, embedding_text,
-            str(chunk_id), created_at,
+            str(chunk_id), created_at, None,
         )
 
     return _run_batched_backfill(
@@ -335,7 +369,7 @@ def backfill_chunks(
         select_sql=select_sql,
         row_to_insert_args=to_args,
         batch_size=batch_size,
-        skip_filters=["project_id IS NULL"],
+        skip_filters=["project_id IS NULL", _CHUNK_BACKFILL_WHERE],
     )
 
 
@@ -370,7 +404,7 @@ def backfill_decisions(
             return None
         return (
             str(project_id), "decision", title, decision_text, None,
-            str(decision_id), created_at,
+            str(decision_id), created_at, None,
         )
 
     return _run_batched_backfill(
@@ -391,29 +425,85 @@ def backfill_patterns(
     """Backfill kind='pattern' from devbrain.patterns.
 
     title = name[:80] (legacy `name` is varchar(255)); content =
-    description.
+    description. legacy `category` (e.g. 'factory_review') is mirrored
+    into `applies_when = {"category": <category>}` so the canonical
+    Phase-3 filter in factory/learning.py (get_review_lessons /
+    _store_lessons dedup) selects exactly the rows it would have
+    selected against the legacy `patterns.category` column. Without
+    this, every pre-P2.b factory_review pattern (and any pattern
+    dual-written before applies_when was added) lands with
+    applies_when=NULL and is invisible to the new filter — and
+    re-running backfill won't rescue them because ON CONFLICT DO
+    NOTHING leaves the untagged row in place.
+
+    Embedding reuse: the legacy patterns table has no embedding
+    column, but store() also inserts an auxiliary devbrain.chunks
+    row (source_type='pattern', source_id=p.id) carrying the
+    embedding. LEFT JOIN that aux chunk so memory.embedding is
+    populated; otherwise the dedup SELECT in
+    factory/learning.py:_store_lessons (filters
+    `embedding IS NOT NULL`) skips backfilled rows and the
+    accompanying drift detector falsely fires.
     """
     _ensure_schema(db)
     if dry_run:
         return _dry_run_counts(db, table="patterns", kind="pattern")
 
+    # One-shot recovery for memory rows already backfilled (or
+    # dual-written) before applies_when / embedding fill were being
+    # propagated. Scoped tightly: only fills NULL columns, never
+    # overwrites existing values.
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE devbrain.memory m
+               SET applies_when = jsonb_build_object('category', p.category)
+              FROM devbrain.patterns p
+             WHERE m.kind = 'pattern'
+               AND m.provenance_id = p.id
+               AND m.applies_when IS NULL
+               AND p.category IS NOT NULL
+            """
+        )
+        cur.execute(
+            """
+            UPDATE devbrain.memory m
+               SET embedding = c.embedding
+              FROM devbrain.chunks c
+             WHERE m.kind = 'pattern'
+               AND m.embedding IS NULL
+               AND c.source_type = 'pattern'
+               AND c.source_id = m.provenance_id
+            """
+        )
+        conn.commit()
+
     select_sql = """
-        SELECT id, project_id, name, description, created_at
-        FROM devbrain.patterns
-        WHERE id > %s
-        ORDER BY id
+        SELECT p.id, p.project_id, p.name, p.description, p.created_at,
+               p.category, c.embedding::text
+        FROM devbrain.patterns p
+        LEFT JOIN devbrain.chunks c
+          ON c.source_type = 'pattern' AND c.source_id = p.id
+        WHERE p.id > %s
+        ORDER BY p.id
         LIMIT %s
     """
 
     def to_args(row, counts):
-        pattern_id, project_id, name, description, created_at = row
+        (
+            pattern_id, project_id, name, description, created_at, category,
+            embedding_text,
+        ) = row
         if project_id is None:
             counts["skipped_no_project"] += 1
             return None
         title = (name or "")[:80] or None
+        applies_when = (
+            json.dumps({"category": category}) if category else None
+        )
         return (
-            str(project_id), "pattern", title, description, None,
-            str(pattern_id), created_at,
+            str(project_id), "pattern", title, description, embedding_text,
+            str(pattern_id), created_at, applies_when,
         )
 
     return _run_batched_backfill(
@@ -454,7 +544,7 @@ def backfill_issues(
             return None
         return (
             str(project_id), "issue", title, description, None,
-            str(issue_id), created_at,
+            str(issue_id), created_at, None,
         )
 
     return _run_batched_backfill(
@@ -507,7 +597,7 @@ def backfill_raw_sessions(
         title = summary[:80]
         return (
             str(project_id), "session_summary", title, summary, None,
-            str(session_id), created_at,
+            str(session_id), created_at, None,
         )
 
     return _run_batched_backfill(

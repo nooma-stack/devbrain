@@ -13,6 +13,7 @@ legacy row collapse to one memory row via ON CONFLICT DO NOTHING.
 """
 from __future__ import annotations
 
+import json
 import logging
 
 logger = logging.getLogger(__name__)
@@ -29,6 +30,7 @@ def record_memory(
     title: str | None = None,
     embedding_sql: str | None = None,
     provenance_id: str | None = None,
+    applies_when: dict | None = None,
 ) -> None:
     """Insert a row into devbrain.memory inside the caller's transaction.
 
@@ -60,6 +62,10 @@ def record_memory(
         provenance_id: legacy row's UUID. If None, no dedup is enforced
             (the partial unique index has WHERE provenance_id IS NOT
             NULL so two NULL-prov rows can both insert).
+        applies_when: optional JSONB tag dict. Callers populate it on
+            curated rows so canonical filters (e.g. factory_review
+            lessons) match without falling back to content-LIKE
+            heuristics.
     """
     # SAVEPOINT itself is inside the try: if the caller's transaction is
     # already InFailedSqlTransaction, even SAVEPOINT raises — and the
@@ -70,12 +76,17 @@ def record_memory(
         cur.execute(
             """
             INSERT INTO devbrain.memory
-                (project_id, kind, title, content, embedding, provenance_id)
-            VALUES (%s, %s, %s, %s, %s::vector, %s)
+                (project_id, kind, title, content, embedding,
+                 provenance_id, applies_when)
+            VALUES (%s, %s, %s, %s, %s::vector, %s, %s::jsonb)
             ON CONFLICT (provenance_id, kind) WHERE provenance_id IS NOT NULL
             DO NOTHING
             """,
-            (project_id, kind, title, content, embedding_sql, provenance_id),
+            (
+                project_id, kind, title, content, embedding_sql,
+                provenance_id,
+                json.dumps(applies_when) if applies_when is not None else None,
+            ),
         )
         cur.execute(f"RELEASE SAVEPOINT {_SAVEPOINT_NAME}")
     except Exception as exc:
