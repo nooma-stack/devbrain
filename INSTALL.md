@@ -520,6 +520,45 @@ clicks, form fills) to any MCP client. The DevBrain installer offers
 the same flow under "PKRelay (optional)" — opt out with
 `--no-pkrelay` if scripting an unattended install.
 
+### 5.2 Multi-dev setup
+
+Point this DevBrain install at a **shared Postgres** (a teammate's host,
+a single team-wide DB) instead of the bundled `localhost:5433` container.
+The multi-dev wizard tests the connection first, then writes
+`DEVBRAIN_DATABASE_URL` to `.env`. Because env wins over yaml in
+`build_database_url`, the new URL takes effect immediately on the next
+DevBrain process start — no yaml edit required.
+
+**Interactive (recommended):**
+
+```bash
+devbrain setup multi-dev
+```
+
+Prompts for host, port, database, username, password. Connection failure
+leaves `.env` untouched.
+
+**Scripted (CI / Ansible / unattended):**
+
+```bash
+devbrain setup-multi-dev \
+    --host db.team.example.com --port 5432 \
+    --database devbrain --username alice --password "$DB_PASSWORD"
+```
+
+> **Security note:** the `--password` flag is visible in `ps aux` for the
+> brief window the command runs. For unattended installs, prefer a
+> wrapper that reads the secret from a vault / sops file and exports it
+> as `$DB_PASSWORD` only for the duration of the call, rather than
+> hard-coding the value in a script.
+
+The command exits non-zero if the connection test fails (`.env` is left
+alone), so it's safe to chain in pipelines: `devbrain setup-multi-dev ...
+&& devbrain devdoctor`.
+
+After running either form, restart any long-lived DevBrain processes
+(launchd ingest service, MCP server) so they pick up the new URL.
+
 ---
 
 ## 6. Platform notes
