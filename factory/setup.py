@@ -644,9 +644,9 @@ def setup_multi_dev(
             _warn(msg)
         return False
 
-    user_q = urllib.parse.quote_plus(str(username))
-    pass_q = urllib.parse.quote_plus(str(password))
-    db_q = urllib.parse.quote_plus(str(database))
+    user_q = urllib.parse.quote(str(username), safe="")
+    pass_q = urllib.parse.quote(str(password), safe="")
+    db_q = urllib.parse.quote(str(database), safe="")
     url = f"postgresql://{user_q}:{pass_q}@{host}:{port_int}/{db_q}"
 
     if not non_interactive:

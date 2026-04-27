@@ -128,7 +128,7 @@ def test_setup_multi_dev_url_encodes_special_chars(isolated_env, monkeypatch):
     # Special chars survived as percent-encoded — no raw "@", ":", "/", "#"
     # in the password substring.
     assert "alice%40corp" in url
-    assert "p%40ss%3Awo%2Frd+%231" in url or "p%40ss%3Awo%2Frd%20%231" in url
+    assert "p%40ss%3Awo%2Frd%20%231" in url
     # And the .env file contains the same encoded URL.
     assert url in (isolated_env / ".env").read_text()
 
