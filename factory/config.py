@@ -118,6 +118,11 @@ def load_config() -> dict:
 
 
 def build_database_url(cfg: dict | None = None) -> str:
+    # Env wins: DEVBRAIN_DATABASE_URL is the multi-dev / remote-DB knob
+    # written by `devbrain setup multi-dev` (and the scripted
+    # `devbrain setup-multi-dev` CLI). Returning early here means a
+    # remote-DB pointer in .env always overrides the per-host yaml
+    # database stanza, regardless of merge order.
     if env_url := os.environ.get("DEVBRAIN_DATABASE_URL"):
         return env_url
     if cfg is None:

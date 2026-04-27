@@ -576,6 +576,113 @@ def install_identity(dev_id: str | None = None) -> str | None:
     return resolved
 
 
+def setup_multi_dev(
+    host: str | None = None,
+    port: int | str | None = None,
+    database: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+    non_interactive: bool = False,
+) -> bool:
+    """Point this DevBrain install at a remote/shared Postgres.
+
+    Builds a `DEVBRAIN_DATABASE_URL` from the provided pieces (or prompts
+    for missing values when interactive), tests the connection BEFORE
+    touching `.env`, and only writes the env var on success. Special
+    characters in username/password are URL-encoded with `quote_plus` so
+    pasted credentials with `@`, `:`, `/`, `#`, or spaces don't corrupt
+    the URL.
+
+    Returns True on success, False if validation, the connection test, or
+    a missing-flag check fails. The function is idempotent — re-running
+    just upserts the same key in `.env` via `_append_env`.
+    """
+    import urllib.parse
+
+    import psycopg2
+
+    if not non_interactive:
+        _header("Multi-dev / Remote Database")
+        _desc(
+            "Point this DevBrain install at a shared Postgres (different host,",
+            "team-wide DB, etc.). Writes DEVBRAIN_DATABASE_URL to .env after",
+            "verifying the connection works. Skips writing if the test fails.",
+        )
+        click.echo()
+
+    if non_interactive:
+        missing = [
+            label for label, value in (
+                ("--host", host),
+                ("--port", port),
+                ("--database", database),
+                ("--username", username),
+                ("--password", password),
+            ) if value in (None, "")
+        ]
+        if missing:
+            click.echo(
+                f"setup-multi-dev: non-interactive mode requires {', '.join(missing)}",
+                err=True,
+            )
+            return False
+    else:
+        host = host or _prompt("DB host", default="localhost")
+        port = port or _prompt("DB port", default="5432")
+        database = database or _prompt("Database name", default="devbrain")
+        username = username or _prompt("Username", default="devbrain")
+        if not password:
+            password = _prompt("Password", hide_input=True, default="")
+
+    try:
+        port_int = int(port)
+    except (TypeError, ValueError):
+        msg = f"setup-multi-dev: invalid port: {port!r}"
+        if non_interactive:
+            click.echo(msg, err=True)
+        else:
+            _warn(msg)
+        return False
+
+    user_q = urllib.parse.quote_plus(str(username))
+    pass_q = urllib.parse.quote_plus(str(password))
+    db_q = urllib.parse.quote_plus(str(database))
+    url = f"postgresql://{user_q}:{pass_q}@{host}:{port_int}/{db_q}"
+
+    if not non_interactive:
+        _info(f"Testing connection to {host}:{port_int}/{database} as {username}...")
+
+    try:
+        conn = psycopg2.connect(url, connect_timeout=5)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT version()")
+                version_row = cur.fetchone()
+        finally:
+            conn.close()
+    except Exception as exc:
+        err = str(exc).replace("\n", " ").strip()[:200]
+        msg = f"setup-multi-dev: connection failed — {err}"
+        if non_interactive:
+            click.echo(msg, err=True)
+        else:
+            _warn(msg)
+            _info("No changes were written to .env.")
+        return False
+
+    _append_env("DEVBRAIN_DATABASE_URL", url)
+
+    if non_interactive:
+        click.echo(f"setup-multi-dev: wrote DEVBRAIN_DATABASE_URL to {DEVBRAIN_HOME}/.env")
+    else:
+        version_str = (version_row[0] if version_row else "").split(" on ")[0]
+        _ok(f"Connected: {version_str}")
+        _ok(f"DEVBRAIN_DATABASE_URL saved to {DEVBRAIN_HOME}/.env (mode 0600)")
+        _show_env_security_note()
+        _info("Restart DevBrain processes (ingest service, MCP) to pick up the new URL.")
+    return True
+
+
 def setup_projects() -> None:
     _header("Projects")
     _desc(
@@ -1693,12 +1800,19 @@ def _run_channels_section() -> None:
     setup_notifications(dev_id)
 
 
+def _run_multi_dev_section() -> None:
+    """Menu wrapper for setup_multi_dev — always interactive from the menu."""
+    setup_multi_dev(non_interactive=False)
+
+
 # (menu label, section key, runner callable)
 MENU_SECTIONS: list[tuple[str, str, callable]] = [
     ("Full setup (run every section in order)", "full", None),  # special-cased
     ("GitHub authentication",                  "github",   setup_github),
     ("AI CLI authentication (Claude / Codex / Gemini, OAuth or API key)", "ai-clis", setup_ai_cli_logins),
     ("Dev identity (register or update)",      "identity", setup_identity),
+    ("Multi-dev / remote database (point this install at a shared Postgres)",
+     "multi-dev", _run_multi_dev_section),
     ("Projects (register new or update)",      "projects", setup_projects),
     ("Notification channels (tmux, Slack, Telegram, SMTP, etc.)", "channels", _run_channels_section),
     ("MCP client config (Claude Code, Codex, Gemini)", "mcp", setup_mcp_client),
@@ -1785,8 +1899,8 @@ def run_setup(section: str | None = None) -> None:
       - section=<key>     → jump directly to that section, then exit
       - section='full'    → run all sections linearly (first-time-user flow)
 
-    Valid section keys: github, ai-clis, identity, projects, channels,
-    mcp, pkrelay, verify, actions, full.
+    Valid section keys: github, ai-clis, identity, multi-dev, projects,
+    channels, mcp, pkrelay, verify, actions, full.
     """
     _ensure_tty_stdin()
 

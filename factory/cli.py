@@ -79,6 +79,33 @@ def install_identity_cmd(dev_id):
     _install_identity(dev_id=dev_id)
 
 
+@cli.command(name="setup-multi-dev")
+@click.option("--host", required=True, help="Postgres host")
+@click.option("--port", required=True, type=int, help="Postgres port")
+@click.option("--database", required=True, help="Database name")
+@click.option("--username", required=True, help="DB username")
+@click.option(
+    "--password", required=True,
+    help="DB password (visible in `ps aux` while this command runs — "
+         "for unattended installs prefer setting it via a wrapper that "
+         "reads from a secret store)",
+)
+def setup_multi_dev_cmd(host, port, database, username, password):
+    """Scripted: point this DevBrain install at a remote/shared Postgres.
+
+    Tests the connection, then writes DEVBRAIN_DATABASE_URL to .env. Exits
+    non-zero if the connection test fails — .env is left untouched on error.
+    """
+    from setup import setup_multi_dev as _setup_multi_dev
+    ok = _setup_multi_dev(
+        host=host, port=port, database=database,
+        username=username, password=password,
+        non_interactive=True,
+    )
+    if not ok:
+        sys.exit(1)
+
+
 @cli.command(name="add-channel")
 @click.option("--dev-id", default=None)
 @click.option("--channel", "channel_spec", required=True, help="TYPE:ADDRESS")
