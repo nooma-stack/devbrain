@@ -435,16 +435,24 @@ def backfill_patterns(
     applies_when=NULL and is invisible to the new filter — and
     re-running backfill won't rescue them because ON CONFLICT DO
     NOTHING leaves the untagged row in place.
+
+    Embedding reuse: the legacy patterns table has no embedding
+    column, but store() also inserts an auxiliary devbrain.chunks
+    row (source_type='pattern', source_id=p.id) carrying the
+    embedding. LEFT JOIN that aux chunk so memory.embedding is
+    populated; otherwise the dedup SELECT in
+    factory/learning.py:_store_lessons (filters
+    `embedding IS NOT NULL`) skips backfilled rows and the
+    accompanying drift detector falsely fires.
     """
     _ensure_schema(db)
     if dry_run:
         return _dry_run_counts(db, table="patterns", kind="pattern")
 
     # One-shot recovery for memory rows already backfilled (or
-    # dual-written) before applies_when was being propagated. Scoped
-    # tightly: only fills rows where applies_when IS NULL and the
-    # legacy patterns row has a non-null category — never overwrites
-    # an existing tag.
+    # dual-written) before applies_when / embedding fill were being
+    # propagated. Scoped tightly: only fills NULL columns, never
+    # overwrites existing values.
     with db._conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -457,19 +465,34 @@ def backfill_patterns(
                AND p.category IS NOT NULL
             """
         )
+        cur.execute(
+            """
+            UPDATE devbrain.memory m
+               SET embedding = c.embedding
+              FROM devbrain.chunks c
+             WHERE m.kind = 'pattern'
+               AND m.embedding IS NULL
+               AND c.source_type = 'pattern'
+               AND c.source_id = m.provenance_id
+            """
+        )
         conn.commit()
 
     select_sql = """
-        SELECT id, project_id, name, description, created_at, category
-        FROM devbrain.patterns
-        WHERE id > %s
-        ORDER BY id
+        SELECT p.id, p.project_id, p.name, p.description, p.created_at,
+               p.category, c.embedding::text
+        FROM devbrain.patterns p
+        LEFT JOIN devbrain.chunks c
+          ON c.source_type = 'pattern' AND c.source_id = p.id
+        WHERE p.id > %s
+        ORDER BY p.id
         LIMIT %s
     """
 
     def to_args(row, counts):
         (
             pattern_id, project_id, name, description, created_at, category,
+            embedding_text,
         ) = row
         if project_id is None:
             counts["skipped_no_project"] += 1
@@ -479,7 +502,7 @@ def backfill_patterns(
             json.dumps({"category": category}) if category else None
         )
         return (
-            str(project_id), "pattern", title, description, None,
+            str(project_id), "pattern", title, description, embedding_text,
             str(pattern_id), created_at, applies_when,
         )
 
