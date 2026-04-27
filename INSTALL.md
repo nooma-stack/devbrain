@@ -559,6 +559,18 @@ alone), so it's safe to chain in pipelines: `devbrain setup-multi-dev ...
 After running either form, restart any long-lived DevBrain processes
 (launchd ingest service, MCP server) so they pick up the new URL.
 
+### 5.3 Migrating between machines
+
+Replacing your machine? `bin/devbrain export-memory --out file.json.gz`
+on the old box and `bin/devbrain import-memory --in file.json.gz` on
+the new one will carry projects, memory, raw transcripts, and
+notification config across — no `pg_dump` required, idempotent on
+re-run, locally-customized channels preserved on the destination.
+
+See [docs/MIGRATING.md](docs/MIGRATING.md) for the full operator
+playbook including pre-flight schema checks, scoped exports
+(`--project SLUG`), and troubleshooting.
+
 ---
 
 ## 6. Platform notes
