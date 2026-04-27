@@ -16,6 +16,8 @@ import yaml
 
 import attribute_orphans
 import backfill_memory
+import export_memory
+import import_memory
 import schema_migrate
 from config import DATABASE_URL, NL_MODEL, OLLAMA_URL
 from cred_rotate import (
@@ -1888,6 +1890,117 @@ def attribute_orphans_cmd(
 
     if total_failures > 0:
         sys.exit(1)
+
+
+@cli.command(name="export-memory")
+@click.option(
+    "--out", "out_path", type=click.Path(path_type=Path), required=True,
+    help="Output file (use .gz suffix for gzip).",
+)
+@click.option(
+    "--project", "project_slugs", multiple=True,
+    help="Export only this project slug. Repeatable. Default: every project.",
+)
+@click.option(
+    "--gzip/--no-gzip", "gzip_output", default=None,
+    help="Force gzip on/off. Default: infer from --out suffix.",
+)
+def export_memory_cmd(
+    out_path: Path,
+    project_slugs: tuple[str, ...],
+    gzip_output: bool | None,
+) -> None:
+    """Export devbrain.memory + raw_sessions + projects + devs to a file.
+
+    Pairs with `import-memory` for cross-machine migration. The export
+    captures everything needed to recreate this DevBrain instance's
+    accumulated memory on another machine — see docs/MIGRATING.md for
+    the full operator playbook.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    db = get_db()
+    try:
+        counts = export_memory.write_export_file(
+            db,
+            out_path,
+            project_slugs=project_slugs or None,
+            database_url=DATABASE_URL,
+            gzip_output=gzip_output,
+        )
+    except Exception as exc:
+        # Catch broadly so DB-down (psycopg2.OperationalError) or other
+        # driver errors surface as "[export] FAILED: …" instead of an
+        # uncaught traceback.
+        click.echo(f"[export] FAILED: {exc}", err=True)
+        sys.exit(1)
+
+    click.echo(
+        f"[export] wrote {out_path}: "
+        f"projects={counts['projects']}, devs={counts['devs']}, "
+        f"memory={counts['memory']}, raw_sessions={counts['raw_sessions']}"
+    )
+
+
+@cli.command(name="import-memory")
+@click.option(
+    "--in", "in_path", type=click.Path(exists=True, path_type=Path),
+    required=True,
+    help="Export file to read (auto-detects .gz).",
+)
+@click.option(
+    "--dry-run", is_flag=True,
+    help="Read the file and report counts without committing changes.",
+)
+def import_memory_cmd(in_path: Path, dry_run: bool) -> None:
+    """Import a `export-memory` payload into this DevBrain instance.
+
+    Idempotent: re-running on the same file is safe. Existing local
+    rows are preserved (slug-keyed projects, dev_id-keyed devs,
+    `(provenance_id, kind)` memory rows, `(source_app, source_hash)`
+    raw_sessions). Locally-customized notification channels survive
+    a re-import — only previously-unknown devs are inserted.
+    """
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    db = get_db()
+    try:
+        payload = import_memory.read_import_file(in_path)
+    except Exception as exc:
+        click.echo(f"[import] FAILED to read {in_path}: {exc}", err=True)
+        sys.exit(1)
+
+    try:
+        results = import_memory.import_from_dict(
+            db, payload, dry_run=dry_run,
+        )
+    except Exception as exc:
+        # Catch broadly so DB-down (psycopg2.OperationalError) or
+        # IntegrityError on a future NOT NULL column surface as
+        # "[import] FAILED: …" instead of an uncaught traceback.
+        click.echo(f"[import] FAILED: {exc}", err=True)
+        sys.exit(1)
+
+    prefix = "[dry-run]" if dry_run else "[import]"
+    click.echo(
+        f"{prefix} projects: {results['projects']['count']} resolved"
+    )
+    click.echo(
+        f"{prefix} devs: {results['devs']['inserted']} inserted, "
+        f"{results['devs']['preserved']} preserved"
+    )
+    click.echo(
+        f"{prefix} raw_sessions: {results['raw_sessions']['inserted']} "
+        f"inserted, {results['raw_sessions']['skipped_dup']} dup "
+        f"(of {results['raw_sessions']['scanned']} scanned)"
+    )
+    mem_msg = (
+        f"{prefix} memory: {results['memory']['inserted']} inserted, "
+        f"{results['memory']['skipped_dup']} dup "
+        f"(of {results['memory']['scanned']} scanned)"
+    )
+    no_slug = results["memory"].get("skipped_no_slug", 0)
+    if no_slug:
+        mem_msg += f", {no_slug} skipped (no project_slug)"
+    click.echo(mem_msg)
 
 
 if __name__ == "__main__":
