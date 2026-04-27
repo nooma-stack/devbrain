@@ -185,10 +185,12 @@ def _store_lessons(
 
     # P2.d.i read switch: existing-pattern dedup reads embeddings from
     # devbrain.memory (kind='pattern') instead of the chunks JOIN
-    # patterns shape used pre-switch. The applies_when filter is the
-    # canonical Phase-3 marker; until the curator populates it the
-    # content-LIKE fallback finds factory_review lessons by their
-    # serialized "Context: …" tail.
+    # patterns shape used pre-switch. applies_when->>'category' is set
+    # by the dual-write below so the canonical filter selects exactly
+    # the factory_review lessons — no content-LIKE fallback needed
+    # (which would false-positive on any user-stored pattern containing
+    # the word "Context:" and silently drop a real lesson via the
+    # similarity dedup loop).
     with conn.cursor() as cur:
         cur.execute(
             """SELECT embedding::text, content
@@ -197,9 +199,8 @@ def _store_lessons(
                  AND kind = 'pattern'
                  AND archived_at IS NULL
                  AND embedding IS NOT NULL
-                 AND (applies_when->>'category' = 'factory_review'
-                      OR content LIKE %s)""",
-            (project_id, "%Context: %"),
+                 AND applies_when->>'category' = 'factory_review'""",
+            (project_id,),
         )
         existing = []
         for row in cur.fetchall():
@@ -273,7 +274,9 @@ def _store_lessons(
             # the pattern (not the auxiliary chunk insert below) so each
             # logical lesson lands as exactly one memory row. SAVEPOINT
             # inside record_memory keeps a memory failure from rolling
-            # back the pattern + chunk legacy commit.
+            # back the pattern + chunk legacy commit. applies_when tags
+            # the row as a factory_review lesson — that's the canonical
+            # filter the dedup query and get_review_lessons select on.
             record_memory(
                 cur,
                 project_id=project_id,
@@ -282,6 +285,7 @@ def _store_lessons(
                 title=text[:100],
                 embedding_sql=vector_str,
                 provenance_id=pattern_id,
+                applies_when={"category": "factory_review"},
             )
 
             cur.execute(
@@ -313,9 +317,9 @@ def get_review_lessons(project_id: str, limit: int = 10) -> list[str]:
 
     P2.d.i: reads from devbrain.memory (kind='pattern') instead of the
     legacy patterns table. applies_when->>'category' is the canonical
-    Phase-3 marker; the content-LIKE fallback bridges until the curator
-    populates applies_when on every row. Returns content from the
-    memory row (P2.b dual-write writes the same description).
+    Phase-3 marker, set by _store_lessons on dual-write so this filter
+    selects exactly the factory_review lessons. Returns content from
+    the memory row (P2.b dual-write writes the same description).
     """
     conn = psycopg2.connect(DATABASE_URL)
     try:
@@ -326,11 +330,10 @@ def get_review_lessons(project_id: str, limit: int = 10) -> list[str]:
                    WHERE project_id = %s
                      AND kind = 'pattern'
                      AND archived_at IS NULL
-                     AND (applies_when->>'category' = 'factory_review'
-                          OR content LIKE %s)
+                     AND applies_when->>'category' = 'factory_review'
                    ORDER BY created_at DESC
                    LIMIT %s""",
-                (project_id, "%Context: %", limit),
+                (project_id, limit),
             )
             results = [row[0] for row in cur.fetchall()]
 

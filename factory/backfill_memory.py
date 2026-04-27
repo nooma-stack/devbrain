@@ -123,6 +123,7 @@ def _dry_run_counts(
     table: str,
     kind: str,
     extra_skip_predicate: str = "",
+    scan_where: str = "",
 ) -> dict:
     """Read-only counts that approximate what a real backfill would do.
 
@@ -138,23 +139,32 @@ def _dry_run_counts(
         extra_skip_predicate: optional extra WHERE clause for the
             "rows we would skip" branch (raw_sessions uses this for
             the summary-NULL guard).
+        scan_where: optional WHERE clause that restricts every count in
+            this dry-run to the same row population the live SELECT
+            would fetch (used by chunks to exclude auxiliary
+            source_types). Applied to scanned, skipped_no_project,
+            skipped_no_summary, and would_insert.
     """
     counts = _new_counts()
     fq_table = f"devbrain.{table}"
+    scan_clause = f" WHERE {scan_where}" if scan_where else ""
+    scan_and = f" AND {scan_where}" if scan_where else ""
 
     with db._conn() as conn, conn.cursor() as cur:
-        cur.execute(f"SELECT count(*) FROM {fq_table}")
+        cur.execute(f"SELECT count(*) FROM {fq_table}{scan_clause}")
         counts["scanned"] = int(cur.fetchone()[0])
 
         cur.execute(
-            f"SELECT count(*) FROM {fq_table} WHERE project_id IS NULL"
+            f"SELECT count(*) FROM {fq_table} "
+            f"WHERE project_id IS NULL{scan_and}"
         )
         counts["skipped_no_project"] = int(cur.fetchone()[0])
 
         if extra_skip_predicate:
             cur.execute(
                 f"SELECT count(*) FROM {fq_table} "
-                f"WHERE project_id IS NOT NULL AND ({extra_skip_predicate})"
+                f"WHERE project_id IS NOT NULL AND "
+                f"({extra_skip_predicate}){scan_and}"
             )
             counts["skipped_no_summary"] = int(cur.fetchone()[0])
 
@@ -164,7 +174,7 @@ def _dry_run_counts(
         cur.execute(
             f"""
             SELECT count(*) FROM {fq_table} t
-            WHERE t.project_id IS NOT NULL{anti_join_extra}
+            WHERE t.project_id IS NOT NULL{anti_join_extra}{scan_and}
               AND NOT EXISTS (
                   SELECT 1 FROM devbrain.memory m
                   WHERE m.provenance_id = t.id AND m.kind = %s
@@ -297,6 +307,21 @@ def _run_batched_backfill(
 # ─── Per-table backfills ─────────────────────────────────────────────────────
 
 
+# Auxiliary chunk rows that store()/_store_lessons()/end_session insert
+# alongside a primary entity. Excluded from the chunks→memory backfill
+# because each already has a primary memory row via the P2.b dual-write
+# (decision/pattern/issue from store(), session_summary from
+# end_session); inserting a kind='chunk' row from the auxiliary chunks
+# row would create a second memory row with the same content but a
+# different (provenance_id, kind) tuple — the unique index can't
+# collapse them, so deep_search would surface both and eat its LIMIT
+# budget.
+_CHUNK_BACKFILL_WHERE = (
+    "(source_type IS NULL OR source_type NOT IN "
+    "('decision','pattern','issue','session_summary'))"
+)
+
+
 def backfill_chunks(
     db,
     *,
@@ -306,16 +331,23 @@ def backfill_chunks(
     """Backfill kind='chunk' from devbrain.chunks.
 
     Reuses the legacy embedding via `embedding::text` → `%s::vector`.
-    Skips rows with project_id IS NULL.
+    Skips rows with project_id IS NULL and rows whose source_type
+    indicates an auxiliary insert (see _CHUNK_BACKFILL_WHERE).
     """
     _ensure_schema(db)
     if dry_run:
-        return _dry_run_counts(db, table="chunks", kind="chunk")
+        return _dry_run_counts(
+            db,
+            table="chunks",
+            kind="chunk",
+            scan_where=_CHUNK_BACKFILL_WHERE,
+        )
 
-    select_sql = """
+    select_sql = f"""
         SELECT id, project_id, content, embedding::text, created_at
         FROM devbrain.chunks
         WHERE id > %s
+          AND {_CHUNK_BACKFILL_WHERE}
         ORDER BY id
         LIMIT %s
     """
@@ -335,7 +367,7 @@ def backfill_chunks(
         select_sql=select_sql,
         row_to_insert_args=to_args,
         batch_size=batch_size,
-        skip_filters=["project_id IS NULL"],
+        skip_filters=["project_id IS NULL", _CHUNK_BACKFILL_WHERE],
     )
 
 

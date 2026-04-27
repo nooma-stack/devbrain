@@ -144,7 +144,7 @@ server.tool(
     query: z.string().describe('Natural language search query'),
     project: z.string().optional().describe('Project slug (defaults to current project, omit for cross-project)'),
     cross_project: z.boolean().optional().default(false).describe('Search all projects'),
-    source_types: z.array(z.string()).optional().describe('Filter by: session, decision, pattern, issue, codebase'),
+    source_types: z.array(z.string()).optional().describe('Filter by: session, decision, pattern, issue, note, openclaw_memory, codebase'),
     depth: z.enum(['summary', 'full', 'auto']).optional().default('auto').describe('summary=chunks only, full=chunks+raw context, auto=smart drill-down'),
     limit: z.number().optional().default(10).describe('Max results'),
   },
@@ -169,11 +169,13 @@ server.tool(
     // before re-ranking on score.
     //
     // source_types maps to memory.kind:
-    //   'session'   → kind='chunk' AND chunks.source_type='session', plus kind='session_summary'
-    //   'decision'  → kind='decision'
-    //   'pattern'   → kind='pattern'
-    //   'issue'     → kind='issue'
-    //   'codebase'  → legacy fallback only (see above)
+    //   'session'         → kind='chunk' AND chunks.source_type='session', plus kind='session_summary'
+    //   'decision'        → kind='decision'
+    //   'pattern'         → kind='pattern'
+    //   'issue'           → kind='issue'
+    //   'note'            → kind='chunk' AND chunks.source_type='note'
+    //   'openclaw_memory' → kind='chunk' AND chunks.source_type='openclaw_memory'
+    //   'codebase'        → legacy fallback only (see above)
 
     let projectId: string | null = null
     if (!cross_project) {
@@ -201,6 +203,12 @@ server.tool(
           chunkSourceTypes.add('session')
         } else if (st === 'decision' || st === 'pattern' || st === 'issue') {
           kinds.add(st)
+        } else if (st === 'note' || st === 'openclaw_memory') {
+          // Stored as chunks-only (no primary entity dual-write); the
+          // backfill landed them as kind='chunk' memory rows whose LEFT
+          // JOIN'd chunk preserves the original source_type.
+          kinds.add('chunk')
+          chunkSourceTypes.add(st)
         }
         // 'codebase' is handled by the legacy fallback below.
       }
@@ -262,6 +270,14 @@ server.tool(
         pIdx++
       }
 
+      // LEFT JOIN restricts to non-auxiliary chunk source_types so a
+      // kind='chunk' memory row backed by an auxiliary chunk (source_type
+      // 'decision'/'pattern'/'issue'/'session_summary' from
+      // store()/_store_lessons/end_session) doesn't pull in the
+      // auxiliary chunk's source_type / source_id / line range as if it
+      // were a real session result. backfill_memory excludes the same
+      // set, but the JOIN restriction is defense in depth for any
+      // historical rows produced before that filter shipped.
       const memorySql = `
         SELECT
           m.id as memory_id,
@@ -278,6 +294,8 @@ server.tool(
         JOIN devbrain.projects p ON m.project_id = p.id
         LEFT JOIN devbrain.chunks c
           ON m.kind = 'chunk' AND c.id = m.provenance_id
+          AND (c.source_type IS NULL OR c.source_type NOT IN
+               ('decision','pattern','issue','session_summary'))
         WHERE m.embedding IS NOT NULL
           AND m.archived_at IS NULL
           ${memoryWhere}
