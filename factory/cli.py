@@ -1927,7 +1927,10 @@ def export_memory_cmd(
             database_url=DATABASE_URL,
             gzip_output=gzip_output,
         )
-    except (RuntimeError, ValueError) as exc:
+    except Exception as exc:
+        # Catch broadly so DB-down (psycopg2.OperationalError) or other
+        # driver errors surface as "[export] FAILED: …" instead of an
+        # uncaught traceback.
         click.echo(f"[export] FAILED: {exc}", err=True)
         sys.exit(1)
 
@@ -1969,7 +1972,10 @@ def import_memory_cmd(in_path: Path, dry_run: bool) -> None:
         results = import_memory.import_from_dict(
             db, payload, dry_run=dry_run,
         )
-    except (ValueError, RuntimeError) as exc:
+    except Exception as exc:
+        # Catch broadly so DB-down (psycopg2.OperationalError) or
+        # IntegrityError on a future NOT NULL column surface as
+        # "[import] FAILED: …" instead of an uncaught traceback.
         click.echo(f"[import] FAILED: {exc}", err=True)
         sys.exit(1)
 
@@ -1986,11 +1992,15 @@ def import_memory_cmd(in_path: Path, dry_run: bool) -> None:
         f"inserted, {results['raw_sessions']['skipped_dup']} dup "
         f"(of {results['raw_sessions']['scanned']} scanned)"
     )
-    click.echo(
+    mem_msg = (
         f"{prefix} memory: {results['memory']['inserted']} inserted, "
         f"{results['memory']['skipped_dup']} dup "
         f"(of {results['memory']['scanned']} scanned)"
     )
+    no_slug = results["memory"].get("skipped_no_slug", 0)
+    if no_slug:
+        mem_msg += f", {no_slug} skipped (no project_slug)"
+    click.echo(mem_msg)
 
 
 if __name__ == "__main__":

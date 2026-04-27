@@ -65,12 +65,15 @@ from __future__ import annotations
 import gzip
 import json
 import logging
+import os
 import uuid as _uuid
 from datetime import date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import IO, Any, Iterable
 from urllib.parse import urlparse, urlunparse
+
+import psycopg2
 
 logger = logging.getLogger(__name__)
 
@@ -169,7 +172,10 @@ def _highest_migration(db) -> str | None:
                 "SELECT filename FROM devbrain.schema_migrations "
                 "ORDER BY filename DESC LIMIT 1"
             )
-        except Exception:
+        except psycopg2.errors.UndefinedTable:
+            # Pre-009 install — the tracking table doesn't exist.
+            # Bare Exception would swallow permission errors and
+            # mask the real cause; narrow to the specific case.
             return None
         row = cur.fetchone()
         return row[0] if row else None
@@ -233,7 +239,11 @@ def _fetch_devs(db) -> list[dict]:
                 "       event_subscriptions, created_at, updated_at "
                 "FROM devbrain.devs ORDER BY dev_id"
             )
-        except Exception:
+        except psycopg2.errors.UndefinedTable:
+            # devs table only exists from migration 005 onward; treat
+            # missing table as "no devs to export". Narrow to the
+            # specific case so permission errors / cursor issues
+            # surface instead of being silently swallowed.
             return []
         cols = [d.name for d in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
@@ -433,11 +443,33 @@ def write_export_file(
         },
     }
 
+    # The export bundles devs.channels (Telegram tokens, webhook URLs,
+    # email addresses) and raw transcripts — the docstring tells
+    # operators to "treat it like a credential dump". On a multi-user
+    # workstation a 0o644 file (umask default) is readable by any
+    # other local account between creation and operator transfer, so
+    # create with 0o600 from the start.
+    fd = os.open(
+        out_path,
+        os.O_CREAT | os.O_WRONLY | os.O_TRUNC,
+        0o600,
+    )
+    underlying: IO[bytes] | None = None
     fh: IO[str]
-    if gzip_output:
-        fh = gzip.open(out_path, "wt", encoding="utf-8")  # type: ignore[assignment]
-    else:
-        fh = open(out_path, "w", encoding="utf-8")
+    try:
+        if gzip_output:
+            underlying = os.fdopen(fd, "wb")
+            fh = gzip.open(  # type: ignore[assignment]
+                underlying, "wt", encoding="utf-8",
+            )
+        else:
+            fh = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        if underlying is not None:
+            underlying.close()
+        else:
+            os.close(fd)
+        raise
     try:
         # Write the header keys, then stream each array. We do this by
         # hand instead of json.dump so the per-row stream never has to
@@ -494,6 +526,10 @@ def write_export_file(
         fh.write("}\n")
     finally:
         fh.close()
+        # gzip.open with a fileobj does NOT close the underlying
+        # fileobj on its own close — release the fd explicitly.
+        if underlying is not None:
+            underlying.close()
 
     logger.info(
         "[export] wrote %s — projects=%d devs=%d memory=%d raw_sessions=%d",

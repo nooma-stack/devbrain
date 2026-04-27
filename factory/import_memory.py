@@ -54,6 +54,8 @@ import json
 import logging
 from pathlib import Path
 
+import psycopg2
+
 logger = logging.getLogger(__name__)
 
 # Wire format version we know how to read. Bump in lockstep with
@@ -121,7 +123,10 @@ def _highest_migration(db) -> str | None:
                 "SELECT filename FROM devbrain.schema_migrations "
                 "ORDER BY filename DESC LIMIT 1"
             )
-        except Exception:
+        except psycopg2.errors.UndefinedTable:
+            # Pre-009 install — the tracking table doesn't exist.
+            # Bare Exception would swallow permission errors and
+            # mask the real cause; narrow to the specific case.
             return None
         row = cur.fetchone()
         return row[0] if row else None
@@ -249,7 +254,10 @@ def _insert_memory(
     Embedding round-trips via the pgvector text literal — bit-equal to
     the source on re-export. ``applies_when`` keeps its JSON shape.
     """
-    counts = {"scanned": 0, "inserted": 0, "skipped_dup": 0}
+    counts = {
+        "scanned": 0, "inserted": 0,
+        "skipped_dup": 0, "skipped_no_slug": 0,
+    }
     sql = """
         INSERT INTO devbrain.memory
             (project_id, kind, title, content, embedding,
@@ -266,7 +274,11 @@ def _insert_memory(
         slug = m.get("project_slug")
         if not slug:
             # devbrain.memory.project_id is NOT NULL — skip orphans.
-            counts["skipped_dup"] += 1
+            # Tracked separately from skipped_dup so the CLI summary
+            # doesn't conflate orphan skips with real ON CONFLICT
+            # collisions. _stream_memory inner-joins on projects, so
+            # the exporter never legitimately produces such rows.
+            counts["skipped_no_slug"] += 1
             continue
         project_id = _ensure_project(cur, slug, slug_to_id)
 
