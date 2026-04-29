@@ -10,6 +10,8 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 - **Migration 014** — `devbrain.memory_dependencies` typed-edge table (`cites` / `depends_on` / `supersedes` / `contradicts`) with backfill from legacy `decisions.superseded_by` chain. Atlas Step 1 of the Phase 3 design ([docs/plans/2026-04-29-phase-3-discipline-layer.md](docs/plans/2026-04-29-phase-3-discipline-layer.md), PR #67).
 - **MCP `store` tool** — accepts `depends_on` and `supersedes` UUID arrays. Resolves either `memory.id` or legacy `decisions/patterns/issues.id` (best-effort lookup) and inserts edges into `memory_dependencies`. Idempotent via the unique `(from_memory_id, to_memory_id, edge_type)` constraint.
 - **`memory.ts` helpers** — `recordMemory` now returns the `memory.id` for downstream edge wiring (was `void`); new `resolveMemoryId(uuid)` and `recordMemoryDependency(...)` helpers.
+- **Migration 015** — `devbrain.memory_ledger` hash-chained append-only audit table (SHA-256 row chain) + `_memory_ledger_record()` AFTER trigger on `devbrain.memory` (insert/update/delete) + `verify_chain(start_seq, end_seq)` SQL function returning the first chain divergence. Atlas Step 2. Tamper detection only — payload contents are NOT duplicated, only hashed.
+- **`pgcrypto` extension** added (was previously unused in the schema).
 
 ## [Unreleased] — Factory Hardening Sprint
 
