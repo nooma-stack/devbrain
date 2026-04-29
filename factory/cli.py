@@ -60,6 +60,17 @@ def _register_project_cli() -> None:
 _register_project_cli()
 
 
+def _register_audit_cli() -> None:
+    try:
+        import audit_cli
+        audit_cli.register(cli)
+    except ImportError as e:
+        logger.debug("audit_cli not available: %s", e)
+
+
+_register_audit_cli()
+
+
 def _resolve_cli_names(cli_arg: str) -> list[str]:
     """Resolve `--cli` option into the list of adapter names."""
     import dev_login as _dl
