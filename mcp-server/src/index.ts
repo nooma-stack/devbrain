@@ -772,20 +772,6 @@ server.tool(
   },
 )
 
-// ─── Tool: list_projects ─────────────────────────────────────────────────────
-
-server.tool(
-  'list_projects',
-  'List all projects registered in DevBrain.',
-  {},
-  async () => {
-    const result = await query(
-      'SELECT slug, name, description, root_path FROM devbrain.projects ORDER BY name',
-    )
-    return { content: [{ type: 'text', text: JSON.stringify(result.rows, null, 2) }] }
-  },
-)
-
 // ─── Tool: factory_plan ──────────────────────────────────────────────────────
 
 // Branch-name validation.
