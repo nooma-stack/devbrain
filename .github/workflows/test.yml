@@ -13,9 +13,31 @@ concurrency:
 
 jobs:
   pytest:
-    name: pytest (fast subset)
+    name: pytest
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_USER: devbrain
+          POSTGRES_PASSWORD: devbrain-local
+          POSTGRES_DB: devbrain
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    env:
+      DEVBRAIN_DB_HOST: localhost
+      DEVBRAIN_DB_PORT: "5433"
+      DEVBRAIN_DB_USER: devbrain
+      DEVBRAIN_DB_PASSWORD: devbrain-local
+      DEVBRAIN_DB_NAME: devbrain
 
     steps:
       - name: Checkout
@@ -39,19 +61,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run pytest (fast subset, no DB)
-        # DB-touching tests need a live Postgres + pgvector instance and are
-        # excluded here. They run locally + via integration test workflow
-        # (separate job, planned). The fast subset still covers the
-        # multi-dev adapter system, profiles, dev_login, cli_executor
-        # routing, notification channels, and factory unit logic.
+      - name: Apply DB schema
+        run: |
+          for f in migrations/*.sql; do
+            PGPASSWORD=devbrain-local psql -h localhost -p 5433 -U devbrain -d devbrain -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: Run pytest (DB available)
+        # Tests that need Ollama (embedding model) or that touch external
+        # services beyond Postgres are still excluded — they belong in a
+        # separate integration workflow.
         run: |
           cd factory
           python -m pytest \
             --ignore=tests/test_export_import_memory.py \
-            --ignore=tests/test_blocked_resolution_flow.py \
-            --ignore=tests/test_multi_dev_integration.py \
-            --ignore=tests/test_memory_table.py \
             --ignore=tests/test_attribute_orphans.py \
             --ignore=tests/test_backfill_memory.py \
             -p no:cacheprovider --tb=short -q
