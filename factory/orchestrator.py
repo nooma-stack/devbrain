@@ -869,7 +869,8 @@ Store the final plan in DevBrain using the store tool with type="decision"."""
         logger.info("Planning with %s...", cli)
         result = run_cli(cli, prompt, cwd=project_root,
                          env_override={"DEVBRAIN_PROJECT": job.project_slug},
-                         phase="planning")
+                         phase="planning",
+                         dev_id=job.submitted_by)
 
         self.db.store_artifact(
             job_id=job.id,
@@ -1175,7 +1176,8 @@ IMPORTANT: Follow existing code patterns in the repo. Read similar files before 
         logger.info("Implementing with %s...", cli)
         result = run_cli(cli, prompt, cwd=project_root,
                          env_override={"DEVBRAIN_PROJECT": job.project_slug},
-                         phase="implementing")
+                         phase="implementing",
+                         dev_id=job.submitted_by)
 
         self.db.store_artifact(
             job_id=job.id,
@@ -1318,7 +1320,8 @@ The prose above the block is what humans read; the block is the machine contract
         logger.info("Architecture review with %s...", arch_cli)
         arch_result = run_cli(arch_cli, arch_prompt, cwd=project_root,
                               env_override={"DEVBRAIN_PROJECT": job.project_slug},
-                              phase="review_arch")
+                              phase="review_arch",
+                              dev_id=job.submitted_by)
 
         # Parse the JSON findings block once for the artifact flag AND
         # derived counts. Partial-parses (invalid_severity dropped from
@@ -1423,7 +1426,8 @@ The prose above the block is what humans read; the block is the machine contract
         logger.info("Security review with %s...", sec_cli)
         sec_result = run_cli(sec_cli, sec_prompt, cwd=project_root,
                              env_override={"DEVBRAIN_PROJECT": job.project_slug},
-                             phase="review_security")
+                             phase="review_security",
+                             dev_id=job.submitted_by)
 
         sec_findings, sec_parse_err = _parse_findings_json(sec_result.stdout)
         if sec_findings is not None:
@@ -1730,7 +1734,8 @@ IMPORTANT: Fix ONLY the listed findings. Do not expand scope. Do not "improve" s
         logger.info("Fix loop attempt %d with %s...", job.error_count + 1, cli)
         result = run_cli(cli, fix_prompt, cwd=project_root,
                          env_override={"DEVBRAIN_PROJECT": job.project_slug},
-                         phase="fix")
+                         phase="fix",
+                         dev_id=job.submitted_by)
 
         self.db.store_artifact(
             job_id=job.id,
