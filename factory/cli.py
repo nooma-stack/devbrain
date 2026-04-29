@@ -45,6 +45,127 @@ def cli():
     pass
 
 
+def _resolve_cli_names(cli_arg: str) -> list[str]:
+    """Resolve `--cli` option into the list of adapter names."""
+    import dev_login as _dl
+    if cli_arg == "all":
+        return _dl.default_registry.list_names()
+    return [cli_arg]
+
+
+def _validate_cli_choice(ctx, param, value):
+    """Click option callback — validate --cli against the live registry."""
+    if value is None:
+        return value
+    import dev_login as _dl
+    valid = list(_dl.default_registry.list_names()) + ["all"]
+    if value not in valid:
+        raise click.BadParameter(f"must be one of {valid}, got {value!r}")
+    return value
+
+
+@cli.command()
+@click.option("--dev", "dev_id", required=True, help="Dev id to log in (lowercase short name)")
+@click.option(
+    "--cli", "cli_arg",
+    callback=_validate_cli_choice,
+    default="all",
+    show_default=True,
+    help="Which AI CLI to log in (claude, codex, gemini, or 'all'). 'all' runs each in turn.",
+)
+@click.option("--git-name", default=None, help="Git author name (skips prompt if --git-email also set)")
+@click.option("--git-email", default=None, help="Git author email")
+def login(dev_id, cli_arg, git_name, git_email):
+    """Log a dev into an AI CLI's per-dev profile."""
+    import dev_login
+
+    db = get_db()
+
+    def prompt() -> tuple[str, str]:
+        name = click.prompt("Git author name", default=dev_id)
+        email = click.prompt("Git author email", default=f"{dev_id}@devbrain.local")
+        return name, email
+
+    cli_names = _resolve_cli_names(cli_arg)
+    outcomes = dev_login.login_dev(
+        dev_id,
+        cli_names,
+        db=db,
+        git_name=git_name,
+        git_email=git_email,
+        prompt_identity=prompt,
+    )
+
+    failures = 0
+    for o in outcomes:
+        if o.success:
+            mark = "✅"
+            click.echo(f"{mark} {o.dev_id} → {o.cli_name}")
+        else:
+            failures += 1
+            click.echo(f"❌ {o.dev_id} → {o.cli_name}: {o.error}", err=True)
+            if o.hint:
+                click.echo(f"   Hint: {o.hint}", err=True)
+
+    if failures:
+        sys.exit(1)
+
+
+@cli.command()
+@click.option("--dev", "dev_id", default=None, help="Filter by a single dev_id")
+def logins(dev_id):
+    """Show which devs are logged into which AI CLIs (table view)."""
+    import dev_login
+
+    rows = dev_login.list_logins(db=get_db(), dev_id=dev_id)
+    if not rows:
+        click.echo("No profiles registered.")
+        return
+
+    by_dev: dict[str, dict[str, bool]] = {}
+    cli_names: list[str] = []
+    for r in rows:
+        by_dev.setdefault(r.dev_id, {})[r.cli_name] = r.logged_in
+        if r.cli_name not in cli_names:
+            cli_names.append(r.cli_name)
+
+    header = ["dev_id"] + cli_names
+    col_w = [max(len(h), 8) for h in header]
+    for did in by_dev:
+        col_w[0] = max(col_w[0], len(did))
+
+    line = "  ".join(h.ljust(w) for h, w in zip(header, col_w))
+    click.echo(line)
+    click.echo("  ".join("-" * w for w in col_w))
+    for did, statuses in sorted(by_dev.items()):
+        row = [did]
+        for c in cli_names:
+            row.append("✅" if statuses.get(c) else "❌")
+        click.echo("  ".join(s.ljust(w) for s, w in zip(row, col_w)))
+
+
+@cli.command()
+@click.option("--dev", "dev_id", required=True, help="Dev id to log out")
+@click.option(
+    "--cli", "cli_arg",
+    callback=_validate_cli_choice,
+    default=None,
+    help="Specific CLI to log out (claude, codex, gemini, or 'all'). Omit to remove the entire profile.",
+)
+@click.confirmation_option(
+    prompt="Are you sure?",
+    help="Skip confirmation with --yes",
+)
+def logout(dev_id, cli_arg):
+    """Remove a dev's AI CLI credentials (whole profile or per-CLI)."""
+    import dev_login
+
+    cli_names = _resolve_cli_names(cli_arg) if cli_arg else None
+    dev_login.logout_dev(dev_id, cli_names=cli_names)
+    target = ", ".join(cli_names) if cli_names else "entire profile"
+    click.echo(f"✅ Logged out {dev_id}: {target}")
+
+
 @cli.command()
 @click.option("--dev-id", default=None, help="SSH username (defaults to $USER)")
 @click.option("--name", default=None, help="Full name")
