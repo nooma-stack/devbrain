@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -198,12 +199,73 @@ def get_available_clis() -> list[str]:
     return [name for name in CLI_CONFIGS if is_cli_available(name)]
 
 
+def _resolve_dev_id(explicit: str | None) -> str | None:
+    """Resolve dev_id: explicit arg > DEVBRAIN_DEV_ID env > None."""
+    if explicit:
+        return explicit
+    return os.environ.get("DEVBRAIN_DEV_ID") or None
+
+
+def _adapter_env_for(cli_name: str, dev_id: str) -> dict[str, str]:
+    """Look up the adapter for cli_name, build SpawnArgs.env for dev_id.
+
+    Returns {} on any failure (unknown adapter, invalid dev_id, missing
+    profile dir creation, missing dev row). Failure is non-fatal — caller
+    falls back to non-adapter env.
+    """
+    try:
+        from ai_clis import default_registry as _reg_module_default
+        # Allow tests to monkeypatch cli_executor._default_registry instead
+        registry = _default_registry if _default_registry is not None else _reg_module_default
+        adapter_cls = registry.get(cli_name)
+    except (KeyError, ImportError):
+        return {}
+
+    try:
+        import profiles
+        profile_dir = profiles.get_profile_dir(dev_id)
+    except (ValueError, OSError) as e:
+        logger.debug("could not resolve profile_dir for dev_id=%s: %s", dev_id, e)
+        return {}
+
+    # Load dev record (best-effort — if DB is unreachable, fall back to bare dev_id)
+    dev_row = None
+    try:
+        from state_machine import FactoryDB
+        from config import DATABASE_URL
+        db = FactoryDB(DATABASE_URL)
+        dev_row = db.get_dev(dev_id)
+    except Exception as e:
+        logger.debug("could not load dev row for %s: %s", dev_id, e)
+
+    from types import SimpleNamespace
+    if dev_row:
+        dev = SimpleNamespace(
+            dev_id=dev_row.get("dev_id", dev_id),
+            full_name=dev_row.get("full_name"),
+            email=dev_row.get("email"),
+            gemini_api_key=dev_row.get("gemini_api_key"),
+        )
+    else:
+        dev = SimpleNamespace(
+            dev_id=dev_id, full_name=None, email=None, gemini_api_key=None,
+        )
+
+    spawn = adapter_cls().spawn_args(dev, profile_dir)
+    return dict(spawn.env)
+
+
+# Test-injection seam (set by monkeypatch in tests; None means use module-default)
+_default_registry = None
+
+
 def run_cli(
     cli_name: str,
     prompt: str,
     cwd: str | None = None,
     env_override: dict | None = None,
     phase: str | None = None,
+    dev_id: str | None = None,
 ) -> CLIResult:
     """Run a CLI tool with a prompt and return the result.
 
@@ -214,6 +276,17 @@ def run_cli(
     factory.config.get_max_turns_for_phase). Pass the same phase name
     used in cli_preferences (planning, implementing, review_arch,
     review_security, qa, fix). Omitting phase uses the tightest default.
+
+    When `dev_id` is provided (or DEVBRAIN_DEV_ID env var is set) and an
+    AI CLI adapter is registered for `cli_name`, the adapter's
+    SpawnArgs.env is layered on top of os.environ. This is how the
+    factory routes per-dev credentials (HOME-swap or CODEX_HOME) into
+    spawned subprocesses. Caller-supplied `env_override` wins over the
+    adapter's env, so individual env vars can still be overridden.
+
+    If no dev_id is resolvable (or the adapter / profile / dev row lookup
+    fails), the legacy behavior is preserved — env is just os.environ +
+    env_override.
     """
     config = CLI_CONFIGS.get(cli_name)
     if not config:
@@ -242,8 +315,10 @@ def run_cli(
 
     logger.info("Running %s (phase=%s, cwd=%s)", cli_name, phase or "default", cwd)
 
-    import os
     env = os.environ.copy()
+    resolved_dev = _resolve_dev_id(dev_id)
+    if resolved_dev:
+        env.update(_adapter_env_for(cli_name, resolved_dev))
     if env_override:
         env.update(env_override)
 
