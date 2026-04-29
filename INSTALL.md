@@ -522,9 +522,17 @@ the same flow under "PKRelay (optional)" — opt out with
 
 ### 5.2 Multi-dev setup
 
-Point this DevBrain install at a **shared Postgres** (a teammate's host,
-a single team-wide DB) instead of the bundled `localhost:5433` container.
-The multi-dev wizard tests the connection first, then writes
+Two different multi-dev models are supported:
+
+**Model 1 — Devs SSH into a shared host (recommended for teams).** Devs
+share a Mac Studio (or similar) running DevBrain locally. Each dev
+brings their own AI CLI subscription via per-dev HOME profiles managed
+by `devbrain login` / `logins` / `logout`. See
+[docs/ONBOARDING_TEAMMATE.md](docs/ONBOARDING_TEAMMATE.md) for the
+end-to-end onboarding playbook.
+
+**Model 2 — Each dev runs DevBrain locally, points at a shared Postgres.**
+Use the multi-dev wizard below. Tests the connection first, then writes
 `DEVBRAIN_DATABASE_URL` to `.env`. Because env wins over yaml in
 `build_database_url`, the new URL takes effect immediately on the next
 DevBrain process start — no yaml edit required.
