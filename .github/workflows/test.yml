@@ -68,4 +68,6 @@ jobs:
             tests/test_cli_executor_routing.py \
             tests/test_channel_smtp.py \
             tests/test_channel_telegram.py \
+            tests/test_port_registry.py \
+            tests/test_seed_ports.py \
             -p no:cacheprovider --tb=short -q
