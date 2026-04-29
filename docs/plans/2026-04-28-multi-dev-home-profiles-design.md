@@ -219,31 +219,26 @@ For each profile in profiles.list_profiles():
 
 ## Authentication & SSH-OAuth Callback
 
-OAuth round-trips need to terminate somewhere both the CLI (on Mac Studio) and the dev's browser (on laptop) can reach. Two patterns:
+OAuth round-trips need to terminate somewhere both the CLI (on Mac Studio) and the dev's browser (on laptop) can reach.
 
-**Pattern A — localhost callback via reverse SSH tunnel (default):**
-- CLI binds HTTP listener on known port on Mac Studio
-- Dev's SSH config has `RemoteForward <port>:localhost:<port>`
-- Browser's callback to `localhost:<port>` round-trips through tunnel
+**Behavioral probe findings (2026-04-29) confirmed no reverse SSH tunnel is required for any of the three CLIs:**
 
-**Pattern B — device code flow (preferred where supported):**
-- CLI prints verification URL + short code
-- Dev pastes URL into laptop browser, enters code
-- No localhost callback needed
+| CLI | Mechanism | Why no tunnel |
+|---|---|---|
+| **Codex** | `--device-auth` flag | Device-code flow — CLI prints URL + short code, no localhost callback. The adapter passes `--device-auth` automatically. |
+| **Claude** | Hosted callback | OAuth redirect goes to `https://platform.claude.com/oauth/code/callback` (verified in probe output). No localhost listener bound. |
+| **Gemini** | API-key fallback | If `dev.gemini_api_key` is set, OAuth is skipped entirely — `GEMINI_API_KEY` env var is enough. The OAuth path itself has not been exhaustively probed; the API-key path is the recommended default for SSH sessions. |
 
-**Per-CLI verification step (gates implementation):** before coding each adapter's `login()`, run a behavioral probe (`HOME=/tmp/test claude /login` etc.), observe whether CLI binds a port (and which) or uses device code. Document mechanism in adapter docstring.
-
-**SSH config template** (in onboarding doc):
+**SSH config template** (in onboarding doc) — only one `RemoteForward` line, for browser driving via PKRelay:
 ```sshconfig
 Host mac-studio
   HostName lhts-mac-studio.local
   User lhtdev
   IdentityFile ~/.ssh/<dev_key>
-  RemoteForward 18794 localhost:18793   # PKRelay browser
-  RemoteForward 8765  localhost:8765    # OAuth callback (placeholder; adjust after probe)
+  RemoteForward 18794 localhost:18793   # PKRelay browser tunnel
 ```
 
-**Fallback for ephemeral OAuth ports:** if a CLI uses dynamic ports for callback, wrap login with a flag/env-var override to force a known port. Per-adapter detail.
+**Adapter responsibility:** each adapter's `login()` selects the right flow internally — no SSH-config tuning needed for the operator. See `factory/ai_clis/PROBE_NOTES.md` for the full per-CLI probe results.
 
 ## Error Handling
 
