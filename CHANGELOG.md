@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.
 - **Migration 015** — `devbrain.memory_ledger` hash-chained append-only audit table (SHA-256 row chain) + `_memory_ledger_record()` AFTER trigger on `devbrain.memory` (insert/update/delete) + `verify_chain(start_seq, end_seq)` SQL function returning the first chain divergence. Atlas Step 2. Tamper detection only — payload contents are NOT duplicated, only hashed.
 - **`pgcrypto` extension** added (was previously unused in the schema).
 - **`devbrain audit verify`** CLI command — wraps `verify_chain()` with project scoping, JSON output, and exit codes (0 intact / 1 broken / 2 operational failure) suitable for cron and CI smoke tests. Atlas Step 3.
+- **`tests/postulates/`** — first three AGM-style postulate tests covering the discipline layer. P1 (supersession cascades) and P2 (archived memory excluded from curator brief) ship as `xfail(strict=True)` pending the curator agent (Atlas Step 5); P3 (HIPAA cross-project memory isolation) is active today and asserts the substrate guarantee directly. Local-only for now — DB-available CI workflow is tracked separately. Atlas Step 4. See [tests/postulates/README.md](tests/postulates/README.md).
 
 ## [Unreleased] — Factory Hardening Sprint
 
