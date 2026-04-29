@@ -79,7 +79,7 @@ def _interactive_collect_ports(
     collected: list[dict] = []
     while True:
         purpose = click.prompt(
-            "Port purpose (e.g., api, web, postgres, redis, asterisk_rtp). Empty to finish",
+            "Port purpose (e.g., api, web, postgres, redis). Empty to finish",
             default="",
             show_default=False,
         ).strip()
