@@ -109,6 +109,8 @@ class FactoryDB:
         priority: int = 0,
         assigned_cli: str | None = None,
         metadata: dict | None = None,
+        submitted_by: str | None = None,
+        branch_name: str | None = None,
     ) -> str:
         """Create a new factory job. Returns job ID."""
         with self._conn() as conn, conn.cursor() as cur:
@@ -124,8 +126,9 @@ class FactoryDB:
                 """
                 INSERT INTO devbrain.factory_jobs
                     (project_id, title, description, spec, status, priority,
-                     current_phase, assigned_cli, metadata)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     current_phase, assigned_cli, metadata,
+                     submitted_by, branch_name)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id
                 """,
                 (
@@ -133,6 +136,7 @@ class FactoryDB:
                     JobStatus.QUEUED.value, priority,
                     "queued", assigned_cli,
                     json.dumps(metadata or {}),
+                    submitted_by, branch_name,
                 ),
             )
             job_id = str(cur.fetchone()[0])

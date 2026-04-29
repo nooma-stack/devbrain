@@ -1,0 +1,46 @@
+#!/bin/bash
+# DevBrain factory CLI shim — friendlier names for factory operations.
+#
+# Forwards a small set of factory verbs to the underlying `devbrain` CLI:
+#
+#   factory submit "..."  →  devbrain submit "..."
+#   factory status        →  devbrain status
+#   factory blocked       →  devbrain blocked
+#   factory resolve ID …  →  devbrain resolve ID …
+#   factory dashboard     →  devbrain dashboard
+#
+# Other devbrain commands (register, login, logins, …) are intentionally
+# NOT proxied — call `devbrain <cmd>` directly. This keeps `factory` scoped
+# to job-lifecycle operations so the docs that say "factory submit" /
+# "factory status" Just Work without polluting the namespace.
+set -e
+
+case "${1:-}" in
+    submit|status|blocked|resolve|dashboard)
+        exec devbrain "$@"
+        ;;
+    -h|--help|"")
+        cat <<EOF
+factory — DevBrain dev factory CLI shim
+
+Usage: factory <command> [args]
+
+Commands:
+  submit "<title>" [opts]   Submit a feature for autonomous implementation.
+  status [--project SLUG]   Show active and recent factory jobs.
+  blocked                   List jobs blocked awaiting human input.
+  resolve <id> [opts]       Resolve a blocked job.
+  dashboard                 Launch the TUI dashboard.
+
+Run 'devbrain <command> --help' for full command help.
+For other DevBrain operations (register, login, logins, …), use 'devbrain' directly.
+EOF
+        [[ "${1:-}" == "" ]] && exit 1 || exit 0
+        ;;
+    *)
+        echo "Error: 'factory $1' is not a recognized factory command." >&2
+        echo "Try one of: submit, status, blocked, resolve, dashboard." >&2
+        echo "For non-factory devbrain commands, use 'devbrain <command>' directly." >&2
+        exit 1
+        ;;
+esac

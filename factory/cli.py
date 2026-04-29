@@ -621,6 +621,136 @@ def dashboard(project):
     app.run()
 
 
+# Branch name validation — same regex the MCP server uses (mcp-server/src/index.ts).
+# Refuses leading "-" / "." (git-flag injection), refspec form (":"),
+# and main/master.
+_SAFE_BRANCH_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]{0,254}$")
+
+
+def _validate_branch(ctx, param, value):
+    if value is None:
+        return None
+    v = value.strip()
+    if not _SAFE_BRANCH_RE.match(v):
+        raise click.BadParameter(
+            "branch has unsafe characters — only [A-Za-z0-9_./-] allowed, "
+            'cannot start with "-" or "."'
+        )
+    if v.lower() in ("main", "master"):
+        raise click.BadParameter(
+            "branch must not be main or master — factory operates on feature branches only"
+        )
+    return v
+
+
+@cli.command(name="submit")
+@click.argument("title")
+@click.option(
+    "--spec", default=None,
+    help="Detailed feature spec. Defaults to TITLE if omitted.",
+)
+@click.option(
+    "--project", default=None,
+    help="Project slug. Defaults to $DEVBRAIN_PROJECT.",
+)
+@click.option(
+    "--cli", "assigned_cli", default=None,
+    callback=_validate_cli_choice,
+    help="AI CLI to use (claude, codex, gemini). Default from config.",
+)
+@click.option(
+    "--priority", default=0, type=int, show_default=True,
+    help="Higher = more urgent.",
+)
+@click.option(
+    "--dev", "submitted_by", default=None,
+    help="Dev id to attribute job to. Defaults to $DEVBRAIN_DEV_ID, then $USER.",
+)
+@click.option(
+    "--branch", default=None, callback=_validate_branch,
+    help="Existing feature branch to continue work on. Refuses main/master.",
+)
+@click.option(
+    "--no-spawn", is_flag=True,
+    help="Create the job row but skip spawning the orchestrator (for tests / manual runs).",
+)
+def submit(title, spec, project, assigned_cli, priority, submitted_by, branch, no_spawn):
+    """Submit a feature to the dev factory.
+
+    Creates a queued job and spawns the orchestrator in the background.
+    The factory plans, implements, reviews, runs QA, and stages for approval.
+
+    \b
+      devbrain submit "Add a no-op test that asserts True"
+      devbrain submit "Add login flow" --spec @spec.md --cli claude --dev alice
+    """
+    project_slug = project or os.environ.get("DEVBRAIN_PROJECT")
+    if not project_slug:
+        click.echo(
+            "Error: --project required (or set DEVBRAIN_PROJECT env var).",
+            err=True,
+        )
+        sys.exit(1)
+
+    dev_id = (
+        submitted_by
+        or os.environ.get("DEVBRAIN_DEV_ID")
+        or os.environ.get("USER")
+    )
+
+    # Allow `--spec @path/to/spec.md` to read spec from file.
+    spec_text = spec if spec else title
+    if spec_text.startswith("@"):
+        spec_path = Path(spec_text[1:]).expanduser()
+        if not spec_path.is_file():
+            click.echo(f"Error: spec file not found: {spec_path}", err=True)
+            sys.exit(1)
+        spec_text = spec_path.read_text()
+
+    db = get_db()
+    try:
+        job_id = db.create_job(
+            project_slug=project_slug,
+            title=title,
+            spec=spec_text,
+            priority=priority,
+            assigned_cli=assigned_cli,
+            submitted_by=dev_id,
+            branch_name=branch,
+        )
+    except ValueError as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+    click.echo(f"✅ Factory job created: {job_id[:8]} ({title})")
+    click.echo(
+        f"   project={project_slug}  cli={assigned_cli or '(default)'}  "
+        f"dev={dev_id or '(none)'}  branch={branch or '(auto)'}"
+    )
+
+    if no_spawn:
+        python_bin = str(Path(__file__).parent.parent / ".venv" / "bin" / "python")
+        factory_runner = str(Path(__file__).parent / "run.py")
+        click.echo("   --no-spawn: orchestrator NOT started.")
+        click.echo(f"   Run manually: {python_bin} {factory_runner} {job_id}")
+        return
+
+    import subprocess
+    factory_runner = str(Path(__file__).parent / "run.py")
+    python_bin = str(Path(__file__).parent.parent / ".venv" / "bin" / "python")
+    try:
+        subprocess.Popen(
+            [python_bin, factory_runner, job_id],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        click.echo(f"   Orchestrator spawned. Track with: devbrain status")
+    except Exception as e:
+        click.echo(f"   ⚠️  Failed to spawn orchestrator: {e}", err=True)
+        click.echo(f"   Run manually: {python_bin} {factory_runner} {job_id}")
+
+
 @cli.command(name="status")
 @click.option("--project", default=None, help="Filter by project slug")
 def status(project):
