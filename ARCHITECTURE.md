@@ -452,10 +452,18 @@ Explicitly deferred:
 
 - **Memory model refactor (Phase 2).** Today's `decisions` / `patterns` /
   `issues` split will collapse into a unified `memory` table with richer
-  typing. No schema change in v0.1.
+  typing. No schema change in v0.1. *(Shipped — see
+  [`docs/MEMORY_MODEL.md`](docs/MEMORY_MODEL.md).)*
 - **Discipline layer (Phase 3).** Curator agent, eval agents, and a rule
   engine that decides what's worth remembering and when to supersede old
   memories. v0.1 stores everything the agent asks to store.
+  Phase 3 also adds three integrity properties borrowed from
+  [Atlas](https://github.com/RichSchefren/atlas) (concepts, not code):
+  dependency-cascade re-evaluation when a memory is superseded
+  (Ripple-style), a hash-chained append-only audit ledger for HIPAA-grade
+  tamper detection, and a postulate-based test suite that formally
+  asserts the discipline layer's invariants. Full design in
+  [`docs/plans/2026-04-29-phase-3-discipline-layer.md`](docs/plans/2026-04-29-phase-3-discipline-layer.md).
 - **Graph layer (Phase 5).** Apache AGE integration and a `memory_edges`
   table for relationship-aware retrieval.
 - **Cognify / Memify pipeline split (Phase 6).** Separation of raw ingest
