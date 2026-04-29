@@ -1,0 +1,71 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight runs when a new commit is pushed to the same branch.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (no-DB subset)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pytest (no-DB unit subset)
+        # Explicit allow-list of test files that genuinely don't touch
+        # Postgres in setup OR teardown. Many "logic-only" tests (e.g.,
+        # test_findings_parser, test_oscillation_guardrail) have shared
+        # fixtures with DB-touching teardowns even when the test body is
+        # pure — those run locally fine but break CI without a service
+        # container.
+        #
+        # Adding a "DB-available" workflow with a pgvector service container
+        # for broader coverage is tracked as a follow-up — earlier attempts
+        # hit migrate-vs-schema-bootstrap ordering issues. The right next
+        # step there is `psql -f migrations/001_initial_schema.sql` first,
+        # then `python factory/cli.py migrate` for everything else (so the
+        # migrate command's schema_migrations writes have a target table
+        # to write to).
+        run: |
+          cd factory
+          python -m pytest \
+            tests/test_ai_clis_base.py \
+            tests/test_ai_clis_auth_helpers.py \
+            tests/test_ai_cli_codex.py \
+            tests/test_ai_cli_claude.py \
+            tests/test_ai_cli_gemini.py \
+            tests/test_profiles.py \
+            tests/test_dev_login.py \
+            tests/test_cli_login_commands.py \
+            tests/test_cli_executor_routing.py \
+            tests/test_channel_smtp.py \
+            tests/test_channel_telegram.py \
+            -p no:cacheprovider --tb=short -q
