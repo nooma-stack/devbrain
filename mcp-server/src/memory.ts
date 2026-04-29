@@ -45,14 +45,27 @@ export interface RecordMemoryArgs {
   provenanceId?: string | null
 }
 
-export async function recordMemory(args: RecordMemoryArgs): Promise<void> {
+export async function recordMemory(args: RecordMemoryArgs): Promise<string | null> {
   try {
-    await query(
-      `INSERT INTO devbrain.memory
-           (project_id, kind, title, content, embedding, provenance_id)
-       VALUES ($1, $2, $3, $4, $5::vector, $6)
-       ON CONFLICT (provenance_id, kind) WHERE provenance_id IS NOT NULL
-       DO NOTHING`,
+    // Single round-trip: try to insert; on conflict (existing row for this
+    // provenance), fall through to a SELECT for the existing id. The CTE
+    // approach is cheaper than insert-then-select-on-conflict and handles
+    // the no-provenance case too (when provenance_id is NULL the partial
+    // unique index doesn't fire, so the INSERT path always succeeds).
+    const result = await query<{ id: string }>(
+      `WITH inserted AS (
+         INSERT INTO devbrain.memory
+             (project_id, kind, title, content, embedding, provenance_id)
+         VALUES ($1, $2, $3, $4, $5::vector, $6)
+         ON CONFLICT (provenance_id, kind) WHERE provenance_id IS NOT NULL
+         DO NOTHING
+         RETURNING id
+       )
+       SELECT id FROM inserted
+       UNION ALL
+       SELECT id FROM devbrain.memory
+       WHERE provenance_id = $6 AND kind = $2 AND NOT EXISTS (SELECT 1 FROM inserted)
+       LIMIT 1`,
       [
         args.projectId,
         args.kind,
@@ -62,11 +75,81 @@ export async function recordMemory(args: RecordMemoryArgs): Promise<void> {
         args.provenanceId ?? null,
       ],
     )
+    return result.rows[0]?.id ?? null
   } catch (err) {
     // Best-effort: never let a memory failure surface to the caller.
     // The legacy write is the contract; this is shadow-write phase.
     console.error(
       `[memory] dual-write failed (kind=${args.kind}, provenance_id=${args.provenanceId ?? 'null'}): ${err}`,
+    )
+    return null
+  }
+}
+
+/**
+ * Resolve a UUID to a `devbrain.memory.id`.
+ *
+ * Accepts either:
+ *   - a memory.id directly (returns it unchanged if it exists), or
+ *   - a legacy provenance UUID (decision/pattern/issue id), in which case
+ *     we look up the corresponding memory row.
+ *
+ * Returns null on miss. Used by the `store` tool to wire up `depends_on`
+ * and `supersedes` edges from agent-supplied UUIDs that may have come
+ * from search results pointing at either the memory or the legacy table.
+ */
+export async function resolveMemoryId(uuid: string): Promise<string | null> {
+  try {
+    const result = await query<{ id: string }>(
+      `SELECT id FROM devbrain.memory WHERE id = $1
+         UNION ALL
+       SELECT id FROM devbrain.memory WHERE provenance_id = $1
+       LIMIT 1`,
+      [uuid],
+    )
+    return result.rows[0]?.id ?? null
+  } catch (err) {
+    console.error(`[memory] resolveMemoryId(${uuid}) failed: ${err}`)
+    return null
+  }
+}
+
+/**
+ * Insert a typed dependency edge between two memory rows.
+ *
+ * Idempotent via the (from_memory_id, to_memory_id, edge_type) unique
+ * constraint. Caller responsibility: ensure both memory IDs are valid
+ * (use resolveMemoryId first); silently skips self-loops and handles
+ * conflicts as no-ops. Best-effort like recordMemory — failures are
+ * logged but never raised to the caller.
+ */
+export async function recordMemoryDependency(args: {
+  fromMemoryId: string
+  toMemoryId: string
+  edgeType: 'cites' | 'depends_on' | 'supersedes' | 'contradicts'
+  confidence?: number
+  createdBy?: string
+  metadata?: Record<string, unknown>
+}): Promise<void> {
+  if (args.fromMemoryId === args.toMemoryId) return
+  try {
+    await query(
+      `INSERT INTO devbrain.memory_dependencies
+           (from_memory_id, to_memory_id, edge_type, confidence, created_by, metadata)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (from_memory_id, to_memory_id, edge_type) DO NOTHING`,
+      [
+        args.fromMemoryId,
+        args.toMemoryId,
+        args.edgeType,
+        args.confidence ?? 1.0,
+        args.createdBy ?? 'mcp:store',
+        args.metadata ? JSON.stringify(args.metadata) : null,
+      ],
+    )
+  } catch (err) {
+    console.error(
+      `[memory] recordMemoryDependency(${args.edgeType}, ${args.fromMemoryId}→${args.toMemoryId}) failed: ${err}`,
     )
   }
 }

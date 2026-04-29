@@ -9,7 +9,7 @@ import { join, resolve } from 'path'
 import { z } from 'zod'
 import { query } from './db.js'
 import { embed, toSqlVector } from './embeddings.js'
-import { recordMemory } from './memory.js'
+import { recordMemory, recordMemoryDependency, resolveMemoryId } from './memory.js'
 import { summarizeSession } from './summarize.js'
 
 // Factory orchestrator runner path
@@ -556,8 +556,20 @@ server.tool(
     fix_applied: z.string().optional().describe('Fix applied (for issues)'),
     prevention: z.string().optional().describe('How to prevent recurrence (for issues)'),
     example_code: z.string().optional().describe('Example code (for patterns)'),
+    depends_on: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'UUIDs of memories this one depends on. Invalidating any of those should re-evaluate this. Accepts either memory.id or a legacy decision/pattern/issue id from search results.',
+      ),
+    supersedes: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'UUIDs of memories this one replaces. Used for retracting a prior decision when storing its replacement. Accepts either memory.id or legacy id.',
+      ),
   },
-  async ({ type, project, title, content, category, tags, rationale, alternatives, root_cause, fix_applied, prevention, example_code }) => {
+  async ({ type, project, title, content, category, tags, rationale, alternatives, root_cause, fix_applied, prevention, example_code, depends_on, supersedes }) => {
     const projectId = await resolveProjectId(project)
     if (!projectId) {
       return { content: [{ type: 'text', text: `Project "${project}" not found.` }] }
@@ -607,7 +619,7 @@ server.tool(
     // We dual-write here (the canonical legacy row) — NOT the
     // auxiliary chunk insert below — so each store() lands exactly one
     // memory row per logical entity.
-    await recordMemory({
+    const memoryId = await recordMemory({
       projectId,
       kind: type,
       title,
@@ -615,6 +627,40 @@ server.tool(
       embeddingSql: vectorStr,
       provenanceId: recordId,
     })
+
+    // Atlas / Phase 3 dependency edges. Each agent-supplied UUID may be
+    // either a memory.id directly or a legacy provenance id; resolve and
+    // insert. Failures are logged but never block the store. Skipped if
+    // the dual-write didn't return a new memory.id (best-effort path).
+    const edgeNotes: string[] = []
+    if (memoryId && (depends_on?.length || supersedes?.length)) {
+      for (const target of depends_on ?? []) {
+        const toId = await resolveMemoryId(target)
+        if (!toId) {
+          edgeNotes.push(`depends_on: could not resolve "${target.slice(0, 8)}"`)
+          continue
+        }
+        await recordMemoryDependency({
+          fromMemoryId: memoryId,
+          toMemoryId: toId,
+          edgeType: 'depends_on',
+          createdBy: 'mcp:store',
+        })
+      }
+      for (const target of supersedes ?? []) {
+        const toId = await resolveMemoryId(target)
+        if (!toId) {
+          edgeNotes.push(`supersedes: could not resolve "${target.slice(0, 8)}"`)
+          continue
+        }
+        await recordMemoryDependency({
+          fromMemoryId: memoryId,
+          toMemoryId: toId,
+          edgeType: 'supersedes',
+          createdBy: 'mcp:store',
+        })
+      }
+    }
 
     // Also create an embedded chunk for the record. Kept for legacy
     // search compatibility; no dual-write from here (would duplicate
@@ -625,7 +671,15 @@ server.tool(
       [projectId, type, recordId, `${title}\n\n${content}`, vectorStr],
     )
 
-    return { content: [{ type: 'text', text: `Stored ${type} "${title}" (${recordId.slice(0, 8)}).` }] }
+    const baseMsg = `Stored ${type} "${title}" (${recordId.slice(0, 8)}).`
+    const edgeSummary = (() => {
+      const parts: string[] = []
+      if (depends_on?.length) parts.push(`depends_on=${depends_on.length}`)
+      if (supersedes?.length) parts.push(`supersedes=${supersedes.length}`)
+      return parts.length ? ` Edges: ${parts.join(', ')}.` : ''
+    })()
+    const noteSummary = edgeNotes.length ? ` (${edgeNotes.join('; ')})` : ''
+    return { content: [{ type: 'text', text: baseMsg + edgeSummary + noteSummary }] }
   },
 )
 
