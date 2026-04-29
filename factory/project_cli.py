@@ -540,6 +540,102 @@ def assign_port_cmd(slug, purpose, host, port_spec, size, accept_archived, notes
     )
 
 
+@click.command(name="unassign-port")
+@click.option("--slug", required=True, help="Project slug owning the port")
+@click.option("--purpose", required=True, help="Purpose name to retire (matches the original assignment)")
+@click.option("--notes", default=None,
+              help="Optional explanation for the retirement (appended to the row's notes).")
+@click.option("--yes", is_flag=True, help="Skip the confirmation prompt.")
+def unassign_port_cmd(slug, purpose, notes, yes):
+    """Retire a port assignment from an active project, preserving history.
+
+    Sets `archived_at = now()` on the assignment row — the row is NOT deleted.
+    This preserves the project's port history: if the project is later spun
+    back up, agents can query its prior assignments via
+    `devbrain ports --project <slug> --include-archived` and decide whether
+    to reclaim the old port (if free) or pick a new one (if another project
+    has since claimed it).
+
+    Refuses if:
+    - The project doesn't exist.
+    - No active assignment exists for the given purpose (already retired
+      or never assigned).
+    """
+    from state_machine import FactoryDB
+    from config import DATABASE_URL
+    from port_registry import PortRange, format_port_range
+
+    db = FactoryDB(DATABASE_URL)
+
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, name FROM devbrain.projects WHERE slug = %s",
+            [slug],
+        )
+        proj = cur.fetchone()
+        if not proj:
+            click.echo(f"Error: no project with slug {slug!r}.", err=True)
+            sys.exit(1)
+        project_id, project_name = proj
+
+        cur.execute(
+            """
+            SELECT id, host, port_start, port_end, notes
+            FROM devbrain.port_assignments
+            WHERE project_id = %s AND purpose = %s AND archived_at IS NULL
+            """,
+            [project_id, purpose],
+        )
+        row = cur.fetchone()
+        if not row:
+            click.echo(
+                f"Error: project '{slug}' has no active assignment for purpose '{purpose}'.",
+                err=True,
+            )
+            sys.exit(1)
+        assignment_id, host, port_start, port_end, existing_notes = row
+
+    port_str = format_port_range(PortRange(port_start, port_end))
+
+    click.echo("")
+    click.echo("─" * 50)
+    click.echo(f"  Project: {slug} ({project_name})")
+    click.echo(f"  Purpose: {purpose}")
+    click.echo(f"  Host:    {host}")
+    click.echo(f"  Port:    {port_str}")
+    click.echo("  Action:  retire (archived_at = now)")
+    click.echo("           historical record preserved for future revival")
+    if notes:
+        click.echo(f"  Notes:   {notes}")
+    click.echo("─" * 50)
+
+    if not yes and not click.confirm("Retire this port assignment?", default=True):
+        click.echo("Aborted.")
+        sys.exit(0)
+
+    final_notes = existing_notes or ""
+    if notes:
+        sep = " | " if final_notes else ""
+        final_notes = f"{final_notes}{sep}retired: {notes}"
+
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE devbrain.port_assignments
+            SET archived_at = now(),
+                notes = %s
+            WHERE id = %s
+            """,
+            [final_notes or None, assignment_id],
+        )
+        conn.commit()
+
+    click.echo(
+        f"✅ Retired {host}:{port_str} from '{slug}' (purpose '{purpose}'). "
+        f"History preserved — view via `devbrain ports --project {slug}`."
+    )
+
+
 @click.command(name="reclaim-port")
 @click.option("--host", default="localhost", show_default=True)
 @click.option("--port", "port_spec", required=True, help="Port or range, e.g. 18000 or 20000-20100")
@@ -607,5 +703,6 @@ def register(cli_group: click.Group) -> None:
     cli_group.add_command(reactivate_project_cmd)
     cli_group.add_command(ports_cmd)
     cli_group.add_command(assign_port_cmd)
+    cli_group.add_command(unassign_port_cmd)
     cli_group.add_command(reclaim_port_cmd)
     cli_group.add_command(seed_ports_cmd)
