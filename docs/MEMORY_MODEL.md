@@ -41,6 +41,13 @@ memify worker (not in this PR — this PR only stores the `strength`,
 Promotion path: `memory` → `lesson` → `rule` (demotion is allowed). All
 three tiers live in the same table; `tier` is the discipline marker.
 
+Phase 3 will add two companion tables — `memory_dependencies` (typed edges
+for cascade re-evaluation on supersession) and `memory_ledger` (hash-chained
+audit trail for HIPAA contexts) — plus a `tests/postulates/` directory of
+formal invariants. See
+[`plans/2026-04-29-phase-3-discipline-layer.md`](plans/2026-04-29-phase-3-discipline-layer.md)
+for the full design and implementation order.
+
 ## Status
 
 This PR (P2.a) adds the table only. Adapters land in **P2.b**, historical
