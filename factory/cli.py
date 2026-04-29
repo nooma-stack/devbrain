@@ -45,6 +45,21 @@ def cli():
     pass
 
 
+# Late-imported registration hook for project + port-registry commands.
+# Done at import time so they appear in --help. Imports inside the function
+# are deferred until first invocation (avoids loading psycopg2 / DB layer
+# on `--help` paths that don't need it).
+def _register_project_cli() -> None:
+    try:
+        import project_cli
+        project_cli.register(cli)
+    except ImportError as e:
+        logger.debug("project_cli not available: %s", e)
+
+
+_register_project_cli()
+
+
 def _resolve_cli_names(cli_arg: str) -> list[str]:
     """Resolve `--cli` option into the list of adapter names."""
     import dev_login as _dl
