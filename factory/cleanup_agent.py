@@ -580,7 +580,7 @@ class CleanupAgent:
                 f"{diagnosis['description']}\n\n"
                 f"Please apply a minimal, targeted fix to resolve the blocking issues."
             )
-            result = run_cli(cli_name, prompt, cwd=project_root)
+            result = run_cli(cli_name, prompt, cwd=project_root, dev_id=job.submitted_by)
             if result.success:
                 return True, f"Targeted fix applied via {cli_name}. stdout: {result.stdout[:500]}"
             else:
