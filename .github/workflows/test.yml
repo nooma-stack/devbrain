@@ -61,20 +61,25 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Apply DB schema
+      - name: Apply DB schema via devbrain migrate
+        # Use the canonical migrate command (records each migration in
+        # devbrain.schema_migrations) so tests that assert on that table
+        # pass. Falling back to raw psql apply would skip the tracking.
         run: |
-          for f in migrations/*.sql; do
-            PGPASSWORD=devbrain-local psql -h localhost -p 5433 -U devbrain -d devbrain -v ON_ERROR_STOP=1 -f "$f"
-          done
+          python factory/cli.py migrate
 
       - name: Run pytest (DB available)
-        # Tests that need Ollama (embedding model) or that touch external
-        # services beyond Postgres are still excluded — they belong in a
-        # separate integration workflow.
+        # Excluded tests need external services beyond Postgres:
+        # - export-import-memory, attribute-orphans, backfill-memory: Ollama
+        # - channel_gchat_dwd, channel_gmail_dwd: Google service account JSON
+        # - doctor: bin/devbrain bash wrapper output not JSON-parseable in CI
         run: |
           cd factory
           python -m pytest \
             --ignore=tests/test_export_import_memory.py \
             --ignore=tests/test_attribute_orphans.py \
             --ignore=tests/test_backfill_memory.py \
+            --ignore=tests/test_channel_gchat_dwd.py \
+            --ignore=tests/test_channel_gmail_dwd.py \
+            --ignore=tests/test_doctor.py \
             -p no:cacheprovider --tb=short -q
