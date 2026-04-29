@@ -15,6 +15,36 @@ import { summarizeSession } from './summarize.js'
 // Factory orchestrator runner path
 const FACTORY_RUNNER = resolve(import.meta.dirname, '../../factory/run.py')
 
+// DevBrain CLI invocation (for write tools that delegate to Python's allocator).
+const DEVBRAIN_CLI = resolve(import.meta.dirname, '../../factory/cli.py')
+const DEVBRAIN_PYTHON = resolve(import.meta.dirname, '../../.venv/bin/python')
+const DEVBRAIN_REPO_ROOT = resolve(import.meta.dirname, '../..')
+
+function runDevbrainCli(args: string[]): { stdout: string; stderr: string; exitCode: number } {
+  const result = spawnSync(DEVBRAIN_PYTHON, [DEVBRAIN_CLI, ...args], {
+    encoding: 'utf-8',
+    cwd: DEVBRAIN_REPO_ROOT,
+  })
+  return {
+    stdout: (result.stdout ?? '').toString(),
+    stderr: (result.stderr ?? '').toString(),
+    exitCode: result.status ?? -1,
+  }
+}
+
+function cliResultToToolResponse(args: string[]): { content: Array<{ type: 'text'; text: string }> } {
+  const { stdout, stderr, exitCode } = runDevbrainCli(args)
+  if (exitCode !== 0) {
+    return {
+      content: [{
+        type: 'text',
+        text: `devbrain ${args[0]} exited ${exitCode}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+      }],
+    }
+  }
+  return { content: [{ type: 'text', text: stdout || `devbrain ${args[0]} completed.` }] }
+}
+
 const server = new McpServer({
   name: 'devbrain',
   version: '0.1.0',
@@ -1436,6 +1466,249 @@ server.tool(
         text: `[session: ${payload.session_id ?? 'unknown'}]\n\n${payload.result ?? '(empty response)'}`,
       }],
     }
+  },
+)
+
+// ─── Tool: list_projects ─────────────────────────────────────────────────────
+
+server.tool(
+  'list_projects',
+  'List all DevBrain projects with status, team, and port-assignment count. Use to discover what projects exist before creating or assigning to one.',
+  {
+    status: z.enum(['active', 'inactive', 'archived', 'experimental']).optional()
+      .describe('Filter by status. Omit for all statuses.'),
+    team: z.string().optional().describe('Filter by team (e.g., nooma-stack, lhtdev).'),
+  },
+  async ({ status, team }) => {
+    const conditions: string[] = []
+    const params: (string | null)[] = []
+    if (status) {
+      conditions.push(`p.status = $${params.length + 1}`)
+      params.push(status)
+    }
+    if (team) {
+      conditions.push(`p.team = $${params.length + 1}`)
+      params.push(team)
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+    const rows = await query<{
+      slug: string; name: string; status: string; team: string | null;
+      compose_project: string | null; root_path: string | null;
+      port_count: number;
+    }>(
+      `SELECT p.slug, p.name, p.status, p.team, p.compose_project, p.root_path,
+              COUNT(pa.id) FILTER (WHERE pa.archived_at IS NULL) AS port_count
+       FROM devbrain.projects p
+       LEFT JOIN devbrain.port_assignments pa ON pa.project_id = p.id
+       ${where}
+       GROUP BY p.id
+       ORDER BY p.status, p.team NULLS LAST, p.slug`,
+      params,
+    )
+    if (rows.rows.length === 0) {
+      return { content: [{ type: 'text', text: 'No projects matched the filter.' }] }
+    }
+    const lines = ['slug\tstatus\tteam\tcompose_project\tactive_ports\troot_path']
+    for (const r of rows.rows) {
+      lines.push([
+        r.slug, r.status, r.team ?? '-', r.compose_project ?? '-',
+        String(r.port_count), r.root_path ?? '-',
+      ].join('\t'))
+    }
+    return { content: [{ type: 'text', text: lines.join('\n') }] }
+  },
+)
+
+// ─── Tool: list_ports ────────────────────────────────────────────────────────
+
+server.tool(
+  'list_ports',
+  "Show port assignments for a project (or all projects). Includes archived assignments by default — they're the project's history. Use to discover what ports are taken before assigning new ones.",
+  {
+    project: z.string().optional().describe('Project slug to filter by. Omit for all projects.'),
+    host: z.string().optional().describe('Host to filter by (e.g., "localhost"). Omit for all hosts.'),
+    include_archived: z.boolean().optional().default(true)
+      .describe('Include retired (archived_at IS NOT NULL) assignments. Default true so the agent sees full history.'),
+  },
+  async ({ project, host, include_archived }) => {
+    const conditions: string[] = []
+    const params: string[] = []
+    if (project) {
+      conditions.push(`p.slug = $${params.length + 1}`)
+      params.push(project)
+    }
+    if (host) {
+      conditions.push(`pa.host = $${params.length + 1}`)
+      params.push(host)
+    }
+    if (!include_archived) {
+      conditions.push(`pa.archived_at IS NULL`)
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+    const rows = await query<{
+      slug: string; status: string; host: string; purpose: string;
+      port_start: number; port_end: number;
+      notes: string | null; archived_at: string | null;
+    }>(
+      `SELECT p.slug, p.status, pa.host, pa.purpose, pa.port_start, pa.port_end,
+              pa.notes, pa.archived_at
+       FROM devbrain.port_assignments pa
+       JOIN devbrain.projects p ON p.id = pa.project_id
+       ${where}
+       ORDER BY pa.host, pa.port_start, p.slug`,
+      params,
+    )
+    if (rows.rows.length === 0) {
+      return { content: [{ type: 'text', text: 'No port assignments matched the filter.' }] }
+    }
+    const lines = ['host\tport\tproject\tstatus\tpurpose\tarchived\tnotes']
+    for (const r of rows.rows) {
+      const portStr = r.port_start === r.port_end ? String(r.port_start) : `${r.port_start}-${r.port_end}`
+      lines.push([
+        r.host, portStr, r.slug, r.status, r.purpose,
+        r.archived_at ? 'yes' : 'no',
+        r.notes ?? '-',
+      ].join('\t'))
+    }
+    return { content: [{ type: 'text', text: lines.join('\n') }] }
+  },
+)
+
+// ─── Tool: get_compose_env ───────────────────────────────────────────────────
+
+server.tool(
+  'get_compose_env',
+  "Return the env vars a project's docker-compose stack expects, derived from its active port assignments. Use to programmatically obtain <PURPOSE>_PORT values without execing the CLI.",
+  {
+    project: z.string().describe('Project slug.'),
+    host: z.string().optional().default('localhost').describe('Filter to ports on this host.'),
+  },
+  async ({ project, host }) => {
+    const projRow = await query<{ status: string; compose_project: string | null }>(
+      `SELECT status, compose_project FROM devbrain.projects WHERE slug = $1`,
+      [project],
+    )
+    if (projRow.rows.length === 0) {
+      return { content: [{ type: 'text', text: `Project '${project}' not found.` }] }
+    }
+    if (projRow.rows[0].status === 'archived') {
+      return { content: [{ type: 'text', text: `Project '${project}' is archived. Reactivate first to query ports.` }] }
+    }
+    const ports = await query<{ purpose: string; port_start: number; port_end: number }>(
+      `SELECT pa.purpose, pa.port_start, pa.port_end
+       FROM devbrain.port_assignments pa
+       JOIN devbrain.projects p ON p.id = pa.project_id
+       WHERE p.slug = $1 AND pa.host = $2 AND pa.archived_at IS NULL
+       ORDER BY pa.purpose`,
+      [project, host],
+    )
+    const env: Record<string, string> = {}
+    for (const r of ports.rows) {
+      const name = r.purpose.toUpperCase().replace(/-/g, '_')
+      if (r.port_start === r.port_end) {
+        env[`${name}_PORT`] = String(r.port_start)
+      } else {
+        env[`${name}_PORT_START`] = String(r.port_start)
+        env[`${name}_PORT_END`] = String(r.port_end)
+      }
+    }
+    if (projRow.rows[0].compose_project) {
+      env['COMPOSE_PROJECT_NAME'] = projRow.rows[0].compose_project
+    }
+    return { content: [{ type: 'text', text: JSON.stringify(env, null, 2) }] }
+  },
+)
+
+// ─── Tool: assign_port ───────────────────────────────────────────────────────
+
+server.tool(
+  'assign_port',
+  'Add a port assignment to an existing project. If `port` is omitted, auto-suggest from the project\'s team range. Skips interactive prompts; safe for autonomous calls.',
+  {
+    project: z.string().describe('Project slug.'),
+    purpose: z.string().describe("What this port is for (e.g., 'redis', 'metrics', 'websocket')."),
+    port: z.string().optional().describe("Explicit port or range, e.g. '8080' or '20000-20100'. Omit to auto-suggest."),
+    size: z.number().int().positive().optional().default(1).describe('For auto-suggested ranges.'),
+    host: z.string().optional().default('localhost'),
+    accept_archived: z.boolean().optional().default(false)
+      .describe("Auto-confirm if suggestion lands on an archived range (skips reclaim prompt)."),
+    notes: z.string().optional(),
+  },
+  async ({ project, purpose, port, size, host, accept_archived, notes }) => {
+    const args = [
+      'assign-port',
+      '--slug', project,
+      '--purpose', purpose,
+      '--host', host,
+      '--size', String(size),
+      '--yes',
+    ]
+    if (port) args.push('--port', port)
+    if (accept_archived) args.push('--accept-archived')
+    if (notes) args.push('--notes', notes)
+    return cliResultToToolResponse(args)
+  },
+)
+
+// ─── Tool: unassign_port ─────────────────────────────────────────────────────
+
+server.tool(
+  'unassign_port',
+  "Retire a port assignment from a project (preserves history — the row stays with archived_at set). Use when a project drops a service or a port purpose is no longer needed.",
+  {
+    project: z.string().describe('Project slug.'),
+    purpose: z.string().describe('Purpose name to retire (must match the original assignment).'),
+    notes: z.string().optional().describe('Reason for retirement (appended to the row notes).'),
+  },
+  async ({ project, purpose, notes }) => {
+    const args = ['unassign-port', '--slug', project, '--purpose', purpose, '--yes']
+    if (notes) args.push('--notes', notes)
+    return cliResultToToolResponse(args)
+  },
+)
+
+// ─── Tool: archive_project ───────────────────────────────────────────────────
+
+server.tool(
+  'archive_project',
+  "Mark a project archived. Port assignments stay reserved — only an explicit reclaim_port can transfer them to a new project.",
+  {
+    project: z.string().describe('Project slug to archive.'),
+  },
+  async ({ project }) => {
+    const args = ['archive-project', '--slug', project, '--yes']
+    return cliResultToToolResponse(args)
+  },
+)
+
+// ─── Tool: reactivate_project ────────────────────────────────────────────────
+
+server.tool(
+  'reactivate_project',
+  "Reactivate an archived project (status → active|inactive|experimental). Archived port assignments stay archived; new assignments need explicit assign_port calls.",
+  {
+    project: z.string().describe('Project slug to reactivate.'),
+    status: z.enum(['active', 'inactive', 'experimental']).optional().default('active'),
+  },
+  async ({ project, status }) => {
+    const args = ['reactivate-project', '--slug', project, '--status', status]
+    return cliResultToToolResponse(args)
+  },
+)
+
+// ─── Tool: reclaim_port ──────────────────────────────────────────────────────
+
+server.tool(
+  'reclaim_port',
+  "Transfer an archived port range to a new project. ⚠ Use with care — only invoke when the agent has confirmed the original archived project won't be revived. The CLI form is normally human-confirmation-gated; this MCP form bypasses that prompt.",
+  {
+    new_project: z.string().describe('Slug of the new project that will own the port.'),
+    host: z.string().optional().default('localhost'),
+    port: z.string().describe("Port or range to reclaim, e.g. '18000' or '20000-20100'."),
+  },
+  async ({ new_project, host, port }) => {
+    const args = ['reclaim-port', '--for-project', new_project, '--host', host, '--port', port, '--yes']
+    return cliResultToToolResponse(args)
   },
 )
 
