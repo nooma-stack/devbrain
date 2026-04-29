@@ -70,4 +70,5 @@ jobs:
             tests/test_channel_telegram.py \
             tests/test_port_registry.py \
             tests/test_seed_ports.py \
+            tests/test_compose_env.py \
             -p no:cacheprovider --tb=short -q

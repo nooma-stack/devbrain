@@ -636,6 +636,149 @@ def unassign_port_cmd(slug, purpose, notes, yes):
     )
 
 
+"""Compose wrapper — devbrain compose <slug> -- <docker compose args...>
+
+Reads a project's active port assignments and exposes them as env vars
+to the spawned docker-compose subprocess so Compose YAML can reference
+them via ${API_PORT}, ${WEB_PORT_START}, etc. without manual config drift.
+"""
+
+
+def _build_compose_env(port_assignments, prefix: str = "", upper: bool = True) -> dict:
+    """Build the env dict from a list of PortAssignment-like rows.
+
+    Single port → <PURPOSE>_PORT=<value>
+    Range       → <PURPOSE>_PORT_START=<value>, <PURPOSE>_PORT_END=<value>
+                  (no <PURPOSE>_PORT for ranges — caller must use _START/_END)
+    """
+    env = {}
+    for a in port_assignments:
+        purpose_name = a.purpose
+        if upper:
+            purpose_name = purpose_name.upper()
+        purpose_name = purpose_name.replace("-", "_")
+        var_base = f"{prefix}{purpose_name}"
+        if a.port_range.start == a.port_range.end:
+            env[f"{var_base}_PORT"] = str(a.port_range.start)
+        else:
+            env[f"{var_base}_PORT_START"] = str(a.port_range.start)
+            env[f"{var_base}_PORT_END"] = str(a.port_range.end)
+    return env
+
+
+@click.command(name="compose", context_settings={"ignore_unknown_options": True})
+@click.argument("slug")
+@click.argument("compose_args", nargs=-1, type=click.UNPROCESSED)
+@click.option("--env", "env_only", is_flag=True,
+              help="Print env vars as `export NAME=value` lines (sourceable) instead of running docker compose.")
+@click.option("--prefix", default="", help="Prefix for env var names (e.g., 'DEVBRAIN_').")
+@click.option("--upper/--no-upper", default=True, show_default=True,
+              help="Uppercase the purpose name in env var names.")
+@click.option("--host", default="localhost", show_default=True,
+              help="Filter port assignments to this host.")
+@click.option("--docker-compose-bin", "docker_compose_bin", default=None,
+              help="Override the docker compose binary (default: 'docker compose').")
+def compose_cmd(slug, compose_args, env_only, prefix, upper, host, docker_compose_bin):
+    """Run docker compose for a project with port env vars auto-injected.
+
+    Looks up the project's active port assignments on the given host and
+    exposes each as an environment variable named <PURPOSE>_PORT (single)
+    or <PURPOSE>_PORT_START / <PURPOSE>_PORT_END (range). Then either
+    prints those (--env) or execs docker compose with them in env.
+
+    Examples:
+      devbrain compose 50tel-pbx up -d
+      devbrain compose 50tel-pbx logs api
+      eval "$(devbrain compose 50tel-pbx --env)"
+
+    The project's compose_project field (if set) is passed to docker compose
+    via -p, so the spawned stack uses that as its project name. This lets
+    multiple devs run their own copies of the same code with their own
+    per-dev port assignments side by side.
+    """
+    import os
+    import shlex
+    import subprocess as sp
+    from state_machine import FactoryDB
+    from config import DATABASE_URL
+    from port_registry import PortRegistry
+
+    db = FactoryDB(DATABASE_URL)
+    registry = PortRegistry(db, team_ranges=_team_ranges_from_config())
+
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, name, status, compose_project, root_path FROM devbrain.projects WHERE slug = %s",
+            [slug],
+        )
+        proj = cur.fetchone()
+    if not proj:
+        click.echo(f"Error: no project with slug {slug!r}.", err=True)
+        sys.exit(1)
+    _proj_id, project_name, status, compose_project, root_path = proj
+
+    if status == "archived":
+        click.echo(
+            f"Error: project '{slug}' is archived. Reactivate first:\n"
+            f"  devbrain reactivate-project --slug {slug}",
+            err=True,
+        )
+        sys.exit(1)
+
+    assignments = registry.list_assignments(
+        host=host, project_slug=slug, include_archived=False,
+    )
+    env_dict = _build_compose_env(assignments, prefix=prefix, upper=upper)
+
+    if env_only:
+        for name in sorted(env_dict):
+            value = env_dict[name]
+            click.echo(f"export {name}={shlex.quote(value)}")
+        if compose_project:
+            click.echo(f"export COMPOSE_PROJECT_NAME={shlex.quote(compose_project)}")
+        return
+
+    if not compose_args:
+        click.echo(
+            "Error: no docker compose command supplied. "
+            "Try `devbrain compose <slug> up`, `... logs api`, etc.\n"
+            "Or use `--env` to print env vars without executing.",
+            err=True,
+        )
+        sys.exit(1)
+
+    env = {**os.environ, **env_dict}
+    if compose_project:
+        env["COMPOSE_PROJECT_NAME"] = compose_project
+
+    # Default to `docker compose` (v2 plugin form). Operator can override.
+    if docker_compose_bin:
+        argv = shlex.split(docker_compose_bin) + list(compose_args)
+    else:
+        argv = ["docker", "compose"] + list(compose_args)
+
+    if compose_project:
+        argv = argv[:2] + ["-p", compose_project] + argv[2:]
+
+    cwd = root_path if root_path else None
+
+    click.echo(f"→ {' '.join(shlex.quote(a) for a in argv)}", err=True)
+    if cwd:
+        click.echo(f"  cwd: {cwd}", err=True)
+    click.echo(f"  env: {len(env_dict)} port var(s) injected", err=True)
+
+    try:
+        result = sp.run(argv, env=env, cwd=cwd)
+    except FileNotFoundError:
+        click.echo(
+            f"Error: docker compose binary not found ({argv[0]}). "
+            f"Install Docker Desktop or pass --docker-compose-bin.",
+            err=True,
+        )
+        sys.exit(1)
+    sys.exit(result.returncode)
+
+
 @click.command(name="reclaim-port")
 @click.option("--host", default="localhost", show_default=True)
 @click.option("--port", "port_spec", required=True, help="Port or range, e.g. 18000 or 20000-20100")
@@ -705,4 +848,5 @@ def register(cli_group: click.Group) -> None:
     cli_group.add_command(assign_port_cmd)
     cli_group.add_command(unassign_port_cmd)
     cli_group.add_command(reclaim_port_cmd)
+    cli_group.add_command(compose_cmd)
     cli_group.add_command(seed_ports_cmd)
