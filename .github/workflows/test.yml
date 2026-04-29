@@ -1,0 +1,57 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-flight runs when a new commit is pushed to the same branch.
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (fast subset)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run pytest (fast subset, no DB)
+        # DB-touching tests need a live Postgres + pgvector instance and are
+        # excluded here. They run locally + via integration test workflow
+        # (separate job, planned). The fast subset still covers the
+        # multi-dev adapter system, profiles, dev_login, cli_executor
+        # routing, notification channels, and factory unit logic.
+        run: |
+          cd factory
+          python -m pytest \
+            --ignore=tests/test_export_import_memory.py \
+            --ignore=tests/test_blocked_resolution_flow.py \
+            --ignore=tests/test_multi_dev_integration.py \
+            --ignore=tests/test_memory_table.py \
+            --ignore=tests/test_attribute_orphans.py \
+            --ignore=tests/test_backfill_memory.py \
+            -p no:cacheprovider --tb=short -q
