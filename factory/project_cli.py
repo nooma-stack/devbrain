@@ -369,6 +369,177 @@ def ports_cmd(project_slug, host, include_archived):
         click.echo("  ".join(str(c).ljust(widths[i]) for i, c in enumerate(cells)))
 
 
+@click.command(name="assign-port")
+@click.option("--slug", required=True, help="Project slug to add the port to")
+@click.option("--purpose", required=True, help="What this port is for (e.g., redis, metrics, websocket)")
+@click.option("--host", default="localhost", show_default=True)
+@click.option("--port", "port_spec", default=None,
+              help="Explicit port or range (e.g., 8080 or 20000-20100). Omit to auto-suggest.")
+@click.option("--size", type=int, default=1, show_default=True,
+              help="For auto-suggested ranges (e.g., 100 for 100 contiguous ports).")
+@click.option("--accept-archived", is_flag=True,
+              help="Auto-confirm if the suggestion lands on an archived project's range.")
+@click.option("--notes", default=None, help="Optional free-form notes for the assignment.")
+@click.option("--yes", is_flag=True, help="Skip the final summary confirmation.")
+def assign_port_cmd(slug, purpose, host, port_spec, size, accept_archived, notes, yes):
+    """Add a port to an existing project after create-project.
+
+    Use when new port requirements come up mid-project (e.g., you realize
+    the project needs Redis, a metrics endpoint, a websocket server). Reuses
+    the same allocator as create-project and respects all the same invariants:
+    no overlap with active or inactive projects, archived ranges only via
+    explicit reclaim, and team-range conventions for auto-suggestion.
+
+    Will refuse if:
+    - The project doesn't exist (use create-project first).
+    - The project is archived (reactivate first).
+    - The project already has a non-archived assignment for this purpose.
+    """
+    from state_machine import FactoryDB
+    from config import DATABASE_URL
+    from port_registry import PortRegistry, PortRange, format_port_range, parse_port_spec
+
+    db = FactoryDB(DATABASE_URL)
+    registry = PortRegistry(db, team_ranges=_team_ranges_from_config())
+
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, name, status, team FROM devbrain.projects WHERE slug = %s",
+            [slug],
+        )
+        row = cur.fetchone()
+    if not row:
+        click.echo(
+            f"Error: no project with slug {slug!r}. "
+            f"Run `devbrain create-project` first to register it.",
+            err=True,
+        )
+        sys.exit(1)
+    project_id, project_name, status, project_team = row
+
+    if status == "archived":
+        click.echo(
+            f"Error: project '{slug}' is archived. Reactivate it first:\n"
+            f"  devbrain reactivate-project --slug {slug}",
+            err=True,
+        )
+        sys.exit(1)
+
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT port_start, port_end FROM devbrain.port_assignments
+            WHERE project_id = %s AND purpose = %s AND archived_at IS NULL
+            """,
+            [project_id, purpose],
+        )
+        existing = cur.fetchone()
+    if existing:
+        existing_str = format_port_range(PortRange(existing[0], existing[1]))
+        click.echo(
+            f"Error: project '{slug}' already has '{purpose}' assigned to {existing_str}.\n"
+            f"  - To keep that port: do nothing - purpose is already registered.\n"
+            f"  - To change: pick a different purpose name, or run "
+            f"`devbrain reclaim-port` to retire the old one explicitly.",
+            err=True,
+        )
+        sys.exit(1)
+
+    if port_spec:
+        try:
+            port_range = parse_port_spec(port_spec)
+        except ValueError as e:
+            click.echo(f"Error parsing port spec: {e}", err=True)
+            sys.exit(1)
+        all_assignments = registry.list_assignments(host=host, include_archived=True)
+        archived_overlap = None
+        for a in all_assignments:
+            if a.project_status == "archived" or a.archived_at:
+                if port_range.overlaps(a.port_range):
+                    archived_overlap = a
+                continue
+            if port_range.overlaps(a.port_range):
+                click.echo(
+                    f"Error: {format_port_range(port_range)} on {host} overlaps with "
+                    f"existing assignment {format_port_range(a.port_range)} for "
+                    f"project '{a.project_slug}' purpose '{a.purpose}' "
+                    f"(status: {a.project_status}). Pick a different port or unassign the existing one first.",
+                    err=True,
+                )
+                sys.exit(1)
+        needs_approval = archived_overlap is not None
+        reclaim_from = archived_overlap.project_slug if archived_overlap else None
+    else:
+        try:
+            suggestion = registry.suggest(
+                purpose=purpose,
+                host=host,
+                size=size,
+                team=project_team,
+                category=_category_for_purpose(purpose),
+            )
+        except Exception as e:
+            click.echo(f"Error suggesting port: {e}", err=True)
+            sys.exit(1)
+        port_range = suggestion.range
+        needs_approval = suggestion.needs_approval
+        reclaim_from = suggestion.reclaim_from_project
+
+    if needs_approval and not accept_archived:
+        click.echo(
+            f"⚠  Port {format_port_range(port_range)} was previously assigned to "
+            f"archived project '{reclaim_from}'."
+        )
+        if not click.confirm(
+            "Reclaim for this project? (Confirm only if the archived project won't be spun back up.)",
+            default=False,
+        ):
+            click.echo("Aborted.")
+            sys.exit(0)
+
+    click.echo("")
+    click.echo("─" * 50)
+    click.echo(f"  Project: {slug} ({project_name})")
+    click.echo(f"  Purpose: {purpose}")
+    click.echo(f"  Host:    {host}")
+    click.echo(f"  Port:    {format_port_range(port_range)}")
+    if notes:
+        click.echo(f"  Notes:   {notes}")
+    if reclaim_from:
+        click.echo(f"  Reclaim from archived: {reclaim_from}")
+    click.echo("─" * 50)
+
+    if not yes and not click.confirm("Add this port assignment?", default=True):
+        click.echo("Aborted.")
+        sys.exit(0)
+
+    with db._conn() as conn, conn.cursor() as cur:
+        if needs_approval:
+            cur.execute(
+                """
+                UPDATE devbrain.port_assignments
+                SET archived_at = now()
+                WHERE host = %s
+                  AND port_start <= %s AND port_end >= %s
+                  AND archived_at IS NULL
+                """,
+                [host, port_range.start, port_range.end],
+            )
+        cur.execute(
+            """
+            INSERT INTO devbrain.port_assignments
+                (project_id, host, purpose, port_start, port_end, notes)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            [project_id, host, purpose, port_range.start, port_range.end, notes],
+        )
+        conn.commit()
+
+    click.echo(
+        f"✅ Assigned {host}:{format_port_range(port_range)} for '{purpose}' on project '{slug}'."
+    )
+
+
 @click.command(name="reclaim-port")
 @click.option("--host", default="localhost", show_default=True)
 @click.option("--port", "port_spec", required=True, help="Port or range, e.g. 18000 or 20000-20100")
@@ -435,5 +606,6 @@ def register(cli_group: click.Group) -> None:
     cli_group.add_command(archive_project_cmd)
     cli_group.add_command(reactivate_project_cmd)
     cli_group.add_command(ports_cmd)
+    cli_group.add_command(assign_port_cmd)
     cli_group.add_command(reclaim_port_cmd)
     cli_group.add_command(seed_ports_cmd)
