@@ -10,10 +10,19 @@ the orchestrator's HOME and broader environment stay untouched. Git
 authorship is set explicitly via GIT_CONFIG_GLOBAL + GIT_AUTHOR_* env
 vars on top of the HOME swap (these win over .gitconfig discovery).
 
-Login flow: Claude uses a hosted callback at
-`platform.claude.com/oauth/code/callback` — no localhost listener, so
-SSH reverse tunneling is NOT needed. The user pastes a code back from
-their laptop browser, identical UX to a device-code flow.
+Login flow: Claude's auth uses PKCE OAuth with a localhost HTTP
+listener that claude.com's hosted callback page hits via JavaScript to
+deliver the OAuth code. When the dev's browser is on the same machine
+as the CLI (RDP / local terminal), the localhost callback completes
+auto-magically. Over SSH (browser on a different machine than the CLI),
+the dev's laptop browser can't reach the Mac Studio's localhost — so
+DevBrain instead drives a HEADLESS Chromium on the Mac Studio that
+visits the OAuth callback URL with the code+state the dev pastes back.
+The headless browser executes the same JS as the dev's normal browser
+would, hits the localhost listener, claude completes the token
+exchange, writes credentials to the per-profile keychain. Empirically
+verified during the 2026-04-30 SSH onboarding bring-up — see
+`docs/plans/2026-04-29-overnight-handoff.md` "Phase 6 Outcome" section.
 
 Credential storage: Claude Code stores OAuth tokens in macOS Keychain
 (service "Claude Code-credentials"). The Security framework resolves
@@ -39,7 +48,9 @@ import select
 import signal
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 
 import click
@@ -49,15 +60,42 @@ from ai_clis.base import AICliAdapter, LoginResult, SpawnArgs
 
 logger = logging.getLogger(__name__)
 
-# Regex matching Claude's OAuth authorization URL — used by the PTY-driven
-# auth flow to extract the URL from claude's terminal output without
-# depending on the surrounding prose (which has changed across versions).
+# Regex matching Claude's OAuth authorization URL — used to extract the URL
+# from claude's terminal output. The capture group grabs everything up to
+# the next whitespace so we get the full URL with all query params.
 _OAUTH_URL_RE = re.compile(rb"https://claude\.com/cai/oauth/authorize\S+")
 # String emitted by claude on successful auth (post-token-exchange). Used
 # as the terminal-state sentinel so we can stop reading the PTY and reap.
 _LOGIN_OK_SENTINEL = b"Login successful"
-# Hard timeout for the entire auth flow including human OAuth dance.
+# Hard timeout for the entire auth flow including the human OAuth dance.
 _AUTH_TIMEOUT_SECONDS = 600
+# How long to wait for headless browser to fire the localhost callback
+# and for claude to write tokens to the keychain.
+_CALLBACK_TIMEOUT_SECONDS = 60
+
+# Chromium-based browsers we'll search for, in preference order. Any of
+# these can run in headless mode with Chrome's CLI flags, which is all
+# we need to drive the OAuth callback page's JavaScript.
+_CHROMIUM_CANDIDATES = [
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+    "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+    "/Applications/Arc.app/Contents/MacOS/Arc",
+]
+
+
+def find_chromium_browser() -> Path | None:
+    """Return path to a chromium-based browser usable in headless mode.
+
+    Public so devdoctor + onboarding tooling can surface a clear
+    install hint when no compatible browser is present.
+    """
+    for candidate in _CHROMIUM_CANDIDATES:
+        p = Path(candidate)
+        if p.exists() and os.access(p, os.X_OK):
+            return p
+    return None
 
 # Paths inside the profile directory.
 _KEYCHAIN_REL = Path("Library") / "Keychains" / "login.keychain-db"
@@ -125,36 +163,124 @@ def _ensure_keychain(profile_dir: Path) -> Path:
     return keychain
 
 
-def _pty_auth_login(env: dict[str, str]) -> tuple[int, bytes]:
-    """Run `claude auth login` under a PTY, driving I/O ourselves.
+def _drive_headless_callback(
+    code: str,
+    state: str,
+    profile_dir: Path,
+) -> bool:
+    """Drive a headless Chromium that visits Claude's OAuth callback page.
 
-    Why PTY: claude's auth flow uses a raw-mode TTY (Ink-based React TUI)
-    for the auth-code paste step. That input path bypasses normal
-    pipe-based stdin — neither subprocess.run() with input=, nor
-    `tmux send-keys`, nor `tmux paste-buffer` can deliver keystrokes
-    that claude reads. A pty.fork() gives us a real terminal pair where
-    claude's `read(/dev/tty)` consumes the bytes we write to the master fd.
+    The hosted callback page at platform.claude.com/oauth/code/callback
+    runs JavaScript that POSTs to localhost:RANDOM_PORT (Claude's listener)
+    to deliver the OAuth code. When the dev's browser is on a different
+    machine than the CLI, that JS can't reach the listener — but a
+    headless Chromium running on the SAME machine as Claude's CLI can.
 
-    Why DevBrain owns the prompt: the alternative — letting claude print
-    its own URL and Ink-render its own prompt — only works on a fully
-    interactive macOS GUI session. Over SSH or when DevBrain is the
-    parent shell, the Ink prompt is unreachable and the dev sees a hung
-    cursor. Instead, we suppress claude's stdout, parse for the OAuth
-    URL ourselves, and use click.prompt() to collect the code via a
-    well-behaved cooked-mode read.
-
-    Returns (exit_code, full_output_buffer). exit_code = -1 if the
-    process was killed for timeout/cancellation.
+    Returns True if Claude wrote a "Claude Code-credentials" entry to
+    the per-profile keychain within the timeout. Returns False on any
+    failure (browser missing, callback didn't fire, claude didn't
+    write tokens).
     """
-    # Build the claude argv. We pass --claudeai explicitly so behaviour
-    # is deterministic regardless of which default Anthropic ships next.
+    chrome = find_chromium_browser()
+    if chrome is None:
+        logger.error(
+            "No Chromium-based browser found for headless OAuth callback; "
+            "tried: %s",
+            ", ".join(_CHROMIUM_CANDIDATES),
+        )
+        return False
+
+    callback_url = (
+        "https://platform.claude.com/oauth/code/callback"
+        f"?code={urllib.parse.quote(code, safe='')}"
+        f"&state={urllib.parse.quote(state, safe='')}"
+    )
+    keychain_path = profile_dir / _KEYCHAIN_REL
+
+    with tempfile.TemporaryDirectory(prefix="devbrain-headless-") as tmp_data:
+        # `--headless=new` is Chromium's modern headless mode (Chrome 109+).
+        # `--virtual-time-budget=10000` lets JS run for 10s of virtual
+        # time before exit, so the page's localhost POST has time to
+        # complete. `--user-data-dir` keeps cookies/storage isolated to
+        # this transient session — nothing pollutes the dev's real Chrome
+        # profile or the lhtdev system Chrome state.
+        argv = [
+            str(chrome), "--headless=new",
+            "--disable-gpu", "--no-sandbox",
+            f"--user-data-dir={tmp_data}",
+            "--virtual-time-budget=15000",
+            "--disable-features=Translate",
+            callback_url,
+        ]
+        try:
+            proc = subprocess.Popen(
+                argv,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as e:
+            logger.error("Failed to spawn headless browser: %s", e)
+            return False
+
+        # Poll for claude to finish the token exchange and write to the
+        # per-profile keychain. We can't watch claude directly because
+        # it's a sibling process and our parent doesn't own its waitpid;
+        # the keychain entry is the durable proof of completion.
+        deadline = time.monotonic() + _CALLBACK_TIMEOUT_SECONDS
+        success = False
+        while time.monotonic() < deadline:
+            check = subprocess.run(
+                ["security", "find-generic-password",
+                 "-s", "Claude Code-credentials",
+                 str(keychain_path)],
+                capture_output=True,
+            )
+            if check.returncode == 0:
+                success = True
+                break
+            time.sleep(1)
+
+        # Always tear down the headless browser.
+        try:
+            proc.terminate()
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        except Exception:
+            pass
+
+    return success
+
+
+def _drive_auth_login(env: dict[str, str], profile_dir: Path) -> tuple[bool, bytes]:
+    """Run `claude auth login` and drive its OAuth flow over SSH-friendly rails.
+
+    Approach:
+      1. pty.fork the child running `claude auth login --claudeai`. PTY
+         (vs plain Popen) so claude renders interactively and we get its
+         stdout in real-time, not just on close.
+      2. Read the master fd until the OAuth URL appears.
+      3. Print the URL to the user via DevBrain's CLI prompt; user OAuths
+         in their laptop browser.
+      4. Collect the code+state from the user via click.prompt.
+      5. Spawn a headless Chromium on this machine that visits Claude's
+         hosted callback URL with the user's code+state. The hosted page's
+         JavaScript fires the localhost POST to Claude's listener — which
+         IS reachable from this same-machine browser, regardless of where
+         the dev's actual browser was.
+      6. Poll the per-profile keychain until Claude writes the token entry
+         (proof of successful exchange).
+      7. Reap the claude subprocess.
+
+    Returns (success, full_pty_buffer). success=False covers: timeout,
+    user cancellation, missing chromium, and any failure to detect a
+    fresh keychain entry within the callback window.
+    """
     argv = ["claude", "auth", "login", "--claudeai"]
 
     pid, master_fd = pty.fork()
     if pid == 0:
-        # ─── child ────────────────────────────────────────────────
-        # Replace ourselves with claude. On exec failure we exit
-        # nonzero so the parent's waitpid() sees a real status.
         try:
             os.execvpe(argv[0], argv, env)
         except FileNotFoundError:
@@ -163,15 +289,9 @@ def _pty_auth_login(env: dict[str, str]) -> tuple[int, bytes]:
             os._exit(126)
         return  # unreachable
 
-    # ─── parent ──────────────────────────────────────────────────
-    # We do NOT print claude's stdout to the user. Claude's noisy
-    # "Opening browser to sign in… If the browser didn't open, visit:..."
-    # prose is replaced by our own clean prompt below. Everything we
-    # capture stays in `buffer` for parsing + post-mortem logging.
     buffer = b""
-    url_handled = False
     deadline = time.monotonic() + _AUTH_TIMEOUT_SECONDS
-    exit_code: int | None = None
+    callback_succeeded = False
 
     def _kill_child(sig: int = signal.SIGTERM) -> None:
         try:
@@ -180,84 +300,88 @@ def _pty_auth_login(env: dict[str, str]) -> tuple[int, bytes]:
             pass
 
     try:
-        while True:
+        # ─── Phase 1: read PTY until OAuth URL surfaces ───────────
+        url: str | None = None
+        while url is None:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                logger.warning("claude auth login timed out after %ds", _AUTH_TIMEOUT_SECONDS)
+                logger.warning("Timed out waiting for claude OAuth URL")
                 _kill_child()
                 break
-
             try:
                 ready, _, _ = select.select([master_fd], [], [], min(remaining, 5.0))
             except (OSError, InterruptedError):
                 continue
+            if not ready:
+                continue
+            try:
+                chunk = os.read(master_fd, 4096)
+            except OSError:
+                break  # slave closed
+            if not chunk:
+                break
+            buffer += chunk
+            logger.debug("claude PTY chunk: %r", chunk[:200])
+            m = _OAUTH_URL_RE.search(buffer)
+            if m:
+                url = m.group(0).decode("utf-8", "replace")
 
-            if ready:
-                try:
-                    chunk = os.read(master_fd, 4096)
-                except OSError:
-                    # Slave end closed — child is exiting.
-                    break
+        if url is None:
+            return False, buffer
+
+        # Extract the `state` we'll need to round-trip back to claude.
+        state = urllib.parse.parse_qs(urllib.parse.urlparse(url).query).get("state", [""])[0]
+
+        # ─── Phase 2: ask user to OAuth + paste code back ─────────
+        click.echo()
+        click.echo("Open this URL in your laptop browser to authorize Claude Code:")
+        click.echo()
+        click.echo(f"  {url}")
+        click.echo()
+        click.echo("After signing in, claude.com will display an auth code on the page.")
+        click.echo("Copy the FULL code (including everything after '#') and paste it here.")
+        raw = click.prompt("Auth code", default="", show_default=False).strip()
+        if not raw:
+            click.echo("(empty input — cancelling auth)", err=True)
+            _kill_child(signal.SIGINT)
+            return False, buffer
+
+        # Handle both `<code>#<state>` and bare `<code>` formats.
+        code_part = raw.split("#", 1)[0]
+
+        # ─── Phase 3: drive headless browser to fire localhost callback ───
+        click.echo("Completing auth via headless browser…")
+        callback_succeeded = _drive_headless_callback(code_part, state, profile_dir)
+
+        # ─── Phase 4: drain remaining PTY output, reap child ──────
+        # claude should exit on its own once the token exchange completes.
+        # Drain to keep the kernel's PTY buffer from blocking it on write,
+        # and to capture any final stderr for logging.
+        try:
+            os.set_blocking(master_fd, False)
+        except OSError:
+            pass
+        drain_deadline = time.monotonic() + 5
+        while time.monotonic() < drain_deadline:
+            try:
+                chunk = os.read(master_fd, 4096)
                 if not chunk:
                     break
                 buffer += chunk
-                logger.debug("claude PTY chunk: %r", chunk[:200])
+            except (BlockingIOError, OSError):
+                time.sleep(0.2)
 
-                # Successful flow may complete before we ever ask for a
-                # code (some auth paths finish via the hosted callback's
-                # back-channel). If we see the sentinel, bail out clean.
-                if _LOGIN_OK_SENTINEL in buffer:
-                    break
+        # If claude is still running after the headless callback succeeded,
+        # send SIGTERM — it may have a polling loop waiting indefinitely.
+        if callback_succeeded:
+            _kill_child()
 
-            # Detect URL once and hand control to the user. Don't gate
-            # on `ready` — the URL might already be in the buffer from
-            # an earlier chunk.
-            if not url_handled:
-                m = _OAUTH_URL_RE.search(buffer)
-                if m:
-                    url_handled = True
-                    url = m.group(0).decode("utf-8", "replace")
-                    click.echo()
-                    click.echo("Open this URL in your laptop browser to authorize Claude Code:")
-                    click.echo()
-                    click.echo(f"  {url}")
-                    click.echo()
-                    click.echo(
-                        "After 'You're all set up for Claude Code' shows in the browser, "
-                        "claude.com may display an auth code on the page. If so, copy it.",
-                    )
-                    code = click.prompt(
-                        "Paste auth code (or just press Enter if no code was shown)",
-                        default="",
-                        show_default=False,
-                    ).strip()
-                    # Send whatever the user gave us, terminated by a newline.
-                    # Claude's auth subprocess reads from /dev/tty (which is
-                    # our master_fd here); the empty-string + newline
-                    # case is harmless if claude already auto-completed
-                    # (the write may go to a closed slave; we swallow that).
-                    payload = (code + "\n").encode("utf-8")
-                    try:
-                        os.write(master_fd, payload)
-                    except OSError:
-                        # Slave closed — claude exited via polling already.
-                        pass
-                    click.echo("Verifying with Anthropic…")
-
-        # Child should exit shortly after we either saw the sentinel or
-        # killed it. Reap the status without hanging forever.
         try:
-            _, status = os.waitpid(pid, 0)
-            if os.WIFEXITED(status):
-                exit_code = os.WEXITSTATUS(status)
-            elif os.WIFSIGNALED(status):
-                exit_code = -1
-            else:
-                exit_code = -1
+            _, _status = os.waitpid(pid, 0)
         except ChildProcessError:
-            exit_code = -1
+            pass
+
     except KeyboardInterrupt:
-        # Ctrl+C: kill claude and propagate.
         _kill_child(signal.SIGINT)
         try:
             os.waitpid(pid, 0)
@@ -270,7 +394,7 @@ def _pty_auth_login(env: dict[str, str]) -> tuple[int, bytes]:
         except OSError:
             pass
 
-    return (exit_code if exit_code is not None else -1), buffer
+    return callback_succeeded, buffer
 
 
 class ClaudeAdapter(AICliAdapter):
@@ -305,9 +429,9 @@ class ClaudeAdapter(AICliAdapter):
 
         env = {**os.environ, "HOME": str(profile_dir)}
 
-        # Pre-flight: claude has to be on PATH. If not, fail fast with a
-        # specific hint instead of letting pty.fork+execvpe surface a
-        # generic ENOENT after we've already lit up the keychain.
+        # Pre-flight: claude has to be on PATH. Surface a specific hint
+        # instead of letting pty.fork+execvpe ENOENT bubble up after we've
+        # already provisioned the keychain.
         try:
             subprocess.run(
                 ["claude", "--version"],
@@ -320,12 +444,20 @@ class ClaudeAdapter(AICliAdapter):
                 hint="Install Claude Code: https://docs.claude.com/en/docs/claude-code/quickstart",
             )
 
-        # Drive claude's auth flow under a PTY so DevBrain owns the I/O
-        # end-to-end. See _pty_auth_login docstring for why direct
-        # subprocess.run() doesn't work for this command on current
-        # claude versions.
+        # Pre-flight: check Chromium is installed before starting OAuth
+        # so we don't get the dev halfway through and then bail.
+        if find_chromium_browser() is None:
+            return LoginResult(
+                success=False,
+                error="No Chromium-based browser found for OAuth callback",
+                hint="Install Chrome: brew install --cask google-chrome  (or run: devbrain devdoctor)",
+            )
+
+        # Drive the auth flow: PTY-capture claude's URL, get code from
+        # user, drive headless browser to fire localhost callback. See
+        # _drive_auth_login docstring for the full architecture.
         try:
-            exit_code, output = _pty_auth_login(env)
+            success, output = _drive_auth_login(env, profile_dir)
         except KeyboardInterrupt:
             return LoginResult(
                 success=False,
@@ -333,20 +465,24 @@ class ClaudeAdapter(AICliAdapter):
                 hint="Re-run `devbrain login --dev <id> --cli claude` when ready.",
             )
 
-        if exit_code != 0:
+        if not success:
             tail = output[-500:].decode("utf-8", "replace") if output else ""
-            logger.debug("claude PTY auth output (tail): %r", tail)
+            logger.debug("claude auth output (tail): %r", tail)
             return LoginResult(
                 success=False,
-                error=f"claude auth login exited with code {exit_code}",
-                hint="Re-run `devbrain login --dev <id> --cli claude` and complete the OAuth flow in your laptop browser.",
+                error="OAuth callback didn't complete — keychain entry not written within timeout",
+                hint=(
+                    "Re-run `devbrain login --dev <id> --cli claude`. If repeated, "
+                    "check that headless Chrome can reach localhost (no firewall blocking) "
+                    "and that the keychain isn't locked: `devbrain reset-keychain --dev <id>`."
+                ),
             )
 
         if not self.is_logged_in(dev, profile_dir):
             return LoginResult(
                 success=False,
-                error="claude auth login completed but ~/.claude.json was not written under the profile",
-                hint=f"Check {profile_dir}/.claude.json exists.",
+                error="claude reported success but ~/.claude.json was not written under the profile",
+                hint=f"Check {profile_dir}/.claude.json exists; consider reset-keychain.",
             )
 
         return LoginResult(success=True)
