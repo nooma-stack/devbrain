@@ -101,21 +101,64 @@ def _validate_cli_choice(ctx, param, value):
 )
 @click.option("--git-name", default=None, help="Git author name (skips prompt if --git-email also set)")
 @click.option("--git-email", default=None, help="Git author email")
-def login(dev_id, cli_arg, git_name, git_email):
+@click.option(
+    "--keychain-password", default=None,
+    help="Custom password for the per-profile macOS keychain (claude-only). "
+         "Stored at <profile>/.claude/.keychain-password (mode 600), read by the "
+         "factory orchestrator before each spawn. If omitted on first claude "
+         "login: prompts to choose Random (recommended) or Custom interactively, "
+         "or generates a random password non-interactively.",
+)
+def login(dev_id, cli_arg, git_name, git_email, keychain_password):
     """Log a dev into an AI CLI's per-dev profile."""
     import dev_login
 
     db = get_db()
+
+    # Stash a custom keychain password BEFORE login_dev runs the claude
+    # adapter, so claude.py:_read_or_generate_keychain_password picks it
+    # up. If --keychain-password wasn't passed and we're interactive AND
+    # this is a fresh keychain provisioning (no password file yet), prompt
+    # the dev to choose between Random and Custom. Random + non-interactive
+    # both fall through to claude.py auto-generating a secure default.
+    cli_names_resolved = _resolve_cli_names(cli_arg)
+    if "claude" in cli_names_resolved:
+        from profiles import get_profile_dir
+        profile_dir = get_profile_dir(dev_id)
+        pw_file = profile_dir / ".claude" / ".keychain-password"
+        if not pw_file.exists():
+            if keychain_password is None and sys.stdin.isatty():
+                click.echo(
+                    "First-time claude login provisions a per-dev macOS keychain "
+                    "to isolate this dev's OAuth tokens from lhtdev's main keychain.",
+                )
+                choice = click.prompt(
+                    "Keychain password: [r]andom (recommended) or [c]ustom",
+                    type=click.Choice(["r", "c", "R", "C"], case_sensitive=False),
+                    default="r",
+                    show_choices=False,
+                    show_default=True,
+                ).lower()
+                if choice == "c":
+                    keychain_password = click.prompt(
+                        "Enter keychain password",
+                        hide_input=True,
+                        confirmation_prompt=True,
+                    )
+            if keychain_password:
+                pw_file.parent.mkdir(parents=True, exist_ok=True)
+                pw_file.write_text(keychain_password)
+                pw_file.chmod(0o600)
+                click.echo(f"   Stashed keychain password at {pw_file}")
 
     def prompt() -> tuple[str, str]:
         name = click.prompt("Git author name", default=dev_id)
         email = click.prompt("Git author email", default=f"{dev_id}@devbrain.local")
         return name, email
 
-    cli_names = _resolve_cli_names(cli_arg)
     outcomes = dev_login.login_dev(
         dev_id,
-        cli_names,
+        cli_names_resolved,
         db=db,
         git_name=git_name,
         git_email=git_email,
@@ -190,6 +233,70 @@ def logout(dev_id, cli_arg):
     dev_login.logout_dev(dev_id, cli_names=cli_names)
     target = ", ".join(cli_names) if cli_names else "entire profile"
     click.echo(f"✅ Logged out {dev_id}: {target}")
+
+
+@cli.command(name="reset-keychain")
+@click.option("--dev", "dev_id", required=True, help="Dev id whose claude keychain to reset")
+@click.option(
+    "--keychain-password", default=None,
+    help="Set a new custom password now (stashed at "
+         "<profile>/.claude/.keychain-password). If omitted: next "
+         "`devbrain login` prompts for Random/Custom interactively, "
+         "or auto-generates a random one non-interactively.",
+)
+@click.confirmation_option(
+    prompt="Reset claude keychain — discards stored OAuth tokens. Continue?",
+    help="Skip confirmation with --yes",
+)
+def reset_keychain(dev_id, keychain_password):
+    """Reset (delete + re-stage) the per-dev claude macOS keychain.
+
+    Use when the keychain password is forgotten/lost, the keychain is
+    corrupted (claude returns "Not logged in" repeatedly with valid creds),
+    or a dev wants to onboard to a different Claude account on the same
+    profile.
+
+    This deletes:
+      - <profile>/Library/Keychains/login.keychain-db (the keychain file)
+      - <profile>/.claude/.keychain-password (the stashed password)
+
+    After reset, run:
+      devbrain login --dev <id> --cli claude
+
+    ...to OAuth fresh into a new keychain.
+    """
+    import profiles
+
+    profiles.validate_dev_id(dev_id)
+    profile_dir = profiles.get_profile_dir(dev_id)
+    keychain = profile_dir / "Library" / "Keychains" / "login.keychain-db"
+    pw_file = profile_dir / ".claude" / ".keychain-password"
+
+    removed = []
+    if keychain.exists():
+        keychain.unlink()
+        removed.append(str(keychain))
+    if pw_file.exists():
+        pw_file.unlink()
+        removed.append(str(pw_file))
+
+    if not removed:
+        click.echo(f"No claude keychain found for dev '{dev_id}'. Nothing to reset.")
+        return
+
+    click.echo("Removed:")
+    for r in removed:
+        click.echo(f"  • {r}")
+
+    if keychain_password:
+        pw_file.parent.mkdir(parents=True, exist_ok=True)
+        pw_file.write_text(keychain_password)
+        pw_file.chmod(0o600)
+        click.echo(f"\nStashed new keychain password at {pw_file}")
+
+    click.echo()
+    click.echo(f"Next: devbrain login --dev {dev_id} --cli claude")
+    click.echo("...to OAuth into a fresh keychain.")
 
 
 @cli.command()
