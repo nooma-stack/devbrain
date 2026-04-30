@@ -1242,26 +1242,7 @@ def _run_devdoctor_checks() -> list[dict]:
             add(f"ai_cli_logged_in:{_ai_cli}", True,
                 "probe timed out (treating as authed)", warn=True)
 
-    # 10. Chromium-based browser. Required for `devbrain login --cli
-    # claude` to drive the OAuth callback page in headless mode (claude's
-    # auth flow uses a localhost listener that the hosted callback page
-    # hits via JavaScript — only same-machine browsers can reach it).
-    # WARN (not FAIL) since codex + gemini logins don't need it.
-    try:
-        sys.path.insert(0, str(DEVBRAIN_HOME / "factory"))
-        from ai_clis.claude import find_chromium_browser as _find_chrome
-        chrome_path = _find_chrome()
-        add(
-            "headless_browser",
-            chrome_path is not None,
-            f"{chrome_path}" if chrome_path
-            else "no Chrome/Chromium/Brave/Edge found — run: brew install --cask google-chrome",
-            warn=True,
-        )
-    except ImportError as exc:
-        add("headless_browser", False, f"factory module import failed: {exc}", warn=True)
-
-    # 11. Env vars (informational — never fails, just reports overrides)
+    # 10. Env vars (informational — never fails, just reports overrides)
     overrides = sorted(k for k in os.environ if k.startswith("DEVBRAIN_"))
     add(
         "env_overrides",
