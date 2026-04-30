@@ -322,6 +322,36 @@ def run_cli(
     if env_override:
         env.update(env_override)
 
+    # macOS-only: unlock the per-profile keychain before spawning claude.
+    #
+    # Claude Code stores OAuth tokens in macOS Keychain (service
+    # "Claude Code-credentials"). Security framework resolves the user's
+    # login keychain via $HOME/Library/Keychains/login.keychain-db, so the
+    # HOME-swap correctly redirects which keychain is used — but the
+    # keychain itself locks between subprocess invocations (no GUI Security
+    # agent in factory contexts), and a locked keychain returns "Not logged
+    # in" identically to a missing one. The adapter stashes the keychain
+    # password in <profile>/.claude/.keychain-password (mode 600) at
+    # provisioning time; we unlock right before the spawn. Failure is
+    # non-fatal: if the keychain or password file isn't present, we let
+    # the spawn proceed and rely on the orchestrator's existing failure
+    # path. Pattern only applies to claude — codex/gemini have their own
+    # credential isolation paths that don't touch Keychain.
+    if cli_name == "claude" and resolved_dev and env.get("HOME"):
+        keychain_path = Path(env["HOME"]) / "Library" / "Keychains" / "login.keychain-db"
+        password_file = Path(env["HOME"]) / ".claude" / ".keychain-password"
+        if keychain_path.exists() and password_file.exists():
+            try:
+                pw = password_file.read_text().strip()
+                subprocess.run(
+                    ["security", "unlock-keychain", "-p", pw, str(keychain_path)],
+                    check=False,
+                    capture_output=True,
+                    timeout=5,
+                )
+            except Exception as e:
+                logger.debug("keychain unlock failed (non-fatal): %s", e)
+
     try:
         result = subprocess.run(
             cmd,

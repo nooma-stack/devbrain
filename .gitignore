@@ -14,3 +14,9 @@ config/devbrain.yaml
 
 # Credentials
 .devbrain/credentials/
+
+# Per-dev profile dirs — created at runtime by `devbrain login`, contain
+# Library/Keychains/login.keychain-db (per-dev OAuth tokens), .gitconfig,
+# and Claude/Codex/Gemini state. MUST be ignored: factory/readiness.py runs
+# `git clean -fd` between jobs and would otherwise destroy them.
+profiles/
