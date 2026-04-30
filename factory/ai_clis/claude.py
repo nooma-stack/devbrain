@@ -32,14 +32,32 @@ from __future__ import annotations
 
 import logging
 import os
+import pty
+import re
 import secrets
+import select
+import signal
 import subprocess
+import sys
+import time
 from pathlib import Path
+
+import click
 
 from ai_clis.auth_helpers import git_author_env
 from ai_clis.base import AICliAdapter, LoginResult, SpawnArgs
 
 logger = logging.getLogger(__name__)
+
+# Regex matching Claude's OAuth authorization URL — used by the PTY-driven
+# auth flow to extract the URL from claude's terminal output without
+# depending on the surrounding prose (which has changed across versions).
+_OAUTH_URL_RE = re.compile(rb"https://claude\.com/cai/oauth/authorize\S+")
+# String emitted by claude on successful auth (post-token-exchange). Used
+# as the terminal-state sentinel so we can stop reading the PTY and reap.
+_LOGIN_OK_SENTINEL = b"Login successful"
+# Hard timeout for the entire auth flow including human OAuth dance.
+_AUTH_TIMEOUT_SECONDS = 600
 
 # Paths inside the profile directory.
 _KEYCHAIN_REL = Path("Library") / "Keychains" / "login.keychain-db"
@@ -107,6 +125,154 @@ def _ensure_keychain(profile_dir: Path) -> Path:
     return keychain
 
 
+def _pty_auth_login(env: dict[str, str]) -> tuple[int, bytes]:
+    """Run `claude auth login` under a PTY, driving I/O ourselves.
+
+    Why PTY: claude's auth flow uses a raw-mode TTY (Ink-based React TUI)
+    for the auth-code paste step. That input path bypasses normal
+    pipe-based stdin — neither subprocess.run() with input=, nor
+    `tmux send-keys`, nor `tmux paste-buffer` can deliver keystrokes
+    that claude reads. A pty.fork() gives us a real terminal pair where
+    claude's `read(/dev/tty)` consumes the bytes we write to the master fd.
+
+    Why DevBrain owns the prompt: the alternative — letting claude print
+    its own URL and Ink-render its own prompt — only works on a fully
+    interactive macOS GUI session. Over SSH or when DevBrain is the
+    parent shell, the Ink prompt is unreachable and the dev sees a hung
+    cursor. Instead, we suppress claude's stdout, parse for the OAuth
+    URL ourselves, and use click.prompt() to collect the code via a
+    well-behaved cooked-mode read.
+
+    Returns (exit_code, full_output_buffer). exit_code = -1 if the
+    process was killed for timeout/cancellation.
+    """
+    # Build the claude argv. We pass --claudeai explicitly so behaviour
+    # is deterministic regardless of which default Anthropic ships next.
+    argv = ["claude", "auth", "login", "--claudeai"]
+
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        # ─── child ────────────────────────────────────────────────
+        # Replace ourselves with claude. On exec failure we exit
+        # nonzero so the parent's waitpid() sees a real status.
+        try:
+            os.execvpe(argv[0], argv, env)
+        except FileNotFoundError:
+            os._exit(127)
+        except Exception:
+            os._exit(126)
+        return  # unreachable
+
+    # ─── parent ──────────────────────────────────────────────────
+    # We do NOT print claude's stdout to the user. Claude's noisy
+    # "Opening browser to sign in… If the browser didn't open, visit:..."
+    # prose is replaced by our own clean prompt below. Everything we
+    # capture stays in `buffer` for parsing + post-mortem logging.
+    buffer = b""
+    url_handled = False
+    deadline = time.monotonic() + _AUTH_TIMEOUT_SECONDS
+    exit_code: int | None = None
+
+    def _kill_child(sig: int = signal.SIGTERM) -> None:
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                logger.warning("claude auth login timed out after %ds", _AUTH_TIMEOUT_SECONDS)
+                _kill_child()
+                break
+
+            try:
+                ready, _, _ = select.select([master_fd], [], [], min(remaining, 5.0))
+            except (OSError, InterruptedError):
+                continue
+
+            if ready:
+                try:
+                    chunk = os.read(master_fd, 4096)
+                except OSError:
+                    # Slave end closed — child is exiting.
+                    break
+                if not chunk:
+                    break
+                buffer += chunk
+                logger.debug("claude PTY chunk: %r", chunk[:200])
+
+                # Successful flow may complete before we ever ask for a
+                # code (some auth paths finish via the hosted callback's
+                # back-channel). If we see the sentinel, bail out clean.
+                if _LOGIN_OK_SENTINEL in buffer:
+                    break
+
+            # Detect URL once and hand control to the user. Don't gate
+            # on `ready` — the URL might already be in the buffer from
+            # an earlier chunk.
+            if not url_handled:
+                m = _OAUTH_URL_RE.search(buffer)
+                if m:
+                    url_handled = True
+                    url = m.group(0).decode("utf-8", "replace")
+                    click.echo()
+                    click.echo("Open this URL in your laptop browser to authorize Claude Code:")
+                    click.echo()
+                    click.echo(f"  {url}")
+                    click.echo()
+                    click.echo(
+                        "After 'You're all set up for Claude Code' shows in the browser, "
+                        "claude.com may display an auth code on the page. If so, copy it.",
+                    )
+                    code = click.prompt(
+                        "Paste auth code (or just press Enter if no code was shown)",
+                        default="",
+                        show_default=False,
+                    ).strip()
+                    # Send whatever the user gave us, terminated by a newline.
+                    # Claude's auth subprocess reads from /dev/tty (which is
+                    # our master_fd here); the empty-string + newline
+                    # case is harmless if claude already auto-completed
+                    # (the write may go to a closed slave; we swallow that).
+                    payload = (code + "\n").encode("utf-8")
+                    try:
+                        os.write(master_fd, payload)
+                    except OSError:
+                        # Slave closed — claude exited via polling already.
+                        pass
+                    click.echo("Verifying with Anthropic…")
+
+        # Child should exit shortly after we either saw the sentinel or
+        # killed it. Reap the status without hanging forever.
+        try:
+            _, status = os.waitpid(pid, 0)
+            if os.WIFEXITED(status):
+                exit_code = os.WEXITSTATUS(status)
+            elif os.WIFSIGNALED(status):
+                exit_code = -1
+            else:
+                exit_code = -1
+        except ChildProcessError:
+            exit_code = -1
+    except KeyboardInterrupt:
+        # Ctrl+C: kill claude and propagate.
+        _kill_child(signal.SIGINT)
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+        raise
+    finally:
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+
+    return (exit_code if exit_code is not None else -1), buffer
+
+
 class ClaudeAdapter(AICliAdapter):
     name = "claude"
     oauth_callback_ports = []  # hosted callback at platform.claude.com
@@ -138,23 +304,41 @@ class ClaudeAdapter(AICliAdapter):
             )
 
         env = {**os.environ, "HOME": str(profile_dir)}
+
+        # Pre-flight: claude has to be on PATH. If not, fail fast with a
+        # specific hint instead of letting pty.fork+execvpe surface a
+        # generic ENOENT after we've already lit up the keychain.
         try:
-            result = subprocess.run(
-                ["claude", "auth", "login"],
-                env=env,
-                check=False,
+            subprocess.run(
+                ["claude", "--version"],
+                env=env, check=True, capture_output=True, timeout=10,
             )
-        except FileNotFoundError:
+        except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
             return LoginResult(
                 success=False,
-                error="claude CLI not found on PATH",
+                error="claude CLI not found or not responding on PATH",
                 hint="Install Claude Code: https://docs.claude.com/en/docs/claude-code/quickstart",
             )
 
-        if result.returncode != 0:
+        # Drive claude's auth flow under a PTY so DevBrain owns the I/O
+        # end-to-end. See _pty_auth_login docstring for why direct
+        # subprocess.run() doesn't work for this command on current
+        # claude versions.
+        try:
+            exit_code, output = _pty_auth_login(env)
+        except KeyboardInterrupt:
             return LoginResult(
                 success=False,
-                error=f"claude auth login exited with code {result.returncode}",
+                error="claude auth login cancelled by user (Ctrl+C)",
+                hint="Re-run `devbrain login --dev <id> --cli claude` when ready.",
+            )
+
+        if exit_code != 0:
+            tail = output[-500:].decode("utf-8", "replace") if output else ""
+            logger.debug("claude PTY auth output (tail): %r", tail)
+            return LoginResult(
+                success=False,
+                error=f"claude auth login exited with code {exit_code}",
                 hint="Re-run `devbrain login --dev <id> --cli claude` and complete the OAuth flow in your laptop browser.",
             )
 
