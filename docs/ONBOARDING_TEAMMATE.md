@@ -162,6 +162,28 @@ Each CLI's login flow:
   OAuth, the credentials land via Claude's hosted callback at
   `platform.claude.com`. May display a code to paste back into the SSH
   terminal.
+
+  **First-time claude login also provisions a per-dev macOS keychain**
+  at `<profile>/Library/Keychains/login.keychain-db` to isolate your
+  OAuth tokens from `lhtdev`'s main keychain (Claude Code stores
+  tokens in macOS Keychain, and HOME-swap alone doesn't redirect that
+  — see `docs/plans/2026-04-29-overnight-handoff.md` for the full
+  story). You'll be prompted:
+
+  ```
+  Keychain password: [r]andom (recommended) or [c]ustom
+  ```
+
+  Choose `r` unless you have a specific reason to set your own —
+  Random generates a secure token, stashes it at
+  `<profile>/.claude/.keychain-password` (mode 600), and you never
+  have to know what it is. Choose `c` if you want to back up the
+  keychain manually or share it across machines.
+
+  If you see a macOS Security agent popup asking *"A Keychain cannot
+  be found to store 'lhtdev'"* during OAuth, click **Cancel** — it's
+  a non-fatal side effect. Login still completes and creds land in
+  the per-profile keychain we just created.
 - **Gemini**: prompts to choose auth method. If you set
   `dev.gemini_api_key` on your registration, OAuth is skipped and the
   API key is used directly. Otherwise, Google's OAuth flow runs (open
@@ -214,6 +236,23 @@ devbrain login --dev alice --cli claude   # or whichever expired
 
 The login flow recreates the credentials in your profile. Resume the
 halted job with `factory resume <job_id>`.
+
+### Reset your claude keychain
+
+Symptom: factory `claude` spawns return "Not logged in · Please run
+/login" repeatedly even after a fresh `devbrain login`. The
+per-profile macOS keychain may be corrupted, or the stashed
+`.keychain-password` may be out of sync with the keychain file. Fix:
+
+```bash
+devbrain reset-keychain --dev alice
+devbrain login --dev alice --cli claude
+```
+
+Reset removes both the keychain file and the stashed password;
+the next login provisions a fresh keychain (re-prompting for
+Random/Custom). For scripted recovery, pass
+`--keychain-password X` to either command.
 
 ### Switch between tmux sessions
 

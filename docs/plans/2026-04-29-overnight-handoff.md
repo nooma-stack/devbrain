@@ -4,7 +4,7 @@
 **Executed by:** Claude Code (Opus 4.7, 1M context) in-session, autonomous
 **Design doc:** [2026-04-28-multi-dev-home-profiles-design.md](./2026-04-28-multi-dev-home-profiles-design.md)
 **Implementation plan:** [2026-04-28-multi-dev-impl-plan.md](./2026-04-28-multi-dev-impl-plan.md)
-**Status:** All 5 phases merged. Phase 6 (smoke test) gated to Patrick's morning review.
+**Status:** All 5 phases merged. **Phase 6 smoke test PASSED on 2026-04-30** with two architectural fixes (commits 4f6d46a + 4bb2fa0) — see "Phase 6 outcome" section below.
 
 ---
 
@@ -193,3 +193,64 @@ Tracked but explicitly out-of-scope for this overnight run:
 3. **If smoke test passes**: onboard the first real BrightBot dev using `docs/ONBOARDING_TEAMMATE.md`.
 4. **If smoke test fails**: file an issue with the specific symptom; most likely candidates are orchestrator call sites or the OAuth flow edge cases in `gemini`'s adapter.
 5. **Optionally** address follow-ups #1 (orchestrator wiring) and #4 (CI) before the first BrightBot dev onboards — they make the system more robust but aren't blockers.
+
+---
+
+## Phase 6 Outcome (2026-04-30)
+
+**Status: PASSED end-to-end.** Job `59727a79` ("Add a no-op test that asserts True") submitted with `submitted_by=patrickkelly-test`, ran `queued → planning → implementing → reviewing → qa → ready_for_approval` in 161s. Factory branch `factory/59727a79/...` created. Commit authored by `Patrick (test profile) <patrickkelly-test@devbrain.local>` (NOT lhtdev). Claude session records confirmed under `<profile>/.claude/projects/-Users-lhtdev-devbrain-worktrees-...`, proving HOME=<profile> propagated through the entire pipeline. Branch was approved + pushed to origin.
+
+### Findings during bring-up
+
+The plan in this doc was based on an incomplete model of how Claude Code stores credentials. Three issues discovered + fixed during the smoke-test session:
+
+1. **`factory submit` CLI didn't exist** — referenced in this doc and `ONBOARDING_TEAMMATE.md` but not implemented. Fixed in `f90b6eb` (added `devbrain submit` + `bin/factory` shim symlinked to `/opt/homebrew/bin/factory`).
+
+2. **`profiles/` was being wiped between jobs.** `factory/readiness.py:313-314` runs `git reset --hard origin/main` + `git clean -fd` between jobs. The `profiles/` directory was untracked and not in `.gitignore`, so `git clean -fd` deleted every dev's profile (Library/Keychains, .gitconfig, .claude/) at the start of each factory run. Fixed in `4f6d46a` (added `profiles/` to `.gitignore`).
+
+3. **Claude Code stores OAuth tokens in macOS Keychain** — not in a file under `$HOME` as the original design assumed. The HOME-swap was a *partial* solution (it correctly redirects MCP cache, project history, gitconfig, etc.) but Claude's credential storage hits Security framework directly. The 2026-04-22 dry-run "ghost" was specifically this — orchestrator-spawned claude over SSH couldn't reach the GUI Security agent and returned "Not logged in" even though the dev had run `devbrain login` successfully.
+
+   **Architecture pivot — Option C: per-profile keychain via HOME-relative path.** Empirically verified that `security default-keychain -d user` resolves via `$HOME/Library/Keychains/login.keychain-db`. So if we provision a keychain at the HOME-relative path within each profile dir, Claude's Security framework calls naturally land in the per-dev keychain. Fixed in `4f6d46a` (cli_executor unlocks before each spawn) and `4bb2fa0` (claude.py auto-provisions keychain on first login + `devbrain reset-keychain` command + Random/Custom password choice).
+
+### Architectural truth (corrected)
+
+| Claim from this doc | Actual |
+|---|---|
+| HOME-swap isolates Claude credentials | Partially. Isolates non-credential state. For OAuth tokens, requires a per-profile keychain at `<profile>/Library/Keychains/login.keychain-db`. |
+| `.claude.json` holds the OAuth tokens | False. It holds account metadata (email, org, subscriptionType). The actual tokens live in macOS Keychain (service `Claude Code-credentials`, account = macOS user). |
+| `.credentials.json` is the source of truth | False. Briefly created during OAuth flow, deleted by claude on next invocation as it migrates to Keychain. |
+| Section 5 OAuth port forwarding (placeholder) | Confirmed unnecessary; all three CLIs use hosted callbacks or device-code flow. |
+| Follow-up #1 (orchestrator dev_id wiring) | Already done by PR #59 (commit `0fd47053`) the same morning this doc was written; doc was not updated. All 6 spawn sites pass `dev_id=job.submitted_by` explicitly. |
+
+### Final commits / artifacts
+
+- `f90b6eb` — `feat(cli): factory submit shim — devbrain submit + bin/factory wrapper`
+- `4f6d46a` — `fix(factory): preserve per-dev profile dirs + unlock keychain before claude spawn`
+- `4bb2fa0` — `feat(cli): productionize per-profile keychain — auto-provision + reset`
+- DevBrain memory: issue `b919ee25` (the architectural break finding) + decision `f26d3f4b` (the per-profile keychain pivot)
+
+### Greenlit for BrightBot dev onboarding
+
+`docs/ONBOARDING_TEAMMATE.md` is updated to reflect the keychain provisioning step. Onboarding flow for the first real dev:
+
+1. Patrick adds their SSH key to `lhtdev@mac-studio`'s `~/.ssh/authorized_keys`.
+2. Dev opens persistent tmux session named after their `dev_id`.
+3. `devbrain register --dev-id alice --name "Alice Smith" --channel tmux:alice`
+4. `devbrain login --dev alice --cli claude` — chooses Random keychain password at the prompt, completes OAuth in their laptop browser, paste code back.
+5. `factory submit "..." --project <slug> --dev alice` — orchestrator routes alice's job through her profile's claude credentials, commits attribute as her.
+
+### Open follow-ups (still applicable)
+
+Updated from the original list — items already done are struck out:
+
+1. ~~Update orchestrator call sites to pass `dev_id=job.submitted_by` explicitly~~ — done by PR #59 before this doc was committed.
+2. Migrate existing mixed-case `dev_ids` to lowercase canonical form — still open.
+3. `devbrain login --auto-register` flag — still open.
+4. Add CI workflow to `.github/workflows/` — partially addressed by PR #71 (Atlas Step 4 added pytest workflow).
+5. Patch design doc Section 5 to drop the `RemoteForward 8765` placeholder — still open.
+6. Tab-completion for `--cli` against the live registry — still open.
+7. Retire `setup-multi-dev` wizard — still open.
+8. `is_logged_in` batch optimization — still open.
+9. Possible Gemini OAuth port verification — still open.
+10. **NEW**: Linux fallback for `_ensure_keychain` (currently macOS-only) — relevant if factory ever runs on a Linux host.
+11. **NEW**: Document the keychain in `Library/Keychains/login.keychain-db` is invisible to macOS Keychain Access.app since it's not under `~/Library/Keychains/`. Use `security find-generic-password -s "Claude Code-credentials" <keychain_path>` for inspection.
