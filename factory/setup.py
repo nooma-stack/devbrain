@@ -1929,21 +1929,39 @@ def setup_add_dev() -> None:
     _ok(f"Invitation id: {inv.id[:8]} (expires {inv.expires_at:%Y-%m-%d %H:%M %Z})")
     _ok(f"Onboarding kit: {kit_path}")
     click.echo()
-    _info(
-        "Send the kit file to the dev. They drop it into their AI agent "
-        "(Claude Code, Codex, etc.) — the agent walks through every step, "
-        "POSTs back to DevBrain, and the dev is live."
-    )
-    _info(
-        "If the dev prefers, they can follow the kit manually instead of "
-        "via an agent. Both paths converge on the same webhook submissions."
-    )
+
+    # ─── Optionally email the kit ────────────────────────────────────
+    if _confirm(f"Email the kit to {email} now?", default=True):
+        from onboarding_email import send_onboarding_email
+        admin_user = _os.environ.get("USER") or getpass.getuser()
+        sent = send_onboarding_email(
+            to_email=email,
+            dev_id=dev_id,
+            full_name=full_name,
+            kit_path=kit_path,
+            admin_name=admin_user,
+            admin_contact=admin_user,
+        )
+        if sent:
+            _ok(f"Email sent to {email}.")
+        else:
+            _warn(
+                "Email not sent (SMTP unconfigured or delivery failed). "
+                f"Send the kit manually, or fix SMTP and re-run: "
+                f"devbrain send-invite --dev {dev_id}"
+            )
+    else:
+        _info(
+            f"Skipping auto-send. Email the kit yourself, or run later: "
+            f"devbrain send-invite --dev {dev_id}"
+        )
+
     click.echo()
     _info(
         "The raw invite token is embedded inside the kit file — DevBrain "
         "stores only its hash. If the kit is lost, run "
-        "`devbrain setup add-dev` again to issue a fresh one (the previous "
-        "invitation can be revoked with `devbrain setup invitations`)."
+        "`devbrain setup add-dev` again to issue a fresh one (revoke the "
+        "previous one with `devbrain revoke-invite <id>`)."
     )
 
 

@@ -20,10 +20,19 @@
 
   <key>ProgramArguments</key>
   <array>
-    <!-- Replace with absolute path to your devbrain checkout if it's
-         not the standard ~/devbrain. The launcher itself sources
-         .env, sets PG* env vars, and execs the python service. -->
-    <string>/Users/lhtdev/devbrain/bin/devbrain-onboard</string>
+    <!-- macOS 26 (Tahoe) added a "Local Network" TCC permission that
+         silently denies listening-socket binds for faceless launchd
+         processes (no UI to display the consent prompt). Workaround:
+         tunnel through `login -fpq` so the process inherits the GUI
+         user session's existing TCC grant. Without this, http.server
+         binds but the socket immediately goes to CLOSED state. See
+         docs/plans/onboarding-webhook-deploy.md for the full diagnosis. -->
+    <string>/usr/bin/login</string>
+    <string>-fpq</string>
+    <string>lhtdev</string>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>exec /Users/lhtdev/devbrain/bin/devbrain-onboard</string>
   </array>
 
   <key>RunAtLoad</key>
@@ -44,5 +53,13 @@
 
   <key>WorkingDirectory</key>
   <string>/Users/lhtdev/devbrain</string>
+
+  <!-- SessionCreate puts the agent in the user's Aqua GUI session
+       context. Without this, on Python 3.14 + macOS, http.server's
+       listening socket goes into CLOSED state immediately after bind
+       (verified empirically 2026-05-01). With SessionCreate=true the
+       socket binds and listens correctly. -->
+  <key>SessionCreate</key>
+  <true/>
 </dict>
 </plist>

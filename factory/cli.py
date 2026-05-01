@@ -2327,6 +2327,72 @@ def add_key_cmd(dev_id, pubkey_arg, pubkey_file):
         click.echo("   The reconciler will activate within ~30s.")
 
 
+@cli.command(name="send-invite")
+@click.option("--dev", "dev_id", required=True, help="Dev id to re-send the kit to")
+def send_invite_cmd(dev_id):
+    """Re-email the onboarding kit for a dev's most recent active invitation.
+
+    Use when the original email bounced, was lost, or SMTP wasn't yet
+    configured at `setup add-dev` time. The same kit file (and same
+    invitation token) is sent — no new invitation is created.
+    """
+    from invitations import list_invitations
+    from onboarding_email import send_onboarding_email
+    from config import DEVBRAIN_HOME
+
+    # Most recent pending/ready invite for this dev (skip activated/revoked).
+    invs = [
+        i for i in list_invitations(get_db())
+        if i.dev_id == dev_id and i.status in ("pending", "ready")
+    ]
+    if not invs:
+        click.echo(
+            f"❌ No pending/ready invitation for dev '{dev_id}'. "
+            f"Run `devbrain setup add-dev` to issue a new one.",
+            err=True,
+        )
+        sys.exit(1)
+    inv = invs[0]
+    if not inv.email:
+        click.echo(
+            f"❌ Invitation has no email address recorded. "
+            f"Cannot auto-send; deliver the kit out of band.",
+            err=True,
+        )
+        sys.exit(1)
+
+    kit_path = DEVBRAIN_HOME / "onboarding" / f"{dev_id}-onboard.md"
+    if not kit_path.exists():
+        click.echo(
+            f"❌ Kit file missing: {kit_path}. "
+            f"It may have been deleted; re-issue the invitation with `setup add-dev`.",
+            err=True,
+        )
+        sys.exit(1)
+
+    db = get_db()
+    dev = db.get_dev(dev_id) if hasattr(db, "get_dev") else {}
+    full_name = (dev or {}).get("full_name") or dev_id
+    admin_user = os.environ.get("USER") or "your admin"
+
+    sent = send_onboarding_email(
+        to_email=inv.email,
+        dev_id=dev_id,
+        full_name=full_name,
+        kit_path=kit_path,
+        admin_name=admin_user,
+        admin_contact=admin_user,
+    )
+    if sent:
+        click.echo(f"✅ Onboarding kit re-sent to {inv.email}.")
+    else:
+        click.echo(
+            f"❌ Send failed. Check `devbrain devdoctor` for SMTP config status.",
+            err=True,
+        )
+        sys.exit(1)
+
+
 @cli.command(name="activate")
 @click.option("--dev", "dev_id", required=True, help="Dev id to activate")
 def activate_cmd(dev_id):
