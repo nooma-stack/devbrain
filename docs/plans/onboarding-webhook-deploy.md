@@ -1,17 +1,14 @@
 # Onboarding Webhook — Deploy Notes
 
-One-time admin setup to expose the `devbrain-onboard` Docker container
-(running on the Mac Studio at `127.0.0.1:8000`) at the public URL
-`https://devbrain.lighthouse-therapy.com/onboard/*`.
+One-time admin setup to expose the host-native `devbrain-onboard`
+service (running on the Mac Studio at `127.0.0.1:8000`) at the public
+URL `https://devbrain.lighthouse-therapy.com/onboard/*`.
 
 The dev's onboarding kit `.md` file embeds URLs of the form
 `https://devbrain.lighthouse-therapy.com/onboard/<token>/pubkey` etc. —
 the dev's AI agent (or the dev themselves) hits those URLs with their
 pubkey and OAuth token. Without the steps below, those URLs resolve to
 nothing and onboarding stalls.
-
-This is one-time work per DevBrain installation. Once configured,
-every new dev onboarding flows through the same path automatically.
 
 ## Architecture recap
 
@@ -26,41 +23,72 @@ agent ─POST─►  https://devbrain.lighthouse-therapy.com/onboard/<token>/...
                                        ▼ (HTTP proxy, port 8000)
                               localhost:8000 ───[reverse SSH tunnel]──►  127.0.0.1:8000
                                                                          (devbrain-onboard
-                                                                          container)
+                                                                          launchd service)
 ```
 
-## Step 1 — Bring up the container on the Mac Studio
+Why host-native (not Docker): the service is a 280-line stdlib
+http.server. Docker added a `credsStore` keychain dependency that's
+hostile to SSH-only operation, and bought us nothing in return.
+Running under launchd directly with the existing devbrain venv is
+simpler, faster to iterate, and easier to debug.
+
+## Step 1 — Smoke-test the webhook on the Mac Studio
 
 ```bash
 ssh mac-studio
 cd ~/devbrain
-docker compose up -d devbrain-onboard
-docker compose logs -f devbrain-onboard
-# Expect: "Starting devbrain-onboard on 0.0.0.0:8000"
-```
 
-Verify the service is reachable on the loopback:
+# Run interactively first to confirm it binds + connects to the DB.
+./bin/devbrain-onboard
+# Expect: "Starting devbrain-onboard on 127.0.0.1:8000"
 
-```bash
+# In another SSH window:
 curl -s http://127.0.0.1:8000/healthz
 # {"status":"ok"}
 ```
 
-## Step 2 — DNS
+Ctrl+C to stop the foreground run. Now wire it under launchd.
+
+## Step 2 — Install the launchd plist
+
+Copy `com.devbrain.onboard.plist` to
+`~/Library/LaunchAgents/com.devbrain.onboard.plist`, then load it:
+
+```bash
+ssh mac-studio
+cp ~/devbrain/launchd/com.devbrain.onboard.plist \
+   ~/Library/LaunchAgents/com.devbrain.onboard.plist
+launchctl load ~/Library/LaunchAgents/com.devbrain.onboard.plist
+launchctl list | grep devbrain.onboard
+# Expect: a numeric PID, "0", "com.devbrain.onboard"
+
+curl -s http://127.0.0.1:8000/healthz
+# {"status":"ok"}
+
+# Logs:
+tail -f ~/Library/Logs/devbrain-onboard.log
+```
+
+Stop / restart:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.devbrain.onboard.plist
+launchctl load   ~/Library/LaunchAgents/com.devbrain.onboard.plist
+```
+
+## Step 3 — DNS
 
 Add an A record for `devbrain.lighthouse-therapy.com` pointing at the
-VPS public IP (`72.60.64.155`). This is the same DNS provider you use
-for `n8n.lighthouse-therapy.com` etc. Wait for propagation
-(`dig +short devbrain.lighthouse-therapy.com` from anywhere returns
-`72.60.64.155`).
+VPS public IP (`72.60.64.155`). Same DNS provider you use for
+`n8n.lighthouse-therapy.com` etc. Wait for propagation
+(`dig +short devbrain.lighthouse-therapy.com` returns `72.60.64.155`).
 
-## Step 3 — Reverse SSH tunnel (Mac Studio → VPS)
+## Step 4 — Reverse SSH tunnel (Mac Studio → VPS)
 
-The Mac Studio dials out to the VPS and exposes its loopback port
-8000 on the VPS's loopback port 8000. Persistent — relaunches if SSH
-drops.
+Mac Studio dials out to the VPS and exposes its loopback port 8000 on
+the VPS's loopback port 8000. Persistent — relaunches if SSH drops.
 
-### 3a. Provision an SSH key for the tunnel
+### 4a. Provision an SSH key for the tunnel
 
 On the Mac Studio (as `lhtdev`):
 
@@ -83,7 +111,7 @@ The `restrict,port-forwarding,permitopen=...` prefix locks this key
 down to creating a single tunnel and nothing else — no shell access,
 no other ports.
 
-### 3b. SSH config on Mac Studio
+### 4b. SSH config on Mac Studio
 
 Append to `~lhtdev/.ssh/config`:
 
@@ -112,45 +140,26 @@ ssh root@72.60.64.155 'curl -s http://127.0.0.1:8000/healthz'
 kill $TUNNEL_PID
 ```
 
-### 3c. launchd plist for persistence
+### 4c. launchd plist for tunnel persistence
 
-Create `/Users/lhtdev/Library/LaunchAgents/com.devbrain.onboard-tunnel.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>           <string>com.devbrain.onboard-tunnel</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/usr/bin/ssh</string>
-    <string>-N</string>
-    <string>devbrain-tunnel</string>
-  </array>
-  <key>RunAtLoad</key>       <true/>
-  <key>KeepAlive</key>       <true/>
-  <key>StandardOutPath</key> <string>/Users/lhtdev/Library/Logs/devbrain-onboard-tunnel.log</string>
-  <key>StandardErrorPath</key><string>/Users/lhtdev/Library/Logs/devbrain-onboard-tunnel.log</string>
-</dict>
-</plist>
-```
-
-Load it:
+Copy `com.devbrain.onboard-tunnel.plist` similarly:
 
 ```bash
-launchctl load /Users/lhtdev/Library/LaunchAgents/com.devbrain.onboard-tunnel.plist
+cp ~/devbrain/launchd/com.devbrain.onboard-tunnel.plist \
+   ~/Library/LaunchAgents/com.devbrain.onboard-tunnel.plist
+launchctl load ~/Library/LaunchAgents/com.devbrain.onboard-tunnel.plist
 launchctl list | grep devbrain
+# Expect both com.devbrain.onboard and com.devbrain.onboard-tunnel
 ```
 
-Verify it stays up across an SSH disconnect:
+Verify it stays up:
 
 ```bash
 ssh root@72.60.64.155 'curl -s http://127.0.0.1:8000/healthz'
 # {"status":"ok"}
 ```
 
-## Step 4 — Traefik route on the VPS
+## Step 5 — Traefik route on the VPS
 
 The VPS already runs Traefik fronting n8n + dashboard + forward-auth
 (per `~/.claude/CLAUDE.md`). Add a router for the onboard endpoint.
@@ -189,7 +198,7 @@ curl -v https://devbrain.lighthouse-therapy.com/onboard/dvbn_inv_DEADBEEF/status
 # (404 because the token isn't real, but the endpoint is reachable.)
 ```
 
-## Step 5 — End-to-end smoke test
+## Step 6 — End-to-end smoke test
 
 Stage a test invitation:
 
@@ -250,9 +259,10 @@ devbrain logout --dev onboard-test --yes
   matching invitation. May have been revoked / expired / never staged.
 - **410 invalid_or_expired_or_replayed**: invitation found but in a
   state that rejects this submission. Either the field's already set
-  (replay) or the invitation has expired. Stage a new one.
+  (replay) or the invitation has expired.
 - **502 Bad Gateway** at the public URL: Traefik can't reach
-  `localhost:8000`. Either the SSH tunnel is dead (check launchd) or
-  the container is down (check `docker compose ps devbrain-onboard`).
+  `localhost:8000`. Either the SSH tunnel is dead (`launchctl list |
+  grep tunnel`) or the webhook service is down (`launchctl list |
+  grep onboard`). Check `~/Library/Logs/devbrain-onboard.log`.
 - **Cert errors**: Traefik letsencrypt provisioning failed. Check
   Traefik logs; usually a DNS propagation issue or rate limit.

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<!--
+  DevBrain Onboarding Webhook — reverse SSH tunnel to LHT VPS.
+
+  Maintains a persistent reverse SSH tunnel that exposes the Mac
+  Studio's local 127.0.0.1:8000 (where the onboard webhook listens)
+  to the VPS's local 127.0.0.1:8000 (where Traefik proxies it under
+  https://devbrain.lighthouse-therapy.com/onboard/*).
+
+  The actual `RemoteForward` directive lives in ~/.ssh/config under
+  `Host devbrain-tunnel` (per the deploy doc). This plist just keeps
+  the SSH connection alive — no command, no shell, just `ssh -N`.
+
+  Install:
+    cp ~/devbrain/launchd/com.devbrain.onboard-tunnel.plist \
+       ~/Library/LaunchAgents/com.devbrain.onboard-tunnel.plist
+    launchctl load ~/Library/LaunchAgents/com.devbrain.onboard-tunnel.plist
+
+  Verify from VPS side:
+    ssh root@72.60.64.155 'curl -s http://127.0.0.1:8000/healthz'
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.devbrain.onboard-tunnel</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/ssh</string>
+    <string>-N</string>
+    <string>devbrain-tunnel</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/lhtdev/Library/Logs/devbrain-onboard-tunnel.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/lhtdev/Library/Logs/devbrain-onboard-tunnel.log</string>
+</dict>
+</plist>

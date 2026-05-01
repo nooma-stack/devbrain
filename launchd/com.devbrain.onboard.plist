@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<!--
+  DevBrain Onboarding Webhook — launchd agent.
+
+  Runs the host-native webhook receiver under launchd so it stays up
+  across reboots and respawns on crash. Logs to
+  ~/Library/Logs/devbrain-onboard.log (rotate via macOS' built-in log
+  rotation if it grows).
+
+  Install:
+    cp ~/devbrain/launchd/com.devbrain.onboard.plist \
+       ~/Library/LaunchAgents/com.devbrain.onboard.plist
+    launchctl load ~/Library/LaunchAgents/com.devbrain.onboard.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.devbrain.onboard</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <!-- Replace with absolute path to your devbrain checkout if it's
+         not the standard ~/devbrain. The launcher itself sources
+         .env, sets PG* env vars, and execs the python service. -->
+    <string>/Users/lhtdev/devbrain/bin/devbrain-onboard</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Minimum uptime gate to avoid respawn-storms on a permanent error
+       (e.g., DB unreachable). 10s of crashing without a 60s success
+       window will trip launchd's throttle. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/lhtdev/Library/Logs/devbrain-onboard.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/lhtdev/Library/Logs/devbrain-onboard.log</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/lhtdev/devbrain</string>
+</dict>
+</plist>

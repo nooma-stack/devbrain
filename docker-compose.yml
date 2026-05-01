@@ -40,54 +40,5 @@ services:
       interval: 5s
       retries: 5
 
-  # =============================================================================
-  # Onboarding Webhook — receives dev pubkey + OAuth token submissions
-  # =============================================================================
-  #
-  # The new-dev flow: admin runs `devbrain setup add-dev`, which generates
-  # a Markdown onboarding kit with embedded webhook URLs. The kit is sent
-  # to the dev. The dev (or their AI agent) POSTs their SSH pubkey and
-  # claude OAuth token to this service, which writes them into the
-  # devbrain.invitations table. The reconciler (separate daemon) picks up
-  # ready invitations and applies them to authorized_keys + per-profile
-  # config.
-  #
-  # Exposure path: this container binds 127.0.0.1:8000 on the host.
-  # A persistent reverse SSH tunnel from Mac Studio to the LHT VPS
-  # forwards that port to the VPS's localhost:8000, where Traefik
-  # serves it as https://devbrain.lighthouse-therapy.com/onboard/*.
-  # See docs/plans/onboarding-webhook-deploy.md for the tunnel + Traefik
-  # setup (one-time admin work).
-  devbrain-onboard:
-    build:
-      context: .
-      dockerfile: containers/onboard-webhook/Dockerfile
-    container_name: devbrain-onboard
-    restart: unless-stopped
-    depends_on:
-      devbrain-db:
-        condition: service_healthy
-    environment:
-      PGHOST: devbrain-db
-      PGPORT: 5432
-      PGUSER: ${DEVBRAIN_DB_USER:-devbrain}
-      PGPASSWORD: ${DEVBRAIN_DB_PASSWORD:?DEVBRAIN_DB_PASSWORD must be set in .env}
-      PGDATABASE: ${DEVBRAIN_DB_NAME:-devbrain}
-      LOG_LEVEL: ${DEVBRAIN_ONBOARD_LOG_LEVEL:-INFO}
-    volumes:
-      # Mount factory source read-only — we treat the host code as the
-      # source of truth so a `git pull` + `docker compose restart
-      # devbrain-onboard` is enough to ship a code change. No image
-      # rebuild required.
-      - ./factory:/app/factory:ro
-    ports:
-      # Loopback only — public exposure happens via the reverse SSH
-      # tunnel + VPS Traefik, never directly from the Mac Studio.
-      - "127.0.0.1:${DEVBRAIN_ONBOARD_HOST_PORT:-8000}:8000"
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).read()"]
-      interval: 30s
-      retries: 3
-
 volumes:
   devbrain-pgdata:

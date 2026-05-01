@@ -1,0 +1,49 @@
+#!/bin/bash
+# Launcher for the DevBrain onboarding webhook receiver.
+#
+# Runs the host-native FastAPI-style stdlib service (factory/onboard_webhook.py)
+# under the existing DevBrain venv. The launchd plist
+# (com.devbrain.onboard.plist) invokes this script so the service stays
+# up across reboots and respawns on crash.
+#
+# Reads PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE from .env. Binds to
+# 127.0.0.1:8000 on the host (override port via DEVBRAIN_ONBOARD_PORT).
+
+set -e
+
+# Resolve symlinks so this script works whether invoked directly or via
+# /opt/homebrew/bin/devbrain-onboard → ~/devbrain/bin/devbrain-onboard.
+_target="${BASH_SOURCE[0]}"
+while [[ -L "$_target" ]]; do
+    _dir="$(cd "$(dirname "$_target")" && pwd)"
+    _target="$(readlink "$_target")"
+    [[ "$_target" != /* ]] && _target="$_dir/$_target"
+done
+DEVBRAIN_DIR="$(cd "$(dirname "$_target")/.." && pwd)"
+
+# Load .env so PGPASSWORD etc. propagate to the Python service.
+if [[ -f "$DEVBRAIN_DIR/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$DEVBRAIN_DIR/.env"
+    set +a
+fi
+
+# Map .env's DEVBRAIN_DB_* names to the standard PG* names that the
+# webhook script reads (matches libpq conventions, simpler test).
+export PGHOST="${PGHOST:-127.0.0.1}"
+export PGPORT="${PGPORT:-${DEVBRAIN_DB_HOST_PORT:-5433}}"
+export PGUSER="${PGUSER:-${DEVBRAIN_DB_USER:-devbrain}}"
+export PGPASSWORD="${PGPASSWORD:-${DEVBRAIN_DB_PASSWORD}}"
+export PGDATABASE="${PGDATABASE:-${DEVBRAIN_DB_NAME:-devbrain}}"
+export BIND_HOST="${DEVBRAIN_ONBOARD_HOST:-127.0.0.1}"
+export BIND_PORT="${DEVBRAIN_ONBOARD_PORT:-8000}"
+export LOG_LEVEL="${DEVBRAIN_ONBOARD_LOG_LEVEL:-INFO}"
+
+if [[ -z "$PGPASSWORD" ]]; then
+    echo "Error: DEVBRAIN_DB_PASSWORD not set in $DEVBRAIN_DIR/.env" >&2
+    exit 1
+fi
+
+cd "$DEVBRAIN_DIR/factory"
+exec "$DEVBRAIN_DIR/.venv/bin/python" onboard_webhook.py
