@@ -109,11 +109,52 @@ def _validate_cli_choice(ctx, param, value):
          "login: prompts to choose Random (recommended) or Custom interactively, "
          "or generates a random password non-interactively.",
 )
-def login(dev_id, cli_arg, git_name, git_email, keychain_password):
+@click.option(
+    "--oauth-token", "oauth_token", default=None,
+    help="Long-lived Claude Code OAuth token (sk-ant-oat01-...) generated "
+         "by `claude setup-token` on the dev's laptop. When set, the factory "
+         "spawns claude with CLAUDE_CODE_OAUTH_TOKEN=<token> instead of "
+         "relying on the per-profile macOS keychain — fully SSH/headless-"
+         "friendly, preserves the dev's Pro/Max/Team subscription billing. "
+         "Stashed at <profile>/.claude/oauth-token (mode 600). The dev should "
+         "treat this string as a credential.",
+)
+def login(dev_id, cli_arg, git_name, git_email, keychain_password, oauth_token):
     """Log a dev into an AI CLI's per-dev profile."""
     import dev_login
 
     db = get_db()
+
+    cli_names_resolved = _resolve_cli_names(cli_arg)
+
+    # Stash the OAuth token (claude only). Once stashed, the factory's
+    # cli_executor will inject it as CLAUDE_CODE_OAUTH_TOKEN env var on
+    # every claude spawn for this dev — no Keychain involvement. We
+    # intentionally do this BEFORE running login_dev so a token-only
+    # onboarding (no Keychain provisioning) skips the OAuth subprocess.
+    if "claude" in cli_names_resolved and oauth_token:
+        if not oauth_token.startswith("sk-ant-oat01-") and not oauth_token.startswith("sk-ant-"):
+            click.echo(
+                "Error: --oauth-token doesn't look like a Claude Code OAuth "
+                "token (expected sk-ant-oat01-...). Get one with `claude "
+                "setup-token` on a machine with a browser.",
+                err=True,
+            )
+            sys.exit(1)
+        from profiles import get_profile_dir, validate_dev_id
+        validate_dev_id(dev_id)
+        profile_dir = get_profile_dir(dev_id)
+        token_file = profile_dir / ".claude" / "oauth-token"
+        token_file.parent.mkdir(parents=True, exist_ok=True)
+        token_file.write_text(oauth_token.strip())
+        token_file.chmod(0o600)
+        click.echo(f"✅ {dev_id} → claude  (oauth-token stashed at {token_file})")
+        # If --cli was 'claude' (the only CLI), we're done — no need to
+        # invoke the interactive Keychain login flow at all. Drop claude
+        # from the list so login_dev doesn't process it.
+        cli_names_resolved = [c for c in cli_names_resolved if c != "claude"]
+        if not cli_names_resolved:
+            return
 
     # Stash a custom keychain password BEFORE login_dev runs the claude
     # adapter, so claude.py:_read_or_generate_keychain_password picks it
@@ -121,7 +162,6 @@ def login(dev_id, cli_arg, git_name, git_email, keychain_password):
     # this is a fresh keychain provisioning (no password file yet), prompt
     # the dev to choose between Random and Custom. Random + non-interactive
     # both fall through to claude.py auto-generating a secure default.
-    cli_names_resolved = _resolve_cli_names(cli_arg)
     if "claude" in cli_names_resolved:
         from profiles import get_profile_dir
         profile_dir = get_profile_dir(dev_id)

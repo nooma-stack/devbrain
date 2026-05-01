@@ -322,35 +322,48 @@ def run_cli(
     if env_override:
         env.update(env_override)
 
-    # macOS-only: unlock the per-profile keychain before spawning claude.
+    # claude-only: pick the right credential delivery path for this dev.
     #
-    # Claude Code stores OAuth tokens in macOS Keychain (service
-    # "Claude Code-credentials"). Security framework resolves the user's
-    # login keychain via $HOME/Library/Keychains/login.keychain-db, so the
-    # HOME-swap correctly redirects which keychain is used — but the
-    # keychain itself locks between subprocess invocations (no GUI Security
-    # agent in factory contexts), and a locked keychain returns "Not logged
-    # in" identically to a missing one. The adapter stashes the keychain
-    # password in <profile>/.claude/.keychain-password (mode 600) at
-    # provisioning time; we unlock right before the spawn. Failure is
-    # non-fatal: if the keychain or password file isn't present, we let
-    # the spawn proceed and rely on the orchestrator's existing failure
-    # path. Pattern only applies to claude — codex/gemini have their own
-    # credential isolation paths that don't touch Keychain.
+    # Two mutually-exclusive paths, in preference order:
+    #   1. CLAUDE_CODE_OAUTH_TOKEN env var if a long-lived OAuth token is
+    #      stashed at <profile>/.claude/oauth-token. This is the
+    #      SSH-friendly path — works headlessly, no Keychain involvement,
+    #      bills against the dev's Pro/Max/Team subscription. Set up via
+    #      `devbrain login --dev <id> --cli claude --oauth-token <token>`
+    #      where <token> comes from `claude setup-token` on the dev's
+    #      laptop.
+    #   2. macOS Keychain unlock if no token but a per-profile keychain
+    #      exists. Claude reads tokens via Security framework lookup
+    #      against $HOME/Library/Keychains/login.keychain-db (which the
+    #      HOME-swap redirects to the per-profile keychain). The keychain
+    #      locks between subprocess invocations (no GUI Security agent in
+    #      factory contexts), so we unlock right before the spawn using
+    #      the password stashed at <profile>/.claude/.keychain-password.
+    #
+    # If neither is set up, the spawn falls through to whatever auth path
+    # claude defaults to (typically the macOS user's login keychain if
+    # any) — which is the legacy non-isolated behavior.
     if cli_name == "claude" and resolved_dev and env.get("HOME"):
-        keychain_path = Path(env["HOME"]) / "Library" / "Keychains" / "login.keychain-db"
-        password_file = Path(env["HOME"]) / ".claude" / ".keychain-password"
-        if keychain_path.exists() and password_file.exists():
+        token_file = Path(env["HOME"]) / ".claude" / "oauth-token"
+        if token_file.exists():
             try:
-                pw = password_file.read_text().strip()
-                subprocess.run(
-                    ["security", "unlock-keychain", "-p", pw, str(keychain_path)],
-                    check=False,
-                    capture_output=True,
-                    timeout=5,
-                )
-            except Exception as e:
-                logger.debug("keychain unlock failed (non-fatal): %s", e)
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = token_file.read_text().strip()
+            except OSError as e:
+                logger.warning("oauth-token read failed (falling back to keychain): %s", e)
+        else:
+            keychain_path = Path(env["HOME"]) / "Library" / "Keychains" / "login.keychain-db"
+            password_file = Path(env["HOME"]) / ".claude" / ".keychain-password"
+            if keychain_path.exists() and password_file.exists():
+                try:
+                    pw = password_file.read_text().strip()
+                    subprocess.run(
+                        ["security", "unlock-keychain", "-p", pw, str(keychain_path)],
+                        check=False,
+                        capture_output=True,
+                        timeout=5,
+                    )
+                except Exception as e:
+                    logger.debug("keychain unlock failed (non-fatal): %s", e)
 
     try:
         result = subprocess.run(
