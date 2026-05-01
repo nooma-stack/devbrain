@@ -35,7 +35,7 @@ import logging
 import os
 import re
 import sys
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional
 
 
@@ -253,7 +253,10 @@ def serve(host: str = "0.0.0.0", port: int = 8000) -> None:
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     logger.info("Starting devbrain-onboard on %s:%s", host, port)
-    server = ThreadingHTTPServer((host, port), OnboardHandler)
+    # Plain HTTPServer (single-threaded). Adequate for the onboarding
+    # use case — submissions are infrequent (one new dev per week tops)
+    # and per-request work is a single Postgres roundtrip.
+    server = HTTPServer((host, port), OnboardHandler)
 
     serve_thread = threading.Thread(
         target=server.serve_forever,
