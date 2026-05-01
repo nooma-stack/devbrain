@@ -1805,12 +1805,156 @@ def _run_multi_dev_section() -> None:
     setup_multi_dev(non_interactive=False)
 
 
+def setup_add_dev() -> None:
+    """Onboard a new dev: stage row, generate invitation, write kit .md.
+
+    The admin runs this on the Mac Studio. They get back a path to a
+    Markdown onboarding-kit file to send to the dev (email, Slack,
+    hand-off, …). The dev (or their AI agent) drops the file into
+    Claude Code / Codex / etc., follows the embedded instructions, and
+    POSTs their pubkey + claude OAuth token back to DevBrain via the
+    webhook receiver. The reconciler picks up complete rows and wires
+    the dev into authorized_keys + a per-profile dir automatically.
+    """
+    import getpass
+    import os as _os
+    import re as _re
+
+    from invitations import (
+        callback_base_url,
+        create_invitation,
+    )
+    from onboarding_kit import write_onboarding_kit
+    from profiles import DEV_ID_RE
+    from state_machine import FactoryDB
+    from config import DATABASE_URL
+
+    _header("Onboard a new dev")
+    _desc(
+        "Stages a pending dev profile and generates a Markdown onboarding",
+        "kit. Send the kit to the dev — they (or their AI agent) walk",
+        "through it, submit their SSH pubkey + Claude OAuth token, and",
+        "DevBrain wires them up automatically.",
+    )
+    click.echo()
+
+    # ─── Collect dev details ──────────────────────────────────────────
+    while True:
+        dev_id = _prompt("Dev id (lowercase, [a-z0-9_-], 1-64 chars)").strip().lower()
+        if DEV_ID_RE.fullmatch(dev_id):
+            break
+        _warn(f"'{dev_id}' is not a valid dev_id. Try again.")
+
+    full_name = _prompt("Full name", default=dev_id.replace("-", " ").title()).strip()
+    email = _prompt("Email").strip()
+    while not _re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        _warn(f"'{email}' doesn't look like a valid email.")
+        email = _prompt("Email").strip()
+
+    slack_handle = _prompt(
+        "Slack handle (optional, e.g., '@alice' or empty to skip)",
+        default="",
+    ).strip()
+
+    auto_activate = _confirm(
+        "Auto-activate this dev when their pubkey + OAuth token arrive? "
+        "(no = require manual `devbrain setup activate --dev <id>`)",
+        default=True,
+    )
+
+    notes = _prompt(
+        "Optional notes (purpose, expected start date, etc.)",
+        default="",
+    ).strip() or None
+
+    # ─── Show summary, confirm ────────────────────────────────────────
+    click.echo()
+    _info("Review:")
+    click.echo(f"   dev_id:        {dev_id}")
+    click.echo(f"   full_name:     {full_name}")
+    click.echo(f"   email:         {email}")
+    if slack_handle:
+        click.echo(f"   slack:         {slack_handle}")
+    click.echo(f"   auto_activate: {auto_activate}")
+    click.echo(f"   ttl:           7 days")
+    if notes:
+        click.echo(f"   notes:         {notes}")
+    click.echo()
+    if not _confirm("Proceed and generate onboarding kit?", default=True):
+        _warn("Cancelled.")
+        return
+
+    # ─── Stage the dev row + invitation ───────────────────────────────
+    db = FactoryDB(DATABASE_URL)
+
+    channels: list[dict] = [
+        {"type": "tmux", "address": dev_id},
+        {"type": "email", "address": email},
+    ]
+    if slack_handle:
+        channels.append({"type": "slack", "address": slack_handle})
+
+    db.register_dev(dev_id=dev_id, full_name=full_name, channels=channels)
+
+    inv, raw_token = create_invitation(
+        db,
+        dev_id=dev_id,
+        auto_activate=auto_activate,
+        email=email,
+        notes=notes,
+        created_by=_os.environ.get("USER") or getpass.getuser(),
+        ttl_days=7,
+    )
+
+    # ─── Generate the onboarding kit .md ──────────────────────────────
+    from config import DEVBRAIN_HOME
+    kit_dir = DEVBRAIN_HOME / "onboarding"
+    kit_dir.mkdir(parents=True, exist_ok=True)
+    kit_path = kit_dir / f"{dev_id}-onboard.md"
+
+    callback_url = callback_base_url(inv.id, raw_token)
+    write_onboarding_kit(
+        path=kit_path,
+        dev_id=dev_id,
+        full_name=full_name,
+        email=email,
+        invite_token=raw_token,
+        callback_base=callback_url,
+        expires_at=inv.expires_at,
+    )
+
+    # ─── Hand back to admin ───────────────────────────────────────────
+    click.echo()
+    _ok(f"Dev '{dev_id}' staged.")
+    _ok(f"Invitation id: {inv.id[:8]} (expires {inv.expires_at:%Y-%m-%d %H:%M %Z})")
+    _ok(f"Onboarding kit: {kit_path}")
+    click.echo()
+    _info(
+        "Send the kit file to the dev. They drop it into their AI agent "
+        "(Claude Code, Codex, etc.) — the agent walks through every step, "
+        "POSTs back to DevBrain, and the dev is live."
+    )
+    _info(
+        "If the dev prefers, they can follow the kit manually instead of "
+        "via an agent. Both paths converge on the same webhook submissions."
+    )
+    click.echo()
+    _info(
+        "The raw invite token is embedded inside the kit file — DevBrain "
+        "stores only its hash. If the kit is lost, run "
+        "`devbrain setup add-dev` again to issue a fresh one (the previous "
+        "invitation can be revoked with `devbrain setup invitations`)."
+    )
+
+
 # (menu label, section key, runner callable)
 MENU_SECTIONS: list[tuple[str, str, callable]] = [
     ("Full setup (run every section in order)", "full", None),  # special-cased
     ("GitHub authentication",                  "github",   setup_github),
     ("AI CLI authentication (Claude / Codex / Gemini, OAuth or API key)", "ai-clis", setup_ai_cli_logins),
     ("Dev identity (register or update)",      "identity", setup_identity),
+    ("Onboard a new dev (stage profile + generate invitation kit)",
+     "add-dev",  setup_add_dev),
     ("Multi-dev / remote database (point this install at a shared Postgres)",
      "multi-dev", _run_multi_dev_section),
     ("Projects (register new or update)",      "projects", setup_projects),
