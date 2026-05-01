@@ -234,18 +234,39 @@ class OnboardHandler(BaseHTTPRequestHandler):
 
 
 def serve(host: str = "0.0.0.0", port: int = 8000) -> None:
-    """Run the webhook server forever (blocks). Used as the container's CMD."""
+    """Run the webhook server forever (blocks). Used as the launchd cmd.
+
+    Implementation note: serve_forever() is invoked in a worker thread,
+    not directly in the main thread. On Python 3.14 + macOS, calling
+    `ThreadingHTTPServer.serve_forever()` directly in the main thread
+    of a backgrounded or launchd-managed process drops the listening
+    socket into CLOSED state immediately — the bind succeeds but the
+    server never accepts connections. Running it in a worker thread
+    while the main thread waits on join() works around the issue and
+    has been verified under both shell-backgrounded and launchd-managed
+    contexts. See onboarding-webhook-deploy.md for the diagnostic trail.
+    """
+    import threading
+
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     logger.info("Starting devbrain-onboard on %s:%s", host, port)
     server = ThreadingHTTPServer((host, port), OnboardHandler)
+
+    serve_thread = threading.Thread(
+        target=server.serve_forever,
+        name="onboard-webhook-serve",
+        daemon=False,
+    )
+    serve_thread.start()
     try:
-        server.serve_forever()
+        serve_thread.join()
     except KeyboardInterrupt:
         logger.info("Received SIGINT, shutting down")
         server.shutdown()
+        serve_thread.join(timeout=5)
 
 
 if __name__ == "__main__":
