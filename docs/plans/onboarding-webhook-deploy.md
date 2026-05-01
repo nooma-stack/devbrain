@@ -32,24 +32,57 @@ hostile to SSH-only operation, and bought us nothing in return.
 Running under launchd directly with the existing devbrain venv is
 simpler, faster to iterate, and easier to debug.
 
+## ⚠️ Known issue on this Mac Studio (2026-05-01)
+
+Empirically: Python 3.14.4 + macOS arm64 + launchd is dropping
+`http.server`'s listening socket into CLOSED state immediately after
+bind. The bind succeeds, the log line prints, but the server never
+serves connections. Reproduces with:
+- ThreadingHTTPServer in main thread
+- ThreadingHTTPServer in worker thread
+- Plain HTTPServer
+- Bare `python3.14 -m http.server` invocation under launchd
+- Same `python -m http.server` backgrounded with `&`
+- Same in tmux detached session
+- nohup, setsid, script, launchctl asuser variants
+
+The same code works correctly when run **interactively in an attached
+TTY** (`./bin/devbrain-onboard` in a foreground Terminal session).
+This points at TTY/process-group/signal handling in the macOS arm64
+build of Python 3.14.
+
+**Workaround for now:** run the webhook in an attached tmux session
+on the Mac Studio's GUI shell (Patrick's Terminal.app while RDP'd in,
+or an SSH session with `-t` from a real terminal). The session must
+have a controlling TTY. Document a follow-up to investigate further:
+- Try Python 3.13 (we installed it; same issue reproduces)
+- Try Python 3.12 (not yet installed; potentially affected)
+- Replace stdlib http.server with `aiohttp` or `flask + waitress`
+- File against Python upstream / Apple if the simple repro is real
+
+If you can spin a Terminal.app on the Mac Studio's GUI session and
+run `./bin/devbrain-onboard` there, the rest of this doc applies as
+written. Skip Step 2 (launchd plist) until the platform issue is
+resolved — `bin/devbrain-onboard` running under tmux-attach is
+sufficient for the alpha onboarding workflow.
+
 ## Step 1 — Smoke-test the webhook on the Mac Studio
 
-```bash
-ssh mac-studio
-cd ~/devbrain
+In an active Terminal.app session on the Mac Studio (RDP'd or local):
 
-# Run interactively first to confirm it binds + connects to the DB.
+```bash
+cd ~/devbrain
 ./bin/devbrain-onboard
 # Expect: "Starting devbrain-onboard on 127.0.0.1:8000"
+# Leaves the process in foreground — keep this terminal open or
+# attach via tmux for persistence (see workaround above).
 
-# In another SSH window:
+# In another terminal window:
 curl -s http://127.0.0.1:8000/healthz
 # {"status":"ok"}
 ```
 
-Ctrl+C to stop the foreground run. Now wire it under launchd.
-
-## Step 2 — Install the launchd plist
+## Step 2 — Install the launchd plist (gated on platform-issue resolution)
 
 Copy `com.devbrain.onboard.plist` to
 `~/Library/LaunchAgents/com.devbrain.onboard.plist`, then load it:
