@@ -1811,14 +1811,19 @@ def setup_add_dev() -> None:
     The admin runs this on the Mac Studio. They get back a path to a
     Markdown onboarding-kit file to send to the dev (email, Slack,
     hand-off, …). The dev (or their AI agent) drops the file into
-    Claude Code / Codex / etc., follows the embedded instructions, and
-    POSTs their pubkey + claude OAuth token back to DevBrain via the
-    webhook receiver. The reconciler picks up complete rows and wires
-    the dev into authorized_keys + a per-profile dir automatically.
+    Claude Code / Codex / etc., follows the embedded instructions:
+    SSH into the Mac Studio with the embedded temp ed25519 key (locked
+    by `command=` to a single rotation script), submit their permanent
+    pubkey + claude OAuth token, and the rotation handler hands off
+    to the reconciler which finishes activation. The temp key
+    auto-expires in 3 days and self-deletes on first successful use.
     """
     import getpass
     import os as _os
     import re as _re
+    import subprocess as _sp
+    import tempfile as _tempfile
+    from datetime import timezone as _tz, timedelta as _td
 
     from invitations import (
         callback_base_url,
@@ -1827,7 +1832,7 @@ def setup_add_dev() -> None:
     from onboarding_kit import write_onboarding_kit
     from profiles import DEV_ID_RE
     from state_machine import FactoryDB
-    from config import DATABASE_URL
+    from config import DATABASE_URL, DEVBRAIN_HOME as _DEVBRAIN_HOME
 
     _header("Onboard a new dev")
     _desc(
@@ -1906,9 +1911,53 @@ def setup_add_dev() -> None:
         ttl_days=7,
     )
 
+    # ─── Generate temp bootstrap SSH keypair ──────────────────────────
+    # The temp key is scoped tighter than the invitation: 3-day expiry
+    # (regardless of invitation TTL), `restrict` (no PTY/forwarding/etc.),
+    # `command="..."` so it can ONLY run onboard_rotate.sh. Self-deletes
+    # from authorized_keys on first successful use.
+    bootstrap_ttl_days = 3
+    bootstrap_expires = inv.created_at.replace(tzinfo=_tz.utc) + _td(days=bootstrap_ttl_days)
+    # OpenSSH expiry-time format: YYYYMMDDHHMMSSZ (UTC).
+    bootstrap_expiry_str = bootstrap_expires.strftime("%Y%m%d%H%M%SZ")
+
+    invite_id_short = inv.id[:8]
+    rotate_script = _DEVBRAIN_HOME / "factory" / "onboard_rotate.sh"
+
+    with _tempfile.TemporaryDirectory(prefix="devbrain-bootstrap-") as tmpd:
+        priv_path = Path(tmpd) / "id_ed25519"
+        # Generate without passphrase — this is a single-use ephemeral
+        # key that will live in the kit briefly, get used once by Alice's
+        # agent, then never again. Passphrase would just be friction.
+        _sp.run(
+            ["ssh-keygen", "-t", "ed25519", "-f", str(priv_path),
+             "-N", "", "-C", f"devbrain-bootstrap-{dev_id}-{invite_id_short}",
+             "-q"],
+            check=True,
+        )
+        bootstrap_private = priv_path.read_text()
+        bootstrap_public = (priv_path.with_suffix(".pub")).read_text().strip()
+
+    # Append to authorized_keys with restrict + command + expiry-time.
+    # Marker on its own line so onboard_rotate.sh can find + remove
+    # the entry by exact-match string.
+    marker = f"# devbrain:bootstrap:{dev_id}:{invite_id_short}"
+    ak_path = Path.home() / ".ssh" / "authorized_keys"
+    ak_path.parent.mkdir(parents=True, exist_ok=True)
+    rotate_command = f'{rotate_script} {dev_id} {invite_id_short}'
+    options = (
+        'restrict,'
+        f'command="{rotate_command}",'
+        f'expiry-time="{bootstrap_expiry_str}"'
+    )
+    new_block = f"\n{marker}\n{options} {bootstrap_public}\n"
+    existing = ak_path.read_text() if ak_path.exists() else ""
+    payload = existing.rstrip() + new_block
+    ak_path.write_text(payload)
+    ak_path.chmod(0o600)
+
     # ─── Generate the onboarding kit .md ──────────────────────────────
-    from config import DEVBRAIN_HOME
-    kit_dir = DEVBRAIN_HOME / "onboarding"
+    kit_dir = _DEVBRAIN_HOME / "onboarding"
     kit_dir.mkdir(parents=True, exist_ok=True)
     kit_path = kit_dir / f"{dev_id}-onboard.md"
 
@@ -1921,6 +1970,9 @@ def setup_add_dev() -> None:
         invite_token=raw_token,
         callback_base=callback_url,
         expires_at=inv.expires_at,
+        bootstrap_private_key=bootstrap_private,
+        bootstrap_invite_id_short=invite_id_short,
+        bootstrap_expiry=bootstrap_expires,
     )
 
     # ─── Hand back to admin ───────────────────────────────────────────

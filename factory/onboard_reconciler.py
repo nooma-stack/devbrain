@@ -158,7 +158,23 @@ def _try_activate(
         # name + email live on the dev row).
         _ensure_gitconfig(profile_dir, db, dev_id)
 
-        # ─── 5. NULL the oauth_token in DB; 6. mark activated ─────
+        # ─── 5. Defense-in-depth: ensure no stale bootstrap marker ─────
+        # `onboard_rotate.sh` self-deletes its own bootstrap entry from
+        # authorized_keys on success. If it died mid-way (process kill,
+        # disk full, etc.), the marker may still be present. We sweep
+        # it here as a safety net — even though the temp key has an
+        # `expiry-time` enforced by sshd, we don't want stale entries
+        # accumulating.
+        bootstrap_marker = f"# devbrain:bootstrap:{dev_id}:{str(id_)[:8]}"
+        try:
+            _remove_marker_from_authorized_keys(ak_path, bootstrap_marker)
+        except OSError as e:
+            logger.warning(
+                "could not sweep bootstrap marker for %s: %s (non-fatal)",
+                dev_id, e,
+            )
+
+        # ─── 6. NULL the oauth_token in DB; 7. mark activated ─────
         cur.execute(
             """
             UPDATE devbrain.invitations

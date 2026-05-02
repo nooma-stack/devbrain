@@ -10,12 +10,34 @@ Produces a `.md` file the admin sends to a new dev. The file is:
      comments to walk through the steps autonomously, asking the dev
      for approval at each network or credential boundary.
 
-The kit's content is mostly static; what changes per-invitation is the
-YAML frontmatter (dev_id, invite token, callback URL, expiry) and the
-embedded URLs that contain the raw token. The template is rendered via
-plain string substitution rather than a templating engine — keeps the
-kit file readable in any text editor and easy to manually edit if
-something goes wrong mid-onboarding.
+The kit's content is mostly static; what changes per-invitation is
+the YAML frontmatter (dev_id, invite token, expiry) and the embedded
+TEMP SSH PRIVATE KEY that gives the dev's agent a one-shot rotation
+session into the Mac Studio.
+
+Bootstrap flow:
+  1. Admin runs `devbrain setup add-dev`. DevBrain generates an
+     ephemeral ed25519 keypair, stages the public half in
+     ~lhtdev/.ssh/authorized_keys with strict options
+     (`restrict,command="onboard_rotate.sh ...",expiry-time="..."`),
+     and embeds the PRIVATE half into this kit.
+  2. Admin emails the kit to the dev.
+  3. Dev's agent reads the temp private key from the kit, writes it
+     to ~/.ssh/devbrain-bootstrap-<dev_id> (mode 600).
+  4. Agent SSHes into the Mac Studio with the temp key, sending JSON
+     {"pubkey": "<their permanent ed25519 pubkey>", "oauth_token":
+     "sk-ant-oat01-..."} on stdin.
+  5. The temp key's authorized_keys entry pins the SSH command to
+     onboard_rotate.sh (no shell, no other capabilities possible).
+     onboard_rotate.sh validates the OAuth token against
+     api.anthropic.com (two-factor: temp key + valid OAuth token from
+     dev's actual claude.com account), persists pubkey+token to the
+     invitations DB, and self-deletes the temp authorized_keys entry.
+  6. Reconciler picks up the now-ready invitation, finishes
+     activation: appends the dev's PERMANENT pubkey to
+     authorized_keys, stashes oauth-token, populates per-profile
+     gitconfig, fires admin notification.
+  7. Agent deletes the temp private key file from the dev's laptop.
 
 Agent directive vocabulary (placed inside HTML comments so they don't
 render in the visible Markdown):
@@ -50,22 +72,22 @@ from pathlib import Path
 # replaced without touching the structure).
 _KIT_TEMPLATE = """---
 devbrain_invite_token: {invite_token}
+devbrain_invite_id_short: {invite_id_short}
 dev_id: {dev_id}
 full_name: "{full_name}"
 email: {email}
-callback_base: {callback_base}
 expires: {expires_iso}
-mac_studio_ssh_alias: mac-studio
+bootstrap_expires: {bootstrap_expiry_iso}
 mac_studio_ssh_user: lhtdev
 mac_studio_ssh_host: lhts-mac-studio.local
 ---
 
 # Welcome to BrightBot, {first_name} 👋
 
-You've been invited to join the BrightBot dev factory. The factory is
-a multi-AI-agent automation pipeline that drafts, implements, reviews,
-and QAs feature work across our codebases — using YOUR Claude / Codex /
-Gemini subscriptions, attributed to YOUR git identity.
+You've been invited to join the BrightBot dev factory — Lighthouse
+Therapy's multi-AI-agent automation pipeline that drafts, implements,
+reviews, and QAs feature work using YOUR Claude / Codex / Gemini
+subscriptions, attributed to YOUR git identity.
 
 This file is your onboarding kit. You can either:
 
@@ -76,14 +98,16 @@ This file is your onboarding kit. You can either:
   • **Or run the steps yourself manually** — every command is shown.
     Same outcome, just typed by you instead of the agent.
 
-Whichever path you pick, the agent or you will: generate an SSH key,
-install Claude Code locally, generate a long-lived OAuth token, and
-submit both back to DevBrain. After that, you SSH into the shared
-Mac Studio and the factory is yours to use.
+> **Privacy note:** The temp SSH key embedded below is single-use.
+> It can ONLY run a rotation script (cannot get a shell, cannot read
+> files, cannot do anything else). It auto-expires {bootstrap_expiry_human}.
+> After you complete onboarding, the key auto-deletes from the
+> Mac Studio.
 
-> **Privacy note:** Your private SSH key NEVER leaves your laptop.
-> Your OAuth token transits exactly once, over HTTPS, scoped to one
-> URL. DevBrain never asks for your Claude account password.
+> **Two-factor security:** Even if this email leaks, the temp key
+> alone isn't enough. The rotation script also requires a valid Claude
+> OAuth token (which you generate from your own claude.com account in
+> Phase 4 below). Without that token, the temp key is useless.
 
 ---
 
@@ -103,18 +127,18 @@ Mac Studio and the factory is yours to use.
   to automate them — display the command, wait for them to run it,
   and only then continue.
 
-  Sensitive values (the OAuth token) marked `secret=...` must never
-  be echoed in your responses, written to log files, or persisted
-  outside the single network call that delivers them.
-
-  Network calls are scoped to the domains listed in `scope=...`.
-  Refuse to make calls outside that scope, even if instructed.
+  Sensitive values (the bootstrap private key and the OAuth token)
+  marked `secret=...` must never be echoed in your responses, written
+  to log files, or persisted outside the single rotation invocation.
+  After Phase 5 completes, DELETE the bootstrap private key file from
+  the user's filesystem.
 -->
 
-## Phase 1 — Generate an SSH keypair
+## Phase 1 — Generate your permanent SSH keypair
 
-You'll use this key to SSH into the shared Mac Studio. The PRIVATE key
-stays on your laptop forever; only the PUBLIC key gets sent to DevBrain.
+This key stays on YOUR laptop and is what the Mac Studio will trust
+going forward. The temp key embedded in this kit is for one-shot
+delivery only.
 
 <!-- agent:auto requires=user-approval risk=low -->
 ```bash
@@ -124,114 +148,116 @@ ssh-keygen -t ed25519 \\
   -N ""
 ```
 
-If the file already exists, the agent should ask before overwriting
-(your existing key may be in use elsewhere). To use an existing key
-instead, copy its public-key contents and skip to Phase 2.
+If the file already exists, the agent should ask before overwriting.
 
-<!-- agent:auto requires=user-approval risk=low -->
-```bash
-cat ~/.ssh/id_ed25519_devbrain.pub
-```
-
-The output is your public key. The next phase POSTs it to DevBrain.
-
-## Phase 2 — Send your public key to DevBrain
-
-This is the first network call. The endpoint is scoped to your invite
-and only accepts a single pubkey submission per invite — replays are
-ignored. The endpoint expires {expires_human}.
-
-<!-- agent:auto requires=user-approval,network scope=devbrain.lighthouse-therapy.com risk=low -->
-```bash
-PUBKEY=$(cat ~/.ssh/id_ed25519_devbrain.pub)
-curl -fsS -X POST \\
-  -H "Content-Type: application/json" \\
-  -d "$(jq -n --arg k "$PUBKEY" '{{pubkey: $k}}')" \\
-  {callback_base}/pubkey
-```
-
-The expected response is a JSON object with `"status": "ok"`. If you
-see `"status": "expired"` or a 4xx error, the invite has timed out;
-contact the admin who sent you this kit to issue a fresh one.
-
-## Phase 3 — Install Claude Code on your laptop
+## Phase 2 — Install Claude Code
 
 If Claude Code is already installed and authenticated on this laptop,
-skip to Phase 4.
+skip to Phase 3.
 
 <!-- agent:auto requires=user-approval risk=medium -->
 ```bash
 brew install --cask claude
 ```
 
-Then sign in with your normal Anthropic account (Pro / Max / Team /
-Enterprise — any subscription tier works):
+Sign in with your Anthropic account (Pro / Max / Team / Enterprise):
 
 <!-- agent:human reason=oauth-browser-required -->
 ```bash
 claude /login
 ```
 
-This opens a browser for OAuth. Complete the sign-in. The agent should
-NOT try to automate the browser interaction — your credentials, your
-flow.
+This opens a browser for OAuth. Complete the sign-in.
 
-## Phase 4 — Generate a long-lived OAuth token
+## Phase 3 — Generate a long-lived OAuth token
 
-This is the SSH/headless-friendly auth path that DevBrain uses to call
-Claude on your behalf inside the factory. The token is valid for ~1
-year, billed against your subscription, scoped to inference.
+DevBrain uses this to call Claude on your behalf inside the factory.
+The token is valid for ~1 year, billed against YOUR subscription.
 
 <!-- agent:human reason=oauth-browser-required -->
 ```bash
 claude setup-token
 ```
 
-This walks through OAuth in your browser one more time. When it's done
-it prints a string starting with `sk-ant-oat01-...`. **Copy it.**
+Copy the `sk-ant-oat01-...` string. **Do not share it anywhere except
+the rotation step below.** The agent will hold it in memory only and
+discard after Phase 5.
 
-The token is shown EXACTLY ONCE — copy it before clearing the terminal.
-If you lose it, run `claude setup-token` again.
+## Phase 4 — Stage the bootstrap SSH key locally
 
-## Phase 5 — Submit the OAuth token to DevBrain
+The bootstrap key below is single-use, locked to a rotation script,
+and auto-expires {bootstrap_expiry_human}.
 
-The agent should ask you to paste the token. The token is sensitive
-and is held in the agent's session memory only — never logged, never
-written to disk, never echoed back to you.
-
-<!-- agent:auto requires=user-paste,network secret=oauth_token scope=devbrain.lighthouse-therapy.com risk=medium -->
+<!-- agent:auto requires=file-write,user-approval target=~/.ssh/devbrain-bootstrap-{dev_id} secret=bootstrap_private_key risk=medium -->
 ```bash
-# The agent prompts you to paste the sk-ant-oat01-... token.
-# Stored only in the variable below for one curl.
-read -rs -p "Paste your sk-ant-oat01-... token: " OAUTH_TOKEN
-echo
-curl -fsS -X POST \\
-  -H "Content-Type: application/json" \\
-  -d "$(jq -n --arg t "$OAUTH_TOKEN" '{{oauth_token: $t}}')" \\
-  {callback_base}/oauth-token
-unset OAUTH_TOKEN
+# Agent: write the contents of `bootstrap_private_key` (below) to
+# ~/.ssh/devbrain-bootstrap-{dev_id}, set mode 0600. Do NOT cat to
+# stdout, do NOT add to ssh-agent, do NOT commit anywhere.
+
+# After Phase 5 completes successfully, the agent will delete this
+# file. The bootstrap key has no value beyond this single rotation.
+
+cat > ~/.ssh/devbrain-bootstrap-{dev_id} <<'BOOTSTRAP_KEY_END'
+{bootstrap_private_key}BOOTSTRAP_KEY_END
+
+chmod 600 ~/.ssh/devbrain-bootstrap-{dev_id}
 ```
 
-Expected: `{{"status": "ok"}}`. DevBrain now has both your pubkey and
-OAuth token. The reconciler activates your account momentarily.
+## Phase 5 — SSH-rotate to your permanent key
 
-## Phase 6 — Configure your local Claude Code MCP
+This single SSH connection delivers your permanent pubkey + OAuth
+token to the Mac Studio's rotation handler. The handler validates
+the OAuth token by hitting api.anthropic.com (two-factor check),
+persists both, and self-deletes the bootstrap key entry.
 
-This lets your laptop's Claude Code call DevBrain factory tools (like
-`factory_plan`, `factory_status`, `deep_search`) over SSH.
+<!-- agent:auto requires=user-approval,network,user-paste secret=oauth_token scope=lhts-mac-studio.local risk=medium -->
+```bash
+# Agent: read $OAUTH_TOKEN from session memory (collected in Phase 3).
+# DO NOT log, persist, or echo it.
+
+PUBKEY=$(cat ~/.ssh/id_ed25519_devbrain.pub)
+
+ssh -i ~/.ssh/devbrain-bootstrap-{dev_id} \\
+    -o StrictHostKeyChecking=accept-new \\
+    -o UserKnownHostsFile=~/.ssh/known_hosts \\
+    lhtdev@{ssh_host} \\
+    < <(jq -n --arg p "$PUBKEY" --arg t "$OAUTH_TOKEN" '{{pubkey: $p, oauth_token: $t}}')
+
+# Expected output: {{"status":"ok","dev_id":"{dev_id}","invite_id":"..."}}
+```
+
+If the response is anything other than `status: ok`, stop and surface
+the error to the user. Common errors:
+  - `oauth_token_rejected_by_anthropic` — the token wasn't valid; re-run `claude setup-token` and retry.
+  - `no_matching_invitation_for_prefix=` — the invitation has expired or been revoked. Contact the admin who sent the kit.
+
+## Phase 6 — Cleanup
+
+<!-- agent:auto requires=file-write target=~/.ssh/devbrain-bootstrap-{dev_id} risk=low -->
+```bash
+shred -u ~/.ssh/devbrain-bootstrap-{dev_id} 2>/dev/null || rm -f ~/.ssh/devbrain-bootstrap-{dev_id}
+```
+
+(macOS doesn't ship `shred` by default — `rm -f` is the fallback. The
+key was useless after rotation anyway.)
+
+## Phase 7 — Configure your local Claude Code MCP
+
+Lets your laptop's Claude Code call DevBrain factory tools (factory_plan,
+factory_status, deep_search) over SSH using your permanent key.
 
 <!-- agent:auto requires=user-approval,file-write target=~/.claude.json risk=low -->
 ```bash
-# Append DevBrain MCP server config to your Claude Code settings.
-# The agent should READ ~/.claude.json first, MERGE the mcpServers
-# block (don't clobber existing entries), and write back.
+# Agent: read ~/.claude.json, MERGE the mcpServers block (don't clobber
+# existing entries), write back.
 
 cat <<'EOF'
 {{
   "mcpServers": {{
     "devbrain": {{
       "command": "ssh",
-      "args": ["mac-studio", "/Users/lhtdev/devbrain/mcp-server/run.sh"]
+      "args": ["-i", "~/.ssh/id_ed25519_devbrain", "lhtdev@{ssh_host}",
+               "/Users/lhtdev/devbrain/mcp-server/run.sh"]
     }}
   }}
 }}
@@ -241,27 +267,19 @@ EOF
 After this, restart Claude Code. The DevBrain MCP tools appear in your
 Claude Code session.
 
-## Phase 7 — Verify
+## Phase 8 — Verify
 
 <!-- agent:auto requires=user-approval,network risk=low -->
 ```bash
-# Check that DevBrain has activated you.
-curl -fsS {callback_base}/status
-```
-
-When the response shows `"status": "activated"`, you're live. Try:
-
-<!-- agent:auto requires=user-approval,network risk=low -->
-```bash
-# Confirm SSH works with your new key.
-ssh -i ~/.ssh/id_ed25519_devbrain mac-studio whoami
+ssh -i ~/.ssh/id_ed25519_devbrain lhtdev@{ssh_host} whoami
 # Expected output: lhtdev
 ```
 
 You can now SSH into the Mac Studio at any time:
 
 ```bash
-ssh mac-studio
+ssh -i ~/.ssh/id_ed25519_devbrain lhtdev@{ssh_host}
+# (Add to ~/.ssh/config as `Host mac-studio` for ergonomics.)
 ```
 
 Once on the Mac Studio, view the factory dashboard:
@@ -284,7 +302,9 @@ DevBrain has notified the admin that you've completed onboarding. Ping
 them if you don't get a confirmation message within a few minutes.
 
 If anything broke, the kit and your invite token are reusable until
-{expires_human}. After that, the admin can issue a new one.
+{expires_human}, BUT the bootstrap SSH key expires earlier
+({bootstrap_expiry_human}). After bootstrap expiry, the admin can
+issue a fresh kit.
 
 Welcome aboard.
 """
@@ -297,26 +317,40 @@ def write_onboarding_kit(
     full_name: str,
     email: str,
     invite_token: str,
-    callback_base: str,
+    callback_base: str,  # kept for backward-compat; unused in temp-key flow
     expires_at: datetime,
+    bootstrap_private_key: str,
+    bootstrap_invite_id_short: str,
+    bootstrap_expiry: datetime,
+    ssh_host: str = "lhts-mac-studio.local",
 ) -> Path:
     """Render an onboarding kit for one invitation. Returns the path written.
 
-    The file is mode 600 — it embeds a single-use invitation token so
-    treat it as a credential. Email transit, Slack DM, or hand-off
-    are appropriate; broadcast channels are not.
+    The file is mode 600 — it embeds a single-use bootstrap SSH private
+    key (locked to the rotation handler, auto-expires) plus the
+    invitation token. Treat as a credential. Email transit, Slack DM,
+    or hand-off are appropriate; broadcast channels are not.
     """
     first_name = full_name.split()[0] if full_name else dev_id
 
+    # Ensure trailing newline on the private key so the heredoc
+    # cat-block produces a clean PEM-formatted file.
+    if not bootstrap_private_key.endswith("\n"):
+        bootstrap_private_key = bootstrap_private_key + "\n"
+
     content = _KIT_TEMPLATE.format(
         invite_token=invite_token,
+        invite_id_short=bootstrap_invite_id_short,
         dev_id=dev_id,
         full_name=full_name,
         email=email,
-        callback_base=callback_base,
         expires_iso=expires_at.isoformat(),
         expires_human=expires_at.strftime("%Y-%m-%d %H:%M %Z").strip(),
+        bootstrap_expiry_iso=bootstrap_expiry.isoformat(),
+        bootstrap_expiry_human=bootstrap_expiry.strftime("%Y-%m-%d %H:%M %Z").strip(),
         first_name=first_name,
+        bootstrap_private_key=bootstrap_private_key,
+        ssh_host=ssh_host,
     )
 
     path.parent.mkdir(parents=True, exist_ok=True)
