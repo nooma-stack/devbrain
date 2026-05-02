@@ -69,6 +69,53 @@ If anything breaks, reply to this email or ping {admin_contact}.
 """
 
 
+def _pick_email_channel():
+    """Return an instantiated, configured email channel, or None.
+
+    Preference order:
+      1. gmail_dwd  (Google Workspace service account; no password)
+      2. smtp       (plain SMTP / Gmail App Password / etc.)
+
+    Only one is expected to be enabled at a time — the setup wizard
+    disables the other when one is configured. But if both are
+    enabled, gmail_dwd wins because it's password-rotation-free and
+    audit-friendly.
+    """
+    import sys
+    from pathlib import Path as _Path
+    sys.path.insert(0, str(_Path(__file__).resolve().parent))
+
+    from config import NOTIFICATIONS_CONFIG
+
+    channels = NOTIFICATIONS_CONFIG.get("channels", {})
+
+    dwd_cfg = channels.get("gmail_dwd", {}) or {}
+    if dwd_cfg.get("enabled"):
+        from notifications.channels.gmail_dwd import GmailDwdChannel
+        kwargs = {k: v for k, v in dwd_cfg.items() if k != "enabled"}
+        ch = GmailDwdChannel(**kwargs)
+        if ch.is_configured():
+            return ch
+        logger.warning(
+            "gmail_dwd channel enabled but not configured (missing "
+            "service_account_path / sender_email, or google-auth + "
+            "google-api-python-client not installed)."
+        )
+
+    smtp_cfg = channels.get("smtp", {}) or {}
+    if smtp_cfg.get("enabled"):
+        from notifications.channels.smtp import SmtpChannel
+        kwargs = {k: v for k, v in smtp_cfg.items() if k != "enabled"}
+        ch = SmtpChannel(**kwargs)
+        if ch.is_configured():
+            return ch
+        logger.warning(
+            "smtp channel enabled but not configured (missing host / sender_email)."
+        )
+
+    return None
+
+
 def send_onboarding_email(
     *,
     to_email: str,
@@ -77,41 +124,22 @@ def send_onboarding_email(
     kit_path: Path,
     admin_name: str = "your admin",
     admin_contact: str = "the admin who sent this email",
-    smtp_config: Optional[dict] = None,
 ) -> bool:
-    """Send the onboarding kit to the dev via SMTP.
+    """Send the onboarding kit to the dev.
 
-    Returns True on successful delivery, False otherwise. Failures are
-    logged and the kit file is left in place — the admin can re-send
-    via `devbrain send-invite --dev <id>` after fixing config.
-
-    smtp_config: optional override (dict matching the channels.smtp
-    block in devbrain.yaml). Defaults to loading from notifications
+    Picks the configured email channel (gmail_dwd preferred, smtp
+    fallback). Returns True on successful delivery, False otherwise.
+    Failures are logged and the kit file is left in place — the admin
+    can re-send via `devbrain send-invite --dev <id>` after fixing
     config.
     """
-    import sys
-    from pathlib import Path as _Path
-    sys.path.insert(0, str(_Path(__file__).resolve().parent))
-
-    from notifications.channels.smtp import SmtpChannel
-
-    if smtp_config is None:
-        from config import NOTIFICATIONS_CONFIG
-        smtp_config = (
-            NOTIFICATIONS_CONFIG.get("channels", {}).get("smtp", {}) or {}
-        )
-
-    if not smtp_config.get("enabled"):
+    channel = _pick_email_channel()
+    if channel is None:
         logger.warning(
-            "SMTP channel not enabled in config — cannot send onboarding email. "
-            "Configure via `devbrain setup channels` or edit config/devbrain.yaml."
+            "No email channel enabled (gmail_dwd or smtp). Configure via "
+            "`devbrain setup channels`, then re-run "
+            "`devbrain send-invite --dev <id>` to retry the send."
         )
-        return False
-
-    init_kwargs = {k: v for k, v in smtp_config.items() if k != "enabled"}
-    channel = SmtpChannel(**init_kwargs)
-    if not channel.is_configured():
-        logger.warning("SMTP channel enabled but missing required fields (host/sender_email)")
         return False
 
     first_name = full_name.split()[0] if full_name else dev_id
@@ -124,11 +152,14 @@ def send_onboarding_email(
         kit_content=kit_content,
     )
 
-    title = f"Welcome to BrightBot — your DevBrain onboarding kit"
+    title = "Welcome to BrightBot — your DevBrain onboarding kit"
 
     result = channel.send(address=to_email, title=title, body=body)
     if not result.delivered:
-        logger.error("SMTP send failed: %s", result.error)
+        logger.error("Email send failed via %s: %s", channel.name, result.error)
         return False
-    logger.info("Onboarding email sent to %s for dev=%s", to_email, dev_id)
+    logger.info(
+        "Onboarding email sent to %s for dev=%s via %s",
+        to_email, dev_id, channel.name,
+    )
     return True

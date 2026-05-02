@@ -761,6 +761,156 @@ def setup_projects() -> None:
     _ok("Config saved to config/devbrain.yaml")
 
 
+def _setup_email_smtp(cfg: dict) -> None:
+    """Configure plain SMTP email (Gmail App Password / Outlook / SendGrid / etc.)."""
+    host = _prompt("  SMTP host", default="smtp.gmail.com")
+    port = _prompt("  SMTP port", default="587")
+    sender = _prompt("  Sender email")
+    password = _prompt("  SMTP password", hide_input=True)
+    cfg["notifications"]["channels"]["smtp"] = {
+        "enabled": True,
+        "host": host,
+        "port": int(port),
+        "use_tls": True,
+        "sender_email": sender,
+        "sender_display_name": "DevBrain",
+    }
+    # Defensively disable any prior gmail_dwd config — only one email
+    # channel should win to avoid double-sends.
+    if cfg["notifications"]["channels"].get("gmail_dwd", {}).get("enabled"):
+        cfg["notifications"]["channels"]["gmail_dwd"]["enabled"] = False
+        _info("Disabled previously-enabled gmail_dwd channel (one email path only).")
+    _append_env("DEVBRAIN_SMTP_PASSWORD", password)
+    _ok("SMTP configured (password saved to .env).")
+
+
+def _setup_email_gmail_dwd(cfg: dict) -> None:
+    """Configure Gmail API via service account with Domain-Wide Delegation.
+
+    Walks the admin through:
+      1. Locating the service account JSON file (validates it parses
+         and has the expected keys).
+      2. Picking the impersonation user (the email AS which DevBrain
+         will send — typically the admin's Workspace address, or a
+         dedicated alias like devbrain@<domain>).
+      3. Printing the DWD scope-grant instructions for admin.google.com.
+      4. Optional live test-send to verify everything wired up.
+    """
+    import json
+    from pathlib import Path
+
+    click.echo()
+    _info("Step 1 — Service account JSON")
+    _desc("Path to the service account credentials JSON file. If you don't")
+    _desc("have one yet, create it at console.cloud.google.com → IAM & Admin")
+    _desc("→ Service Accounts → <your account> → Keys → Add Key → JSON.")
+    while True:
+        sa_path_str = _prompt("  Service account JSON path").strip()
+        sa_path = Path(sa_path_str).expanduser()
+        if not sa_path.is_file():
+            _warn(f"File not found: {sa_path}. Try again or Ctrl+C to cancel.")
+            continue
+        try:
+            sa_data = json.loads(sa_path.read_text())
+        except json.JSONDecodeError as e:
+            _warn(f"File doesn't parse as JSON: {e}")
+            continue
+        if sa_data.get("type") != "service_account":
+            _warn(f"Expected type=\"service_account\", got {sa_data.get('type')!r}.")
+            continue
+        if not sa_data.get("client_email") or not sa_data.get("client_id"):
+            _warn("Missing client_email / client_id — not a valid service account JSON.")
+            continue
+        sa_client_email = sa_data["client_email"]
+        sa_client_id = sa_data["client_id"]
+        sa_project = sa_data.get("project_id", "(unknown)")
+        _ok(f"Loaded service account: {sa_client_email} (project: {sa_project})")
+        break
+
+    click.echo()
+    _info("Step 2 — Impersonation user (the From: address)")
+    _desc("DevBrain will send AS this user via DWD. Must be a real user in")
+    _desc("the same Workspace domain as the service account. Common picks:")
+    _desc("  • Your own admin email (patrick@lighthouse-therapy.com)")
+    _desc("  • A dedicated noreply alias (devbrain@lighthouse-therapy.com)")
+    impersonate = _prompt("  Impersonation email").strip()
+    while "@" not in impersonate:
+        _warn("Need a full email address.")
+        impersonate = _prompt("  Impersonation email").strip()
+    display_name = _prompt(
+        "  Sender display name (shown in 'From' field)",
+        default="DevBrain",
+    ).strip() or "DevBrain"
+
+    click.echo()
+    _info("Step 3 — Workspace admin scope grant (one-time)")
+    _desc("DWD requires a Workspace admin to authorize this service account")
+    _desc("for the Gmail send scope. Done at admin.google.com:")
+    _desc(f"  1. admin.google.com → Security → Access and data control →")
+    _desc(f"     API controls → Domain-wide delegation → Manage")
+    _desc(f"  2. Add new client. Use these values:")
+    _desc(f"       Client ID: {sa_client_id}")
+    _desc(f"       OAuth scopes: https://www.googleapis.com/auth/gmail.send")
+    _desc(f"  3. Authorize.")
+    _desc("If you're a Workspace admin, you can do this in another tab now.")
+    _desc("Otherwise: ask your Workspace admin and re-run this section after")
+    _desc("they've granted the scope.")
+    click.echo()
+
+    cfg["notifications"]["channels"]["gmail_dwd"] = {
+        "enabled": True,
+        "service_account_path": str(sa_path),
+        "sender_email": impersonate,
+        "sender_display_name": display_name,
+    }
+    # Disable plain SMTP if previously enabled — one email channel wins.
+    if cfg["notifications"]["channels"].get("smtp", {}).get("enabled"):
+        cfg["notifications"]["channels"]["smtp"]["enabled"] = False
+        _info("Disabled previously-enabled SMTP channel (one email path only).")
+    _save_yaml(cfg)
+    _ok(f"gmail_dwd configured: send AS {impersonate} via {sa_path.name}")
+
+    # Optional live test
+    click.echo()
+    if _confirm("Send a test email now to verify DWD is working?", default=True):
+        test_to = _prompt(
+            "  Test recipient (delivery confirmation goes here)",
+            default=impersonate,
+        ).strip()
+        try:
+            from notifications.channels.gmail_dwd import GmailDwdChannel
+            channel = GmailDwdChannel(
+                service_account_path=str(sa_path),
+                sender_email=impersonate,
+                sender_display_name=display_name,
+            )
+            if not channel.is_configured():
+                _warn(
+                    "Channel reports not-configured — likely missing google-auth + "
+                    "google-api-python-client. Install with: "
+                    f"pip install google-auth google-api-python-client",
+                )
+                return
+            result = channel.send(
+                address=test_to,
+                title="DevBrain — Gmail DWD test",
+                body=(
+                    "If you're reading this, DevBrain's Gmail DWD channel is "
+                    "wired up correctly. You can ignore this email."
+                ),
+            )
+            if result.delivered:
+                _ok(f"Test email sent to {test_to}. Check the inbox.")
+            else:
+                _warn(f"Send failed: {result.error}")
+                _info(
+                    "Most common cause: DWD scope not yet granted in admin.google.com. "
+                    "Grant gmail.send scope, wait 1-2 minutes for propagation, re-test."
+                )
+        except Exception as e:
+            _warn(f"Test send raised: {type(e).__name__}: {e}")
+
+
 def setup_notifications(dev_id: str) -> None:
     _header("Notification Channels")
     _desc(
@@ -859,25 +1009,24 @@ def setup_notifications(dev_id: str) -> None:
             condition="Telegram enabled",
         )
 
-    # SMTP
+    # Email — pick provider path
     click.echo()
-    _desc("Email (SMTP) — Sends notifications via any SMTP server (Gmail,")
-    _desc("Outlook, SendGrid, self-hosted). Requires server credentials.")
+    _desc("Email — Two paths. Pick whichever your environment supports:")
+    _desc("  • Google Workspace service account (Domain-Wide Delegation) —")
+    _desc("    no password to manage, sends as any user in your domain,")
+    _desc("    auditable per Workspace logs. One-time DWD scope grant in")
+    _desc("    admin.google.com required (instructions during setup).")
+    _desc("  • SMTP — any provider (Gmail App Password, Outlook, SendGrid,")
+    _desc("    self-hosted). Simpler bring-up; password to manage.")
     if _confirm("Enable email notifications?", default=False):
-        host = _prompt("  SMTP host", default="smtp.gmail.com")
-        port = _prompt("  SMTP port", default="587")
-        sender = _prompt("  Sender email")
-        password = _prompt("  SMTP password", hide_input=True)
-        cfg["notifications"]["channels"]["smtp"] = {
-            "enabled": True,
-            "host": host,
-            "port": int(port),
-            "use_tls": True,
-            "sender_email": sender,
-            "sender_display_name": "DevBrain",
-        }
-        _append_env("DEVBRAIN_SMTP_PASSWORD", password)
-        _ok("SMTP configured (password saved to .env)")
+        method = _prompt(
+            "  Method — [g]oogle-workspace service account, [s]mtp password",
+            default="g",
+        ).strip().lower()
+        if method.startswith("g"):
+            _setup_email_gmail_dwd(cfg)
+        else:
+            _setup_email_smtp(cfg)
 
     # Register channels with the dev
     for ch in channels_to_register:
