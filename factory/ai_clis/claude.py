@@ -89,28 +89,36 @@ def _ensure_keychain(profile_dir: Path) -> Path:
     keychain.parent.mkdir(parents=True, exist_ok=True)
     password = _read_or_generate_keychain_password(profile_dir)
 
-    if not keychain.exists():
+    # No-op gracefully on non-macOS (e.g., Linux CI runners). The
+    # `security` binary is shipped only with macOS; if it's absent,
+    # claude's auth flow falls through to whatever its non-Keychain
+    # path is. This keeps the test suite green on Linux runners and
+    # makes the code portable for any future Linux factory host.
+    try:
+        if not keychain.exists():
+            subprocess.run(
+                ["security", "create-keychain", "-p", password, str(keychain)],
+                check=True, capture_output=True,
+            )
+            # Disable auto-lock — factory orchestrator spawns can't pop a
+            # GUI dialog to re-enter the password. The keychain still
+            # locks between subprocess invocations (per-process security
+            # agent state), so cli_executor.run_cli runs `security
+            # unlock-keychain` before each spawn.
+            subprocess.run(
+                ["security", "set-keychain-settings", str(keychain)],
+                check=False, capture_output=True,
+            )
+            logger.info("Provisioned per-dev keychain at %s", keychain)
+
+        # Unlock for the upcoming claude auth login subprocess (otherwise
+        # macOS pops a password prompt the user shouldn't see).
         subprocess.run(
-            ["security", "create-keychain", "-p", password, str(keychain)],
-            check=True, capture_output=True,
-        )
-        # Disable auto-lock — factory orchestrator spawns can't pop a
-        # GUI dialog to re-enter the password. The keychain still locks
-        # between subprocess invocations (per-process security agent
-        # state), so cli_executor.run_cli runs `security unlock-keychain`
-        # before each spawn.
-        subprocess.run(
-            ["security", "set-keychain-settings", str(keychain)],
+            ["security", "unlock-keychain", "-p", password, str(keychain)],
             check=False, capture_output=True,
         )
-        logger.info("Provisioned per-dev keychain at %s", keychain)
-
-    # Unlock for the upcoming claude auth login subprocess (otherwise
-    # macOS pops a password prompt the user shouldn't see).
-    subprocess.run(
-        ["security", "unlock-keychain", "-p", password, str(keychain)],
-        check=False, capture_output=True,
-    )
+    except FileNotFoundError:
+        logger.debug("`security` binary not found — non-macOS host, skipping keychain provisioning")
     return keychain
 
 
