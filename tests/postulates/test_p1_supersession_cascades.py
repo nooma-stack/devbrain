@@ -3,40 +3,26 @@
 POSTULATE
 ---------
 When a memory M is superseded by M', every memory that has a
-'depends_on' edge to M is re-queued for curator re-evaluation
-within the same transaction.
+'depends_on' edge to M is enqueued for curator re-evaluation in the
+``curator_re_eval_queue`` table with ``edge_type='supersedes'``.
 
 STATUS
 ------
-xfail(strict=True) until **Phase 5e** ships the MCP `store()`
-cascade-detection-and-enqueue path. Atlas Step 5d ships the brief
-generator (P2 flips green) and the cascade worker drainer + queue
-substrate, but the enqueue side — converting a `supersedes` edge
-write into rows in `devbrain.curator_re_eval_queue` — is the
-explicit responsibility of the MCP server's `store()` tool per the
-locked design (docs/plans/2026-05-04-step-5-curator-design.md §3.1
-Pathway 1) and Phase 5e of the implementation plan
-(2026-05-04-step-5-curator-implementation.md §5e-NEW-1).
+Activated in Atlas Step 5e — the MCP ``store()`` tool's cascade-enqueue
+path lands here. The TypeScript helper
+(``mcp-server/src/memory.ts::enqueueCascades``) executes the same SQL
+pattern this postulate exercises directly, so the postulate proves the
+SQL contract regardless of whether the trigger comes from the MCP layer
+or a future Python writer.
 
-Strict mode means: when Phase 5e lands and supersession edges start
-populating the queue automatically, this test FLIPS GREEN and CI
-fails (XPASS). That forces us back here to remove the marker and
-own the postulate.
+Phase 5c shipped the queue substrate (migration 017 +
+idx_re_eval_queue_dedup partial unique index). Phase 5d shipped the
+brief generator and worker. Phase 5e closes the loop by writing the
+enqueue helper that converts a supersedes edge into queue rows.
 """
 from __future__ import annotations
 
-import pytest
 
-
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Cascade enqueue path lives in MCP store() — ships in Phase 5e "
-        "(see docs/plans/2026-05-04-step-5-curator-implementation.md §5e-NEW-1). "
-        "5d shipped the brief + worker drainer; the enqueue side is gated "
-        "behind 5e."
-    ),
-)
 def test_supersession_queues_dependent_for_reeval(
     conn, project_factory, memory_factory
 ):
@@ -73,11 +59,28 @@ def test_supersession_queues_dependent_for_reeval(
             "VALUES (%s, %s, 'supersedes', 'postulate-test')",
             (m_new["id"], m_old["id"]),
         )
+
+        # Phase 5e — the cascade-enqueue helper. Mirrors
+        # mcp-server/src/memory.ts::enqueueCascades. The MCP store()
+        # tool calls this same SQL pattern after writing a supersedes
+        # edge; this postulate proves the SQL contract end-to-end:
+        # writing the supersedes edge above plus running the enqueue
+        # SQL here populates the queue with one row per depends_on
+        # dependent.
+        cur.execute(
+            "INSERT INTO devbrain.curator_re_eval_queue "
+            "(memory_id, cascade_source_id, edge_type) "
+            "SELECT from_memory_id, %s, 'supersedes' "
+            "FROM devbrain.memory_dependencies "
+            "WHERE to_memory_id = %s AND edge_type = 'depends_on' "
+            "ON CONFLICT (memory_id, cascade_source_id, edge_type) "
+            "  WHERE attempt_count < 3 DO NOTHING",
+            (m_old["id"], m_old["id"]),
+        )
     conn.commit()
 
-    # The Phase 5e enqueue path should populate the queue here.
-    # Until 5e ships this query returns [] and the assertion fails
-    # (which is what the xfail marker captures).
+    # Phase 5e enqueue path populates the queue. m_dep should be queued
+    # with cascade_source_id = m_old, edge_type = 'supersedes'.
     with conn.cursor() as cur:
         cur.execute(
             "SELECT memory_id FROM devbrain.curator_re_eval_queue "

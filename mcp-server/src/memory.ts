@@ -153,3 +153,52 @@ export async function recordMemoryDependency(args: {
     )
   }
 }
+
+/**
+ * Enqueue dependents of `cascadeSourceId` for re-evaluation.
+ *
+ * Atlas Step 5e Pathway 1 (store() cascade detection). Walks
+ * `memory_dependencies` and inserts one row per dependent memory into
+ * `devbrain.curator_re_eval_queue`. The cascade worker (factory side)
+ * drains the queue and applies the bounded additive cascade penalty.
+ *
+ * Three triggers map to three edgeType values, all enforced by the
+ * curator_re_eval_queue.edge_type CHECK constraint:
+ *   - 'supersedes'   — caller wrote a `supersedes` edge over `cascadeSourceId`
+ *   - 'archived_at'  — caller archived the row at `cascadeSourceId`
+ *   - 'applies_when' — caller mutated the applies_when JSONB
+ *
+ * Dedup: ON CONFLICT against the partial unique index from migration 017
+ * (idx_re_eval_queue_dedup, partial WHERE attempt_count < 3). The
+ * cascade penalty is additive (not idempotent), so two concurrent
+ * enqueues for the same triplet would double-penalize without this
+ * guard. Failed rows (attempt_count=3) drop out of the unique index, so
+ * legitimate re-enqueues after operator triage aren't blocked.
+ *
+ * Best-effort: failures are logged but never raised. The store() that
+ * triggered the cascade has already persisted the user-facing mutation;
+ * a missed enqueue downgrades to "next factory job startup will pick
+ * the affected dependents up via end_session() drain or the next
+ * cascade wave," not a silent data-loss event.
+ */
+export async function enqueueCascades(
+  cascadeSourceId: string,
+  edgeType: 'supersedes' | 'archived_at' | 'applies_when',
+): Promise<void> {
+  try {
+    await query(
+      `INSERT INTO devbrain.curator_re_eval_queue
+           (memory_id, cascade_source_id, edge_type)
+       SELECT from_memory_id, $1, $2
+       FROM devbrain.memory_dependencies
+       WHERE to_memory_id = $1 AND edge_type = 'depends_on'
+       ON CONFLICT (memory_id, cascade_source_id, edge_type)
+         WHERE attempt_count < 3 DO NOTHING`,
+      [cascadeSourceId, edgeType],
+    )
+  } catch (err) {
+    console.error(
+      `[memory] enqueueCascades(${edgeType}, source=${cascadeSourceId}) failed: ${err}`,
+    )
+  }
+}
