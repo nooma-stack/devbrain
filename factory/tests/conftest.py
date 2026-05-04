@@ -64,8 +64,15 @@ def conn(database_url):
     """Per-test connection. Caller is responsible for cleanup of any rows
     they insert; schema-assertion tests that only read information_schema
     don't need teardown.
+
+    Registers psycopg2's UUID adapter on the module so id columns flow
+    in/out as `uuid.UUID` consistently — without this, the adapter is
+    only registered when state_machine.py happens to be imported, which
+    leaks load-order dependence into tests.
     """
     psycopg2 = pytest.importorskip("psycopg2")
+    import psycopg2.extras
+    psycopg2.extras.register_uuid()
     c = psycopg2.connect(database_url)
     try:
         with c.cursor() as cur:
@@ -147,7 +154,13 @@ def project_factory(conn):
 
 @pytest.fixture
 def memory_factory(conn):
-    """Insert a devbrain.memory row directly (bypassing the MCP server)."""
+    """Insert a devbrain.memory row directly (bypassing the MCP server).
+
+    Optional kwargs `tier` and `strength` set those columns at insert time
+    (both ship in migration 010). `compliance_profiles` is silently
+    ignored until that column ships in Step 7 — the kwarg is accepted so
+    forward-compat tests don't have to special-case the call site.
+    """
 
     def make(
         project_id: str,
@@ -156,18 +169,77 @@ def memory_factory(conn):
         title: str | None = None,
         content: str | None = None,
         provenance_id: str | None = None,
+        tier: str | None = None,
+        strength: float | None = None,
+        compliance_profiles: list[str] | None = None,  # noqa: ARG001 — Step 7
     ) -> dict:
         title = title or f"{TEST_TAG}title_{uuid.uuid4().hex[:6]}"
         content = content or f"{TEST_TAG}body_{uuid.uuid4().hex[:6]}"
+
+        cols = ["project_id", "kind", "title", "content", "provenance_id"]
+        vals: list = [project_id, kind, title, content, provenance_id]
+        if tier is not None:
+            cols.append("tier")
+            vals.append(tier)
+        if strength is not None:
+            cols.append("strength")
+            vals.append(strength)
+
+        placeholders = ", ".join(["%s"] * len(cols))
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO devbrain.memory "
-                "(project_id, kind, title, content, provenance_id) "
-                "VALUES (%s, %s, %s, %s, %s) RETURNING id",
-                (project_id, kind, title, content, provenance_id),
+                f"INSERT INTO devbrain.memory ({', '.join(cols)}) "
+                f"VALUES ({placeholders}) RETURNING id",
+                vals,
             )
             row = cur.fetchone()
         conn.commit()
-        return {"id": row[0], "title": title, "content": content, "kind": kind}
+        # row[0] is a uuid.UUID — psycopg2.extras.register_uuid() is
+        # called from the conn fixture so all id flow is consistent.
+        return {
+            "id": row[0],
+            "title": title,
+            "content": content,
+            "kind": kind,
+            "tier": tier or "memory",
+        }
 
     return make
+
+
+@pytest.fixture
+def factory_job_factory(conn):
+    """Insert a devbrain.factory_jobs row.
+
+    Cleanup happens at fixture teardown — required because we commit the
+    INSERT (so the brief generator can see the row) and the conn fixture's
+    rollback won't undo committed work.
+    """
+    created: list[str] = []
+
+    def make(project_id, spec="test", status="queued", title=None) -> dict:
+        title = title or f"{TEST_TAG}job_{uuid.uuid4().hex[:6]}"
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO devbrain.factory_jobs "
+                "(project_id, title, spec, status) "
+                "VALUES (%s, %s, %s, %s) "
+                "RETURNING id, project_id, title, spec, status",
+                (project_id, title, spec, status),
+            )
+            cols = [d[0] for d in cur.description]
+            row = dict(zip(cols, cur.fetchone()))
+        conn.commit()
+        created.append(row["id"])
+        return row
+
+    yield make
+
+    if created:
+        conn.rollback()
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM devbrain.factory_jobs WHERE id = ANY(%s)",
+                (created,),
+            )
+        conn.commit()

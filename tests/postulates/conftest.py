@@ -45,7 +45,14 @@ def database_url() -> str:
 
 @pytest.fixture
 def conn(database_url):
-    """Per-test connection with autocommit OFF so cleanup is total."""
+    """Per-test connection with autocommit OFF so cleanup is total.
+
+    Registers psycopg2's UUID adapter on the module so id columns flow
+    in/out as `uuid.UUID` consistently — without this, the adapter is
+    only registered when state_machine.py happens to be imported.
+    """
+    import psycopg2.extras
+    psycopg2.extras.register_uuid()
     c = psycopg2.connect(database_url)
     try:
         # Annotate this session as a postulate test so audit ledger rows

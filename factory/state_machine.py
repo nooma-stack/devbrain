@@ -271,7 +271,64 @@ class FactoryDB:
             conn.commit()
 
         logger.info("Job %s: %s → %s", job_id[:8], job.status.value, new_status.value)
+
+        # Curator brief generation hook. Runs at QUEUED -> PLANNING only.
+        # The brief is cached on factory_jobs.curator_brief so every
+        # downstream phase (planning, implementing, reviewing, qa) reads
+        # an identical snapshot. See
+        # docs/plans/2026-05-04-step-5-curator-design.md §3 for the
+        # design and §4 (Pathway 3) for the data flow.
+        if (
+            job.status == JobStatus.QUEUED
+            and new_status == JobStatus.PLANNING
+        ):
+            self._generate_brief_for_planning(job_id, job.project_id, job.spec)
+
         return self.get_job(job_id)
+
+    def _generate_brief_for_planning(
+        self, job_id: str, project_id: str, spec: str | None
+    ) -> None:
+        """Generate the curator brief at QUEUED -> PLANNING.
+
+        On failure: increment error_count, stash the error in metadata
+        (no last_error column exists on factory_jobs), and re-raise so
+        the caller (orchestrator._run_planning) sees the failure and can
+        decide whether to FAIL the job. After 3 brief-generation
+        failures the orchestrator's existing FAILED-after-max-retries
+        logic kicks in.
+        """
+        # Local import to avoid a circular import at module load —
+        # curator.brief lives under factory/curator/ and may itself
+        # import state_machine for the JobStatus enum at some point.
+        from curator.brief import generate_brief
+
+        try:
+            with self._conn() as conn:
+                generate_brief(conn, job_id, project_id, spec or "")
+        except Exception as exc:
+            logger.exception("Brief generation failed for job %s", job_id[:8])
+            self._record_brief_failure(job_id, str(exc))
+            raise
+
+    def _record_brief_failure(self, job_id: str, error: str) -> None:
+        """Increment error_count and stash the error in metadata.brief_error.
+
+        factory_jobs has error_count (migration 001) but no last_error
+        column — use the metadata JSONB instead. The orchestrator's
+        FIX_LOOP/max_retries branch already handles repeated failures
+        via error_count.
+        """
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devbrain.factory_jobs "
+                "SET error_count = error_count + 1, "
+                "    metadata = metadata || %s::jsonb, "
+                "    updated_at = now() "
+                "WHERE id = %s",
+                (json.dumps({"brief_error": error[:1000]}), job_id),
+            )
+            conn.commit()
 
     def update_metadata(self, job_id: str, metadata: dict) -> None:
         """Merge the given dict into a job's metadata JSONB without
