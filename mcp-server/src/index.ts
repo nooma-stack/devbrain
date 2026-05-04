@@ -9,7 +9,7 @@ import { join, resolve } from 'path'
 import { z } from 'zod'
 import { query } from './db.js'
 import { embed, toSqlVector } from './embeddings.js'
-import { recordMemory, recordMemoryDependency, resolveMemoryId } from './memory.js'
+import { enqueueCascades, recordMemory, recordMemoryDependency, resolveMemoryId } from './memory.js'
 import { summarizeSession } from './summarize.js'
 
 // Factory orchestrator runner path
@@ -659,7 +659,26 @@ server.tool(
           edgeType: 'supersedes',
           createdBy: 'mcp:store',
         })
+        // Atlas Step 5e Pathway 1 (cascade detection): writing a
+        // supersedes edge enqueues every depends_on dependent of the
+        // superseded row for re-evaluation. The cascade worker drains
+        // the queue at factory job startup and at end_session().
+        // Best-effort — enqueueCascades swallows its own errors so a
+        // failed enqueue never blocks the store().
+        await enqueueCascades(toId, 'supersedes')
       }
+      // Future store() trigger points (Phase 3.x — when the tool
+      // schema gains archive / applies_when params):
+      //   if (params.archived_at && !previousRow?.archived_at) {
+      //     await enqueueCascades(memoryId, 'archived_at')
+      //   }
+      //   if (params.applies_when !== undefined &&
+      //       !deepEqual(params.applies_when, previousRow?.applies_when)) {
+      //     await enqueueCascades(memoryId, 'applies_when')
+      //   }
+      // The enqueueCascades helper supports all three edge_type values
+      // (CHECK constraint on curator_re_eval_queue.edge_type) so the
+      // wiring is purely a store-handler-shape change.
     }
 
     // Also create an embedded chunk for the record. Kept for legacy
@@ -687,7 +706,7 @@ server.tool(
 
 server.tool(
   'end_session',
-  'Call before ending any work session. Summarizes what was done and stores it in DevBrain for future reference.',
+  'Call before ending any work session. Summarizes what was done and stores it in DevBrain for future reference. Atlas Step 5e adds optional structured-judgment params (cascade_decisions / new_relationships / lesson_candidates) — the calling agent volunteers per-memory verdicts that the curator persists; the cascade queue is drained at the same call.',
   {
     project: z.string().describe('Project slug'),
     summary: z.string().describe('What was accomplished in this session'),
@@ -695,8 +714,31 @@ server.tool(
     files_changed: z.array(z.string()).optional(),
     issues_found: z.array(z.string()).optional(),
     next_steps: z.array(z.string()).optional(),
+    // Atlas Step 5e: structured judgment volunteered by the calling agent.
+    // The agent has full session context (no separate LLM agent here).
+    session_id: z.string().optional()
+      .describe('Idempotency key. If two end_session calls share session_id and identical payload, the second is a no-op returning the first call\'s result.'),
+    cascade_decisions: z.array(z.object({
+      memory_id: z.string().uuid(),
+      action: z.enum(['promote', 'merge', 'contradict', 'refine', 'no_action']),
+      rationale: z.string().optional().default(''),
+    })).optional()
+      .describe('Per-memory verdicts. Cross-project payloads are rejected wholesale (P_end_session_isolation).'),
+    new_relationships: z.array(z.object({
+      from_memory_id: z.string().uuid(),
+      to_memory_id: z.string().uuid(),
+      edge_type: z.string(),
+    })).optional()
+      .describe('New dependency edges this session learned about.'),
+    lesson_candidates: z.array(z.object({
+      title: z.string(),
+      content: z.string(),
+      applies_when: z.record(z.unknown()).optional(),
+      compliance_profiles: z.array(z.string()).optional(),
+    })).optional()
+      .describe('Net-new lesson rows extracted from this session.'),
   },
-  async ({ project, summary, decisions_made, files_changed, issues_found, next_steps }) => {
+  async ({ project, summary, decisions_made, files_changed, issues_found, next_steps, session_id, cascade_decisions, new_relationships, lesson_candidates }) => {
     const projectId = await resolveProjectId(project)
     if (!projectId) {
       return { content: [{ type: 'text', text: `Project "${project}" not found.` }] }
@@ -738,7 +780,72 @@ server.tool(
       provenanceId: chunkResult.rows[0]?.id ?? null,
     })
 
-    return { content: [{ type: 'text', text: `Session summary stored for project "${project}".` }] }
+    // Atlas Step 5e: structured-judgment enrichment.
+    //
+    // If the agent volunteered cascade_decisions / new_relationships /
+    // lesson_candidates, shell out to the Python entry point at
+    // factory/curator/end_session_entry.py. That handler:
+    //   1. validates cross-project isolation (P_end_session_isolation)
+    //   2. applies the judgment (promotes lessons, halves strength on
+    //      'contradict', enqueues self-cascade on 'refine', inserts new
+    //      memory_dependencies edges, creates lesson rows)
+    //   3. drains the cascade queue (5e-NEW-2)
+    //   4. records the call in devbrain.end_session_log keyed on
+    //      (session_id, payload_hash) for idempotency
+    //      (P_end_session_idempotent)
+    //
+    // The summary persistence above is the legacy "tell me what
+    // happened" surface; this branch is the new "tell me what the
+    // session LEARNED" surface. They're orthogonal — agents that
+    // upgrade pass the new params, older callers see no change.
+    let enrichmentReport = ''
+    if (
+      session_id !== undefined &&
+      ((cascade_decisions?.length ?? 0) > 0 ||
+       (new_relationships?.length ?? 0) > 0 ||
+       (lesson_candidates?.length ?? 0) > 0)
+    ) {
+      const enrichmentPayload = {
+        project_id: projectId,
+        session_id,
+        cascade_decisions: cascade_decisions ?? [],
+        new_relationships: new_relationships ?? [],
+        lesson_candidates: lesson_candidates ?? [],
+      }
+      const result = spawnSync(
+        DEVBRAIN_PYTHON,
+        ['-m', 'curator.end_session_entry'],
+        {
+          input: JSON.stringify(enrichmentPayload),
+          encoding: 'utf-8',
+          cwd: resolve(import.meta.dirname, '../../factory'),
+          env: { ...process.env },
+        },
+      )
+      if (result.status !== 0) {
+        // Surface the error — judgment is the user-facing primary work
+        // here; if the agent opted into structured enrichment they need
+        // to know it failed so they can retry.
+        enrichmentReport = (
+          `\n\nWARNING: end_session enrichment failed (exit ${result.status}).` +
+          `\nstderr: ${(result.stderr ?? '').toString().slice(0, 800)}`
+        )
+      } else {
+        try {
+          const parsed = JSON.parse((result.stdout ?? '').toString())
+          const drained = parsed.cascades_drained ?? 0
+          enrichmentReport = (
+            `\n\nEnrichment applied: ${parsed.status}.` +
+            ` Cascades drained: ${drained}.` +
+            (parsed.drain_error ? ` (drain warning: ${parsed.drain_error})` : '')
+          )
+        } catch {
+          enrichmentReport = `\n\nEnrichment applied; raw output: ${(result.stdout ?? '').toString().slice(0, 200)}`
+        }
+      }
+    }
+
+    return { content: [{ type: 'text', text: `Session summary stored for project "${project}".${enrichmentReport}` }] }
   },
 )
 
