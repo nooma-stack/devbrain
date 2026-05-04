@@ -20,6 +20,7 @@ from pathlib import Path
 from state_machine import FactoryDB, FactoryJob, JobStatus
 from cli_executor import run_cli, notify_desktop, DEFAULT_CLI_ASSIGNMENTS
 from config import FACTORY_FIX_LOOP_WARNINGS_TRIGGER_RETRY
+from curator.worker import drain_one_batch as drain_curator_queue
 from learning import extract_lessons, get_review_lessons
 from cleanup_agent import CleanupAgent
 from file_registry import FileRegistry
@@ -424,6 +425,19 @@ class FactoryOrchestrator:
 
         cleanup = CleanupAgent(self.db)
         logger.info("Starting pipeline for job %s: %s", job_id[:8], job.title)
+
+        # Cascade re-eval queue drainer — sibling poll alongside the
+        # factory's per-job pipeline. Each invocation of run_job drains
+        # any pending curator_re_eval_queue rows so the planner sees the
+        # most up-to-date strength values when the brief is generated.
+        # Failures are non-fatal: the job pipeline is the primary work.
+        try:
+            with self.db._conn() as drain_conn:
+                drained = drain_curator_queue(drain_conn, batch_size=50)
+            if drained:
+                logger.info("curator: drained %d queue rows", drained)
+        except Exception:
+            logger.exception("curator: drain failed (non-blocking)")
 
         # Pre-job factory readiness check. Any dirty state discovered here
         # is either auto-repaired or the job is blocked — we never start
