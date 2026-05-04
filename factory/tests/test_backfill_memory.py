@@ -309,17 +309,26 @@ def test_backfill_decisions_uses_correct_kind(db):
 
 def test_backfill_idempotent_via_on_conflict(db):
     pid = _devbrain_project_id(db)
+
+    # Drain any pre-existing chunks left by sibling tests in the same
+    # `devbrain` project. The backfill is idempotent (ON CONFLICT
+    # DO NOTHING) but paginated by batch_size, so without draining first
+    # the second call below would still see un-processed pre-existing
+    # chunks and `second["inserted"]` would be > 0. Draining converges
+    # because once everything's in `devbrain.memory`, backfill_chunks
+    # returns inserted=0.
+    while backfill_memory.backfill_chunks(db, batch_size=200)["inserted"] > 0:
+        pass
+
     for i in range(5):
         _seed_chunk(db, project_id=pid, content=f"{TEST_CONTENT_PREFIX}idem{i}")
 
-    first = backfill_memory.backfill_chunks(db, batch_size=10)
+    first = backfill_memory.backfill_chunks(db, batch_size=200)
     assert first["inserted"] >= 5
     first_inserted = first["inserted"]
 
-    second = backfill_memory.backfill_chunks(db, batch_size=10)
+    second = backfill_memory.backfill_chunks(db, batch_size=200)
     assert second["inserted"] == 0
-    # The 5 we just seeded must show up as dups on the second pass.
-    # Other concurrent backfills may have added more dups, so use >=.
     assert second["skipped_dup"] >= first_inserted
 
 
@@ -479,6 +488,14 @@ def test_backfill_skips_raw_session_with_null_summary(db):
 
 def test_backfill_all_then_rerun_inserts_zero(db):
     pid = _devbrain_project_id(db)
+
+    # Drain any pre-existing rows from sibling tests so the second call
+    # below has a clean baseline. Without this, batch_size pagination
+    # leaves un-processed chunks/decisions/etc. that show up as
+    # `second["TOTAL"]["inserted"] > 0`.
+    while backfill_memory.backfill_all(db, batch_size=200)["TOTAL"]["inserted"] > 0:
+        pass
+
     _seed_chunk(db, project_id=pid, content=f"{TEST_CONTENT_PREFIX}rerun c")
     _seed_decision(
         db, project_id=pid,
@@ -500,6 +517,6 @@ def test_backfill_all_then_rerun_inserts_zero(db):
         summary=f"{TEST_CONTENT_PREFIX}rerun rs summary",
     )
 
-    backfill_memory.backfill_all(db, batch_size=10)
-    second = backfill_memory.backfill_all(db, batch_size=10)
+    backfill_memory.backfill_all(db, batch_size=200)
+    second = backfill_memory.backfill_all(db, batch_size=200)
     assert second["TOTAL"]["inserted"] == 0
