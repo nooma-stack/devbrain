@@ -1564,15 +1564,147 @@ gh pr create --title "feat(curator): Atlas Step 5d — brief generator + flip P1
 
 ---
 
-## Phase 5e — `end_session()` enrichment
+## Phase 5e — `store()` cascade enqueue + `end_session()` enrichment + drain trigger
+
+> **Three concerns in one phase, all in the MCP server layer:**
+>
+> 1. **`store()` cascade detection + enqueue** — when an agent calls `store()`
+>    with a cascading mutation (writes a `supersedes` edge, sets `archived_at`,
+>    or mutates `applies_when`), detect affected dependents from
+>    `memory_dependencies` and INSERT into `devbrain.curator_re_eval_queue`.
+>    Without this, the queue is always empty in normal operation.
+> 2. **`end_session()` enrichment** — accepts `cascade_decisions`,
+>    `new_relationships`, `lesson_candidates` from the calling agent.
+> 3. **`end_session()` drain trigger** — after applying judgment from
+>    enrichment payload, drain the queue. Honors the design promise that
+>    ripple effects propagate from anywhere (chat sessions + factory jobs),
+>    not just at factory job startup.
+>
+> **Architecture (per locked design + Patrick's option E refinement on 2026-05-04):**
+>
+> | Trigger | When | Action |
+> |---|---|---|
+> | Mid-session `store()` | Agent writes a cascading mutation | **Enqueue** affected dependents (5e-NEW-1) |
+> | `end_session()` | Agent ends session | Apply judgment payload (5e-1..6) + **Drain** queue (5e-NEW-2) |
+> | Factory job `QUEUED → PLANNING` | New factory job submitted | Drain queue (already shipped in 5c) |
+>
+> Without enqueue (5e-NEW-1), the drain triggers (factory + end_session)
+> have nothing to do. They land together.
 
 **Files:**
 - Create: `factory/curator/end_session.py`
 - Modify: `mcp-server/src/index.ts` — add new optional params to `end_session` tool schema
-- Modify: `mcp-server/src/memory.ts` (or wherever `end_session` impl lives) — plumb new params to DB
+- Modify: `mcp-server/src/memory.ts` (or wherever `store` + `end_session` impls live) — add cascade detection + enqueue to `store()`; plumb `end_session()` enrichment + drain trigger
 - Test: `factory/tests/test_curator_end_session.py`
+- Test: `factory/tests/test_store_cascade_enqueue.py` (NEW — covers 5e-NEW-1)
 - Postulate: `tests/postulates/test_p_end_session_isolation.py`
 - Postulate: `tests/postulates/test_p_end_session_idempotent.py`
+
+### Task 5e-NEW-1: `store()` cascade detection + enqueue
+
+When `store()` is called, after the memory row is inserted/updated, detect
+whether the mutation should cascade and enqueue affected dependents.
+
+**Three cascade triggers** (matches the `edge_type` CHECK on `curator_re_eval_queue`):
+
+1. **Writing a `supersedes` edge** — the new row has `supersedes=[old_id]`
+   in its params; `old_id` is the cascade source. Walk
+   `memory_dependencies` to find all rows where
+   `to_memory_id=old_id AND edge_type='depends_on'`. Enqueue each as
+   `(memory_id=dependent, cascade_source_id=old_id, edge_type='supersedes')`.
+2. **Setting `archived_at`** — `store()` archived a memory. The archived
+   memory_id is the cascade source. Walk dependents, enqueue with
+   `edge_type='archived_at'`.
+3. **Mutating `applies_when`** — `store()` updated a memory's
+   `applies_when` JSONB. Walk dependents, enqueue with
+   `edge_type='applies_when'`.
+
+**Use `INSERT … ON CONFLICT (memory_id, cascade_source_id, edge_type) WHERE attempt_count < 3 DO NOTHING`** to dedup against the partial unique index from migration 017. PG 15+ supports WHERE-clause conflict targets.
+
+**Implementation in `mcp-server/src/memory.ts`** (TypeScript). Pattern:
+
+```typescript
+// Inside the store handler, after the INSERT/UPDATE on devbrain.memory:
+async function enqueueCascades(
+  client: Pool,
+  cascadeSourceId: string,
+  edgeType: 'supersedes' | 'archived_at' | 'applies_when'
+): Promise<void> {
+  await client.query(
+    `INSERT INTO devbrain.curator_re_eval_queue
+       (memory_id, cascade_source_id, edge_type)
+     SELECT from_memory_id, $1, $2
+     FROM devbrain.memory_dependencies
+     WHERE to_memory_id = $1 AND edge_type = 'depends_on'
+     ON CONFLICT (memory_id, cascade_source_id, edge_type)
+       WHERE attempt_count < 3 DO NOTHING`,
+    [cascadeSourceId, edgeType]
+  );
+}
+
+// Trigger points in store handler:
+if (params.supersedes && params.supersedes.length > 0) {
+  for (const oldId of params.supersedes) {
+    await enqueueCascades(pool, oldId, 'supersedes');
+  }
+}
+if (params.archived_at && !previousArchivedAt) {
+  await enqueueCascades(pool, memoryId, 'archived_at');
+}
+if (params.applies_when && !deepEqual(params.applies_when, previousAppliesWhen)) {
+  await enqueueCascades(pool, memoryId, 'applies_when');
+}
+```
+
+**Test (`factory/tests/test_store_cascade_enqueue.py`)** — 3 integration
+tests, one per cascade trigger. Each writes a memory with the trigger,
+queries `curator_re_eval_queue`, asserts the expected dependent rows
+appear with the correct `(memory_id, cascade_source_id, edge_type)`.
+Use the `project_factory` + `memory_factory` fixtures from
+`factory/tests/conftest.py` (added in 5c). Setup: insert source, insert
+dependent, INSERT a `depends_on` edge, then exercise the store handler
+(may need to drive via the MCP server end-to-end OR call the
+TypeScript handler logic via a Python test wrapper — implementer's call).
+
+**Coverage gate:** the `enqueueCascades` function and its three call
+sites in the store handler must be exercised by these 3 tests.
+
+### Task 5e-NEW-2: `end_session()` drain trigger
+
+After `end_session_idempotent_handler` applies the structured judgment,
+call `drain_one_batch(conn, batch_size=200)`. Larger batch than the
+factory job startup default (50) because end_session is a natural
+"catch up" moment.
+
+**Add to `factory/curator/end_session.py`** at the end of
+`end_session_idempotent_handler`, after the `INSERT INTO end_session_log`:
+
+```python
+# Drain everything the session enqueued (during work) plus what step 1 just added.
+# Larger batch — end_session is a natural catch-up moment.
+from curator.worker import drain_one_batch
+try:
+    drained = drain_one_batch(conn, batch_size=200)
+    result["cascades_drained"] = drained
+except Exception as exc:  # noqa: BLE001
+    # Drain failure should NOT fail end_session — judgment already persisted.
+    # Log and continue.
+    import logging
+    logging.getLogger(__name__).exception("end_session drain failed: %s", exc)
+    result["cascades_drained"] = 0
+    result["drain_error"] = str(exc)[:500]
+```
+
+The drain failure is non-fatal — judgment is the user-facing primary
+work; drain is a "best-effort cleanup" that runs in the same call.
+Failed drain rows stay in queue for the next end_session OR factory job.
+
+**Test:** add to `factory/tests/test_curator_end_session.py`:
+`test_end_session_drains_queue_after_applying_judgment` — set up cascade
+queue rows pre-call, fire end_session, assert queue rows drained AND
+strength values updated AND `cascades_drained` count in result.
+
+
 
 ### Task 5e-1: Implement `factory/curator/end_session.py`
 

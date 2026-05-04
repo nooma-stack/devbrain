@@ -8,17 +8,20 @@ within the same transaction.
 
 STATUS
 ------
-xfail(strict=True) until the curator agent (Atlas Step 5 in
-docs/plans/2026-04-29-phase-3-discipline-layer.md §7) lands. The
-substrate that the test stands on (memory_dependencies edges) is
-already shipped in migration 014 — what's missing is the curator's
-re-evaluation queue.
+xfail(strict=True) until **Phase 5e** ships the MCP `store()`
+cascade-detection-and-enqueue path. Atlas Step 5d ships the brief
+generator (P2 flips green) and the cascade worker drainer + queue
+substrate, but the enqueue side — converting a `supersedes` edge
+write into rows in `devbrain.curator_re_eval_queue` — is the
+explicit responsibility of the MCP server's `store()` tool per the
+locked design (docs/plans/2026-05-04-step-5-curator-design.md §3.1
+Pathway 1) and Phase 5e of the implementation plan
+(2026-05-04-step-5-curator-implementation.md §5e-NEW-1).
 
-Strict mode means: the day the curator queue does start surfacing
-dependents, this test FLIPS GREEN and CI fails (XPASS). That forces
-us back here to remove the xfail marker and own the postulate
-properly. Without strict=True the test would silently keep "passing
-by failing" forever.
+Strict mode means: when Phase 5e lands and supersession edges start
+populating the queue automatically, this test FLIPS GREEN and CI
+fails (XPASS). That forces us back here to remove the marker and
+own the postulate.
 """
 from __future__ import annotations
 
@@ -27,8 +30,12 @@ import pytest
 
 @pytest.mark.xfail(
     strict=True,
-    reason="Curator cascade re-eval queue lands in Atlas Step 5; "
-    "see docs/plans/2026-04-29-phase-3-discipline-layer.md §4.",
+    reason=(
+        "Cascade enqueue path lives in MCP store() — ships in Phase 5e "
+        "(see docs/plans/2026-05-04-step-5-curator-implementation.md §5e-NEW-1). "
+        "5d shipped the brief + worker drainer; the enqueue side is gated "
+        "behind 5e."
+    ),
 )
 def test_supersession_queues_dependent_for_reeval(
     conn, project_factory, memory_factory
@@ -68,13 +75,14 @@ def test_supersession_queues_dependent_for_reeval(
         )
     conn.commit()
 
-    # The curator re-eval queue does not exist yet. When Step 5 lands
-    # this query needs to be replaced with the real reader.
+    # The Phase 5e enqueue path should populate the queue here.
+    # Until 5e ships this query returns [] and the assertion fails
+    # (which is what the xfail marker captures).
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT memory_id FROM devbrain.curator_reeval_queue "
-            "WHERE project_id = %s",
-            (project["id"],),
+            "SELECT memory_id FROM devbrain.curator_re_eval_queue "
+            "WHERE cascade_source_id = %s AND edge_type = 'supersedes'",
+            (m_old["id"],),
         )
         queued = [r[0] for r in cur.fetchall()]
 
