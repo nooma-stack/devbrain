@@ -91,9 +91,21 @@ def project_factory(conn):
     # table). Roll back before cleanup so the DELETE statements run.
     conn.rollback()
 
-    # Order: ledger rows first (no FK), then deps, then memory, then project.
+    # Order: queue rows + ledger rows first (FK to memory), then deps,
+    # then end_session_log (FK to project), then memory, then project.
+    # Phase 5e adds end_session_log (FK project_id) and reuses the
+    # curator_re_eval_queue from Phase 5a (FK memory_id ON DELETE CASCADE
+    # but cascade_source_id plain REFERENCES, so explicit DELETE first).
     with conn.cursor() as cur:
         for pid in created:
+            cur.execute(
+                "DELETE FROM devbrain.curator_re_eval_queue "
+                "WHERE memory_id IN "
+                "(SELECT id FROM devbrain.memory WHERE project_id = %s) "
+                "OR cascade_source_id IN "
+                "(SELECT id FROM devbrain.memory WHERE project_id = %s)",
+                (pid, pid),
+            )
             cur.execute(
                 "DELETE FROM devbrain.memory_ledger "
                 "WHERE memory_id IN (SELECT id FROM devbrain.memory WHERE project_id = %s)",
@@ -105,6 +117,16 @@ def project_factory(conn):
                 "   OR to_memory_id   IN (SELECT id FROM devbrain.memory WHERE project_id = %s)",
                 (pid, pid),
             )
+            # end_session_log added in migration 018; gracefully missing
+            # in installs that haven't migrated yet (test will SKIP rather
+            # than ERROR there).
+            try:
+                cur.execute(
+                    "DELETE FROM devbrain.end_session_log WHERE project_id = %s",
+                    (pid,),
+                )
+            except Exception:
+                conn.rollback()
             cur.execute("DELETE FROM devbrain.memory WHERE project_id = %s", (pid,))
             cur.execute("DELETE FROM devbrain.projects WHERE id = %s", (pid,))
     conn.commit()

@@ -141,6 +141,16 @@ def project_factory(conn):
                 "(SELECT id FROM devbrain.memory WHERE project_id = %s)",
                 (pid, pid),
             )
+            # end_session_log (migration 018) FKs project_id; clean up
+            # before deleting the project. Missing-table exception is
+            # swallowed to keep older installs green.
+            try:
+                cur.execute(
+                    "DELETE FROM devbrain.end_session_log WHERE project_id = %s",
+                    (pid,),
+                )
+            except Exception:
+                conn.rollback()
             cur.execute(
                 "DELETE FROM devbrain.memory WHERE project_id = %s", (pid,)
             )
