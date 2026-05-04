@@ -47,13 +47,10 @@ jobs:
         # pure — those run locally fine but break CI without a service
         # container.
         #
-        # Adding a "DB-available" workflow with a pgvector service container
-        # for broader coverage is tracked as a follow-up — earlier attempts
-        # hit migrate-vs-schema-bootstrap ordering issues. The right next
-        # step there is `psql -f migrations/001_initial_schema.sql` first,
-        # then `python factory/cli.py migrate` for everything else (so the
-        # migrate command's schema_migrations writes have a target table
-        # to write to).
+        # The DB-available counterpart lives in the `pytest-db` job below,
+        # which spins up a pgvector service container, applies all
+        # migrations in order, and runs the postulates + curator
+        # integration tests (Atlas Step 5f).
         run: |
           cd factory
           python -m pytest \
@@ -72,3 +69,91 @@ jobs:
             tests/test_seed_ports.py \
             tests/test_compose_env.py \
             -p no:cacheprovider --tb=short -q
+
+  pytest-db:
+    name: pytest (DB-available — postulates + curator integration)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: devbrain
+          POSTGRES_PASSWORD: devbrain-ci
+          POSTGRES_DB: devbrain
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U devbrain"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Bootstrap schema (apply all migrations in order)
+        # Migration 001 creates the `vector` extension and the devbrain
+        # schema; subsequent migrations build on it. Apply every
+        # migrations/0NN_*.sql in numerical order.
+        env:
+          PGPASSWORD: devbrain-ci
+        run: |
+          for f in $(ls migrations/0*.sql | sort); do
+            echo "Applying $f..."
+            psql -h localhost -p 5432 -U devbrain -d devbrain -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: Run postulates (rootdir = repo root)
+        # Conftest gates on DEVBRAIN_DB_PASSWORD and reads
+        # DEVBRAIN_DB_HOST_PORT (not DEVBRAIN_DB_PORT) — see
+        # tests/postulates/conftest.py.
+        env:
+          DEVBRAIN_DB_HOST: localhost
+          DEVBRAIN_DB_HOST_PORT: "5432"
+          DEVBRAIN_DB_USER: devbrain
+          DEVBRAIN_DB_PASSWORD: devbrain-ci
+          DEVBRAIN_DB_NAME: devbrain
+        run: |
+          python -m pytest tests/postulates/ -v --tb=short
+
+      - name: Run curator + migration + cascade integration tests (rootdir = factory/)
+        # factory/tests/conftest.py uses the same env-var contract; rootdir
+        # differs because pytest discovers factory/pytest.ini.
+        env:
+          DEVBRAIN_DB_HOST: localhost
+          DEVBRAIN_DB_HOST_PORT: "5432"
+          DEVBRAIN_DB_USER: devbrain
+          DEVBRAIN_DB_PASSWORD: devbrain-ci
+          DEVBRAIN_DB_NAME: devbrain
+        run: |
+          cd factory && python -m pytest \
+            tests/test_curator_brief.py \
+            tests/test_curator_end_session.py \
+            tests/test_curator_strength.py \
+            tests/test_curator_types.py \
+            tests/test_curator_worker.py \
+            tests/test_migration_017.py \
+            tests/test_migration_018.py \
+            tests/test_store_cascade_enqueue.py \
+            -v --tb=short
