@@ -2749,5 +2749,40 @@ def import_memory_cmd(in_path: Path, dry_run: bool) -> None:
     click.echo(mem_msg)
 
 
+# ---------------------------------------------------------------------------
+# Curator subcommands — cascade re-eval queue operations.
+# ---------------------------------------------------------------------------
+
+@cli.group()
+def curator():
+    """Curator agent + cascade queue operations."""
+
+
+@curator.command("queue-stuck")
+def cmd_queue_stuck():
+    """List re-eval queue rows that failed 3+ times.
+
+    These rows have exhausted their retry budget and are skipped by the
+    drain worker. Operator triage: investigate `last_error`, then either
+    fix the underlying problem and DELETE the row (a fresh enqueue is
+    permitted because the dedup partial unique index excludes
+    attempt_count >= 3 rows), or accept the stale strength.
+    """
+    from curator.cli import list_stuck_queue_rows
+
+    db = get_db()
+    with db._conn() as conn:
+        rows = list_stuck_queue_rows(conn)
+    if not rows:
+        click.echo("No stuck rows.")
+        return
+    for r in rows:
+        click.echo(
+            f"{r['id']}  memory={r['memory_id']}  "
+            f"src={r['cascade_source_id']}  edge={r['edge_type']}  "
+            f"attempts={r['attempt_count']}  err={r['last_error']!r}"
+        )
+
+
 if __name__ == "__main__":
     cli()
