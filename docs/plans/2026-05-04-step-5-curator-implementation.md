@@ -75,6 +75,15 @@ CREATE INDEX IF NOT EXISTS idx_re_eval_queue_unfailed
     ON devbrain.curator_re_eval_queue (enqueued_at)
     WHERE attempt_count < 3;
 
+-- Dedup active queue rows. The cascade penalty is additive (not idempotent), so
+-- two simultaneous enqueues for the same (dependent, source, edge_type) triplet
+-- would double-penalize. The enqueue path uses INSERT ... ON CONFLICT DO NOTHING
+-- against this index. Failed rows (attempt_count = 3) don't block legitimate
+-- re-enqueues after they're surfaced and triaged.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_re_eval_queue_dedup
+    ON devbrain.curator_re_eval_queue (memory_id, cascade_source_id, edge_type)
+    WHERE attempt_count < 3;
+
 -- Audit: last time the cascade worker touched this memory row.
 ALTER TABLE devbrain.memory
     ADD COLUMN IF NOT EXISTS last_cascade_at TIMESTAMPTZ;
