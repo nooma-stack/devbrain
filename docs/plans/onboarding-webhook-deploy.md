@@ -32,39 +32,37 @@ hostile to SSH-only operation, and bought us nothing in return.
 Running under launchd directly with the existing devbrain venv is
 simpler, faster to iterate, and easier to debug.
 
-## ⚠️ Known issue on this Mac Studio (2026-05-01)
+## Tahoe TCC platform issue — resolved (2026-05-04)
 
-Empirically: Python 3.14.4 + macOS arm64 + launchd is dropping
-`http.server`'s listening socket into CLOSED state immediately after
-bind. The bind succeeds, the log line prints, but the server never
-serves connections. Reproduces with:
-- ThreadingHTTPServer in main thread
-- ThreadingHTTPServer in worker thread
-- Plain HTTPServer
-- Bare `python3.14 -m http.server` invocation under launchd
-- Same `python -m http.server` backgrounded with `&`
-- Same in tmux detached session
-- nohup, setsid, script, launchctl asuser variants
+**Original symptom (2026-05-01):** Python 3.14 + macOS Tahoe + launchd
+dropped `http.server`'s listening socket into CLOSED state immediately
+after bind. Diagnosed as macOS 26 (Tahoe) silently denying the new
+"Local Network" TCC permission to faceless launchd processes (no UI to
+display the consent prompt). Reproduced with every `http.server`
+variant we tried (ThreadingHTTPServer, plain HTTPServer, bare
+`python -m http.server`, nohup/setsid/launchctl-asuser) — all bound
+and immediately closed. **Worked only when run interactively in an
+attached TTY** because TTY-attached processes inherit the GUI user's
+TCC grants.
 
-The same code works correctly when run **interactively in an attached
-TTY** (`./bin/devbrain-onboard` in a foreground Terminal session).
-This points at TTY/process-group/signal handling in the macOS arm64
-build of Python 3.14.
+**Resolution:** `launchd/com.devbrain.onboard.plist` was updated to
+tunnel the program through `/usr/bin/login -fpq` and set
+`SessionCreate=true`, both of which place the spawned process inside
+the GUI user's Aqua session context. The session inherits the user's
+existing Local Network TCC grant, so http.server's bind survives and
+the socket actually listens.
 
-**Workaround for now:** run the webhook in an attached tmux session
-on the Mac Studio's GUI shell (Patrick's Terminal.app while RDP'd in,
-or an SSH session with `-t` from a real terminal). The session must
-have a controlling TTY. Document a follow-up to investigate further:
-- Try Python 3.13 (we installed it; same issue reproduces)
-- Try Python 3.12 (not yet installed; potentially affected)
-- Replace stdlib http.server with `aiohttp` or `flask + waitress`
-- File against Python upstream / Apple if the simple repro is real
+**Verified working** on 2026-05-04 with Mac Studio Tahoe + Python 3.14
++ devbrain venv:
+- `launchctl load -w` succeeds
+- Python process binds 127.0.0.1:8000 in LISTEN state
+- `curl http://127.0.0.1:8000/healthz` returns `{"status":"ok"}`
+- Survives launchd respawn after kill -9
 
-If you can spin a Terminal.app on the Mac Studio's GUI session and
-run `./bin/devbrain-onboard` there, the rest of this doc applies as
-written. Skip Step 2 (launchd plist) until the platform issue is
-resolved — `bin/devbrain-onboard` running under tmux-attach is
-sufficient for the alpha onboarding workflow.
+**No follow-up investigation needed.** The original "try Python 3.13 /
+3.12, file against Python upstream" leads were chasing the wrong
+problem — it wasn't a Python http.server bug, it was a macOS TCC
+deny. The plist workaround is sufficient and stable.
 
 ## Step 1 — Smoke-test the webhook on the Mac Studio
 
@@ -82,7 +80,7 @@ curl -s http://127.0.0.1:8000/healthz
 # {"status":"ok"}
 ```
 
-## Step 2 — Install the launchd plist (gated on platform-issue resolution)
+## Step 2 — Install the launchd plist
 
 Copy `com.devbrain.onboard.plist` to
 `~/Library/LaunchAgents/com.devbrain.onboard.plist`, then load it:
