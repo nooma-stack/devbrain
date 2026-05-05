@@ -4,10 +4,12 @@ Synchronous; called from FactoryDB.transition() at the QUEUED -> PLANNING
 edge. Pure filtering + ranking — no LLM in v3.0. Could become LLM-driven
 later without breaking the CuratorBrief v1.0 contract.
 
-Profile filtering depends on the compliance_profiles columns shipped in
-Step 7. Until then, all tier='rule' rows are loaded (no profile filter)
-— the SELECT is wrapped in try/except + rollback so the same code keeps
-working before and after the column ships.
+Profile filtering uses the compliance_profiles columns shipped in
+Step 7a (migration 022). Semantics are explicit opt-in:
+- Project with empty/NULL compliance_profiles_enabled => NO rules apply.
+- Rule with empty/NULL compliance_profiles is invisible to all projects.
+- A rule appears in a project's brief iff
+  rule.compliance_profiles && project.compliance_profiles_enabled.
 """
 from __future__ import annotations
 
@@ -32,10 +34,7 @@ def generate_brief(
     """Generate a CuratorBrief and persist to factory_jobs.curator_brief.
 
     The conn must already be in a clean state (no aborted transaction).
-    On success the brief is committed via _persist_to_job. On any
-    SELECT-level failure caused by missing Step 7 columns, the function
-    rolls back the failed query and falls through to a no-filter SELECT
-    so the rest of the brief still builds.
+    On success the brief is committed via _persist_to_job.
     """
     profiles = _load_enabled_profiles(conn, project_id)
     rules = _load_rules(conn, project_id, profiles)
@@ -59,40 +58,37 @@ def generate_brief(
 
 
 def _load_enabled_profiles(conn, project_id) -> list[str]:
-    """Step 7 column. Returns [] if column doesn't exist yet."""
+    """Return the project's enabled compliance profiles, or [] if NULL/absent."""
     with conn.cursor() as cur:
-        try:
-            cur.execute(
-                "SELECT compliance_profiles_enabled FROM devbrain.projects "
-                "WHERE id = %s",
-                (project_id,),
-            )
-            row = cur.fetchone()
-            return list(row[0] or []) if row and row[0] else []
-        except Exception:
-            conn.rollback()
+        cur.execute(
+            "SELECT compliance_profiles_enabled FROM devbrain.projects "
+            "WHERE id = %s",
+            (project_id,),
+        )
+        row = cur.fetchone()
+        if not row:
             return []
+        return list(row[0] or [])
 
 
 def _load_rules(conn, project_id, profiles) -> list[MemoryRef]:
-    """Filter by profile intersection if Step 7 column exists; else all rules."""
-    base = (
-        "SELECT id, kind, title, content, tier, strength, last_cascade_at "
-        "FROM devbrain.memory "
-        "WHERE project_id = %s AND tier = 'rule' AND archived_at IS NULL"
-    )
+    """Filter rules by compliance-profile intersection.
+
+    Per P6 semantics: a project with no enabled profiles gets NO rules.
+    Per P7 semantics: rules surface iff their compliance_profiles
+    overlaps the project's compliance_profiles_enabled.
+    """
+    if not profiles:
+        return []
     with conn.cursor() as cur:
-        if profiles:
-            try:
-                cur.execute(
-                    base + " AND compliance_profiles && %s "
-                    "ORDER BY strength DESC",
-                    (project_id, profiles),
-                )
-                return [_to_ref(row) for row in cur.fetchall()]
-            except Exception:
-                conn.rollback()
-        cur.execute(base + " ORDER BY strength DESC", (project_id,))
+        cur.execute(
+            "SELECT id, kind, title, content, tier, strength, last_cascade_at "
+            "FROM devbrain.memory "
+            "WHERE project_id = %s AND tier = 'rule' AND archived_at IS NULL "
+            "  AND compliance_profiles && %s::text[] "
+            "ORDER BY strength DESC",
+            (project_id, profiles),
+        )
         return [_to_ref(row) for row in cur.fetchall()]
 
 
