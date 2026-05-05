@@ -284,6 +284,18 @@ class FactoryDB:
         ):
             self._generate_brief_for_planning(job_id, job.project_id, job.spec)
 
+        # Curator eval phase hook. Runs at IMPLEMENTING -> REVIEWING only.
+        # Invokes the two eval agents (security + test) over the brief +
+        # plan + diff, applies the three-signal feedback loop to the
+        # surfaced memories, processes the refinement queue, and runs the
+        # rule-demotion sweep. See docs/plans/2026-05-04-step-6-eval-
+        # graduation-design.md §3 + Phase 6e Task 6e-1.
+        if (
+            job.status == JobStatus.IMPLEMENTING
+            and new_status == JobStatus.REVIEWING
+        ):
+            self._run_eval_phase(job)
+
         return self.get_job(job_id)
 
     def _generate_brief_for_planning(
@@ -329,6 +341,107 @@ class FactoryDB:
                 (json.dumps({"brief_error": error[:1000]}), job_id),
             )
             conn.commit()
+
+    def _run_eval_phase(self, job: FactoryJob) -> None:
+        """Run eval agents + graduation + refinement + demotion sweep.
+
+        Fires at IMPLEMENTING -> REVIEWING. Failure isolation: any
+        exception from the eval pipeline is logged but NOT re-raised, so
+        a flaky LLM doesn't block the state machine from advancing the
+        job to REVIEWING. The architecture/security review (the existing
+        review path) runs immediately after this returns and provides a
+        second line of defense.
+
+        See docs/plans/2026-05-04-step-6-eval-graduation-design.md
+        §Phase 6e for the contract.
+        """
+        # Local imports to avoid circulars at module load — the curator
+        # subpackage doesn't import state_machine, but the eval runner
+        # spawns subprocess.run for `claude` and we want lazy loading.
+        from curator.eval.runner import run_evals
+        from curator.graduation import (
+            apply_feedback_signals,
+            demote_low_precision_rules,
+        )
+        from curator.refinement import refine_applies_when
+
+        try:
+            brief = self._load_brief(job.id)
+            plan = self._load_plan(job.id)
+            diff = self._load_diff(job.id)
+
+            with self._conn() as conn:
+                eval_results = run_evals(conn, job.id, brief, plan, diff)
+                apply_feedback_signals(conn, job.id, brief, eval_results)
+                refine_applies_when(conn, job.project_id)
+                demote_low_precision_rules(conn, job.project_id)
+        except Exception:
+            # Don't block the state machine on eval failures — log and
+            # let the existing review/QA paths catch downstream issues.
+            logger.exception(
+                "Eval phase failed for job %s; continuing to REVIEWING",
+                job.id[:8],
+            )
+
+    def _load_brief(self, job_id: str) -> dict:
+        """Load the curator brief snapshot from factory_jobs.curator_brief.
+
+        Returns an empty dict if no brief was generated (e.g. brief
+        generation failed at QUEUED -> PLANNING). The eval prompts are
+        designed to handle empty input gracefully.
+        """
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT curator_brief FROM devbrain.factory_jobs WHERE id = %s",
+                (job_id,),
+            )
+            row = cur.fetchone()
+        if row is None or row[0] is None:
+            return {}
+        return row[0]
+
+    def _load_plan(self, job_id: str) -> str:
+        """Load the implementation plan stored as a planning artifact.
+
+        The orchestrator writes the plan via store_artifact(phase=
+        'planning', artifact_type='plan_doc'). If multiple plan_doc
+        artifacts exist (e.g. after a replan resolution from BLOCKED),
+        the most recent wins.
+        """
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT content FROM devbrain.factory_artifacts "
+                "WHERE job_id = %s AND phase = 'planning' "
+                "  AND artifact_type = 'plan_doc' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (job_id,),
+            )
+            row = cur.fetchone()
+        return row[0] if row else ""
+
+    def _load_diff(self, job_id: str) -> str:
+        """Load the implementation diff stored as an artifact.
+
+        v3.0 reads the cached diff artifact written at the end of the
+        implementation phase (orchestrator stores `git diff main...HEAD
+        --stat`). Phase 3.x: regenerate a full diff from the worktree
+        for richer eval context. If no diff artifact exists (e.g. a
+        legacy job or worktree-less job), return empty string — the
+        eval prompts are designed to handle empty diff (the brief still
+        carries the surfaced memories).
+        """
+        # TODO(Phase 3.x): regenerate a full diff via `git diff
+        # main...HEAD` in the job's worktree for richer eval context.
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT content FROM devbrain.factory_artifacts "
+                "WHERE job_id = %s AND phase = 'implementation' "
+                "  AND artifact_type = 'diff' "
+                "ORDER BY created_at DESC LIMIT 1",
+                (job_id,),
+            )
+            row = cur.fetchone()
+        return row[0] if row else ""
 
     def update_metadata(self, job_id: str, metadata: dict) -> None:
         """Merge the given dict into a job's metadata JSONB without
