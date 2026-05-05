@@ -2784,5 +2784,31 @@ def cmd_queue_stuck():
         )
 
 
+# ---------------------------------------------------------------------------
+# Compliance-rule subcommands — the lint check enforces that every
+# profile-tagged rule ships with a postulate test (Atlas Step 7b).
+# ---------------------------------------------------------------------------
+
+@cli.group()
+def rules():
+    """Compliance rule operations."""
+
+
+@rules.command("lint")
+def cmd_rules_lint():
+    """Verify every profile-tagged rule has a matching postulate test.
+
+    A rule is "profile-tagged" if its compliance_profiles array is
+    non-empty. The lint heuristic: scan tests/postulates/*.py for either
+    the rule's UUID or a slugified title token. Exits 1 if any tagged
+    rule has no matching postulate, 0 otherwise.
+    """
+    from curator.rules_lint import run_lint
+
+    db = get_db()
+    with db._conn() as conn:
+        sys.exit(run_lint(conn))
+
+
 if __name__ == "__main__":
     cli()
