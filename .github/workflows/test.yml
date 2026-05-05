@@ -177,6 +177,7 @@ jobs:
             tests/test_migration_019.py \
             tests/test_migration_020.py \
             tests/test_migration_021.py \
+            tests/test_migration_023.py \
             tests/test_step6_e2e.py \
             tests/test_store_cascade_enqueue.py \
             -v --tb=short
