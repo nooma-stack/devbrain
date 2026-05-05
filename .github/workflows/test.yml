@@ -150,10 +150,20 @@ jobs:
           cd factory && python -m pytest \
             tests/test_curator_brief.py \
             tests/test_curator_end_session.py \
+            tests/test_curator_eval_runner.py \
+            tests/test_curator_eval_types.py \
+            tests/test_curator_graduation.py \
+            tests/test_curator_refinement.py \
             tests/test_curator_strength.py \
             tests/test_curator_types.py \
             tests/test_curator_worker.py \
+            tests/test_eval_security.py \
+            tests/test_eval_test.py \
             tests/test_migration_017.py \
             tests/test_migration_018.py \
+            tests/test_migration_019.py \
+            tests/test_migration_020.py \
+            tests/test_migration_021.py \
+            tests/test_step6_e2e.py \
             tests/test_store_cascade_enqueue.py \
             -v --tb=short
