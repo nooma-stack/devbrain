@@ -28,7 +28,12 @@ from curator.brief import generate_brief  # noqa: E402
 def test_archived_memory_not_in_curator_brief(
     conn, project_factory, memory_factory
 ):
-    project = project_factory("p2")
+    # Step 7 semantics: a rule only surfaces if the project enables a
+    # matching compliance profile. Tag the project + rules so the live
+    # rule is reachable (the archived rule is the actual subject of the
+    # postulate, but we need a positive control so the assertion is
+    # meaningful).
+    project = project_factory("p2", compliance_profiles_enabled=["hipaa"])
 
     # Live memory + lesson + rule — every section the brief surfaces.
     live_decision = memory_factory(
@@ -66,17 +71,19 @@ def test_archived_memory_not_in_curator_brief(
         stale_lesson_id = cur.fetchone()[0]
         cur.execute(
             "INSERT INTO devbrain.memory "
-            "(project_id, kind, title, content, tier) "
-            "VALUES (%s, 'decision', 'live-rule', 'live rule', 'rule') "
+            "(project_id, kind, title, content, tier, compliance_profiles) "
+            "VALUES (%s, 'decision', 'live-rule', 'live rule', 'rule', "
+            "        ARRAY['hipaa']) "
             "RETURNING id",
             (project["id"],),
         )
         live_rule_id = cur.fetchone()[0]
         cur.execute(
             "INSERT INTO devbrain.memory "
-            "(project_id, kind, title, content, tier, archived_at) "
+            "(project_id, kind, title, content, tier, compliance_profiles, "
+            "        archived_at) "
             "VALUES (%s, 'decision', 'stale-rule', 'stale rule', 'rule', "
-            "        now()) "
+            "        ARRAY['hipaa'], now()) "
             "RETURNING id",
             (project["id"],),
         )
