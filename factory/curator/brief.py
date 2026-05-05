@@ -10,6 +10,15 @@ Step 7a (migration 022). Semantics are explicit opt-in:
 - Rule with empty/NULL compliance_profiles is invisible to all projects.
 - A rule appears in a project's brief iff
   rule.compliance_profiles && project.compliance_profiles_enabled.
+
+Rules are sourced from two project namespaces (intentional narrow
+exception to P3 same-project isolation):
+- The target project_id (project-local custom rules).
+- The canonical 'devbrain' project (shared regulatory library — where
+  migration 023 seeds the HIPAA/SOC2/FERPA rule library).
+Lessons, decisions, and cascade signals remain strictly project-local;
+only rule rows cross the project boundary, and only when the target
+project has explicitly opted in via compliance_profiles_enabled.
 """
 from __future__ import annotations
 
@@ -77,17 +86,28 @@ def _load_rules(conn, project_id, profiles) -> list[MemoryRef]:
     Per P6 semantics: a project with no enabled profiles gets NO rules.
     Per P7 semantics: rules surface iff their compliance_profiles
     overlaps the project's compliance_profiles_enabled.
+    Per P_cross_project_rules: rules in the canonical 'devbrain' project
+    are treated as a shared regulatory library and surface in any
+    project's brief when the profile intersection holds.
     """
     if not profiles:
         return []
     with conn.cursor() as cur:
         cur.execute(
+            "SELECT id FROM devbrain.projects WHERE slug = 'devbrain'"
+        )
+        canonical_row = cur.fetchone()
+        project_ids: list = [project_id]
+        if canonical_row and canonical_row[0] != project_id:
+            project_ids.append(canonical_row[0])
+        cur.execute(
             "SELECT id, kind, title, content, tier, strength, last_cascade_at "
             "FROM devbrain.memory "
-            "WHERE project_id = %s AND tier = 'rule' AND archived_at IS NULL "
+            "WHERE project_id = ANY(%s) "
+            "  AND tier = 'rule' AND archived_at IS NULL "
             "  AND compliance_profiles && %s::text[] "
             "ORDER BY strength DESC",
-            (project_id, profiles),
+            (project_ids, profiles),
         )
         return [_to_ref(row) for row in cur.fetchall()]
 
