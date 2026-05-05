@@ -124,6 +124,19 @@ jobs:
             psql -h localhost -p 5432 -U devbrain -d devbrain -v ON_ERROR_STOP=1 -f "$f"
           done
 
+      - name: Lint compliance rules (devbrain rules lint)
+        # Atlas Step 7b: every profile-tagged rule must ship with a
+        # matching postulate test. The lint runs against the empty CI
+        # database (no rules seeded yet) and exits 0 — once Phase 7c
+        # seeds rules, missing postulates will fail this step before
+        # pytest runs, surfacing the gap quickly.
+        # config.py reads DEVBRAIN_DATABASE_URL when set (short-circuits
+        # the yaml lookup), so that single env var is all the lint needs.
+        env:
+          DEVBRAIN_DATABASE_URL: postgresql://devbrain:devbrain-ci@localhost:5432/devbrain
+        run: |
+          cd factory && python -m curator.rules_lint
+
       - name: Run postulates (rootdir = repo root)
         # Conftest gates on DEVBRAIN_DB_PASSWORD and reads
         # DEVBRAIN_DB_HOST_PORT (not DEVBRAIN_DB_PORT) — see
