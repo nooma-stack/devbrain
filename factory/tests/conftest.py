@@ -92,16 +92,31 @@ def project_factory(conn):
     rows, dependency edges, ledger rows, curator queue rows, factory_jobs
     rows) before the project itself — required because committed rows
     are not rolled back by the conn fixture.
+
+    Optional kwarg `compliance_profiles_enabled` (Atlas Step 7a) lets
+    the caller seed devbrain.projects.compliance_profiles_enabled at
+    insert time. Only set when non-None so older installs (pre-022) keep
+    skipping the column.
     """
     created: list[str] = []
 
-    def make(slug_hint: str = "p") -> dict:
+    def make(
+        slug_hint: str = "p",
+        *,
+        compliance_profiles_enabled: list[str] | None = None,
+    ) -> dict:
         slug = f"{TEST_TAG}{slug_hint}_{uuid.uuid4().hex[:8]}"
+        cols = ["slug", "name"]
+        vals: list = [slug, f"Factory Test {slug_hint}"]
+        if compliance_profiles_enabled is not None:
+            cols.append("compliance_profiles_enabled")
+            vals.append(compliance_profiles_enabled)
+        placeholders = ", ".join(["%s"] * len(cols))
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO devbrain.projects (slug, name) VALUES (%s, %s) "
-                "RETURNING id, slug",
-                (slug, f"Factory Test {slug_hint}"),
+                f"INSERT INTO devbrain.projects ({', '.join(cols)}) "
+                f"VALUES ({placeholders}) RETURNING id, slug",
+                vals,
             )
             row = cur.fetchone()
         conn.commit()
@@ -167,9 +182,10 @@ def memory_factory(conn):
     """Insert a devbrain.memory row directly (bypassing the MCP server).
 
     Optional kwargs `tier` and `strength` set those columns at insert time
-    (both ship in migration 010). `compliance_profiles` is silently
-    ignored until that column ships in Step 7 — the kwarg is accepted so
-    forward-compat tests don't have to special-case the call site.
+    (both ship in migration 010). `compliance_profiles` (Atlas Step 7a)
+    sets devbrain.memory.compliance_profiles when non-None — the kwarg
+    was previously a no-op forward-compat slot, now that migration 022
+    has shipped it persists the value.
     """
 
     def make(
@@ -181,7 +197,7 @@ def memory_factory(conn):
         provenance_id: str | None = None,
         tier: str | None = None,
         strength: float | None = None,
-        compliance_profiles: list[str] | None = None,  # noqa: ARG001 — Step 7
+        compliance_profiles: list[str] | None = None,
     ) -> dict:
         title = title or f"{TEST_TAG}title_{uuid.uuid4().hex[:6]}"
         content = content or f"{TEST_TAG}body_{uuid.uuid4().hex[:6]}"
@@ -194,6 +210,9 @@ def memory_factory(conn):
         if strength is not None:
             cols.append("strength")
             vals.append(strength)
+        if compliance_profiles is not None:
+            cols.append("compliance_profiles")
+            vals.append(compliance_profiles)
 
         placeholders = ", ".join(["%s"] * len(cols))
         with conn.cursor() as cur:

@@ -18,11 +18,6 @@ from curator.brief import generate_brief
 
 
 @pytest.mark.db
-@pytest.mark.skip(
-    reason="TODO Step 7: re-enable when compliance_profiles + "
-    "compliance_profiles_enabled columns ship. brief.py already handles "
-    "the missing-column case gracefully (try/except around the SELECT)."
-)
 def test_brief_filters_by_compliance_profiles(
     conn, project_factory, memory_factory, factory_job_factory
 ):
