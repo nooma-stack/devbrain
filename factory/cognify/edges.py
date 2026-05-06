@@ -12,10 +12,12 @@ LLM cost ceiling: max 15 calls per pass for contradicts detection.
 
 Phase 5 dependency: walk() is called directly. Phase 5 is live in main
 (commit 9523987). No fallback needed.
+
+Spend tracking: each LLM call for contradiction detection writes a row to
+devbrain.cognify_spend_log via observability.spend.record_spend.
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
 from typing import Any
@@ -23,11 +25,16 @@ from uuid import UUID
 
 from cognify.orchestrator import CognifyPass, PassResult, register_pass
 from graph.walker import walk
+from observability.pricing import SONNET_4_6, compute_cost_usd
+from observability.spend import record_spend
 
 logger = logging.getLogger(__name__)
 
 # Max LLM calls per pass for contradicts detection.
 MAX_LLM_CALLS_PER_PASS = 15
+
+# Model used for contradiction judgment. Must match a key in observability/pricing.py.
+_EDGES_MODEL = "claude-sonnet-4-6"
 
 # Walk parameters for contradiction candidate selection.
 CONTRADICTION_MAX_HOPS = 3
@@ -75,7 +82,7 @@ def _run_edges(
     """Main edges pass logic. Returns (cites_new, contradicts_new, llm_calls)."""
     cites_new = _detect_cites(conn, project_id, dry_run=dry_run)
     contradicts_new, llm_calls = _detect_contradicts(
-        conn, project_id, dry_run=dry_run
+        conn, project_id, dry_run=dry_run, record_conn=conn
     )
     return cites_new, contradicts_new, llm_calls
 
@@ -138,7 +145,11 @@ def _normalize_title(title: str) -> str:
 
 
 def _detect_contradicts(
-    conn: Any, project_id: Any, *, dry_run: bool = False
+    conn: Any,
+    project_id: Any,
+    *,
+    dry_run: bool = False,
+    record_conn: Any = None,
 ) -> tuple[int, int]:
     """Detect contradicts edges using Phase 5 graph_walk + LLM judgment.
 
@@ -148,6 +159,10 @@ def _detect_contradicts(
     the 'contradicts' edge type (to find existing contradicts neighbors)
     plus 'cites'/'derived_from' (to find semantically related candidates).
     (seed, neighbor) pairs are the LLM judgment candidates.
+
+    record_conn: connection used to write spend log rows. When None, spend
+        is not recorded (e.g. dry_run or test scenarios without the table).
+        In production, pass the same conn used for edge writes.
     """
     memories = _load_memories(conn, project_id)
     if len(memories) < 2:
@@ -193,8 +208,31 @@ def _detect_contradicts(
         if not content_a or not content_b:
             continue
 
-        contradicts_flag = _llm_judge_contradiction(content_a, content_b)
+        contradicts_flag, usage = _llm_judge_contradiction(content_a, content_b)
         llm_calls += 1
+
+        # Record spend for this LLM call (non-zero tokens only — skip mock/no-API runs).
+        if record_conn is not None and any(
+            usage.get(k, 0) for k in ("input_tokens", "output_tokens")
+        ):
+            cost = compute_cost_usd(
+                SONNET_4_6,
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+                cache_read_tokens=usage.get("cache_read_tokens", 0),
+                cache_write_tokens=usage.get("cache_write_tokens", 0),
+            )
+            record_spend(
+                record_conn,
+                project_id=project_id,
+                pass_name="edges",
+                model=_EDGES_MODEL,
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+                cache_read_tokens=usage.get("cache_read_tokens", 0),
+                cache_write_tokens=usage.get("cache_write_tokens", 0),
+                cost_usd=cost,
+            )
 
         if contradicts_flag:
             if dry_run:
@@ -221,20 +259,32 @@ def _detect_contradicts(
     return new_edges, llm_calls
 
 
-def _llm_judge_contradiction(content_a: str, content_b: str) -> bool:
-    """Return True if the LLM judges content_a and content_b to contradict.
+def _llm_judge_contradiction(
+    content_a: str, content_b: str
+) -> tuple[bool, dict]:
+    """Return (contradicts, usage) — whether the LLM judges content_a and
+    content_b to contradict, plus token usage for spend tracking.
+
+    usage dict keys: input_tokens, output_tokens, cache_read_tokens,
+    cache_write_tokens. All are 0 when the LLM was not called.
 
     Degrades gracefully if the SDK is unavailable or the API key is missing.
     """
+    _empty_usage = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+    }
     try:
         import anthropic  # noqa: PLC0415
     except ImportError:
-        return False
+        return False, _empty_usage
 
     import os
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        return False
+        return False, _empty_usage
 
     client = anthropic.Anthropic(api_key=api_key)
     prompt = (
@@ -244,15 +294,22 @@ def _llm_judge_contradiction(content_a: str, content_b: str) -> bool:
     )
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-6",
+            model=_EDGES_MODEL,
             max_tokens=8,
             messages=[{"role": "user", "content": prompt}],
         )
+        usage = response.usage
+        token_usage = {
+            "input_tokens": getattr(usage, "input_tokens", 0),
+            "output_tokens": getattr(usage, "output_tokens", 0),
+            "cache_read_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
+            "cache_write_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        }
         text = response.content[0].text.strip().upper()
-        return text.startswith("YES")
+        return text.startswith("YES"), token_usage
     except Exception as exc:  # noqa: BLE001
         logger.warning("cognify_edges: LLM contradiction check failed: %s", exc)
-        return False
+        return False, _empty_usage
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────
