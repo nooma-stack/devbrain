@@ -33,8 +33,9 @@ class EvalResult(BaseModel):
 
     version: Literal["1.0"]
     job_id: UUID
-    agent_name: Literal["eval_security", "eval_test"]
+    agent_name: Literal["eval_security", "eval_test", "eval_perf", "eval_lint"]
     findings: list[EvalFinding]
     elapsed_ms: int
     started_at: datetime
     error: str | None = None  # set if agent failed; findings will be []
+    skipped: str | None = None  # set if agent skipped cleanly (e.g. no config)

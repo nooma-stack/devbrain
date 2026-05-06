@@ -358,7 +358,7 @@ class FactoryDB:
         # Local imports to avoid circulars at module load — the curator
         # subpackage doesn't import state_machine, but the eval runner
         # spawns subprocess.run for `claude` and we want lazy loading.
-        from curator.eval.runner import run_evals
+        from curator.eval.runner import run_all_evals, _parse_diff_files
         from curator.graduation import (
             apply_feedback_signals,
             demote_low_precision_rules,
@@ -369,9 +369,10 @@ class FactoryDB:
             brief = self._load_brief(job.id)
             plan = self._load_plan(job.id)
             diff = self._load_diff(job.id)
+            diff_files = _parse_diff_files(diff)
 
             with self._conn() as conn:
-                eval_results = run_evals(conn, job.id, brief, plan, diff)
+                eval_results = run_all_evals(conn, job.id, brief, plan, diff, diff_files)
                 apply_feedback_signals(conn, job.id, brief, eval_results)
                 refine_applies_when(conn, job.project_id)
                 demote_low_precision_rules(conn, job.project_id)
