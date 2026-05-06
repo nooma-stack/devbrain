@@ -428,6 +428,82 @@ def test_embedding_bit_equality_round_trip(db, tmp_path):
     )
 
 
+# ─── 6.5 column drift — Phase 5/6/7 columns survive round-trip ──────────────
+
+
+def test_phase_5_6_7_columns_round_trip(db, tmp_path):
+    """compliance_profiles + 5 other Phase-era columns must survive export →
+    import. Pre-fix bug: export/import column lists omitted these, so
+    rule-tier rows with non-empty compliance_profiles round-tripped as
+    NULL — the source of the 34,650-row pollution incident on 2026-05-05.
+    Migration 026 cleaned the artifacts; this test prevents regression.
+    """
+    pid = _seed_project(db, slug=f"{EXPORT_IMPORT_TEST_PREFIX}drift")
+    prov = str(uuid.uuid4())
+    _seed_memory(
+        db, project_id=pid, kind="decision",
+        title=f"{EXPORT_IMPORT_TEST_PREFIX}drift_rule",
+        content=f"{EXPORT_IMPORT_TEST_PREFIX}rule body",
+        provenance_id=prov,
+    )
+
+    # Stamp the 6 columns with non-default values so a NULL/0 default in
+    # the importer would stand out clearly.
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE devbrain.memory
+            SET tier                = 'rule',
+                compliance_profiles = ARRAY['hipaa','soc2']::text[],
+                current_streak      = 7,
+                graduated_at        = '2026-05-01 12:00:00+00',
+                demoted_at          = '2026-05-02 12:00:00+00',
+                effective_hit_count = 42,
+                last_cascade_at     = '2026-05-03 12:00:00+00'
+            WHERE provenance_id = %s
+            """,
+            (prov,),
+        )
+        conn.commit()
+
+    out = tmp_path / "drift.json"
+    export_memory.write_export_file(db, out)
+
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM devbrain.memory WHERE provenance_id = %s", (prov,),
+        )
+        conn.commit()
+
+    payload = import_memory.read_import_file(out)
+    import_memory.import_from_dict(db, payload)
+
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT tier, compliance_profiles, current_streak,
+                   graduated_at, demoted_at, effective_hit_count,
+                   last_cascade_at
+            FROM devbrain.memory WHERE provenance_id = %s
+            """,
+            (prov,),
+        )
+        row = cur.fetchone()
+
+    assert row is not None, "imported row must exist"
+    tier, profiles, streak, grad_at, dem_at, eff_count, cascade_at = row
+    assert tier == "rule"
+    assert list(profiles) == ["hipaa", "soc2"], (
+        "compliance_profiles must round-trip exactly — this is the column "
+        "whose drift produced the 2026-05-05 pollution incident"
+    )
+    assert streak == 7
+    assert grad_at is not None
+    assert dem_at is not None
+    assert eff_count == 42
+    assert cascade_at is not None
+
+
 # ─── 7. gzip output is smaller than plain ───────────────────────────────────
 
 

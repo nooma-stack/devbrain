@@ -260,7 +260,10 @@ def _stream_memory(db, project_ids: list[str] | None):
         "SELECT m.id, p.slug AS project_slug, m.kind, m.title, m.content, "
         "       m.embedding::text AS embedding_text, m.strength, m.hit_count, "
         "       m.last_hit, m.applies_when, m.provenance_id, m.tier, "
-        "       m.archived_at, m.created_at, m.updated_at "
+        "       m.archived_at, m.created_at, m.updated_at, "
+        "       m.compliance_profiles, m.current_streak, "
+        "       m.graduated_at, m.demoted_at, m.effective_hit_count, "
+        "       m.last_cascade_at "
         "FROM devbrain.memory m "
         "JOIN devbrain.projects p ON p.id = m.project_id "
     )
@@ -295,6 +298,12 @@ def _stream_memory(db, project_ids: list[str] | None):
                     "archived_at": row[12],
                     "created_at": row[13],
                     "updated_at": row[14],
+                    "compliance_profiles": row[15],
+                    "current_streak": row[16],
+                    "graduated_at": row[17],
+                    "demoted_at": row[18],
+                    "effective_hit_count": row[19],
+                    "last_cascade_at": row[20],
                 }
         finally:
             cur.close()
