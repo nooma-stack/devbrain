@@ -933,6 +933,90 @@ server.tool(
   },
 )
 
+// ─── Tool: graph_walk ───────────────────────────────────────────────────────
+//
+// Phase 5b: Explore the memory graph from a known memory_id using bounded
+// recursive-CTE traversal (no Apache AGE). Delegates to the Python walker
+// at factory/graph/graph_walk_entry.py via spawnSync — same pattern as
+// the end_session enrichment path.
+//
+// Returns {memories, edges, truncated} from walker.walk(). The Python
+// entry point handles DB connection and serialization.
+
+server.tool(
+  'graph_walk',
+  'Explore the memory graph from a known memory. Returns related memories within max_hops, filtered by edge types. Use when you have a relevant memory_id (from deep_search or store result) and want to see its neighborhood.',
+  {
+    seed_memory_id: z.string().uuid().describe('Starting memory ID (from deep_search or store result)'),
+    edge_types: z
+      .array(z.enum(['cites', 'depends_on', 'supersedes', 'contradicts', 'derived_from', 'refined_by']))
+      .optional()
+      .describe('Edge types to follow. Defaults to strong-signal subset: supersedes, refined_by, derived_from, depends_on.'),
+    max_hops: z.number().min(1).max(6).optional().default(3)
+      .describe('Maximum BFS depth. Default 3; max 6.'),
+    max_nodes: z.number().min(5).max(200).optional().default(50)
+      .describe('Maximum nodes to return (including seed). Default 50; max 200. truncated=true when hit.'),
+    direction: z.enum(['outgoing', 'incoming', 'both']).optional().default('both')
+      .describe('Edge direction: outgoing (follow from→to), incoming (follow to→from), or both. Default both.'),
+    cross_project: z.boolean().optional().default(false)
+      .describe('If true, expand across project boundaries. Default false (same-project only).'),
+  },
+  async ({ seed_memory_id, edge_types, max_hops, max_nodes, direction, cross_project }) => {
+    const payload = {
+      seed_memory_id,
+      edge_types: edge_types ?? null,
+      max_hops: max_hops ?? 3,
+      max_nodes: max_nodes ?? 50,
+      direction: direction ?? 'both',
+      cross_project: cross_project ?? false,
+    }
+
+    const result = spawnSync(
+      DEVBRAIN_PYTHON,
+      ['-m', 'graph.graph_walk_entry'],
+      {
+        input: JSON.stringify(payload),
+        encoding: 'utf-8',
+        cwd: resolve(import.meta.dirname, '../../factory'),
+        env: { ...process.env },
+      },
+    )
+
+    if (result.status !== 0) {
+      return {
+        content: [{
+          type: 'text',
+          text: `graph_walk failed (exit ${result.status}).\nstderr: ${(result.stderr ?? '').toString().slice(0, 800)}`,
+        }],
+      }
+    }
+
+    let parsed: unknown
+    try {
+      parsed = JSON.parse((result.stdout ?? '').toString())
+    } catch {
+      return {
+        content: [{
+          type: 'text',
+          text: `graph_walk returned unparseable output:\n${(result.stdout ?? '').toString().slice(0, 400)}`,
+        }],
+      }
+    }
+
+    const out = parsed as { error?: string; memories?: unknown[]; edges?: unknown[]; truncated?: boolean }
+    if (out.error) {
+      return { content: [{ type: 'text', text: `graph_walk error: ${out.error}` }] }
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(out, null, 2),
+      }],
+    }
+  },
+)
+
 // ─── Tool: factory_plan ──────────────────────────────────────────────────────
 
 // Branch-name validation.
