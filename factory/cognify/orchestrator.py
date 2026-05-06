@@ -121,6 +121,7 @@ def run_pass(
     project_id: Any = None,
     *,
     dry_run: bool = False,
+    cross_project: bool = False,
 ) -> PassResult:
     """Run a single named pass and record it in cognify_run_log.
 
@@ -129,6 +130,9 @@ def run_pass(
         pass_name: one of 'decay', 'gc', 'extract', 'edges', 'strengthen'.
         project_id: UUID or None.
         dry_run: if True, compute only; no DB mutations.
+        cross_project: only honored by passes that opt in (currently
+            'edges' for canonical-rule contradiction sweeps). Other
+            passes ignore the flag.
 
     Returns:
         PassResult from the pass.
@@ -151,7 +155,15 @@ def run_pass(
     error_text: str | None = None
 
     try:
-        result = instance.run(conn, project_id, dry_run=dry_run)
+        # Pass-specific kwargs: only forward cross_project to passes that
+        # accept it. The introspection check keeps the signature optional
+        # without forcing every pass to declare it.
+        kwargs = {"dry_run": dry_run}
+        import inspect
+        sig = inspect.signature(instance.run)
+        if "cross_project" in sig.parameters:
+            kwargs["cross_project"] = cross_project
+        result = instance.run(conn, project_id, **kwargs)
     except Exception as exc:
         error_text = traceback.format_exc()[:2000]
         logger.exception("cognify pass %s failed", pass_name)
@@ -171,18 +183,24 @@ def run_all(
     project_id: Any = None,
     *,
     dry_run: bool = False,
+    cross_project: bool = False,
 ) -> dict[str, PassResult]:
     """Run all 5 passes in dependency order.
 
     Returns a dict of {pass_name: PassResult}.
     Continues past individual pass failures (logged but not re-raised) so a
     flaky LLM in 'extract' doesn't block 'strengthen'.
+
+    cross_project is forwarded to passes that accept it (currently 'edges').
     """
     _ensure_registry()
     results: dict[str, PassResult] = {}
     for name in PASS_ORDER:
         try:
-            results[name] = run_pass(conn, name, project_id, dry_run=dry_run)
+            results[name] = run_pass(
+                conn, name, project_id,
+                dry_run=dry_run, cross_project=cross_project,
+            )
         except RuntimeError:
             # Logged inside run_pass; continue to next pass.
             results[name] = PassResult(metadata={"error": "pass failed"})
