@@ -169,7 +169,7 @@ server.tool(
 
 server.tool(
   'deep_search',
-  'Search DevBrain for relevant context. Call this FIRST before starting any work. Returns embedded chunks with source references. Use depth="auto" to automatically fetch raw context when the query asks for specific details.',
+  'Search DevBrain for relevant context. Call this FIRST before starting any work. Returns embedded chunks with source references. Use depth="auto" to automatically fetch raw context when the query asks for specific details. Use with_graph=true to also return the graph neighborhood of top-matched memories.',
   {
     query: z.string().describe('Natural language search query'),
     project: z.string().optional().describe('Project slug (defaults to current project, omit for cross-project)'),
@@ -177,8 +177,14 @@ server.tool(
     source_types: z.array(z.string()).optional().describe('Filter by: session, decision, pattern, issue, note, openclaw_memory, codebase'),
     depth: z.enum(['summary', 'full', 'auto']).optional().default('auto').describe('summary=chunks only, full=chunks+raw context, auto=smart drill-down'),
     limit: z.number().optional().default(10).describe('Max results'),
+    with_graph: z.boolean().optional().default(false)
+      .describe('Phase 5: also return graph neighborhood of top-matched memories. Adds a top-level "graph" field with memories, edges, seeds.'),
+    graph_max_hops: z.number().min(1).max(6).optional().default(3)
+      .describe('Max BFS depth for graph walk (only when with_graph=true). Default 3.'),
+    graph_max_nodes: z.number().min(5).max(200).optional().default(50)
+      .describe('Max total nodes in graph result (only when with_graph=true). Default 50.'),
   },
-  async ({ query: searchQuery, project, cross_project, source_types, depth, limit }) => {
+  async ({ query: searchQuery, project, cross_project, source_types, depth, limit, with_graph, graph_max_hops, graph_max_nodes }) => {
     const queryEmbedding = await embed(searchQuery)
     const vectorStr = toSqlVector(queryEmbedding)
 
@@ -462,15 +468,69 @@ server.tool(
       }),
     )
 
+    // Phase 5d: graph neighborhood enrichment.
+    //
+    // When with_graph=true, collect the memory_ids of top-ranked results
+    // (those with a real memory_id — codebase legacy fallback rows have
+    // memory_id='') and pass them to the Python graph walker. Returns a
+    // combined neighborhood deduped across all seeds.
+    let graphField: unknown = undefined
+    if (with_graph) {
+      const seedIds = results
+        .map((r) => r.memory_id as string)
+        .filter((id) => id && id.length > 10)
+
+      if (seedIds.length > 0) {
+        const graphPayload = {
+          seed_memory_ids: seedIds,
+          graph_max_hops: graph_max_hops ?? 3,
+          graph_max_nodes: graph_max_nodes ?? 50,
+        }
+
+        const graphResult = spawnSync(
+          DEVBRAIN_PYTHON,
+          ['-m', 'graph.deep_search_graph_entry'],
+          {
+            input: JSON.stringify(graphPayload),
+            encoding: 'utf-8',
+            cwd: resolve(import.meta.dirname, '../../factory'),
+            env: { ...process.env },
+          },
+        )
+
+        if (graphResult.status === 0) {
+          try {
+            const parsed = JSON.parse((graphResult.stdout ?? '').toString())
+            if (!parsed.error) {
+              graphField = parsed
+            } else {
+              console.error(`[deep_search] graph walk error: ${parsed.error}`)
+            }
+          } catch {
+            console.error(`[deep_search] graph walk returned unparseable output`)
+          }
+        } else {
+          console.error(`[deep_search] graph walk failed (exit ${graphResult.status}): ${(graphResult.stderr ?? '').toString().slice(0, 400)}`)
+        }
+      } else {
+        graphField = { memories: [], edges: [], seeds: [] }
+      }
+    }
+
+    const responseBody: Record<string, unknown> = {
+      results,
+      hint: results.some((r) => r.has_full_context)
+        ? 'Call get_source_context(chunk_id) for full raw transcript around any result.'
+        : 'No raw session context available for these results.',
+    }
+    if (with_graph) {
+      responseBody.graph = graphField ?? { memories: [], edges: [], seeds: [] }
+    }
+
     return {
       content: [{
         type: 'text',
-        text: JSON.stringify({
-          results,
-          hint: results.some((r) => r.has_full_context)
-            ? 'Call get_source_context(chunk_id) for full raw transcript around any result.'
-            : 'No raw session context available for these results.',
-        }, null, 2),
+        text: JSON.stringify(responseBody, null, 2),
       }],
     }
   },
