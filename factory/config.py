@@ -167,6 +167,18 @@ FACTORY_TIER_2_SUBCATEGORIES = dict(
 )
 FACTORY_CRED_DEPENDENTS = list(FACTORY_CONFIG.get("cred_dependents", []))
 
+# Onboarding network endpoint — used by the kit's SSH commands so a
+# remote dev can reach the rotation handler without local-network mDNS.
+# Default falls back to the legacy lhts-mac-studio.local for backward
+# compat with installs that haven't published a tunnel yet. Production
+# installs should override via config/devbrain.yaml:
+#   onboarding:
+#     ssh_host: 72.60.64.155        # VPS jump host (or DNS name)
+#     ssh_port: 2222                # reverse-tunnel port forwarding to Mac Studio
+_ONBOARDING_CONFIG = _config.get("onboarding", {})
+ONBOARDING_SSH_HOST = str(_ONBOARDING_CONFIG.get("ssh_host", "lhts-mac-studio.local"))
+ONBOARDING_SSH_PORT = int(_ONBOARDING_CONFIG.get("ssh_port", 22))
+
 # Fix-loop trigger tier. When True (default as of 2026-04-23), reviewer
 # WARNING findings also route a job through FIX_LOOP; when False the
 # pre-2026-04-23 behavior (BLOCKING-only) is preserved.

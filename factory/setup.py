@@ -1986,7 +1986,12 @@ def setup_add_dev(cli: str | None = None) -> None:
     from onboarding_kit import write_onboarding_kit
     from profiles import DEV_ID_RE
     from state_machine import FactoryDB
-    from config import DATABASE_URL, DEVBRAIN_HOME as _DEVBRAIN_HOME
+    from config import (
+        DATABASE_URL,
+        DEVBRAIN_HOME as _DEVBRAIN_HOME,
+        ONBOARDING_SSH_HOST,
+        ONBOARDING_SSH_PORT,
+    )
 
     _header("Onboard a new dev")
     _desc(
@@ -2161,6 +2166,8 @@ def setup_add_dev(cli: str | None = None) -> None:
         bootstrap_private_key=bootstrap_private,
         bootstrap_invite_id_short=invite_id_short,
         bootstrap_expiry=bootstrap_expires,
+        ssh_host=ONBOARDING_SSH_HOST,
+        ssh_port=ONBOARDING_SSH_PORT,
         cli=cli,
     )
 
