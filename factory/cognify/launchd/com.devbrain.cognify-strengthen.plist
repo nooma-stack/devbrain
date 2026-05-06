@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- cognify_strengthen: daily graduation + demotion sweep. Zero LLM cost.  -->
+<!-- Placeholders: ${DEVBRAIN_HOME}, ${USER}, ${PROJECT_SLUG} filled by      -->
+<!--   `devbrain setup` or replaced manually before loading.                 -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.devbrain.cognify-strengthen</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>${DEVBRAIN_HOME}/.venv/bin/python</string>
+        <string>${DEVBRAIN_HOME}/factory/cli.py</string>
+        <string>cognify</string>
+        <string>--pass=strengthen</string>
+        <string>--project=${PROJECT_SLUG}</string>
+    </array>
+
+    <!-- Run once daily (86400 seconds) -->
+    <key>StartInterval</key>
+    <integer>86400</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DEVBRAIN_HOME</key>
+        <string>${DEVBRAIN_HOME}</string>
+        <key>PYTHONPATH</key>
+        <string>${DEVBRAIN_HOME}/factory</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>${DEVBRAIN_HOME}/factory</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/${USER}/.devbrain/logs/cognify-strengthen.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/${USER}/.devbrain/logs/cognify-strengthen.err</string>
+
+    <key>ThrottleInterval</key>
+    <integer>300</integer>
+</dict>
+</plist>

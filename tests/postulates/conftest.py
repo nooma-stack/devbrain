@@ -9,9 +9,19 @@ work in that same comment.
 from __future__ import annotations
 
 import os
+import sys
 import uuid
+from pathlib import Path
 
 import pytest
+
+# Add factory/ to sys.path so postulate tests can import factory modules
+# (cognify.*, curator.*, graph.*, etc.) directly without going through the
+# factory/pytest.ini sys.path setup which only applies when pytest is run
+# from inside factory/.
+_FACTORY_DIR = str(Path(__file__).parent.parent.parent / "factory")
+if _FACTORY_DIR not in sys.path:
+    sys.path.insert(0, _FACTORY_DIR)
 
 psycopg2 = pytest.importorskip("psycopg2")
 
@@ -152,6 +162,16 @@ def project_factory(conn):
                 "DELETE FROM devbrain.factory_jobs WHERE project_id = %s",
                 (pid,),
             )
+            # cognify_run_log FK project_id (Atlas Phase 6); clean up
+            # before deleting the project. Gracefully missing in pre-025
+            # installs.
+            try:
+                cur.execute(
+                    "DELETE FROM devbrain.cognify_run_log WHERE project_id = %s",
+                    (pid,),
+                )
+            except Exception:
+                conn.rollback()
             cur.execute("DELETE FROM devbrain.projects WHERE id = %s", (pid,))
     conn.commit()
 

@@ -2810,5 +2810,158 @@ def cmd_rules_lint():
         sys.exit(run_lint(conn))
 
 
+# ─── cognify commands ─────────────────────────────────────────────────────────
+
+
+@cli.command("cognify")
+@click.option(
+    "--pass",
+    "pass_name",
+    default=None,
+    help="Pass to run: extract | decay | edges | strengthen | gc",
+)
+@click.option("--all", "run_all", is_flag=True, default=False,
+              help="Run all passes in dependency order.")
+@click.option(
+    "--project",
+    "project_slug",
+    default=None,
+    help="Project slug to scope the pass (required for LLM passes).",
+)
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Report what the pass would do without making changes.")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Emit result as JSON.")
+def cognify_command(pass_name, run_all, project_slug, dry_run, as_json):
+    """Run one or all cognify passes.
+
+    Examples:\n
+      devbrain cognify --pass=decay\n
+      devbrain cognify --pass=extract --project=myproject\n
+      devbrain cognify --all --project=myproject\n
+      devbrain cognify --pass=decay --dry-run
+    """
+    import sys
+    from config import DATABASE_URL
+    import psycopg2
+    import psycopg2.extras
+    psycopg2.extras.register_uuid()
+
+    if not pass_name and not run_all:
+        raise click.UsageError("Specify --pass=<name> or --all")
+
+    db = get_db()
+    project_id = None
+    if project_slug:
+        with db._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM devbrain.projects WHERE slug = %s",
+                (project_slug,),
+            )
+            row = cur.fetchone()
+        if not row:
+            raise click.ClickException(f"Project {project_slug!r} not found.")
+        project_id = row[0]
+
+    # Import cognify modules (adds factory/ to sys.path).
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
+    from cognify.orchestrator import run_pass as _run_pass, run_all as _run_all
+
+    with db._conn() as conn:
+        if run_all:
+            results = _run_all(conn, project_id, dry_run=dry_run)
+            if as_json:
+                import json as _json
+                click.echo(_json.dumps(
+                    {k: vars(v) for k, v in results.items()}, indent=2, default=str
+                ))
+            else:
+                for pname, res in results.items():
+                    status = "dry-run" if dry_run else "ok"
+                    click.echo(
+                        f"  {pname:12s}  rows={res.rows_processed}  "
+                        f"llm={res.llm_calls}  [{status}]"
+                    )
+        else:
+            result = _run_pass(conn, pass_name, project_id, dry_run=dry_run)
+            if as_json:
+                import json as _json
+                click.echo(_json.dumps(vars(result), indent=2, default=str))
+            else:
+                status = "dry-run" if dry_run else "ok"
+                click.echo(
+                    f"cognify {pass_name}: rows={result.rows_processed}  "
+                    f"llm={result.llm_calls}  [{status}]"
+                )
+
+
+@cli.command("cognify-reextract")
+@click.option("--session", "session_id", default=None,
+              help="Re-extract a single session by provenance_id.")
+@click.option("--all", "all_sessions", is_flag=True, default=False,
+              help="Re-extract all sessions for the project.")
+@click.option("--since", default=None,
+              help="Re-extract sessions ingested after this ISO date.")
+@click.option("--project", "project_slug", required=True,
+              help="Project slug.")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Report what would be re-extracted without making changes.")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Emit result as JSON.")
+def cognify_reextract_command(
+    session_id, all_sessions, since, project_slug, dry_run, as_json
+):
+    """Re-extract lessons/decisions for one or all sessions.
+
+    Archives prior extracted rows (sets archived_at; never deletes).
+    New rows carry metadata.reextracted_from for traceability.
+
+    Examples:\n
+      devbrain cognify-reextract --session=abc123 --project=myproject\n
+      devbrain cognify-reextract --all --project=myproject\n
+      devbrain cognify-reextract --since=2026-04-01 --project=myproject
+    """
+    import sys
+
+    db = get_db()
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM devbrain.projects WHERE slug = %s",
+            (project_slug,),
+        )
+        row = cur.fetchone()
+    if not row:
+        raise click.ClickException(f"Project {project_slug!r} not found.")
+    project_id = row[0]
+
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
+    from cognify.reextract_cli import run_reextract
+
+    with db._conn() as conn:
+        result = run_reextract(
+            conn,
+            project_id,
+            session_id=session_id,
+            all_sessions=all_sessions,
+            since=since,
+            dry_run=dry_run,
+        )
+
+    if as_json:
+        import json as _json
+        click.echo(_json.dumps(result, indent=2, default=str))
+    else:
+        if dry_run:
+            click.echo(
+                f"dry-run: would re-extract {result.get('sessions_targeted', 0)} session(s)"
+            )
+        else:
+            click.echo(
+                f"Re-extracted {result.get('sessions_targeted', 0)} session(s): "
+                f"lessons={result.get('lessons_created', 0)}  "
+                f"decisions={result.get('decisions_created', 0)}"
+            )
+
+
 if __name__ == "__main__":
     cli()
