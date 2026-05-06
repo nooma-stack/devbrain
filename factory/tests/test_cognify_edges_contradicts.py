@@ -407,3 +407,72 @@ def test_detect_contradicts_skips_empty_content_pairs(conn, project_factory):
 
     # Empty content → pair skipped → 0 LLM calls.
     assert call_count["n"] == 0
+
+
+# ── cross-project flag ───────────────────────────────────────────────────────
+
+
+@pytest.mark.db
+def test_detect_contradicts_cross_project_forwards_to_walker(conn, project_factory):
+    """cross_project=True must flow through to graph_walker.walk().
+
+    The flag is not a behavior change at this level — _detect_contradicts
+    just hands cross_project to walk(). What matters: forwarding works
+    and the call observably reaches walk() with the right value.
+    """
+    project = project_factory("contra_xp")
+    m_a = _insert_mem(
+        conn, project["id"], "LessonA",
+        "Always do X.", kind="decision", tier="lesson",
+    )
+    m_b = _insert_mem(
+        conn, project["id"], "LessonB",
+        "Never do X.", kind="decision", tier="lesson",
+    )
+    _insert_edge_direct(conn, m_a, m_b, "derived_from")
+
+    captured_cross_project: list[bool] = []
+    real_walk = None
+
+    def capturing_walk(*args, **kwargs):
+        captured_cross_project.append(kwargs.get("cross_project", "missing"))
+        # Return an empty walk result so the test stays fast (no LLM calls).
+        from curator.eval.types import EvalFinding  # noqa: F401  (smoke import)
+        from graph.walker import GraphWalkResult
+        return GraphWalkResult(memories=[], edges=[], truncated=False)
+
+    with patch("cognify.edges.walk", side_effect=capturing_walk):
+        _detect_contradicts(conn, project["id"], cross_project=True)
+
+    assert any(v is True for v in captured_cross_project), (
+        "cross_project=True must propagate to graph_walker.walk()"
+    )
+
+
+@pytest.mark.db
+def test_detect_contradicts_default_cross_project_is_false(conn, project_factory):
+    """Default cross_project=False — preserves P3-aligned same-project behavior."""
+    project = project_factory("contra_xp_default")
+    m_a = _insert_mem(
+        conn, project["id"], "LessonA",
+        "Always do X.", kind="decision", tier="lesson",
+    )
+    m_b = _insert_mem(
+        conn, project["id"], "LessonB",
+        "Never do X.", kind="decision", tier="lesson",
+    )
+    _insert_edge_direct(conn, m_a, m_b, "derived_from")
+
+    captured: list[bool] = []
+
+    def capturing_walk(*args, **kwargs):
+        captured.append(kwargs.get("cross_project", "missing"))
+        from graph.walker import GraphWalkResult
+        return GraphWalkResult(memories=[], edges=[], truncated=False)
+
+    with patch("cognify.edges.walk", side_effect=capturing_walk):
+        _detect_contradicts(conn, project["id"])  # no cross_project kwarg
+
+    assert all(v is False for v in captured), (
+        "default cross_project must be False"
+    )

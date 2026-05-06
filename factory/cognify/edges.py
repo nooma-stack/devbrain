@@ -62,18 +62,31 @@ class EdgesPass(CognifyPass):
     6-hour cadence. Up to 15 LLM calls per run (contradicts only).
     cites detection is zero-LLM text matching.
     Uses Phase 5 graph_walk for efficient contradiction pair selection.
+
+    cross_project (default False): when True, the contradiction walker
+    surfaces canonical 'devbrain' rules-library memories alongside the
+    project's own memories as candidate pairs. Use to detect when a
+    project's lesson/rule contradicts a regulatory rule in the canonical
+    library. When False, traversal is strict same-project (P3-aligned).
     """
 
     pass_name = "edges"
 
-    def run(self, conn: Any, project_id: Any, *, dry_run: bool = False) -> PassResult:
+    def run(
+        self,
+        conn: Any,
+        project_id: Any,
+        *,
+        dry_run: bool = False,
+        cross_project: bool = False,
+    ) -> PassResult:
         if project_id is None:
             raise ValueError(
                 "cognify_edges requires a project_id (LLM pass; project-scoped)"
             )
 
         cites_new, contradicts_new, llm_calls = _run_edges(
-            conn, project_id, dry_run=dry_run
+            conn, project_id, dry_run=dry_run, cross_project=cross_project
         )
         return PassResult(
             rows_processed=cites_new + contradicts_new,
@@ -87,12 +100,22 @@ class EdgesPass(CognifyPass):
 
 
 def _run_edges(
-    conn: Any, project_id: Any, *, dry_run: bool = False
+    conn: Any,
+    project_id: Any,
+    *,
+    dry_run: bool = False,
+    cross_project: bool = False,
 ) -> tuple[int, int, int]:
-    """Main edges pass logic. Returns (cites_new, contradicts_new, llm_calls)."""
+    """Main edges pass logic. Returns (cites_new, contradicts_new, llm_calls).
+
+    cites detection stays strictly project-local (text-pattern match;
+    no walker involvement). Only contradicts detection honors
+    cross_project when True.
+    """
     cites_new = _detect_cites(conn, project_id, dry_run=dry_run)
     contradicts_new, llm_calls = _detect_contradicts(
-        conn, project_id, dry_run=dry_run, record_conn=conn
+        conn, project_id, dry_run=dry_run, record_conn=conn,
+        cross_project=cross_project,
     )
     return cites_new, contradicts_new, llm_calls
 
@@ -160,6 +183,7 @@ def _detect_contradicts(
     *,
     dry_run: bool = False,
     record_conn: Any = None,
+    cross_project: bool = False,
 ) -> tuple[int, int]:
     """Detect contradicts edges using Phase 5 graph_walk + LLM judgment.
 
@@ -174,6 +198,13 @@ def _detect_contradicts(
     record_conn: connection used to write spend log rows. When None, spend
         is not recorded (e.g. dry_run or test scenarios without the table).
         In production, pass the same conn used for edge writes.
+
+    cross_project: when True, the walker surfaces canonical 'devbrain'
+        rules-library memories (tier='rule' with non-empty
+        compliance_profiles) as candidate pairs alongside the project's
+        own memories. Detects when a project's lesson contradicts a
+        canonical regulatory rule. When False (default), traversal stays
+        strict same-project (P3-aligned).
     """
     all_memories = _load_memories(conn, project_id)
     if len(all_memories) < 2:
@@ -199,7 +230,7 @@ def _detect_contradicts(
             max_hops=CONTRADICTION_MAX_HOPS,
             max_nodes=CONTRADICTION_MAX_NODES,
             direction="both",
-            cross_project=False,
+            cross_project=cross_project,
         )
         for neighbor in result.memories:
             if neighbor.id == m["id"]:

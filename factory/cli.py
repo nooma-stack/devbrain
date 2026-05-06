@@ -2830,16 +2830,21 @@ def cmd_rules_lint():
 )
 @click.option("--dry-run", is_flag=True, default=False,
               help="Report what the pass would do without making changes.")
+@click.option("--cross-project", "cross_project", is_flag=True, default=False,
+              help="Edges pass only: include canonical 'devbrain' rules library "
+                   "as candidate-pair source. Detects when project lessons "
+                   "contradict canonical regulatory rules. Other passes ignore.")
 @click.option("--json", "as_json", is_flag=True, default=False,
               help="Emit result as JSON.")
-def cognify_command(pass_name, run_all, project_slug, dry_run, as_json):
+def cognify_command(pass_name, run_all, project_slug, dry_run, cross_project, as_json):
     """Run one or all cognify passes.
 
     Examples:\n
       devbrain cognify --pass=decay\n
       devbrain cognify --pass=extract --project=myproject\n
       devbrain cognify --all --project=myproject\n
-      devbrain cognify --pass=decay --dry-run
+      devbrain cognify --pass=decay --dry-run\n
+      devbrain cognify --pass=edges --project=brightbot --cross-project
     """
     import sys
     from config import DATABASE_URL
@@ -2869,7 +2874,9 @@ def cognify_command(pass_name, run_all, project_slug, dry_run, as_json):
 
     with db._conn() as conn:
         if run_all:
-            results = _run_all(conn, project_id, dry_run=dry_run)
+            results = _run_all(
+                conn, project_id, dry_run=dry_run, cross_project=cross_project
+            )
             if as_json:
                 import json as _json
                 click.echo(_json.dumps(
@@ -2883,7 +2890,10 @@ def cognify_command(pass_name, run_all, project_slug, dry_run, as_json):
                         f"llm={res.llm_calls}  [{status}]"
                     )
         else:
-            result = _run_pass(conn, pass_name, project_id, dry_run=dry_run)
+            result = _run_pass(
+                conn, pass_name, project_id,
+                dry_run=dry_run, cross_project=cross_project,
+            )
             if as_json:
                 import json as _json
                 click.echo(_json.dumps(vars(result), indent=2, default=str))
