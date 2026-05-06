@@ -19,6 +19,16 @@ but the cognify_run_log rows written by the orchestrator never receive raw
 memory.content — only row counts and metadata are logged.
 
 LLM cost ceiling: max 20 calls per pass invocation (Sonnet 4.6).
+
+Spend tracking: each LLM call writes a row to devbrain.cognify_spend_log
+(migration 029) via observability.spend.record_spend. Costs are estimates
+based on hardcoded Anthropic list prices (see observability/pricing.py).
+
+Versioned extraction: CURRENT_EXTRACTION_VERSION marks the prompt/model
+version for all newly written tier='lesson' rows. Bump this constant when
+the extraction prompt or model changes, then run:
+    devbrain cognify-reextract --since-version=<N>
+to reprocess rows produced by prior versions.
 """
 from __future__ import annotations
 
@@ -29,11 +39,21 @@ from typing import Any
 from uuid import UUID
 
 from cognify.orchestrator import CognifyPass, PassResult, register_pass
+from observability.pricing import SONNET_4_6, compute_cost_usd
+from observability.spend import record_spend
 
 logger = logging.getLogger(__name__)
 
 # Maximum LLM calls per scheduled pass invocation.
 MAX_LLM_CALLS_PER_PASS = 20
+
+# Extraction prompt/model version. Bump this integer when the extraction
+# prompt or model changes, then run `devbrain cognify-reextract --since-version=N`
+# to reprocess existing rows. Starts at 1 per Phase 6 design §6.
+CURRENT_EXTRACTION_VERSION = 1
+
+# Model used for extraction. Must match a key in observability/pricing.py.
+_EXTRACT_MODEL = "claude-sonnet-4-6"
 
 
 @dataclass
@@ -182,6 +202,28 @@ def extract_from_session(
     extracted = _llm_extract(combined, max_llm_calls=max_llm_calls)
     llm_calls = 1  # one call per session for v1
 
+    # Record spend for this LLM call.
+    usage = extracted.get("_usage", {})
+    if any(usage.get(k, 0) for k in ("input_tokens", "output_tokens")):
+        cost = compute_cost_usd(
+            SONNET_4_6,
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+            cache_read_tokens=usage.get("cache_read_tokens", 0),
+            cache_write_tokens=usage.get("cache_write_tokens", 0),
+        )
+        record_spend(
+            conn,
+            project_id=project_id,
+            pass_name="extract",
+            model=_EXTRACT_MODEL,
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+            cache_read_tokens=usage.get("cache_read_tokens", 0),
+            cache_write_tokens=usage.get("cache_write_tokens", 0),
+            cost_usd=cost,
+        )
+
     lessons_created = 0
     decisions_created = 0
     skipped = 0
@@ -317,21 +359,30 @@ def _llm_extract(content: str, *, max_llm_calls: int = 1) -> dict:
     Returns a dict with keys:
       - "lessons": list of {title, content}
       - "decisions": list of {title, content}
+      - "_usage": dict with token usage fields for spend tracking
+          (input_tokens, output_tokens, cache_read_tokens, cache_write_tokens).
+          Always present; all counts are 0 if the LLM was not called.
 
     v1 implementation: uses the Anthropic SDK with prompt caching.
     If the SDK is not available (e.g. CI without API key), returns empty
     lists so the pass degrades gracefully.
     """
+    _empty_usage = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+    }
     try:
         import anthropic  # noqa: PLC0415
     except ImportError:
         logger.warning("cognify_extract: anthropic SDK not available; skipping LLM")
-        return {"lessons": [], "decisions": []}
+        return {"lessons": [], "decisions": [], "_usage": _empty_usage}
 
     api_key = _get_api_key()
     if not api_key:
         logger.warning("cognify_extract: no API key configured; skipping LLM")
-        return {"lessons": [], "decisions": []}
+        return {"lessons": [], "decisions": [], "_usage": _empty_usage}
 
     client = anthropic.Anthropic(api_key=api_key)
 
@@ -347,7 +398,7 @@ def _llm_extract(content: str, *, max_llm_calls: int = 1) -> dict:
 
     try:
         response = client.messages.create(
-            model="claude-sonnet-4-6",
+            model=_EXTRACT_MODEL,
             max_tokens=2048,
             system=[
                 {
@@ -363,15 +414,24 @@ def _llm_extract(content: str, *, max_llm_calls: int = 1) -> dict:
                 }
             ],
         )
+        usage = response.usage
+        token_usage = {
+            "input_tokens": getattr(usage, "input_tokens", 0),
+            "output_tokens": getattr(usage, "output_tokens", 0),
+            "cache_read_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
+            "cache_write_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        }
         text = response.content[0].text.strip()
         # Strip markdown code fences if present.
         if text.startswith("```"):
             text = "\n".join(text.split("\n")[1:])
             text = text.rsplit("```", 1)[0].strip()
-        return json.loads(text)
+        result = json.loads(text)
+        result["_usage"] = token_usage
+        return result
     except Exception as exc:  # noqa: BLE001
         logger.warning("cognify_extract: LLM call failed: %s", exc)
-        return {"lessons": [], "decisions": []}
+        return {"lessons": [], "decisions": [], "_usage": _empty_usage}
 
 
 def _get_api_key() -> str | None:
@@ -436,10 +496,13 @@ def _upsert_memory(
         return existing[0], False
 
     # Insert new extract row (no provenance_id — avoid unique constraint).
-    cols = ["project_id", "kind", "title", "content", "tier", "strength", "applies_when"]
+    cols = [
+        "project_id", "kind", "title", "content",
+        "tier", "strength", "applies_when", "extraction_version",
+    ]
     vals: list = [
         project_id, db_kind, title, content, "lesson", 1.0,
-        json.dumps(applies_when),
+        json.dumps(applies_when), CURRENT_EXTRACTION_VERSION,
     ]
 
     placeholders = ", ".join(["%s"] * len(cols))

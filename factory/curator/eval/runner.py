@@ -22,6 +22,13 @@ finding). The schema reuses the existing artifact columns:
 If an agent fails (subprocess exit non-zero, JSON parse error, timeout),
 the EvalResult carries an empty findings list + the error string. The
 OTHER agents still run — failure isolation is per-agent, not per-batch.
+
+Spend tracking: each LLM agent call writes a row to
+devbrain.cognify_spend_log (migration 029) via
+observability.spend.record_spend. Token usage is parsed from the
+claude subprocess JSON output (fields: input_tokens, output_tokens,
+cache_creation_input_tokens, cache_read_input_tokens). Spend logging
+failures are non-fatal — a warning is emitted and the eval chain continues.
 """
 from __future__ import annotations
 
@@ -35,8 +42,13 @@ from typing import Any
 from uuid import UUID
 
 from curator.eval.types import EvalFinding, EvalResult
+from observability.pricing import SONNET_4_6, compute_cost_usd
+from observability.spend import record_spend
 
 logger = logging.getLogger(__name__)
+
+# Model used by the eval agent chain. Must match a key in observability/pricing.py.
+_EVAL_MODEL = "claude-sonnet-4-6"
 
 # Path to prompts dir — resolved relative to this module.
 _PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -57,6 +69,8 @@ def run_evals(
     brief: dict,
     plan: str,
     diff: str,
+    *,
+    project_id: Any = None,
 ) -> list[EvalResult]:
     """Run LLM eval chain (security → test → perf), sharing a warm cache.
 
@@ -65,13 +79,22 @@ def run_evals(
 
     Failure isolation: if one agent raises, its EvalResult carries
     findings=[] + error=<exc>; the other agents still run.
+
+    Args:
+        conn: psycopg2 connection (also used for spend logging).
+        job_id: factory job UUID.
+        brief: job brief dict.
+        plan: implementation plan text.
+        diff: git diff string.
+        project_id: UUID of the project, used for spend log P3 scoping.
+            If None, spend rows are written without a project_id.
     """
     cached_context = _build_cached_context(brief, plan, diff)
     results: list[EvalResult] = []
 
     for agent_name, prompt_file in _LLM_AGENT_ORDER:
         try:
-            result = _invoke_agent(
+            result, usage = _invoke_agent(
                 job_id=job_id,
                 agent_name=agent_name,
                 prompt_path=_PROMPTS_DIR / prompt_file,
@@ -88,6 +111,29 @@ def run_evals(
                 started_at=datetime.now(timezone.utc),
                 error=str(exc)[:500],
             )
+            usage = {}
+
+        # Record spend for this eval agent call.
+        if any(usage.get(k, 0) for k in ("input_tokens", "output_tokens")):
+            cost = compute_cost_usd(
+                SONNET_4_6,
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+                cache_read_tokens=usage.get("cache_read_tokens", 0),
+                cache_write_tokens=usage.get("cache_write_tokens", 0),
+            )
+            record_spend(
+                conn,
+                project_id=project_id,
+                pass_name=agent_name,
+                model=_EVAL_MODEL,
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+                cache_read_tokens=usage.get("cache_read_tokens", 0),
+                cache_write_tokens=usage.get("cache_write_tokens", 0),
+                cost_usd=cost,
+            )
+
         results.append(result)
 
     _persist_findings(conn, job_id, results)
@@ -114,11 +160,16 @@ def _invoke_agent(
     agent_name: str,
     prompt_path: Path,
     cached_context: str,
-) -> EvalResult:
+) -> tuple["EvalResult", dict]:
     """Invoke claude with the eval prompt + cached context.
 
     First call instantiates cache; second call reuses it (claude's prompt
     cache TTL is 5 min, well within typical job phase duration).
+
+    Returns:
+        (EvalResult, usage_dict) where usage_dict has keys:
+          input_tokens, output_tokens, cache_read_tokens, cache_write_tokens.
+        All usage counts are 0 if the subprocess output did not include usage.
     """
     started_at = datetime.now(timezone.utc)
     start = time.perf_counter()
@@ -147,8 +198,20 @@ def _invoke_agent(
     response = json.loads(proc.stdout)
     findings = _parse_findings(agent_name, response)
 
+    # Extract token usage from the claude JSON output. The claude CLI
+    # --output-format json response includes a top-level "usage" object with
+    # input_tokens, output_tokens, cache_creation_input_tokens,
+    # cache_read_input_tokens fields.
+    raw_usage = response.get("usage") or {}
+    usage = {
+        "input_tokens": raw_usage.get("input_tokens", 0) or 0,
+        "output_tokens": raw_usage.get("output_tokens", 0) or 0,
+        "cache_read_tokens": raw_usage.get("cache_read_input_tokens", 0) or 0,
+        "cache_write_tokens": raw_usage.get("cache_creation_input_tokens", 0) or 0,
+    }
+
     elapsed_ms = int((time.perf_counter() - start) * 1000)
-    return EvalResult(
+    result = EvalResult(
         version="1.0",
         job_id=job_id,
         agent_name=agent_name,
@@ -156,6 +219,7 @@ def _invoke_agent(
         elapsed_ms=elapsed_ms,
         started_at=started_at,
     )
+    return result, usage
 
 
 def _parse_findings(agent_name: str, response: dict) -> list[EvalFinding]:

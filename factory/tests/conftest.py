@@ -175,6 +175,15 @@ def project_factory(conn):
                 )
             except Exception:
                 conn.rollback()
+            # cognify_spend_log (migration 029) FKs project_id; clean up
+            # before deleting the project.
+            try:
+                cur.execute(
+                    "DELETE FROM devbrain.cognify_spend_log WHERE project_id = %s",
+                    (pid,),
+                )
+            except Exception:
+                conn.rollback()
             cur.execute(
                 "DELETE FROM devbrain.memory WHERE project_id = %s", (pid,)
             )

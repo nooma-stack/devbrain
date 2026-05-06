@@ -30,6 +30,16 @@ from cognify.edges import (
     _llm_judge_contradiction,
 )
 
+# After PR #103 (spend tracking), _llm_judge_contradiction returns
+# (bool, usage_dict). All bool-only mocks below get this empty usage shape
+# so the production unpack at the call site doesn't TypeError.
+_NO_USAGE = {
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_read_tokens": 0,
+    "cache_write_tokens": 0,
+}
+
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -87,8 +97,8 @@ def _total_contradicts_edges(conn, project_id):
 def test_llm_judge_returns_false_without_api_key(monkeypatch):
     """No ANTHROPIC_API_KEY → graceful False, no exception."""
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    result = _llm_judge_contradiction("A says always do X.", "B says never do X.")
-    assert result is False
+    flag, _usage = _llm_judge_contradiction("A says always do X.", "B says never do X.")
+    assert flag is False
 
 
 def test_llm_judge_returns_true_on_yes_response(monkeypatch):
@@ -112,9 +122,9 @@ def test_llm_judge_returns_true_on_yes_response(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "anthropic", mock_anthropic_mod)
 
-    result = _llm_judge_contradiction("Always cache results.", "Never cache results.")
+    flag, _usage = _llm_judge_contradiction("Always cache results.", "Never cache results.")
 
-    assert result is True
+    assert flag is True
     mock_client.messages.create.assert_called_once()
 
 
@@ -135,9 +145,9 @@ def test_llm_judge_returns_false_on_no_response(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "anthropic", mock_anthropic_mod)
 
-    result = _llm_judge_contradiction("Use async patterns.", "Use async patterns.")
+    flag, _usage = _llm_judge_contradiction("Use async patterns.", "Use async patterns.")
 
-    assert result is False
+    assert flag is False
 
 
 def test_llm_judge_graceful_on_api_exception(monkeypatch):
@@ -154,9 +164,9 @@ def test_llm_judge_graceful_on_api_exception(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "anthropic", mock_anthropic_mod)
 
-    result = _llm_judge_contradiction("A.", "B.")
+    flag, _usage = _llm_judge_contradiction("A.", "B.")
 
-    assert result is False
+    assert flag is False
 
 
 def test_contradiction_seed_tiers_constant():
@@ -186,7 +196,7 @@ def test_detect_contradicts_inserts_bidirectional_edges(conn, project_factory):
     )
     _insert_edge_direct(conn, m_a, m_b, "derived_from")
 
-    with patch("cognify.edges._llm_judge_contradiction", return_value=True):
+    with patch("cognify.edges._llm_judge_contradiction", return_value=(True, _NO_USAGE)):
         new_edges, llm_calls = _detect_contradicts(conn, project["id"])
 
     assert new_edges == 2  # bidirectional
@@ -212,7 +222,7 @@ def test_detect_contradicts_no_edge_when_llm_says_no(conn, project_factory):
     )
     _insert_edge_direct(conn, m_a, m_b, "derived_from")
 
-    with patch("cognify.edges._llm_judge_contradiction", return_value=False):
+    with patch("cognify.edges._llm_judge_contradiction", return_value=(False, _NO_USAGE)):
         new_edges, llm_calls = _detect_contradicts(conn, project["id"])
 
     assert new_edges == 0
@@ -237,7 +247,7 @@ def test_detect_contradicts_idempotent(conn, project_factory):
     )
     _insert_edge_direct(conn, m_a, m_b, "derived_from")
 
-    with patch("cognify.edges._llm_judge_contradiction", return_value=True):
+    with patch("cognify.edges._llm_judge_contradiction", return_value=(True, _NO_USAGE)):
         first_new, _ = _detect_contradicts(conn, project["id"])
         second_new, _ = _detect_contradicts(conn, project["id"])
 
@@ -262,7 +272,7 @@ def test_detect_contradicts_dry_run_no_insert(conn, project_factory):
     )
     _insert_edge_direct(conn, m_a, m_b, "derived_from")
 
-    with patch("cognify.edges._llm_judge_contradiction", return_value=True):
+    with patch("cognify.edges._llm_judge_contradiction", return_value=(True, _NO_USAGE)):
         new_edges, llm_calls = _detect_contradicts(conn, project["id"], dry_run=True)
 
     assert new_edges >= 1
@@ -294,7 +304,7 @@ def test_detect_contradicts_respects_llm_call_ceiling(conn, project_factory):
 
     def counting_judge(a, b):
         call_count["n"] += 1
-        return False  # no edges, just counting calls
+        return False, _NO_USAGE  # no edges, just counting calls
 
     with patch("cognify.edges._llm_judge_contradiction", side_effect=counting_judge):
         _detect_contradicts(conn, project["id"])
@@ -320,7 +330,7 @@ def test_detect_contradicts_fallback_when_no_lesson_rule_tiers(conn, project_fac
     )
     _insert_edge_direct(conn, m_a, m_b, "derived_from")
 
-    with patch("cognify.edges._llm_judge_contradiction", return_value=True):
+    with patch("cognify.edges._llm_judge_contradiction", return_value=(True, _NO_USAGE)):
         new_edges, llm_calls = _detect_contradicts(conn, project["id"])
 
     # Fallback activated: still finds and judges the pair.
@@ -358,7 +368,7 @@ def test_detect_contradicts_project_isolation(conn, project_factory):
 
     def spy(a, b):
         call_count["n"] += 1
-        return True
+        return True, _NO_USAGE
 
     with patch("cognify.edges._llm_judge_contradiction", side_effect=spy):
         _detect_contradicts(conn, proj_a["id"])
@@ -390,7 +400,7 @@ def test_detect_contradicts_skips_empty_content_pairs(conn, project_factory):
 
     def spy(a, b):
         call_count["n"] += 1
-        return False
+        return False, _NO_USAGE
 
     with patch("cognify.edges._llm_judge_contradiction", side_effect=spy):
         _detect_contradicts(conn, project["id"])
