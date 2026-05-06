@@ -8,7 +8,10 @@ Each batch:
 2. For each: load memory, compute new_strength, UPDATE memory, DELETE
    queue row.
 3. Multi-hop: if penalty was significant (> MULTI_HOP_THRESHOLD after
-   freshness decay), walk the row's own dependents and enqueue them.
+   freshness decay), walk ALL transitive dependents in one pass using the
+   Phase 5 graph walker (factory.graph.walker.walk with direction='incoming')
+   and enqueue them all at once. This replaces the old 1-hop SQL JOIN that
+   required multiple drain cycles to propagate deep cascades.
 
 On exception: increment attempt_count, persist last_error, leave queue
 row in place. After 3 failures, the row is filtered out by both the
@@ -20,6 +23,12 @@ Cycle prevention: each row carries an enqueued_at timestamp. The worker
 also reads memory.last_cascade_at; if that timestamp is at-or-after the
 queue row's enqueued_at the row is dropped without doing work — this
 breaks dependency cycles (A -> B -> A) cleanly.
+
+Multi-hop cycle prevention: the walker's own visited-set accumulator in
+the recursive CTE prevents revisiting nodes within a single walk. The
+`last_cascade_at >= enqueued_at` guard provides the second layer:
+transitive dependents whose last_cascade_at is already at-or-after the
+cascade wave's enqueued_at are skipped at enqueue time.
 """
 from __future__ import annotations
 
@@ -36,6 +45,11 @@ logger = logging.getLogger(__name__)
 # freshness decay) is smaller than this, don't bother propagating to the
 # dependent's own dependents — too small to matter.
 MULTI_HOP_THRESHOLD = Decimal("0.05")
+
+# Walker bounds for transitive dependent enumeration. max_hops=5 matches
+# the Phase 5.x design spec; max_nodes=200 matches the walker's hard cap.
+_WALK_MAX_HOPS = 5
+_WALK_MAX_NODES = 200
 
 
 def drain_one_batch(conn: Any, batch_size: int = 50) -> int:
@@ -153,36 +167,62 @@ def _process_one(
             (queue_id,),
         )
 
-        # Multi-hop propagation. Cycle prevention is two-layer:
+        # Multi-hop propagation via Phase 5 graph walker.
         #
-        #   1. Propagate the cascade wave's timestamp (this row's
-        #      enqueued_at) into the new row instead of letting NOW()
-        #      win. A multi-hop row is logically "from the same wave"
-        #      as its parent, so its enqueued_at must match — that's
-        #      what lets the `last_cascade_at >= enqueued_at` guard in
-        #      _process_one short-circuit a repeat visit.
-        #   2. Filter out dependents whose memory.last_cascade_at is
-        #      at-or-after this row's enqueued_at — they were already
-        #      touched by this same wave.
+        # Instead of the old 1-hop SQL JOIN, we walk ALL transitive
+        # dependents of memory_id in one pass (direction='incoming' —
+        # "who depends on me?"). The walker uses a recursive CTE with a
+        # visited-set accumulator, so cycles are already handled at the
+        # SQL level. We then INSERT all discovered dependents (excluding
+        # the seed itself) into the queue in one bulk INSERT.
+        #
+        # Cycle prevention is two-layer:
+        #   1. The walker's visited-set CTE prevents revisiting nodes
+        #      within this walk pass.
+        #   2. The `last_cascade_at >= enqueued_at` WHERE filter below
+        #      skips dependents already touched by this cascade wave.
+        #
+        # The cascade wave's enqueued_at is propagated into new rows
+        # (not NOW()) so that `_process_one`'s guard correctly
+        # short-circuits revisits of the same wave.
         #
         # Combined with the dedup partial unique index
         # (idx_re_eval_queue_dedup, partial WHERE attempt_count < 3) on
         # (memory_id, cascade_source_id, edge_type), this guarantees a
         # cycle (A->B->A) converges in one wave.
         if penalty > MULTI_HOP_THRESHOLD:
-            cur.execute(
-                "INSERT INTO devbrain.curator_re_eval_queue "
-                "(memory_id, cascade_source_id, edge_type, enqueued_at) "
-                "SELECT d.from_memory_id, %s, %s, %s "
-                "FROM devbrain.memory_dependencies d "
-                "JOIN devbrain.memory m ON m.id = d.from_memory_id "
-                "WHERE d.to_memory_id = %s "
-                "  AND d.edge_type = 'depends_on' "
-                "  AND (m.last_cascade_at IS NULL "
-                "       OR m.last_cascade_at < %s) "
-                "ON CONFLICT (memory_id, cascade_source_id, edge_type) "
-                "WHERE attempt_count < 3 DO NOTHING",
-                (memory_id, edge_type, enqueued_at, memory_id, enqueued_at),
+            from graph.walker import walk as _graph_walk  # local import avoids circular dep
+
+            walk_result = _graph_walk(
+                conn,
+                memory_id,
+                edge_types=["depends_on"],
+                max_hops=_WALK_MAX_HOPS,
+                max_nodes=_WALK_MAX_NODES,
+                direction="incoming",
+                cross_project=False,
             )
+            # Collect all transitive dependent IDs excluding the seed
+            # (hops=0 is the seed itself, not a dependent).
+            dependent_ids = [
+                str(ref.id)
+                for ref in walk_result.memories
+                if ref.hops > 0
+            ]
+            if dependent_ids:
+                # Bulk-enqueue transitive dependents. Filter at the DB
+                # level to skip any already touched by this cascade wave.
+                cur.execute(
+                    "INSERT INTO devbrain.curator_re_eval_queue "
+                    "(memory_id, cascade_source_id, edge_type, enqueued_at) "
+                    "SELECT m.id, %s, %s, %s "
+                    "FROM devbrain.memory m "
+                    "WHERE m.id = ANY(%s::uuid[]) "
+                    "  AND (m.last_cascade_at IS NULL "
+                    "       OR m.last_cascade_at < %s) "
+                    "ON CONFLICT (memory_id, cascade_source_id, edge_type) "
+                    "WHERE attempt_count < 3 DO NOTHING",
+                    (memory_id, edge_type, enqueued_at, dependent_ids, enqueued_at),
+                )
 
     conn.commit()
