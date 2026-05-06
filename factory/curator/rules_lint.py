@@ -51,17 +51,37 @@ class UnverifiedRule:
     compliance_profiles: list[str]
 
 
-def find_unverified_rules(conn: Any) -> list[UnverifiedRule]:
-    """Return profile-tagged rules with no matching postulate test."""
+def find_unverified_rules(
+    conn: Any, project_id: UUID | None = None
+) -> list[UnverifiedRule]:
+    """Return profile-tagged rules with no matching postulate test.
+
+    Optional ``project_id`` scopes the scan to a single project — useful for
+    tests that seed their own rules in a disposable project and don't want
+    to see seeded rules from migration 023 in the canonical 'devbrain'
+    project. Production CLI invocation passes None (scans all projects).
+    """
     with conn.cursor() as cur:
-        cur.execute(
-            "SELECT id, title, compliance_profiles "
-            "FROM devbrain.memory "
-            "WHERE tier = 'rule' "
-            "  AND compliance_profiles IS NOT NULL "
-            "  AND array_length(compliance_profiles, 1) > 0 "
-            "  AND archived_at IS NULL"
-        )
+        if project_id is not None:
+            cur.execute(
+                "SELECT id, title, compliance_profiles "
+                "FROM devbrain.memory "
+                "WHERE tier = 'rule' "
+                "  AND project_id = %s "
+                "  AND compliance_profiles IS NOT NULL "
+                "  AND array_length(compliance_profiles, 1) > 0 "
+                "  AND archived_at IS NULL",
+                (project_id,),
+            )
+        else:
+            cur.execute(
+                "SELECT id, title, compliance_profiles "
+                "FROM devbrain.memory "
+                "WHERE tier = 'rule' "
+                "  AND compliance_profiles IS NOT NULL "
+                "  AND array_length(compliance_profiles, 1) > 0 "
+                "  AND archived_at IS NULL"
+            )
         rows = cur.fetchall()
 
     if not rows:
@@ -82,9 +102,14 @@ def find_unverified_rules(conn: Any) -> list[UnverifiedRule]:
     return unverified
 
 
-def run_lint(conn: Any) -> int:
-    """CLI entry point. Exit 0 if clean, 1 if violations found."""
-    unverified = find_unverified_rules(conn)
+def run_lint(conn: Any, project_id: UUID | None = None) -> int:
+    """CLI entry point. Exit 0 if clean, 1 if violations found.
+
+    Optional ``project_id`` scopes the scan to a single project (passed
+    through to find_unverified_rules). CLI callers leave it as None to
+    scan all projects.
+    """
+    unverified = find_unverified_rules(conn, project_id=project_id)
     if not unverified:
         print("[rules lint] All profile-tagged rules have postulate tests. OK")
         return 0

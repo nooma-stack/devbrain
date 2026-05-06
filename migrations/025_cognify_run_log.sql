@@ -6,7 +6,7 @@
 --
 -- Phase 6 design: docs/plans/2026-05-05-phase-6-cognify-memify-design.md §7
 
-CREATE TABLE devbrain.cognify_run_log (
+CREATE TABLE IF NOT EXISTS devbrain.cognify_run_log (
     id              BIGSERIAL PRIMARY KEY,
     pass_name       TEXT NOT NULL,                          -- 'extract', 'decay', etc.
     project_id      UUID REFERENCES devbrain.projects(id),
@@ -18,11 +18,12 @@ CREATE TABLE devbrain.cognify_run_log (
     metadata        JSONB
 );
 
-CREATE INDEX idx_cognify_run_log_pass_started
+CREATE INDEX IF NOT EXISTS idx_cognify_run_log_pass_started
     ON devbrain.cognify_run_log (pass_name, started_at DESC);
 
-CREATE INDEX idx_cognify_run_log_project_pass
+CREATE INDEX IF NOT EXISTS idx_cognify_run_log_project_pass
     ON devbrain.cognify_run_log (project_id, pass_name, started_at DESC);
 
 INSERT INTO devbrain.schema_migrations (filename)
-VALUES ('025_cognify_run_log.sql');
+VALUES ('025_cognify_run_log.sql')
+ON CONFLICT (filename) DO NOTHING;
