@@ -92,6 +92,7 @@ from typing import Literal
 CliName = Literal["claude", "codex", "gemini"]
 
 VALID_CLIS: tuple[str, ...] = ("claude", "codex", "gemini")
+VALID_PLATFORMS: tuple[str, ...] = ("auto", "mac", "linux", "windows")
 
 # ─── Shared preamble (same for every CLI) ─────────────────────────────────────
 
@@ -520,6 +521,91 @@ _MCP_CONFIG_PATHS: dict[str, str] = {
     "gemini": "~/.gemini/settings.json",
 }
 
+# ─── Phase 0: Windows preflight (only when platform=windows) ──────────────────
+#
+# Verifies WSL2 + Ubuntu + apt prereqs, installs only what's missing. After
+# Phase 0 completes, the dev reopens their AI agent INSIDE the WSL Ubuntu
+# shell. Phases 1-8 then run as standard bash and "just work".
+
+_PHASE0_WINDOWS = """\
+## Phase 0 — Windows preflight (WSL2 + Ubuntu + apt prereqs)
+
+Phases 1-8 of this kit assume a Linux-shaped shell (bash, ssh, jq,
+process substitution, `~/.ssh/`). On Windows the cleanest path is
+**WSL2 + Ubuntu** — the rest of the kit then runs unchanged inside
+the WSL shell.
+
+The agent does verify-before-install: each dependency is checked first;
+only missing pieces are installed.
+
+### Step 0.1 — Verify WSL2
+
+<!-- agent:auto requires=user-approval risk=low -->
+```powershell
+# Run in PowerShell.
+wsl --status 2>&1
+# Expected if installed: "Default Distribution: Ubuntu" or similar.
+# If output is "Windows Subsystem for Linux has no installed
+# distributions" or the command isn't found — install per Step 0.2.
+```
+
+### Step 0.2 — Install WSL2 + Ubuntu (only if Step 0.1 reported missing)
+
+<!-- agent:human reason=requires-admin-elevation -->
+```powershell
+# Run in PowerShell as Administrator. Requires reboot afterward.
+wsl --install -d Ubuntu
+# Reboot when prompted, then:
+#   1. Open "Ubuntu" from the Start menu
+#   2. Set a Linux username + password when prompted
+#   3. Once the Ubuntu shell is open, continue to Step 0.3
+```
+
+> If WSL is already installed but the default distro isn't Ubuntu, you
+> can skip the install and just `wsl -d Ubuntu` from PowerShell. The
+> agent should NOT clobber an existing distro choice.
+
+### Step 0.3 — Verify Ubuntu apt prereqs
+
+<!-- agent:auto requires=user-approval risk=low -->
+```bash
+# Run inside the WSL Ubuntu shell.
+for cmd in jq ssh curl openssl; do
+    if command -v $cmd >/dev/null 2>&1; then
+        echo "✓ $cmd present"
+    else
+        echo "✗ $cmd missing"
+    fi
+done
+```
+
+### Step 0.4 — Install missing apt packages (only the ones flagged ✗ above)
+
+<!-- agent:auto requires=user-approval,sudo risk=low -->
+```bash
+# Adjust the package list to ONLY the missing ones from Step 0.3.
+# jq → jq, ssh → openssh-client, curl → curl, openssl → openssl
+sudo apt update
+sudo apt install -y <space-separated-package-names>
+```
+
+### Step 0.5 — Switch your AI agent to WSL
+
+The remaining phases (1-8) run inside this WSL Ubuntu shell. **Reopen
+your AI agent here** — close the Windows-native session and:
+
+- **Codex / Gemini CLI:** install + run them inside WSL (Phase 2 covers this)
+- **Claude Code:** install Claude Code inside WSL (Phase 2 covers this)
+- **Claude Desktop / Codex Desktop apps:** Windows-native is fine, but
+  the kit's bash commands need to execute via your WSL agent session
+
+Once your agent is running inside WSL Ubuntu, continue to Phase 1.
+
+---
+
+"""
+
+
 _PHASE2_BY_CLI: dict[str, str] = {
     "claude": _PHASE2_CLAUDE,
     "codex": _PHASE2_CODEX,
@@ -554,6 +640,7 @@ def write_onboarding_kit(
     ssh_host: str = "lhts-mac-studio.local",
     ssh_port: int = 22,
     cli: CliName = "claude",
+    platform: str = "auto",
 ) -> Path:
     """Render an onboarding kit for one invitation. Returns the path written.
 
@@ -570,6 +657,10 @@ def write_onboarding_kit(
     """
     if cli not in VALID_CLIS:
         raise ValueError(f"cli must be one of {VALID_CLIS!r}, got {cli!r}")
+    if platform not in VALID_PLATFORMS:
+        raise ValueError(
+            f"platform must be one of {VALID_PLATFORMS!r}, got {platform!r}"
+        )
 
     first_name = full_name.split()[0] if full_name else dev_id
 
@@ -598,8 +689,10 @@ def write_onboarding_kit(
         ssh_port_flag=f"-p {ssh_port}",
     )
 
-    sections = [
-        _PREAMBLE,
+    sections: list[str] = [_PREAMBLE]
+    if platform == "windows":
+        sections.append(_PHASE0_WINDOWS)
+    sections += [
         _PHASE2_BY_CLI[cli],
         _PHASE3_BY_CLI[cli],
         _PHASE4,

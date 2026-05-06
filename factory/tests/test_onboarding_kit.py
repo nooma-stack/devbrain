@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from onboarding_kit import VALID_CLIS, write_onboarding_kit
+from onboarding_kit import VALID_CLIS, VALID_PLATFORMS, write_onboarding_kit
 
 
 COMMON_KWARGS = dict(
@@ -307,3 +307,55 @@ def test_rotate_helper_gemini_format_check():
         "gemini_api_key": "not-a-google-key",
     }
     assert _run_helper(body) == 2
+
+
+# ─── Windows preflight (platform=windows) ─────────────────────────────────────
+
+
+def test_valid_platforms_tuple():
+    assert set(VALID_PLATFORMS) == {"auto", "mac", "linux", "windows"}
+
+
+def test_invalid_platform_raises(tmp_path):
+    with pytest.raises(ValueError, match="platform must be one of"):
+        write_onboarding_kit(
+            path=tmp_path / "kit.md", platform="bsd", **COMMON_KWARGS
+        )
+
+
+def test_windows_platform_includes_phase0(tmp_path):
+    """platform='windows' prepends a Phase 0 preflight section."""
+    kit_path = tmp_path / "alice-onboard-win.md"
+    write_onboarding_kit(path=kit_path, platform="windows", **COMMON_KWARGS)
+    content = kit_path.read_text()
+    assert "Phase 0 — Windows preflight" in content
+    # Verify-before-install pattern: the kit checks WSL status BEFORE
+    # offering to install — never blindly runs the installer.
+    assert "wsl --status" in content
+    assert "if installed:" in content.lower() or "if Step 0.1 reported missing" in content
+    # Apt prereqs are also verified before install (Step 0.3 → 0.4).
+    assert "command -v" in content
+    assert "for cmd in jq ssh curl openssl" in content
+
+
+def test_non_windows_platforms_omit_phase0(tmp_path):
+    """auto / mac / linux must NOT emit the Windows preflight."""
+    for plat in ("auto", "mac", "linux"):
+        kit_path = tmp_path / f"alice-onboard-{plat}.md"
+        write_onboarding_kit(
+            path=kit_path, platform=plat, **COMMON_KWARGS
+        )
+        content = kit_path.read_text()
+        assert "Phase 0 — Windows preflight" not in content, (
+            f"platform={plat!r} should not emit Phase 0"
+        )
+
+
+def test_default_platform_is_auto(tmp_path):
+    """Omitting the platform kwarg defaults to 'auto' — same shape as
+    explicit 'auto'."""
+    kit_default = tmp_path / "default.md"
+    kit_auto = tmp_path / "auto.md"
+    write_onboarding_kit(path=kit_default, **COMMON_KWARGS)
+    write_onboarding_kit(path=kit_auto, platform="auto", **COMMON_KWARGS)
+    assert kit_default.read_text() == kit_auto.read_text()

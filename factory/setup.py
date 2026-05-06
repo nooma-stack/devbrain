@@ -1954,7 +1954,7 @@ def _run_multi_dev_section() -> None:
     setup_multi_dev(non_interactive=False)
 
 
-def setup_add_dev(cli: str | None = None) -> None:
+def setup_add_dev(cli: str | None = None, platform: str | None = None) -> None:
     """Onboard a new dev: stage row, generate invitation, write kit .md.
 
     The admin runs this on the Mac Studio. They get back a path to a
@@ -2050,6 +2050,41 @@ def setup_add_dev(cli: str | None = None) -> None:
         from onboarding_kit import VALID_CLIS as _VALID_CLIS
         if cli not in _VALID_CLIS:
             _warn(f"--cli '{cli}' is not valid. Must be one of: {', '.join(_VALID_CLIS)}")
+            raise SystemExit(2)
+
+    # ─── Dev's OS / platform selection (controls Windows WSL preflight) ──
+    from onboarding_kit import VALID_PLATFORMS as _VALID_PLATFORMS
+    if platform is None:
+        _platform_labels = {
+            "auto":    "Auto-detect at runtime (default — agent figures it out)",
+            "mac":     "macOS",
+            "linux":   "Linux",
+            "windows": "Windows (kit prepends WSL2 + Ubuntu preflight)",
+        }
+        click.echo()
+        _info("Dev's local platform?")
+        for i, p in enumerate(_VALID_PLATFORMS, 1):
+            click.echo(f"    {i}. {_platform_labels[p]}")
+        click.echo()
+        while True:
+            raw = _prompt("Choice (1-4 or platform name)", default="1").strip().lower()
+            if raw in ("1", "auto"):
+                platform = "auto"
+                break
+            elif raw in ("2", "mac"):
+                platform = "mac"
+                break
+            elif raw in ("3", "linux"):
+                platform = "linux"
+                break
+            elif raw in ("4", "windows"):
+                platform = "windows"
+                break
+            else:
+                _warn(f"'{raw}' is not valid. Enter 1-4 or a platform name.")
+    else:
+        if platform not in _VALID_PLATFORMS:
+            _warn(f"--platform '{platform}' is not valid. Must be one of: {', '.join(_VALID_PLATFORMS)}")
             raise SystemExit(2)
 
     auto_activate = _confirm(
@@ -2169,6 +2204,7 @@ def setup_add_dev(cli: str | None = None) -> None:
         ssh_host=ONBOARDING_SSH_HOST,
         ssh_port=ONBOARDING_SSH_PORT,
         cli=cli,
+        platform=platform,
     )
 
     # ─── Hand back to admin ───────────────────────────────────────────
