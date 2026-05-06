@@ -22,14 +22,13 @@ import pytest
 import readiness as readiness_module
 from readiness import FactoryReadiness, ReadinessIssue
 from state_machine import FactoryDB
-from config import DATABASE_URL
 
 TEST_PROJECT_ROOT = "/tmp/readiness_test_root"
 
 
 @pytest.fixture
-def db():
-    return FactoryDB(DATABASE_URL)
+def db(database_url):
+    return FactoryDB(database_url)
 
 
 @pytest.fixture(autouse=True)

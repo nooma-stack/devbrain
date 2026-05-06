@@ -16,7 +16,6 @@ import pytest
 from psycopg2 import sql
 
 import cred_rotate
-from config import DATABASE_URL
 from cred_rotate import (
     DependentCheck,
     RotationContext,
@@ -37,14 +36,14 @@ class _FakeCompleted:
     stderr: str = ""
 
 
-def _admin_conn():
-    return psycopg2.connect(DATABASE_URL)
+def _admin_conn(database_url):
+    return psycopg2.connect(database_url)
 
 
 @pytest.fixture
-def test_role():
+def test_role(database_url):
     """Create a throwaway Postgres role for the rotation, drop it after."""
-    with _admin_conn() as conn, conn.cursor() as cur:
+    with _admin_conn(database_url) as conn, conn.cursor() as cur:
         cur.execute(
             sql.SQL("DROP ROLE IF EXISTS {r}").format(r=sql.Identifier(TEST_ROLE))
         )
@@ -55,7 +54,7 @@ def test_role():
         )
         conn.commit()
     yield TEST_ROLE
-    with _admin_conn() as conn, conn.cursor() as cur:
+    with _admin_conn(database_url) as conn, conn.cursor() as cur:
         cur.execute(
             sql.SQL("DROP ROLE IF EXISTS {r}").format(r=sql.Identifier(TEST_ROLE))
         )

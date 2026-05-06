@@ -3,12 +3,11 @@ import json
 import pytest
 from state_machine import FactoryDB, JobStatus
 
-from config import DATABASE_URL
 
 
 @pytest.fixture
-def db():
-    return FactoryDB(DATABASE_URL)
+def db(database_url):
+    return FactoryDB(database_url)
 
 
 @pytest.fixture(autouse=True)

@@ -4,12 +4,11 @@ import pytest
 from state_machine import FactoryDB, JobStatus
 from orchestrator import _count_warning, _extract_warning_items
 
-from config import DATABASE_URL
 
 
 @pytest.fixture
-def db():
-    return FactoryDB(DATABASE_URL)
+def db(database_url):
+    return FactoryDB(database_url)
 
 
 # Autouse cleanup: every integration test in this directory that creates

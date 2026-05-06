@@ -12,7 +12,6 @@ import psycopg2
 import psycopg2.errors
 import pytest
 
-from config import DATABASE_URL
 from state_machine import FactoryDB
 
 # All test-created rows have content starting with this prefix so the
@@ -22,8 +21,8 @@ TEST_CONTENT_PREFIX = "memory_table_test_"
 
 
 @pytest.fixture
-def db():
-    return FactoryDB(DATABASE_URL)
+def db(database_url):
+    return FactoryDB(database_url)
 
 
 @pytest.fixture(autouse=True)

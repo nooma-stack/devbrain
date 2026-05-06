@@ -14,7 +14,6 @@ import logging
 import pytest
 
 import orchestrator as orchestrator_module
-from config import DATABASE_URL
 from orchestrator import FactoryOrchestrator
 from state_machine import FactoryDB
 
@@ -22,8 +21,8 @@ TEST_TITLE_PREFIX = "fbranch_setup_"
 
 
 @pytest.fixture
-def db():
-    return FactoryDB(DATABASE_URL)
+def db(database_url):
+    return FactoryDB(database_url)
 
 
 @pytest.fixture(autouse=True)
@@ -52,8 +51,8 @@ def cleanup(db):
 
 
 @pytest.fixture
-def orch():
-    return FactoryOrchestrator(DATABASE_URL)
+def orch(database_url):
+    return FactoryOrchestrator(database_url)
 
 
 class _FakeCompleted:

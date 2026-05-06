@@ -25,7 +25,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import export_memory  # noqa: E402
 import import_memory  # noqa: E402
-from config import DATABASE_URL  # noqa: E402
 from state_machine import FactoryDB  # noqa: E402
 
 # Every seeded row's content/title/slug starts with this prefix so the
@@ -34,8 +33,8 @@ EXPORT_IMPORT_TEST_PREFIX = "export_import_test_"
 
 
 @pytest.fixture
-def db():
-    return FactoryDB(DATABASE_URL)
+def db(database_url):
+    return FactoryDB(database_url)
 
 
 @pytest.fixture(autouse=True)

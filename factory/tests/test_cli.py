@@ -1,7 +1,23 @@
 """Tests for the devbrain CLI."""
+import os
+
 import pytest
 from click.testing import CliRunner
 from cli import cli, parse_channel
+
+# The DB-touching CLI tests invoke Click commands that build their own
+# FactoryDB from config.DATABASE_URL, which is computed at module import
+# time from DEVBRAIN_DATABASE_URL (the full URL env var) or from the
+# config/devbrain.yaml database stanza. These tests only work when
+# DEVBRAIN_DATABASE_URL is set in the environment BEFORE pytest starts,
+# ensuring config.py resolves the correct URL at import time.
+#
+# DEVBRAIN_DB_PASSWORD (the conftest fixture env var) is NOT sufficient
+# because config.py doesn't read DEVBRAIN_DB_PASSWORD directly.
+_skip_db = pytest.mark.skipif(
+    not os.getenv("DEVBRAIN_DATABASE_URL"),
+    reason="DEVBRAIN_DATABASE_URL not set; CLI DB tests require the full URL env var",
+)
 
 
 @pytest.fixture
@@ -27,6 +43,7 @@ def test_parse_channel_invalid():
         parse_channel("notvalid")
 
 
+@_skip_db
 def test_register_command(runner):
     result = runner.invoke(cli, [
         "register",
@@ -38,6 +55,7 @@ def test_register_command(runner):
     assert "registered" in result.output.lower()
 
 
+@_skip_db
 def test_register_multiple_channels(runner):
     result = runner.invoke(cli, [
         "register",
@@ -48,6 +66,7 @@ def test_register_multiple_channels(runner):
     assert result.exit_code == 0
 
 
+@_skip_db
 def test_history_command(runner):
     result = runner.invoke(cli, [
         "history", "--dev", "test_cli_reg", "--recent", "5",
@@ -64,6 +83,7 @@ def test_history_nl_dry_run_handles_ollama(runner):
     assert result.exit_code in (0, 1)
 
 
+@_skip_db
 def test_status_command(runner):
     """devbrain status runs without error."""
     result = runner.invoke(cli, ["status"])
@@ -77,6 +97,7 @@ def test_status_command(runner):
     )
 
 
+@_skip_db
 def test_status_with_project_filter(runner):
     """devbrain status --project works."""
     result = runner.invoke(cli, ["status", "--project", "devbrain"])

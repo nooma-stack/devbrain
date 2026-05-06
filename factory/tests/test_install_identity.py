@@ -2,7 +2,6 @@
 import pytest
 
 import setup
-from config import DATABASE_URL
 from state_machine import FactoryDB
 
 
@@ -103,8 +102,8 @@ def test_install_identity_preserves_existing_row(monkeypatch):
 # never hit Postgres.
 
 @pytest.fixture
-def db():
-    conn_db = FactoryDB(DATABASE_URL)
+def db(database_url):
+    conn_db = FactoryDB(database_url)
 
     def _purge():
         with conn_db._conn() as conn, conn.cursor() as cur:
@@ -119,8 +118,11 @@ def db():
     _purge()
 
 
-def test_install_identity_persists_row(db):
+def test_install_identity_persists_row(db, database_url, monkeypatch):
     """End-to-end: row is written and readable via get_dev."""
+    # setup.install_identity() creates its own FactoryDB(DATABASE_URL) internally;
+    # monkeypatch ensures it uses the test DB URL, not the config default.
+    monkeypatch.setattr("setup.DATABASE_URL", database_url)
     dev_id = "test_install_identity_persist"
     result = setup.install_identity(dev_id=dev_id)
 
@@ -132,8 +134,11 @@ def test_install_identity_persists_row(db):
     assert row["channels"] == []
 
 
-def test_install_identity_idempotent(db):
+def test_install_identity_idempotent(db, database_url, monkeypatch):
     """Re-running with the same dev_id does not error or duplicate."""
+    # setup.install_identity() creates its own FactoryDB(DATABASE_URL) internally;
+    # monkeypatch ensures it uses the test DB URL, not the config default.
+    monkeypatch.setattr("setup.DATABASE_URL", database_url)
     dev_id = "test_install_identity_idem"
 
     first = setup.install_identity(dev_id=dev_id)

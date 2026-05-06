@@ -4,12 +4,11 @@ from unittest.mock import patch
 from state_machine import FactoryDB
 from notifications.router import NotificationRouter, NotificationEvent
 
-from config import DATABASE_URL
 
 
 @pytest.fixture
-def db():
-    return FactoryDB(DATABASE_URL)
+def db(database_url):
+    return FactoryDB(database_url)
 
 
 @pytest.fixture(autouse=True)
