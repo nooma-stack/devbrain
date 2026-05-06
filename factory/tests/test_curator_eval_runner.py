@@ -141,9 +141,9 @@ def test_build_cached_context_preserves_brief_structure():
 # ------------------------------------------------------------- run_evals
 
 
-def test_run_evals_invokes_both_agents_in_order():
-    """eval_security MUST run before eval_test — reversing the order
-    means the second call doesn't hit the prompt cache."""
+def test_run_evals_invokes_all_agents_in_order():
+    """eval_security MUST run first (primes cache), eval_test second,
+    eval_perf third. Reversing breaks the warm-cache pattern."""
     job_id = uuid4()
     conn = _FakeConn()
     captured_args: list[list[str]] = []
@@ -155,17 +155,18 @@ def test_run_evals_invokes_both_agents_in_order():
     with patch("curator.eval.runner.subprocess.run", side_effect=fake_run):
         results = run_evals(conn, job_id, brief={}, plan="", diff="")
 
-    assert len(results) == 2
+    assert len(results) == 3
     assert results[0].agent_name == "eval_security"
     assert results[1].agent_name == "eval_test"
-    # Both invocations went through the claude CLI.
+    assert results[2].agent_name == "eval_perf"
+    # All three invocations went through the claude CLI.
     assert all(args[0] == "claude" for args in captured_args)
-    assert len(captured_args) == 2
+    assert len(captured_args) == 3
 
 
-def test_run_evals_passes_same_user_payload_to_both_agents():
+def test_run_evals_passes_same_user_payload_to_all_agents():
     """Cache hit depends on identical user message across calls. The
-    runner sends the same `cached_context` as stdin to both subprocess
+    runner sends the same `cached_context` as stdin to all subprocess
     calls; only the system-prompt differs."""
     job_id = uuid4()
     conn = _FakeConn()
@@ -178,8 +179,9 @@ def test_run_evals_passes_same_user_payload_to_both_agents():
     with patch("curator.eval.runner.subprocess.run", side_effect=fake_run):
         run_evals(conn, job_id, brief={"k": "v"}, plan="P", diff="D")
 
-    assert len(captured_inputs) == 2
-    assert captured_inputs[0] == captured_inputs[1]
+    assert len(captured_inputs) == 3
+    # All three agents receive the same cached context body.
+    assert captured_inputs[0] == captured_inputs[1] == captured_inputs[2]
 
 
 def test_run_evals_persists_findings_to_factory_artifacts():
@@ -188,7 +190,12 @@ def test_run_evals_persists_findings_to_factory_artifacts():
     job_id = uuid4()
     conn = _FakeConn()
 
-    responses = [_security_finding_response(), _test_finding_response()]
+    # security + test have findings; perf is clean.
+    responses = [
+        _security_finding_response(),
+        _test_finding_response(),
+        {"findings": []},
+    ]
     response_iter = iter(responses)
 
     def fake_run(cmd, **kwargs):
@@ -197,13 +204,14 @@ def test_run_evals_persists_findings_to_factory_artifacts():
     with patch("curator.eval.runner.subprocess.run", side_effect=fake_run):
         results = run_evals(conn, job_id, brief={}, plan="", diff="")
 
-    # Two findings -> two INSERT rows; one commit at end.
+    # Two findings + one summary row (eval_perf clean) -> 3 INSERTs; one commit.
     inserts = [r for r in conn.cursor_obj.executed if r[0].startswith("INSERT")]
-    assert len(inserts) == 2
+    assert len(inserts) == 3
     assert conn.commits == 1
-    # Each result has 1 finding.
+    # security and test each have 1 finding; perf is clean.
     assert len(results[0].findings) == 1
     assert len(results[1].findings) == 1
+    assert len(results[2].findings) == 0
 
 
 def test_run_evals_persists_summary_row_when_no_findings():
@@ -219,15 +227,19 @@ def test_run_evals_persists_summary_row_when_no_findings():
         run_evals(conn, job_id, brief={}, plan="", diff="")
 
     inserts = [r for r in conn.cursor_obj.executed if r[0].startswith("INSERT")]
-    assert len(inserts) == 2  # one summary per agent
+    assert len(inserts) == 3  # one summary per agent (security, test, perf)
     # Each insert has artifact_type ending in _summary.
     artifact_types = [params[2] for _, params in inserts]
-    assert artifact_types == ["eval_security_summary", "eval_test_summary"]
+    assert artifact_types == [
+        "eval_security_summary",
+        "eval_test_summary",
+        "eval_perf_summary",
+    ]
 
 
 def test_run_evals_isolates_agent_failure():
-    """When eval_security raises, eval_test still runs. The failed
-    agent's EvalResult carries findings=[] and a non-null `error`."""
+    """When eval_security raises, eval_test and eval_perf still run. The
+    failed agent's EvalResult carries findings=[] and a non-null `error`."""
     job_id = uuid4()
     conn = _FakeConn()
 
@@ -243,7 +255,7 @@ def test_run_evals_isolates_agent_failure():
     with patch("curator.eval.runner.subprocess.run", side_effect=fake_run):
         results = run_evals(conn, job_id, brief={}, plan="", diff="")
 
-    assert len(results) == 2
+    assert len(results) == 3
     # eval_security failed.
     assert results[0].agent_name == "eval_security"
     assert results[0].findings == []
@@ -252,11 +264,14 @@ def test_run_evals_isolates_agent_failure():
     # eval_test still ran cleanly.
     assert results[1].agent_name == "eval_test"
     assert results[1].error is None
+    # eval_perf also ran cleanly.
+    assert results[2].agent_name == "eval_perf"
+    assert results[2].error is None
 
 
 def test_run_evals_handles_json_decode_error():
     """If claude returns malformed JSON, the agent's EvalResult carries
-    the exception in `error`; the other agent is unaffected."""
+    the exception in `error`; other agents are unaffected."""
     job_id = uuid4()
     conn = _FakeConn()
     call_idx = {"n": 0}
@@ -274,7 +289,9 @@ def test_run_evals_handles_json_decode_error():
     # The error message length is bounded so we don't blow up the
     # factory_artifacts row.
     assert len(results[0].error) <= 500
+    # eval_test and eval_perf still ran cleanly.
     assert results[1].error is None
+    assert results[2].error is None
 
 
 def test_run_evals_handles_subprocess_timeout():
@@ -295,12 +312,12 @@ def test_run_evals_handles_subprocess_timeout():
 
     assert results[0].error is not None
     assert results[1].error is None
+    assert results[2].error is None
 
 
 def test_run_evals_passes_system_prompts_per_agent():
-    """eval_security and eval_test must use different --system-prompt
-    bodies — that's the only thing that varies between the two cached
-    calls."""
+    """Each agent must use a distinct --system-prompt body — that's the
+    only thing that varies across the three cached calls."""
     job_id = uuid4()
     conn = _FakeConn()
     captured_cmds: list[list[str]] = []
@@ -319,10 +336,15 @@ def test_run_evals_passes_system_prompts_per_agent():
 
     sp_security = _system_prompt(captured_cmds[0])
     sp_test = _system_prompt(captured_cmds[1])
+    sp_perf = _system_prompt(captured_cmds[2])
+    # All three prompts are distinct.
     assert sp_security != sp_test
+    assert sp_security != sp_perf
+    assert sp_test != sp_perf
     # Sanity: the prompt files we shipped land in the right slot.
     assert "eval_security" in sp_security
     assert "eval_test" in sp_test
+    assert "eval_perf" in sp_perf
 
 
 # ----------------------------------------------------- _persist_findings
@@ -427,15 +449,14 @@ def test_eval_result_round_trips_through_serialization():
 
 def test_parse_findings_unknown_agent_raises():
     """The internal dispatcher rejects unknown agent names — only the
-    two registered eval agents are valid."""
+    registered LLM eval agents are valid."""
     from curator.eval.runner import _parse_findings
     with pytest.raises(ValueError):
-        _parse_findings("eval_performance", {"findings": []})
+        _parse_findings("eval_typo", {"findings": []})
 
 
 def test_parse_findings_routes_to_correct_module():
-    """eval_security delegates to curator.eval.eval_security.parse;
-    eval_test delegates to curator.eval.eval_test.parse."""
+    """Each agent name delegates to its own parse module."""
     from curator.eval.runner import _parse_findings
 
     response = {
@@ -453,7 +474,10 @@ def test_parse_findings_routes_to_correct_module():
     }
     sec = _parse_findings("eval_security", response)
     tst = _parse_findings("eval_test", response)
+    perf = _parse_findings("eval_perf", response)
     assert len(sec) == 1
     assert len(tst) == 1
+    assert len(perf) == 1
     assert sec[0].file == "x.py"
     assert tst[0].file == "x.py"
+    assert perf[0].file == "x.py"
