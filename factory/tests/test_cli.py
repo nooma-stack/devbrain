@@ -5,16 +5,18 @@ import pytest
 from click.testing import CliRunner
 from cli import cli, parse_channel
 
-# The DB-touching CLI tests call commands that build their own FactoryDB
-# from config.DATABASE_URL (computed at import time). They work when
-# DEVBRAIN_DATABASE_URL is set in the environment before pytest starts,
-# which ensures config.py resolves the correct URL. Skip them when the
-# env var is absent — the database_url fixture skips on DEVBRAIN_DB_PASSWORD,
-# but that doesn't propagate into the CLI's own DB connection.
-_DB_URL_ENV = os.getenv("DEVBRAIN_DATABASE_URL") or os.getenv("DEVBRAIN_DB_PASSWORD")
+# The DB-touching CLI tests invoke Click commands that build their own
+# FactoryDB from config.DATABASE_URL, which is computed at module import
+# time from DEVBRAIN_DATABASE_URL (the full URL env var) or from the
+# config/devbrain.yaml database stanza. These tests only work when
+# DEVBRAIN_DATABASE_URL is set in the environment BEFORE pytest starts,
+# ensuring config.py resolves the correct URL at import time.
+#
+# DEVBRAIN_DB_PASSWORD (the conftest fixture env var) is NOT sufficient
+# because config.py doesn't read DEVBRAIN_DB_PASSWORD directly.
 _skip_db = pytest.mark.skipif(
-    not _DB_URL_ENV,
-    reason="DEVBRAIN_DATABASE_URL (or DEVBRAIN_DB_PASSWORD) not set; CLI DB tests require DB",
+    not os.getenv("DEVBRAIN_DATABASE_URL"),
+    reason="DEVBRAIN_DATABASE_URL not set; CLI DB tests require the full URL env var",
 )
 
 
