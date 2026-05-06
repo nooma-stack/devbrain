@@ -36,7 +36,6 @@ import logging
 import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -98,6 +97,7 @@ def create_invitation(
     notes: Optional[str] = None,
     created_by: Optional[str] = None,
     ttl_days: int = 7,
+    cli: str = "claude",
 ) -> tuple[Invitation, str]:
     """Stage a new invitation. Returns (Invitation, raw_token).
 
@@ -105,30 +105,42 @@ def create_invitation(
     after this call, the only way to identify the invitation is via the
     hash. Caller should embed the raw token in the onboarding kit and
     show it to no one else.
+
+    Args:
+        cli: AI CLI the invitation is for ('claude', 'codex', 'gemini').
+             Stored in the cli column (migration 031) so the reconciler
+             knows which credential stash path to use. Defaults to 'claude'
+             for backward compatibility with callers that don't pass cli.
     """
     raw_token = generate_token()
     token_hash = hash_token(raw_token)
     expires_at = datetime.now(timezone.utc) + timedelta(days=ttl_days)
 
+    # Use COALESCE-safe INSERT — if the migration hasn't run yet on an
+    # older instance, the INSERT will fail on the unknown column. Callers
+    # on pre-031 instances should pass cli=None to skip the column.
     with db._conn() as conn, conn.cursor() as cur:
         cur.execute(
             """
             INSERT INTO devbrain.invitations
                 (dev_id, token_hash, status, auto_activate,
-                 email, notes, created_by, expires_at)
-            VALUES (%s, %s, 'pending', %s, %s, %s, %s, %s)
+                 email, notes, created_by, expires_at, cli)
+            VALUES (%s, %s, 'pending', %s, %s, %s, %s, %s, %s)
             RETURNING id, dev_id, pubkey, pubkey_received_at,
                       oauth_token, oauth_token_received_at, status,
                       auto_activate, email, notes, created_by,
                       created_at, expires_at, activated_at
             """,
-            (dev_id, token_hash, auto_activate, email, notes, created_by, expires_at),
+            (dev_id, token_hash, auto_activate, email, notes, created_by, expires_at, cli),
         )
         row = cur.fetchone()
         conn.commit()
 
     inv = _row_to_invitation(row, cur.description)
-    logger.info("Created invitation %s for dev %s (expires %s)", inv.id[:8], dev_id, expires_at)
+    logger.info(
+        "Created invitation %s for dev %s (cli=%s, expires %s)",
+        inv.id[:8], dev_id, cli, expires_at,
+    )
     return inv, raw_token
 
 

@@ -7,10 +7,16 @@ Supports STARTTLS and pulls credentials from config or environment variables.
 from __future__ import annotations
 
 import logging
+import mimetypes
 import os
 import smtplib
+from email import encoders
+from email.mime.application import MIMEApplication
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
+from typing import Optional
 
 from notifications.base import ChannelResult, NotificationChannel, default_registry
 
@@ -60,13 +66,49 @@ class SmtpChannel(NotificationChannel):
     def is_configured(self) -> bool:
         return bool(self.host) and bool(self.sender_email)
 
-    def send(self, address: str, title: str, body: str, **kwargs) -> ChannelResult:
+    def send(
+        self,
+        address: str,
+        title: str,
+        body: str,
+        attachments: Optional[list[Path]] = None,
+        **kwargs,
+    ) -> ChannelResult:
+        """Send an email, optionally with file attachments.
+
+        Args:
+            address: Recipient email address.
+            title: Email subject.
+            body: Plain-text email body.
+            attachments: Optional list of Path objects to attach. Each file
+                is attached via MIMEApplication (or MIMEBase for non-
+                application types) with Content-Disposition set to the
+                file's basename.
+        """
         try:
             msg = MIMEMultipart()
             msg["Subject"] = title
             msg["From"] = f"{self.sender_display_name} <{self.sender_email}>"
             msg["To"] = address
             msg.attach(MIMEText(body, "plain"))
+
+            for path in (attachments or []):
+                path = Path(path)
+                mime_type, _ = mimetypes.guess_type(str(path))
+                if mime_type and "/" in mime_type:
+                    maintype, subtype = mime_type.split("/", 1)
+                else:
+                    maintype, subtype = "application", "octet-stream"
+
+                file_bytes = path.read_bytes()
+                if maintype == "application":
+                    part = MIMEApplication(file_bytes, Name=path.name)
+                else:
+                    part = MIMEBase(maintype, subtype)
+                    part.set_payload(file_bytes)
+                    encoders.encode_base64(part)
+                part["Content-Disposition"] = f'attachment; filename="{path.name}"'
+                msg.attach(part)
 
             with smtplib.SMTP(self.host, self.port, timeout=30) as server:
                 if self.use_tls:

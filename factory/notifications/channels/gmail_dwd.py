@@ -9,9 +9,13 @@ from __future__ import annotations
 
 import base64
 import logging
+import mimetypes
+from email.mime.application import MIMEApplication
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
+from typing import Optional
 
 from notifications.base import ChannelResult, NotificationChannel, default_registry
 
@@ -80,7 +84,25 @@ class GmailDwdChannel(NotificationChannel):
         self._service = build("gmail", "v1", credentials=credentials)
         return self._service
 
-    def send(self, address: str, title: str, body: str, **kwargs) -> ChannelResult:
+    def send(
+        self,
+        address: str,
+        title: str,
+        body: str,
+        attachments: Optional[list[Path]] = None,
+        **kwargs,
+    ) -> ChannelResult:
+        """Send an email, optionally with file attachments.
+
+        Args:
+            address: Recipient email address.
+            title: Email subject.
+            body: Plain-text email body.
+            attachments: Optional list of Path objects to attach. Each file
+                is attached using its basename as the Content-Disposition
+                filename. Files are encoded as base64 per the Gmail API's
+                multipart/mixed requirements.
+        """
         if not self.is_configured():
             return ChannelResult(
                 delivered=False,
@@ -94,6 +116,25 @@ class GmailDwdChannel(NotificationChannel):
             msg["From"] = f"{self.sender_display_name} <{self.sender_email}>"
             msg["To"] = address
             msg.attach(MIMEText(body, "plain"))
+
+            for path in (attachments or []):
+                path = Path(path)
+                mime_type, _ = mimetypes.guess_type(str(path))
+                if mime_type and "/" in mime_type:
+                    maintype, subtype = mime_type.split("/", 1)
+                else:
+                    maintype, subtype = "application", "octet-stream"
+
+                file_bytes = path.read_bytes()
+                if maintype == "application":
+                    part = MIMEApplication(file_bytes, Name=path.name)
+                else:
+                    part = MIMEBase(maintype, subtype)
+                    part.set_payload(file_bytes)
+                    from email import encoders
+                    encoders.encode_base64(part)
+                part["Content-Disposition"] = f'attachment; filename="{path.name}"'
+                msg.attach(part)
 
             raw = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
 

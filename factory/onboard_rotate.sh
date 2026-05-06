@@ -8,39 +8,45 @@
 #
 # Lifecycle: a new dev's invitation kit ships a temp ed25519 private
 # key + invite token. Their AI agent SSHes in using the temp key,
-# sending JSON on stdin: {"pubkey": "<their permanent ed25519 pubkey>",
-# "oauth_token": "sk-ant-oat01-..."}. We:
+# sending CLI-specific JSON on stdin (see below). We:
 #
 #   1. Read the JSON.
 #   2. Validate pubkey shape (defense-in-depth — Python helper does
 #      the canonical check).
-#   3. Validate the OAuth token by hitting api.anthropic.com — must
-#      return 200 (or 400 for our deliberately-malformed request body
-#      against a valid auth header). 401 == invalid token, reject.
-#   4. Persist via the same DB path the webhook uses (submit_pubkey,
-#      submit_oauth_token) so the reconciler picks it up identically.
-#   5. Self-delete this temp key's authorized_keys entry by marker
-#      comment.
-#   6. Audit-log the rotation (timestamp, dev_id, invite_id_short,
-#      SSH client IP).
-#   7. Return JSON to the agent: {"status":"ok"}.
+#   3. Look up the invitation to determine which CLI was used (cli
+#      column, migration 031).
+#   4. Validate the CLI credential against its upstream API:
+#        claude: POST to api.anthropic.com — 200/400 = valid, 401 = reject
+#        codex:  same Anthropic API (codex auth.json contains an
+#                Anthropic-format OAuth token under "accessToken")
+#        gemini: GET to generativelanguage.googleapis.com with the API key
+#   5. Persist via the same DB path the webhook uses so the reconciler
+#      picks it up identically.
+#   6. Self-delete this temp key's authorized_keys entry by marker.
+#   7. Audit-log the rotation.
+#   8. Return JSON to the agent: {"status":"ok"}.
+#
+# ─── Stdin JSON shapes by CLI ─────────────────────────────────────────────────
+#
+#   claude:  {"pubkey":"...", "oauth_token":"sk-ant-oat01-..."}
+#   codex:   {"pubkey":"...", "codex_auth_json":{...}}
+#             (the full ~/.codex/auth.json object; accessToken pulled server-side)
+#   gemini:  {"pubkey":"...", "gemini_api_key":"AIza..."}
+#
+# ─── Two-factor security ──────────────────────────────────────────────────────
+#
+# The temp SSH key gets the agent INTO this script. The CLI credential
+# (which the dev generated on their own machine/account) is the SECOND
+# factor. An attacker who intercepts the email gets the temp SSH key +
+# invite token, but can't forge a valid CLI credential — the respective
+# platform only issues those to authenticated accounts.
 #
 # Failure modes (all return non-zero exit + JSON error to the agent):
 #   - Malformed JSON
 #   - Pubkey shape rejected
-#   - OAuth token rejected by Anthropic API
+#   - CLI credential rejected by upstream API
 #   - DB write failure
 #   - File permission failure on authorized_keys edit
-#
-# Two-factor security: the temp SSH key gets the agent INTO this
-# script. The OAuth token (which Alice generated on her laptop via
-# `claude setup-token`, requiring her browser auth to claude.com) is
-# the SECOND factor that gets the rotation accepted. An attacker who
-# intercepts the email gets the temp SSH key + invite token, but can't
-# forge a valid sk-ant-oat01-... token — Anthropic only issues those to
-# authenticated accounts. Bar to a successful attack: compromise both
-# the email channel AND the dev's claude.com account, both within the
-# 3-day TTL.
 
 set -euo pipefail
 
@@ -57,8 +63,9 @@ exec 3>&1 1>&2  # 3 = stdout for client; 1+2 = our diagnostic logs
 
 # ─── Read JSON from stdin ──────────────────────────────────────────────────
 
-# Cap input at 8 KB. Real bodies are <1 KB (pubkey ~80 bytes, token ~120).
-INPUT="$(head -c 8192)"
+# Cap input at 64 KB (auth.json for codex can be a few KB; 64 KB is
+# generous without being unbounded).
+INPUT="$(head -c 65536)"
 if [ -z "$INPUT" ]; then
   printf '{"status":"error","error":"empty_body"}\n' >&3
   echo "$(date -u +%FT%TZ) rotate-fail dev=${DEV_ID} reason=empty_body from=${SSH_CLIENT:-unknown}" >> "$LOG_FILE"
@@ -74,8 +81,8 @@ import json, sys
 try:
     d = json.loads(sys.stdin.read())
     v = d.get('$field')
-    if not isinstance(v, str): sys.exit(2)
-    sys.stdout.write(v)
+    if v is None: sys.exit(2)
+    sys.stdout.write(json.dumps(v) if not isinstance(v, str) else v)
 except Exception:
     sys.exit(2)
 " <<< "$INPUT"
@@ -86,55 +93,177 @@ PUBKEY="$(read_field pubkey)" || {
   echo "$(date -u +%FT%TZ) rotate-fail dev=${DEV_ID} reason=missing_pubkey from=${SSH_CLIENT:-unknown}" >> "$LOG_FILE"
   exit 1
 }
-OAUTH_TOKEN="$(read_field oauth_token)" || {
-  printf '{"status":"error","error":"missing_or_invalid_oauth_token"}\n' >&3
-  echo "$(date -u +%FT%TZ) rotate-fail dev=${DEV_ID} reason=missing_token from=${SSH_CLIENT:-unknown}" >> "$LOG_FILE"
-  exit 1
-}
 
-# ─── Validate OAuth token against Anthropic API ────────────────────────────
+# ─── Determine CLI from DB invitation row ─────────────────────────────────────
 
-# A successful `Authorization: Bearer <token>` returns 200 (or 400 with our
-# deliberately-minimal body — 400 is fine, it means auth passed and only
-# the body shape was wrong). 401 means invalid auth. We treat anything
-# other than 200/400 as transient and retry-friendly... but for safety,
-# only ACCEPT 200/400. Anything else: reject this attempt.
+CLI_NAME="$(
+  cd "${DEVBRAIN_HOME}/factory"
+  PYTHONPATH="${DEVBRAIN_HOME}/factory" \
+  "${DEVBRAIN_HOME}/.venv/bin/python" -c "
+import sys, os
+sys.path.insert(0, '${DEVBRAIN_HOME}/factory')
+from state_machine import FactoryDB
+from config import DATABASE_URL
+db = FactoryDB(DATABASE_URL)
+with db._conn() as conn, conn.cursor() as cur:
+    cur.execute(
+        \"\"\"SELECT COALESCE(cli, 'claude') FROM devbrain.invitations
+           WHERE id::text LIKE %s AND status IN ('pending','ready')
+             AND expires_at > NOW()\"\"\",
+        ('${INVITE_ID_SHORT}%',)
+    )
+    row = cur.fetchone()
+    print(row[0] if row else 'claude')
+" 2>/dev/null || echo "claude"
+)"
 
-VALIDATION_HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
-  -H "Authorization: Bearer ${OAUTH_TOKEN}" \
-  -H "anthropic-version: 2023-06-01" \
-  -H "Content-Type: application/json" \
-  -X POST https://api.anthropic.com/v1/messages \
-  -d '{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"x"}]}' || echo 000)
+# ─── Extract + validate CLI credential ────────────────────────────────────────
 
-case "$VALIDATION_HTTP" in
-  200|400) ;;
-  401|403)
-    printf '{"status":"error","error":"oauth_token_rejected_by_anthropic","http":%s}\n' "$VALIDATION_HTTP" >&3
-    echo "$(date -u +%FT%TZ) rotate-fail dev=${DEV_ID} reason=oauth_${VALIDATION_HTTP} from=${SSH_CLIENT:-unknown}" >> "$LOG_FILE"
-    exit 1
+case "$CLI_NAME" in
+
+  claude)
+    OAUTH_TOKEN="$(read_field oauth_token)" || {
+      printf '{"status":"error","error":"missing_or_invalid_oauth_token"}\n' >&3
+      echo "$(date -u +%FT%TZ) rotate-fail dev=${DEV_ID} reason=missing_oauth_token from=${SSH_CLIENT:-unknown}" >> "$LOG_FILE"
+      exit 1
+    }
+
+    # Validate OAuth token against Anthropic API (200 or 400 = valid auth;
+    # 401/403 = bad token).
+    VALIDATION_HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+      -H "Authorization: Bearer ${OAUTH_TOKEN}" \
+      -H "anthropic-version: 2023-06-01" \
+      -H "Content-Type: application/json" \
+      -X POST https://api.anthropic.com/v1/messages \
+      -d '{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"x"}]}' || echo 000)
+
+    case "$VALIDATION_HTTP" in
+      200|400) ;;
+      401|403)
+        printf '{"status":"error","error":"oauth_token_rejected_by_anthropic","http":%s}\n' "$VALIDATION_HTTP" >&3
+        echo "$(date -u +%FT%TZ) rotate-fail dev=${DEV_ID} reason=oauth_${VALIDATION_HTTP} from=${SSH_CLIENT:-unknown}" >> "$LOG_FILE"
+        exit 1
+        ;;
+      *)
+        printf '{"status":"error","error":"oauth_validation_unreachable","http":%s}\n' "$VALIDATION_HTTP" >&3
+        echo "$(date -u +%FT%TZ) rotate-fail dev=${DEV_ID} reason=oauth_${VALIDATION_HTTP} from=${SSH_CLIENT:-unknown}" >> "$LOG_FILE"
+        exit 1
+        ;;
+    esac
     ;;
+
+  codex)
+    CODEX_AUTH_JSON="$(read_field codex_auth_json)" || {
+      printf '{"status":"error","error":"missing_or_invalid_codex_auth_json"}\n' >&3
+      echo "$(date -u +%FT%TZ) rotate-fail dev=${DEV_ID} reason=missing_codex_auth_json from=${SSH_CLIENT:-unknown}" >> "$LOG_FILE"
+      exit 1
+    }
+
+    # Extract the accessToken from auth.json — codex stores an Anthropic
+    # OAuth-format token there. Validate against api.anthropic.com same as
+    # the claude path. If the auth.json uses a different token key in
+    # future codex versions, this will surface as a 401 (safe failure).
+    CODEX_ACCESS_TOKEN="$(python3 -c "
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+    # Support both 'accessToken' and 'access_token' key names
+    tok = d.get('accessToken') or d.get('access_token') or ''
+    print(tok)
+except Exception:
+    print('')
+" <<< "$CODEX_AUTH_JSON")"
+
+    if [ -z "$CODEX_ACCESS_TOKEN" ]; then
+      printf '{"status":"error","error":"codex_auth_json_missing_access_token"}\n' >&3
+      echo "$(date -u +%FT%TZ) rotate-fail dev=${DEV_ID} reason=codex_no_access_token from=${SSH_CLIENT:-unknown}" >> "$LOG_FILE"
+      exit 1
+    fi
+
+    VALIDATION_HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+      -H "Authorization: Bearer ${CODEX_ACCESS_TOKEN}" \
+      -H "anthropic-version: 2023-06-01" \
+      -H "Content-Type: application/json" \
+      -X POST https://api.anthropic.com/v1/messages \
+      -d '{"model":"claude-haiku-4-5-20251001","max_tokens":1,"messages":[{"role":"user","content":"x"}]}' || echo 000)
+
+    case "$VALIDATION_HTTP" in
+      200|400) ;;
+      401|403)
+        printf '{"status":"error","error":"codex_auth_json_invalid","http":%s}\n' "$VALIDATION_HTTP" >&3
+        echo "$(date -u +%FT%TZ) rotate-fail dev=${DEV_ID} reason=codex_auth_${VALIDATION_HTTP} from=${SSH_CLIENT:-unknown}" >> "$LOG_FILE"
+        exit 1
+        ;;
+      *)
+        printf '{"status":"error","error":"codex_validation_unreachable","http":%s}\n' "$VALIDATION_HTTP" >&3
+        echo "$(date -u +%FT%TZ) rotate-fail dev=${DEV_ID} reason=codex_auth_${VALIDATION_HTTP} from=${SSH_CLIENT:-unknown}" >> "$LOG_FILE"
+        exit 1
+        ;;
+    esac
+    ;;
+
+  gemini)
+    GEMINI_API_KEY="$(read_field gemini_api_key)" || {
+      printf '{"status":"error","error":"missing_or_invalid_gemini_api_key"}\n' >&3
+      echo "$(date -u +%FT%TZ) rotate-fail dev=${DEV_ID} reason=missing_gemini_api_key from=${SSH_CLIENT:-unknown}" >> "$LOG_FILE"
+      exit 1
+    }
+
+    # Validate the Gemini API key by hitting the models list endpoint.
+    # 200 = valid key; 400/403 = bad key.
+    VALIDATION_HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 \
+      "https://generativelanguage.googleapis.com/v1beta/models?key=${GEMINI_API_KEY}" || echo 000)
+
+    case "$VALIDATION_HTTP" in
+      200) ;;
+      400|401|403)
+        printf '{"status":"error","error":"gemini_api_key_rejected","http":%s}\n' "$VALIDATION_HTTP" >&3
+        echo "$(date -u +%FT%TZ) rotate-fail dev=${DEV_ID} reason=gemini_key_${VALIDATION_HTTP} from=${SSH_CLIENT:-unknown}" >> "$LOG_FILE"
+        exit 1
+        ;;
+      *)
+        printf '{"status":"error","error":"gemini_validation_unreachable","http":%s}\n' "$VALIDATION_HTTP" >&3
+        echo "$(date -u +%FT%TZ) rotate-fail dev=${DEV_ID} reason=gemini_key_${VALIDATION_HTTP} from=${SSH_CLIENT:-unknown}" >> "$LOG_FILE"
+        exit 1
+        ;;
+    esac
+    ;;
+
   *)
-    printf '{"status":"error","error":"oauth_validation_unreachable","http":%s}\n' "$VALIDATION_HTTP" >&3
-    echo "$(date -u +%FT%TZ) rotate-fail dev=${DEV_ID} reason=oauth_${VALIDATION_HTTP} from=${SSH_CLIENT:-unknown}" >> "$LOG_FILE"
+    printf '{"status":"error","error":"unknown_cli","cli":"%s"}\n' "$CLI_NAME" >&3
+    echo "$(date -u +%FT%TZ) rotate-fail dev=${DEV_ID} reason=unknown_cli=${CLI_NAME} from=${SSH_CLIENT:-unknown}" >> "$LOG_FILE"
     exit 1
     ;;
 esac
 
 # ─── Persist to invitations DB via Python helper ───────────────────────────
 
-# Helper handles: pubkey shape validation, submit_pubkey,
-# submit_oauth_token, all with the proper hashing/state-machine
-# guards. We pass invite_id_short as argv (non-secret) and the
-# pubkey + token as JSON on stdin (avoids them appearing in `ps`).
-# Construct JSON for the helper without putting the OAuth token in argv
-# (argv is visible via `ps` to the same user; stdin isn't).
-HELPER_INPUT="$(printf '%s\n---SEP---\n%s' "$PUBKEY" "$OAUTH_TOKEN" | python3 -c '
+# Helper handles: pubkey shape validation, credential persistence per CLI,
+# and the proper state-machine guards. We pass invite_id_short as argv
+# (non-secret) and all credentials as JSON on stdin (avoids them appearing
+# in `ps`).
+HELPER_INPUT="$(python3 -c "
 import json, sys
-text = sys.stdin.read()
-parts = text.split("\n---SEP---\n", 1)
-print(json.dumps({"pubkey": parts[0], "oauth_token": parts[1] if len(parts) > 1 else ""}))
-')"
+cli = '${CLI_NAME}'
+pubkey = sys.argv[1]
+data = {'pubkey': pubkey, 'cli': cli}
+if cli == 'claude':
+    data['oauth_token'] = sys.argv[2]
+elif cli == 'codex':
+    data['codex_auth_json'] = json.loads(sys.argv[2])
+elif cli == 'gemini':
+    data['gemini_api_key'] = sys.argv[2]
+print(json.dumps(data))
+" \
+  "$PUBKEY" \
+  "$(
+    case "$CLI_NAME" in
+      claude) echo "$OAUTH_TOKEN" ;;
+      codex)  echo "$CODEX_AUTH_JSON" ;;
+      gemini) echo "$GEMINI_API_KEY" ;;
+    esac
+  )"
+)"
 
 ROTATE_RESULT="$(
   cd "${DEVBRAIN_HOME}/factory"
@@ -186,7 +315,7 @@ fi
 
 # ─── Audit log + reply ─────────────────────────────────────────────────────
 
-echo "$(date -u +%FT%TZ) rotate-ok dev=${DEV_ID} invite=${INVITE_ID_SHORT} from=${SSH_CLIENT:-unknown}" >> "$LOG_FILE"
+echo "$(date -u +%FT%TZ) rotate-ok dev=${DEV_ID} invite=${INVITE_ID_SHORT} cli=${CLI_NAME} from=${SSH_CLIENT:-unknown}" >> "$LOG_FILE"
 
 printf '{"status":"ok","dev_id":"%s","invite_id":"%s"}\n' "$DEV_ID" "$INVITE_ID_SHORT" >&3
 
