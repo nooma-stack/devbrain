@@ -180,4 +180,7 @@ jobs:
             tests/test_migration_023.py \
             tests/test_step6_e2e.py \
             tests/test_store_cascade_enqueue.py \
+            tests/test_cognify_edges.py \
+            tests/test_cognify_edges_cites.py \
+            tests/test_cognify_edges_contradicts.py \
             -v --tb=short

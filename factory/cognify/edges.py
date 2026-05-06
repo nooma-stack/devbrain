@@ -37,8 +37,18 @@ MAX_LLM_CALLS_PER_PASS = 15
 _EDGES_MODEL = "claude-sonnet-4-6"
 
 # Walk parameters for contradiction candidate selection.
-CONTRADICTION_MAX_HOPS = 3
+# §4.3 of Phase 6 design specifies max_hops=2 for candidate selection.
+CONTRADICTION_MAX_HOPS = 2
 CONTRADICTION_MAX_NODES = 50
+
+# Tiers whose rows are candidates for contradiction checking.
+# Lessons and rules carry semantic claims; decisions are also worth checking.
+CONTRADICTION_SEED_TIERS = frozenset(["lesson", "rule"])
+
+# Edge types used when walking for contradiction candidate pairs.
+# Per Phase 6 §4.3: derived_from, refined_by, depends_on (not 'cites' — we're
+# looking for related knowledge, not just textual references).
+CONTRADICTION_WALK_EDGE_TYPES = ["derived_from", "refined_by", "depends_on"]
 
 # Edge types we write.
 EDGE_TYPE_CITES = "cites"
@@ -155,27 +165,37 @@ def _detect_contradicts(
 
     Returns (new_edges, llm_calls).
 
-    Pair selection: for each memory in the project, walk max_hops=3 using
-    the 'contradicts' edge type (to find existing contradicts neighbors)
-    plus 'cites'/'derived_from' (to find semantically related candidates).
-    (seed, neighbor) pairs are the LLM judgment candidates.
+    Pair selection: for each tier='lesson' or tier='rule' row in the project,
+    walk max_hops=2 using derived_from/refined_by/depends_on edges. The
+    walker's results are the "nearby" memories — candidate contradiction pairs
+    (more likely to be related, so worth comparing). LLM cost ceiling: 15
+    calls per pass (MAX_LLM_CALLS_PER_PASS).
 
     record_conn: connection used to write spend log rows. When None, spend
         is not recorded (e.g. dry_run or test scenarios without the table).
         In production, pass the same conn used for edge writes.
     """
-    memories = _load_memories(conn, project_id)
-    if len(memories) < 2:
+    all_memories = _load_memories(conn, project_id)
+    if len(all_memories) < 2:
         return 0, 0
+
+    # Seed nodes: only lesson/rule tiers (semantic claims worth contradicting).
+    seed_memories = [
+        m for m in all_memories if m.get("tier") in CONTRADICTION_SEED_TIERS
+    ]
+    if not seed_memories:
+        # Fall back to all memories if no lesson/rule rows exist yet (e.g. new
+        # project that only has 'decision' rows). Cost ceiling still applies.
+        seed_memories = all_memories
 
     candidate_pairs: list[tuple[UUID, UUID]] = []
     seen: set[frozenset] = set()
 
-    for m in memories:
+    for m in seed_memories:
         result = walk(
             conn,
             seed_memory_id=m["id"],
-            edge_types=["cites", "derived_from", "depends_on"],
+            edge_types=CONTRADICTION_WALK_EDGE_TYPES,
             max_hops=CONTRADICTION_MAX_HOPS,
             max_nodes=CONTRADICTION_MAX_NODES,
             direction="both",
@@ -193,9 +213,10 @@ def _detect_contradicts(
     if not candidate_pairs:
         return 0, 0
 
-    # Build a content index for LLM comparison.
+    # Build a content index for LLM comparison (all_memories, not just seeds,
+    # because neighbors may be from any tier).
     content_by_id: dict[UUID, str] = {
-        m["id"]: m.get("content", "") for m in memories
+        m["id"]: m.get("content", "") for m in all_memories
     }
 
     new_edges = 0
@@ -316,10 +337,13 @@ def _llm_judge_contradiction(
 
 
 def _load_memories(conn: Any, project_id: Any) -> list[dict]:
-    """Load all non-archived memory rows for a project."""
+    """Load all non-archived memory rows for a project.
+
+    Returns dicts with keys: id, kind, tier, title, content.
+    """
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, kind, title, content "
+            "SELECT id, kind, tier, title, content "
             "FROM devbrain.memory "
             "WHERE project_id = %s AND archived_at IS NULL "
             "ORDER BY created_at",
