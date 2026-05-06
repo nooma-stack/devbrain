@@ -149,7 +149,9 @@ def test_edges_pass_dry_run_no_edges(conn, project_factory):
 
 
 def test_llm_judge_contradiction_returns_false_without_api_key(monkeypatch):
-    """_llm_judge_contradiction returns False when ANTHROPIC_API_KEY is not set."""
+    """_llm_judge_contradiction returns (False, empty_usage) when API key is not set."""
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    result = _llm_judge_contradiction("Memory A says X.", "Memory B says not X.")
-    assert result is False
+    contradicts, usage = _llm_judge_contradiction("Memory A says X.", "Memory B says not X.")
+    assert contradicts is False
+    assert usage["input_tokens"] == 0
+    assert usage["output_tokens"] == 0
