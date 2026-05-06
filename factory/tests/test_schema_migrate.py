@@ -15,7 +15,6 @@ import psycopg2.errors
 import pytest
 
 import schema_migrate
-from config import DATABASE_URL
 from state_machine import FactoryDB
 
 # All test-created filenames start with this prefix so the cleanup
@@ -24,8 +23,8 @@ TEST_FILENAME_PREFIX = "schema_migrate_test_"
 
 
 @pytest.fixture
-def db():
-    return FactoryDB(DATABASE_URL)
+def db(database_url):
+    return FactoryDB(database_url)
 
 
 @pytest.fixture(autouse=True)
@@ -194,7 +193,7 @@ def test_migrate_dry_run_does_not_apply(db, tmp_path):
 # ─── 7. concurrent migrate — second caller skips ─────────────────────────────
 
 
-def test_concurrent_migrate_second_caller_skips(db, tmp_path):
+def test_concurrent_migrate_second_caller_skips(db, tmp_path, database_url):
     """If another process holds the advisory lock, migrate() returns []."""
     sql = _write(
         tmp_path, "blocked.sql",
@@ -203,7 +202,7 @@ def test_concurrent_migrate_second_caller_skips(db, tmp_path):
 
     # Take the advisory lock from a separate connection — the migrate()
     # call below should see pg_try_advisory_lock return false and bail.
-    holder = psycopg2.connect(DATABASE_URL)
+    holder = psycopg2.connect(database_url)
     try:
         with holder.cursor() as cur:
             cur.execute(

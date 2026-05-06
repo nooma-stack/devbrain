@@ -22,14 +22,13 @@ import pytest
 import orchestrator as orch_mod
 from orchestrator import FactoryOrchestrator
 from state_machine import FactoryDB, JobStatus
-from config import DATABASE_URL
 
 TEST_TITLE_PREFIX = "approve_sync_test_"
 
 
 @pytest.fixture
-def db():
-    return FactoryDB(DATABASE_URL)
+def db(database_url):
+    return FactoryDB(database_url)
 
 
 @pytest.fixture(autouse=True)
@@ -65,8 +64,8 @@ def cleanup(db):
 
 
 @pytest.fixture
-def orch():
-    return FactoryOrchestrator(DATABASE_URL)
+def orch(database_url):
+    return FactoryOrchestrator(database_url)
 
 
 @pytest.fixture

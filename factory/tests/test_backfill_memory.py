@@ -20,7 +20,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import backfill_memory  # noqa: E402
-from config import DATABASE_URL  # noqa: E402
 from state_machine import FactoryDB  # noqa: E402
 
 # Every seeded row's content/title starts with this prefix so the
@@ -30,8 +29,8 @@ TEST_CONTENT_PREFIX = "backfill_memory_test_"
 
 
 @pytest.fixture
-def db():
-    return FactoryDB(DATABASE_URL)
+def db(database_url):
+    return FactoryDB(database_url)
 
 
 @pytest.fixture(autouse=True)

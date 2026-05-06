@@ -29,7 +29,6 @@ sys.path.insert(
     0, str(Path(__file__).resolve().parent.parent.parent / "ingest")
 )
 
-from config import DATABASE_URL  # noqa: E402  (factory/config.py)
 from db import insert_chunk  # noqa: E402  (ingest/db.py)
 from memory_writer import record_memory  # noqa: E402  (ingest/memory_writer.py)
 from state_machine import FactoryDB  # noqa: E402
@@ -41,8 +40,8 @@ TEST_CONTENT_PREFIX = "dual_write_test_"
 
 
 @pytest.fixture
-def db():
-    return FactoryDB(DATABASE_URL)
+def db(database_url):
+    return FactoryDB(database_url)
 
 
 @pytest.fixture(autouse=True)

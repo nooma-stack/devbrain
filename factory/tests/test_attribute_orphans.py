@@ -21,15 +21,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import attribute_orphans  # noqa: E402
 from cli import cli as devbrain_cli  # noqa: E402
-from config import DATABASE_URL  # noqa: E402
 from state_machine import FactoryDB  # noqa: E402
 
 TEST_CONTENT_PREFIX = "attribute_orphans_test_"
 
 
 @pytest.fixture
-def db():
-    return FactoryDB(DATABASE_URL)
+def db(database_url):
+    return FactoryDB(database_url)
 
 
 @pytest.fixture(autouse=True)

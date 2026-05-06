@@ -6,12 +6,11 @@ from cleanup_agent import CleanupAgent
 from file_registry import FileRegistry
 from notifications.router import NotificationRouter, NotificationEvent
 
-from config import DATABASE_URL
 
 
 @pytest.fixture
-def db():
-    return FactoryDB(DATABASE_URL)
+def db(database_url):
+    return FactoryDB(database_url)
 
 
 @pytest.fixture(autouse=True)
@@ -245,7 +244,7 @@ def test_router_attempts_multiple_channels(db):
 
 # ─── Test 6: job_started notification fires when pipeline begins ──────
 
-def test_job_started_notification_fires_from_orchestrator(db):
+def test_job_started_notification_fires_from_orchestrator(db, database_url):
     """Running a job through _run_planning fires job_started."""
     from orchestrator import FactoryOrchestrator
 
@@ -261,7 +260,7 @@ def test_job_started_notification_fires_from_orchestrator(db):
     )
     _set_submitted_by(db, job_id, "test_integ_starter")
 
-    orch = FactoryOrchestrator(DATABASE_URL)
+    orch = FactoryOrchestrator(database_url)
 
     # Mock the CLI call in planning so it doesn't actually run claude
     from unittest.mock import MagicMock

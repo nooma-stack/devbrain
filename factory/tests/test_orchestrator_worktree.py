@@ -26,7 +26,6 @@ import pytest
 
 import orchestrator as orchestrator_module
 import cleanup_agent as cleanup_agent_module
-from config import DATABASE_URL
 from orchestrator import FactoryOrchestrator, _worktree_path_for_job
 from cleanup_agent import CleanupAgent
 from state_machine import FactoryDB
@@ -35,8 +34,8 @@ TEST_TITLE_PREFIX = "worktree_test_"
 
 
 @pytest.fixture
-def db():
-    return FactoryDB(DATABASE_URL)
+def db(database_url):
+    return FactoryDB(database_url)
 
 
 @pytest.fixture(autouse=True)
@@ -103,17 +102,17 @@ def test_worktree_path_derivation(db):
 # ─── _get_job_cwd routing ─────────────────────────────────────────────────
 
 
-def test_get_job_cwd_falls_back_when_no_branch_name(db, tmp_path, monkeypatch):
+def test_get_job_cwd_falls_back_when_no_branch_name(db, tmp_path, monkeypatch, database_url):
     """Job without branch_name → returns project_root."""
-    orch = FactoryOrchestrator(DATABASE_URL)
+    orch = FactoryOrchestrator(database_url)
     job = _make_job(db, f"{TEST_TITLE_PREFIX}no_branch")
     monkeypatch.setattr(orch, "_get_project_root", lambda j: str(tmp_path))
     assert orch._get_job_cwd(job) == str(tmp_path)
 
 
-def test_get_job_cwd_falls_back_when_worktree_missing(db, tmp_path, monkeypatch):
+def test_get_job_cwd_falls_back_when_worktree_missing(db, tmp_path, monkeypatch, database_url):
     """Job has branch_name but worktree dir doesn't exist → project_root."""
-    orch = FactoryOrchestrator(DATABASE_URL)
+    orch = FactoryOrchestrator(database_url)
     job = _make_job(
         db, f"{TEST_TITLE_PREFIX}missing_wt", branch_name="feature/whatever",
     )
@@ -125,10 +124,9 @@ def test_get_job_cwd_falls_back_when_worktree_missing(db, tmp_path, monkeypatch)
 
 
 def test_get_job_cwd_returns_worktree_when_branch_and_dir_exist(
-    db, tmp_path, monkeypatch,
-):
+    db, tmp_path, monkeypatch, database_url):
     """Job has branch_name AND worktree dir exists → worktree path."""
-    orch = FactoryOrchestrator(DATABASE_URL)
+    orch = FactoryOrchestrator(database_url)
     job = _make_job(
         db, f"{TEST_TITLE_PREFIX}real_wt", branch_name="feature/exists",
     )
@@ -145,9 +143,9 @@ def test_get_job_cwd_returns_worktree_when_branch_and_dir_exist(
 # ─── _setup_implementation_branch creates a worktree ──────────────────────
 
 
-def test_setup_branch_creates_worktree_with_b_on_fresh_job(db, monkeypatch):
+def test_setup_branch_creates_worktree_with_b_on_fresh_job(db, monkeypatch, database_url):
     """No branch_name → worktree created with `-b <new-branch>`."""
-    orch = FactoryOrchestrator(DATABASE_URL)
+    orch = FactoryOrchestrator(database_url)
     job = _make_job(db, f"{TEST_TITLE_PREFIX}fresh_job")
     calls: list[list[str]] = []
 
@@ -169,9 +167,9 @@ def test_setup_branch_creates_worktree_with_b_on_fresh_job(db, monkeypatch):
     assert branch in calls[0]
 
 
-def test_setup_branch_fails_job_on_worktree_creation_failure(db, monkeypatch):
+def test_setup_branch_fails_job_on_worktree_creation_failure(db, monkeypatch, database_url):
     """Worktree creation returns non-zero → (None, fail_msg)."""
-    orch = FactoryOrchestrator(DATABASE_URL)
+    orch = FactoryOrchestrator(database_url)
     job = _make_job(db, f"{TEST_TITLE_PREFIX}wt_create_fail")
 
     def fake_run(cmd, **kwargs):

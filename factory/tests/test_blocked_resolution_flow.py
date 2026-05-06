@@ -6,12 +6,11 @@ from cleanup_agent import CleanupAgent
 from file_registry import FileRegistry
 from orchestrator import FactoryOrchestrator
 
-from config import DATABASE_URL
 
 
 @pytest.fixture
-def db():
-    return FactoryDB(DATABASE_URL)
+def db(database_url):
+    return FactoryDB(database_url)
 
 
 @pytest.fixture(autouse=True)
@@ -70,7 +69,7 @@ def test_blocked_flow_investigation_creates_report(db):
 
 # ─── Test 2: cancel resolution → REJECTED ────────────────────────────────
 
-def test_resolve_cancel_transitions_to_rejected(db):
+def test_resolve_cancel_transitions_to_rejected(db, database_url):
     """Setting resolution=cancel and running _run_blocked transitions to REJECTED."""
     db.register_dev(dev_id="test_bflow_carol", channels=[])
 
@@ -80,7 +79,7 @@ def test_resolve_cancel_transitions_to_rejected(db):
     db.transition(job_id, JobStatus.BLOCKED)
     db.set_blocked_resolution(job_id, "cancel")
 
-    orch = FactoryOrchestrator(DATABASE_URL)
+    orch = FactoryOrchestrator(database_url)
     job = db.get_job(job_id)
     result = orch._run_blocked(job)
 
@@ -92,7 +91,7 @@ def test_resolve_cancel_transitions_to_rejected(db):
 
 # ─── Test 3: replan resolution → PLANNING ────────────────────────────────
 
-def test_resolve_replan_transitions_to_planning(db):
+def test_resolve_replan_transitions_to_planning(db, database_url):
     db.register_dev(dev_id="test_bflow_dave", channels=[])
 
     job_id = db.create_job(project_slug="devbrain", title="bflow_replan_test", spec="Test")
@@ -101,7 +100,7 @@ def test_resolve_replan_transitions_to_planning(db):
     db.transition(job_id, JobStatus.BLOCKED)
     db.set_blocked_resolution(job_id, "replan")
 
-    orch = FactoryOrchestrator(DATABASE_URL)
+    orch = FactoryOrchestrator(database_url)
     job = db.get_job(job_id)
     result = orch._run_blocked(job)
 
@@ -112,7 +111,7 @@ def test_resolve_replan_transitions_to_planning(db):
 
 # ─── Test 4: proceed resolution with free locks → IMPLEMENTING ────────────
 
-def test_resolve_proceed_with_free_locks(db):
+def test_resolve_proceed_with_free_locks(db, database_url):
     """proceed with no conflicting locks transitions to IMPLEMENTING."""
     db.register_dev(dev_id="test_bflow_eve", channels=[])
 
@@ -123,7 +122,7 @@ def test_resolve_proceed_with_free_locks(db):
     db.transition(job_id, JobStatus.BLOCKED)
     db.set_blocked_resolution(job_id, "proceed")
 
-    orch = FactoryOrchestrator(DATABASE_URL)
+    orch = FactoryOrchestrator(database_url)
     job = db.get_job(job_id)
 
     # Mock git subprocess so we don't actually create a branch on disk
@@ -136,12 +135,12 @@ def test_resolve_proceed_with_free_locks(db):
 
 # ─── Test 5: BLOCKED with no resolution stays BLOCKED ────────────────────
 
-def test_blocked_without_resolution_stays_blocked(db):
+def test_blocked_without_resolution_stays_blocked(db, database_url):
     job_id = db.create_job(project_slug="devbrain", title="bflow_no_res_test", spec="Test")
     db.transition(job_id, JobStatus.PLANNING)
     db.transition(job_id, JobStatus.BLOCKED)
 
-    orch = FactoryOrchestrator(DATABASE_URL)
+    orch = FactoryOrchestrator(database_url)
     job = db.get_job(job_id)
     result = orch._run_blocked(job)
 

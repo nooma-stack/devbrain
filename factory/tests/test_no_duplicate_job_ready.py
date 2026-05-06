@@ -23,7 +23,6 @@ import cleanup_agent as cleanup_mod
 from orchestrator import FactoryOrchestrator
 from notifications import router as router_module
 from state_machine import FactoryDB, JobStatus
-from config import DATABASE_URL
 
 
 TEST_TITLE_PREFIX = "no_dup_test_"
@@ -47,8 +46,8 @@ class _NoopReadiness:
 
 
 @pytest.fixture
-def db():
-    return FactoryDB(DATABASE_URL)
+def db(database_url):
+    return FactoryDB(database_url)
 
 
 @pytest.fixture(autouse=True)
@@ -93,8 +92,8 @@ def cleanup(db):
 
 
 @pytest.fixture
-def orch():
-    return FactoryOrchestrator(DATABASE_URL)
+def orch(database_url):
+    return FactoryOrchestrator(database_url)
 
 
 class _FakeRouter:
