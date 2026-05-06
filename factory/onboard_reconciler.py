@@ -86,7 +86,7 @@ def _try_activate(
         cur.execute(
             """
             SELECT id, dev_id, pubkey, oauth_token, status, auto_activate,
-                   email, notes
+                   email, notes, COALESCE(cli, 'claude') AS cli
             FROM devbrain.invitations
             WHERE id = %s
             FOR UPDATE
@@ -97,7 +97,7 @@ def _try_activate(
         if row is None:
             return False
         (id_, dev_id, pubkey, oauth_token, status, auto_activate,
-         email, notes) = row
+         email, notes, cli) = row
         if status != "ready":
             return False
         if not auto_activate:
@@ -141,16 +141,15 @@ def _try_activate(
             )
             return False
 
-        # ─── 3. Provision profile dir + 4. stash OAuth token ──────
+        # ─── 3. Provision profile dir + 4. stash CLI credential ──────
         profile_dir = _resolve_profile_dir(dev_id)
         profile_dir.mkdir(parents=True, exist_ok=True)
-        (profile_dir / ".claude").mkdir(parents=True, exist_ok=True)
         try:
-            _stash_oauth_token(profile_dir, oauth_token)
+            _stash_credential(profile_dir, oauth_token, cli=cli)
         except OSError as e:
             logger.error(
-                "invitation %s could not stash oauth-token: %s — rolling back authorized_keys",
-                str(id_)[:8], e,
+                "invitation %s could not stash credential (cli=%s): %s — rolling back authorized_keys",
+                str(id_)[:8], cli, e,
             )
             _remove_marker_from_authorized_keys(ak_path, marker)
             return False
@@ -188,12 +187,13 @@ def _try_activate(
         conn.commit()
 
     # ─── 7. Notify admin ──────────────────────────────────────────
+    cli_label = cli if cli else "claude"
     _notify_admin(
         db, dev_id, status="activated",
         detail=(
-            f"Dev '{dev_id}' is now live. Pubkey added to authorized_keys, "
-            f"OAuth token stashed at <profile>/.claude/oauth-token. "
-            f"Factory is ready to spawn claude on their behalf."
+            f"Dev '{dev_id}' is now live (cli={cli_label}). Pubkey added to "
+            f"authorized_keys, credential stashed at per-profile path. "
+            f"Factory is ready to spawn {cli_label} on their behalf."
         ),
     )
 
@@ -293,14 +293,63 @@ def _remove_marker_from_authorized_keys(path: Path, marker: str) -> None:
     path.chmod(0o600)
 
 
+def _stash_credential(profile_dir: Path, credential: str, cli: str = "claude") -> None:
+    """Stash the CLI credential at the correct per-profile path (mode 600).
+
+    Routing by CLI:
+      claude: <profile>/.claude/oauth-token
+              Plain text sk-ant-oat01-... value.
+
+      codex:  <profile>/.codex/auth.json
+              JSON content of the dev's ~/.codex/auth.json.  The factory
+              spawn env sets CODEX_HOME=<profile>/.codex so codex picks
+              this up automatically.
+
+      gemini: <profile>/.devbrain/env (KEY=VALUE format, sourced by spawn)
+              Appends/overwrites GEMINI_API_KEY=<key>. The spawn env sets
+              GEMINI_API_KEY from this file so gemini picks it up.
+    """
+    if not credential:
+        raise ValueError("credential is empty")
+
+    cli = cli or "claude"
+
+    if cli == "claude":
+        f = profile_dir / ".claude" / "oauth-token"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(credential.strip())
+        f.chmod(0o600)
+
+    elif cli == "codex":
+        f = profile_dir / ".codex" / "auth.json"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(credential.strip())
+        f.chmod(0o600)
+
+    elif cli == "gemini":
+        env_dir = profile_dir / ".devbrain"
+        env_dir.mkdir(parents=True, exist_ok=True)
+        env_file = env_dir / "env"
+        # Read existing lines, replace or append GEMINI_API_KEY.
+        lines: list[str] = []
+        if env_file.exists():
+            lines = [
+                ln for ln in env_file.read_text().splitlines()
+                if not ln.startswith("GEMINI_API_KEY=")
+            ]
+        lines.append(f"GEMINI_API_KEY={credential.strip()}")
+        env_file.write_text("\n".join(lines) + "\n")
+        env_file.chmod(0o600)
+
+    else:
+        raise ValueError(f"Unknown CLI: {cli!r}")
+
+
+# Keep the old name as an alias for backward compatibility with any
+# external callers that might reference it directly.
 def _stash_oauth_token(profile_dir: Path, oauth_token: str) -> None:
-    """Write the OAuth token to <profile>/.claude/oauth-token (mode 600)."""
-    if not oauth_token:
-        raise ValueError("oauth_token is empty")
-    f = profile_dir / ".claude" / "oauth-token"
-    f.parent.mkdir(parents=True, exist_ok=True)
-    f.write_text(oauth_token.strip())
-    f.chmod(0o600)
+    """Backward-compat alias — stash a Claude oauth-token."""
+    _stash_credential(profile_dir, oauth_token, cli="claude")
 
 
 def _ensure_gitconfig(profile_dir: Path, db, dev_id: str) -> None:

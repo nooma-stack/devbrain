@@ -1954,18 +1954,23 @@ def _run_multi_dev_section() -> None:
     setup_multi_dev(non_interactive=False)
 
 
-def setup_add_dev() -> None:
+def setup_add_dev(cli: str | None = None) -> None:
     """Onboard a new dev: stage row, generate invitation, write kit .md.
 
     The admin runs this on the Mac Studio. They get back a path to a
     Markdown onboarding-kit file to send to the dev (email, Slack,
     hand-off, …). The dev (or their AI agent) drops the file into
-    Claude Code / Codex / etc., follows the embedded instructions:
-    SSH into the Mac Studio with the embedded temp ed25519 key (locked
-    by `command=` to a single rotation script), submit their permanent
-    pubkey + claude OAuth token, and the rotation handler hands off
-    to the reconciler which finishes activation. The temp key
-    auto-expires in 3 days and self-deletes on first successful use.
+    their AI agent of choice (Claude Code, Codex, Gemini CLI), follows
+    the embedded instructions: SSH into the Mac Studio with the embedded
+    temp ed25519 key (locked by `command=` to a single rotation script),
+    submit their permanent pubkey + CLI credential, and the rotation
+    handler hands off to the reconciler which finishes activation. The
+    temp key auto-expires in 3 days and self-deletes on first successful use.
+
+    Args:
+        cli: AI CLI to generate the kit for ('claude', 'codex', 'gemini').
+             If None, the admin is prompted interactively. Defaults to
+             'claude' for backward compatibility.
     """
     import getpass
     import os as _os
@@ -2010,6 +2015,38 @@ def setup_add_dev() -> None:
         default="",
     ).strip()
 
+    # ─── AI CLI selection ─────────────────────────────────────────────
+    if cli is None:
+        _valid_clis = ("claude", "codex", "gemini")
+        _cli_labels = {
+            "claude": "Claude Code (Anthropic)",
+            "codex":  "Codex (OpenAI)",
+            "gemini": "Gemini CLI (Google)",
+        }
+        click.echo()
+        _info("Which AI CLI will this dev use?")
+        for i, c in enumerate(_valid_clis, 1):
+            click.echo(f"    {i}. {_cli_labels[c]}")
+        click.echo()
+        while True:
+            raw = _prompt("Choice (1-3 or cli name)", default="1").strip().lower()
+            if raw in ("1", "claude"):
+                cli = "claude"
+                break
+            elif raw in ("2", "codex"):
+                cli = "codex"
+                break
+            elif raw in ("3", "gemini"):
+                cli = "gemini"
+                break
+            else:
+                _warn(f"'{raw}' is not valid. Enter 1, 2, 3, or a cli name.")
+    else:
+        from onboarding_kit import VALID_CLIS as _VALID_CLIS
+        if cli not in _VALID_CLIS:
+            _warn(f"--cli '{cli}' is not valid. Must be one of: {', '.join(_VALID_CLIS)}")
+            raise SystemExit(2)
+
     auto_activate = _confirm(
         "Auto-activate this dev when their pubkey + OAuth token arrive? "
         "(no = require manual `devbrain setup activate --dev <id>`)",
@@ -2027,6 +2064,7 @@ def setup_add_dev() -> None:
     click.echo(f"   dev_id:        {dev_id}")
     click.echo(f"   full_name:     {full_name}")
     click.echo(f"   email:         {email}")
+    click.echo(f"   cli:           {cli}")
     if slack_handle:
         click.echo(f"   slack:         {slack_handle}")
     click.echo(f"   auto_activate: {auto_activate}")
@@ -2058,6 +2096,7 @@ def setup_add_dev() -> None:
         notes=notes,
         created_by=_os.environ.get("USER") or getpass.getuser(),
         ttl_days=7,
+        cli=cli,
     )
 
     # ─── Generate temp bootstrap SSH keypair ──────────────────────────
@@ -2122,6 +2161,7 @@ def setup_add_dev() -> None:
         bootstrap_private_key=bootstrap_private,
         bootstrap_invite_id_short=invite_id_short,
         bootstrap_expiry=bootstrap_expires,
+        cli=cli,
     )
 
     # ─── Hand back to admin ───────────────────────────────────────────
