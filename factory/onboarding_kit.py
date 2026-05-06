@@ -335,6 +335,7 @@ persists both, and self-deletes the bootstrap key entry.
 PUBKEY=$(cat ~/.ssh/id_ed25519_devbrain.pub)
 
 ssh -i ~/.ssh/devbrain-bootstrap-{dev_id} \\
+    {ssh_port_flag} \\
     -o StrictHostKeyChecking=accept-new \\
     -o UserKnownHostsFile=~/.ssh/known_hosts \\
     lhtdev@{ssh_host} \\
@@ -364,6 +365,7 @@ token format, persists both, and self-deletes the bootstrap key entry.
 PUBKEY=$(cat ~/.ssh/id_ed25519_devbrain.pub)
 
 ssh -i ~/.ssh/devbrain-bootstrap-{dev_id} \\
+    {ssh_port_flag} \\
     -o StrictHostKeyChecking=accept-new \\
     -o UserKnownHostsFile=~/.ssh/known_hosts \\
     lhtdev@{ssh_host} \\
@@ -394,6 +396,7 @@ bootstrap key entry.
 PUBKEY=$(cat ~/.ssh/id_ed25519_devbrain.pub)
 
 ssh -i ~/.ssh/devbrain-bootstrap-{dev_id} \\
+    {ssh_port_flag} \\
     -o StrictHostKeyChecking=accept-new \\
     -o UserKnownHostsFile=~/.ssh/known_hosts \\
     lhtdev@{ssh_host} \\
@@ -436,7 +439,8 @@ cat <<'EOF'
   "mcpServers": {{
     "devbrain": {{
       "command": "ssh",
-      "args": ["-i", "~/.ssh/id_ed25519_devbrain", "lhtdev@{ssh_host}",
+      "args": ["-i", "~/.ssh/id_ed25519_devbrain", "-p", "{ssh_port}",
+               "lhtdev@{ssh_host}",
                "/Users/lhtdev/devbrain/mcp-server/run.sh"]
     }}
   }}
@@ -451,14 +455,14 @@ After this, restart {cli_display_name}. The DevBrain MCP tools appear in your
 
 <!-- agent:auto requires=user-approval,network risk=low -->
 ```bash
-ssh -i ~/.ssh/id_ed25519_devbrain lhtdev@{ssh_host} whoami
+ssh -i ~/.ssh/id_ed25519_devbrain {ssh_port_flag} lhtdev@{ssh_host} whoami
 # Expected output: lhtdev
 ```
 
 You can now SSH into the Mac Studio at any time:
 
 ```bash
-ssh -i ~/.ssh/id_ed25519_devbrain lhtdev@{ssh_host}
+ssh -i ~/.ssh/id_ed25519_devbrain {ssh_port_flag} lhtdev@{ssh_host}
 # (Add to ~/.ssh/config as `Host mac-studio` for ergonomics.)
 ```
 
@@ -548,6 +552,7 @@ def write_onboarding_kit(
     bootstrap_invite_id_short: str,
     bootstrap_expiry: datetime,
     ssh_host: str = "lhts-mac-studio.local",
+    ssh_port: int = 22,
     cli: CliName = "claude",
 ) -> Path:
     """Render an onboarding kit for one invitation. Returns the path written.
@@ -589,6 +594,8 @@ def write_onboarding_kit(
         first_name=first_name,
         bootstrap_private_key=bootstrap_private_key,
         ssh_host=ssh_host,
+        ssh_port=ssh_port,
+        ssh_port_flag=f"-p {ssh_port}",
     )
 
     sections = [

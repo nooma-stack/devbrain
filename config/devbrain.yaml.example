@@ -3,6 +3,17 @@
 # Copy this file to config/devbrain.yaml and fill in your values.
 # The real config/devbrain.yaml is gitignored so secrets stay local.
 
+# Onboarding network endpoint — used by the kit's SSH commands so a
+# remote dev can reach the rotation handler without local-network mDNS.
+# Production setups should publish a public host (typically a VPS with
+# a reverse tunnel from Mac Studio) and override below.
+#
+# Defaults (not set here): ssh_host=lhts-mac-studio.local, ssh_port=22 —
+# only works for devs on the same Bonjour-resolvable LAN as Mac Studio.
+onboarding:
+  ssh_host: 72.60.64.155        # Public IP / DNS name (e.g., your VPS)
+  ssh_port: 2222                # Reverse-tunnel port forwarding to Mac Studio's sshd
+
 database:
   host: localhost
   port: 5433
