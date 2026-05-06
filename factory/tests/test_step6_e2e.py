@@ -145,8 +145,10 @@ def test_implementing_to_reviewing_runs_full_eval_pipeline(
             result = db.transition(job_id, JobStatus.REVIEWING)
 
         assert result.status == JobStatus.REVIEWING
-        # Both eval agents (security + test) should have been invoked.
-        assert mock_run.call_count == 2
+        # All three LLM eval agents (security + test + perf — Step 8) should
+        # have been invoked. eval_lint is subprocess-driven and uses its own
+        # subprocess.run patch path, so it doesn't count here.
+        assert mock_run.call_count == 3
 
         # Assert all 3 lessons graduated to rules with graduated_at set.
         with conn.cursor() as cur:
