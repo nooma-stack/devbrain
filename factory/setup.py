@@ -2182,6 +2182,7 @@ def setup_add_dev(cli: str | None = None) -> None:
             kit_path=kit_path,
             admin_name=admin_user,
             admin_contact=admin_user,
+            cli=cli,
         )
         if sent:
             _ok(f"Email sent to {email}.")

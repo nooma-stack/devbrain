@@ -1,12 +1,10 @@
 """Tests for SmtpChannel."""
-import email
 import os
 import smtplib
 from email import message_from_bytes
 from pathlib import Path
-from unittest.mock import patch, MagicMock, call
+from unittest.mock import patch, MagicMock
 
-import pytest
 
 from notifications.channels.smtp import SmtpChannel
 
