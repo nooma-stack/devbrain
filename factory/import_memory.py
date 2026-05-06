@@ -262,10 +262,16 @@ def _insert_memory(
         INSERT INTO devbrain.memory
             (project_id, kind, title, content, embedding,
              strength, hit_count, last_hit, applies_when,
-             provenance_id, tier, archived_at, created_at, updated_at)
+             provenance_id, tier, archived_at, created_at, updated_at,
+             compliance_profiles, current_streak,
+             graduated_at, demoted_at, effective_hit_count,
+             last_cascade_at)
         VALUES (%s, %s, %s, %s, %s::vector,
                 %s, %s, %s, %s::jsonb,
-                %s, %s, %s, %s, %s)
+                %s, %s, %s, %s, %s,
+                %s::text[], %s,
+                %s, %s, %s,
+                %s)
         ON CONFLICT (provenance_id, kind) WHERE provenance_id IS NOT NULL
         DO NOTHING
     """
@@ -303,6 +309,12 @@ def _insert_memory(
                 m.get("archived_at"),
                 m.get("created_at"),
                 m.get("updated_at") or m.get("created_at"),
+                m.get("compliance_profiles"),
+                m.get("current_streak", 0),
+                m.get("graduated_at"),
+                m.get("demoted_at"),
+                m.get("effective_hit_count", 0),
+                m.get("last_cascade_at"),
             ),
         )
         if cur.rowcount == 1:
