@@ -2,21 +2,33 @@
 
 Covers JSON shape, exit code on failure, and that env var overrides surface.
 The doctor probes real services (Postgres, Ollama), so these tests assume
-a working local install — same assumption the rest of the test suite makes.
+a working local install — skipped when the devbrain .venv is not present
+in the expected location (e.g. in worktrees that share the parent venv).
 """
 
 import json
+import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEVBRAIN_BIN = REPO_ROOT / "bin" / "devbrain"
+# The devbrain binary shells out via its own .venv; skip if that venv is
+# absent (e.g. when running from a git worktree that shares the parent's
+# .venv rather than having its own copy).
+_VENV_PYTHON = REPO_ROOT / ".venv" / "bin" / "python"
+_DOCTOR_AVAILABLE = _VENV_PYTHON.exists()
+
+pytestmark = pytest.mark.skipif(
+    not _DOCTOR_AVAILABLE,
+    reason="devbrain .venv not present at expected path — likely a worktree; run from main checkout",
+)
 
 
 def _run(env_overrides: dict | None = None) -> tuple[int, str]:
     """Run `devbrain doctor --json` and return (exit_code, stdout)."""
-    import os
-
     env = os.environ.copy()
     if env_overrides:
         env.update(env_overrides)
