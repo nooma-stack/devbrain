@@ -122,6 +122,22 @@ class FactoryDB:
                 raise ValueError(f"Project '{project_slug}' not found")
             project_id = row[0]
 
+            # ACL: if submitted_by names a registered dev with a non-NULL
+            # allowed_projects list, verify the target project slug is in it.
+            if submitted_by:
+                cur.execute(
+                    "SELECT allowed_projects FROM devbrain.devs WHERE dev_id = %s",
+                    (submitted_by,),
+                )
+                dev_row = cur.fetchone()
+                if dev_row is not None:
+                    allowed = dev_row[0]  # TEXT[] or None
+                    if allowed is not None and project_slug not in allowed:
+                        raise PermissionError(
+                            f"Dev '{submitted_by}' is not permitted to submit jobs "
+                            f"to project '{project_slug}'."
+                        )
+
             cur.execute(
                 """
                 INSERT INTO devbrain.factory_jobs
@@ -707,7 +723,7 @@ class FactoryDB:
             cur.execute(
                 """
                 SELECT id, dev_id, full_name, channels, event_subscriptions,
-                       created_at, updated_at
+                       created_at, updated_at, allowed_projects
                 FROM devbrain.devs
                 WHERE dev_id = %s
                 """,
@@ -724,6 +740,7 @@ class FactoryDB:
                 "event_subscriptions": row[4] or [],
                 "created_at": row[5],
                 "updated_at": row[6],
+                "allowed_projects": row[7],  # None or list of slugs
             }
 
     def list_devs(self) -> list[dict]:
@@ -732,7 +749,7 @@ class FactoryDB:
             cur.execute(
                 """
                 SELECT id, dev_id, full_name, channels, event_subscriptions,
-                       created_at, updated_at
+                       created_at, updated_at, allowed_projects
                 FROM devbrain.devs
                 ORDER BY dev_id ASC
                 """
@@ -746,6 +763,7 @@ class FactoryDB:
                     "event_subscriptions": r[4] or [],
                     "created_at": r[5],
                     "updated_at": r[6],
+                    "allowed_projects": r[7],  # None or list of slugs
                 }
                 for r in cur.fetchall()
             ]
@@ -807,6 +825,27 @@ class FactoryDB:
                  WHERE dev_id = %s
                 """,
                 (json.dumps(filtered), dev_id),
+            )
+            conn.commit()
+
+    def set_dev_allowed_projects(
+        self, dev_id: str, allowed_projects: list[str] | None
+    ) -> None:
+        """Set the projects this dev may submit jobs to.
+
+        allowed_projects=None  → unrestricted (all projects).
+        allowed_projects=[]    → locked out of all projects.
+        allowed_projects=[...] → restricted to named slugs.
+        Uses project SLUGS for portability across DB instances.
+        """
+        dev = self.get_dev(dev_id)
+        if not dev:
+            raise ValueError(f"Dev '{dev_id}' not found")
+        with self._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devbrain.devs SET allowed_projects = %s, updated_at = now() "
+                "WHERE dev_id = %s",
+                (allowed_projects, dev_id),
             )
             conn.commit()
 
