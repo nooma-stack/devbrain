@@ -169,7 +169,7 @@ server.tool(
 
 server.tool(
   'deep_search',
-  'Search DevBrain for relevant context. Call this FIRST before starting any work. Returns embedded chunks with source references. Use depth="auto" to automatically fetch raw context when the query asks for specific details.',
+  'Search DevBrain for relevant context. Call this FIRST before starting any work. Returns embedded chunks with source references. Use depth="auto" to automatically fetch raw context when the query asks for specific details. Use with_graph=true to also return the graph neighborhood of top-matched memories.',
   {
     query: z.string().describe('Natural language search query'),
     project: z.string().optional().describe('Project slug (defaults to current project, omit for cross-project)'),
@@ -177,8 +177,14 @@ server.tool(
     source_types: z.array(z.string()).optional().describe('Filter by: session, decision, pattern, issue, note, openclaw_memory, codebase'),
     depth: z.enum(['summary', 'full', 'auto']).optional().default('auto').describe('summary=chunks only, full=chunks+raw context, auto=smart drill-down'),
     limit: z.number().optional().default(10).describe('Max results'),
+    with_graph: z.boolean().optional().default(false)
+      .describe('Phase 5: also return graph neighborhood of top-matched memories. Adds a top-level "graph" field with memories, edges, seeds.'),
+    graph_max_hops: z.number().min(1).max(6).optional().default(3)
+      .describe('Max BFS depth for graph walk (only when with_graph=true). Default 3.'),
+    graph_max_nodes: z.number().min(5).max(200).optional().default(50)
+      .describe('Max total nodes in graph result (only when with_graph=true). Default 50.'),
   },
-  async ({ query: searchQuery, project, cross_project, source_types, depth, limit }) => {
+  async ({ query: searchQuery, project, cross_project, source_types, depth, limit, with_graph, graph_max_hops, graph_max_nodes }) => {
     const queryEmbedding = await embed(searchQuery)
     const vectorStr = toSqlVector(queryEmbedding)
 
@@ -462,15 +468,69 @@ server.tool(
       }),
     )
 
+    // Phase 5d: graph neighborhood enrichment.
+    //
+    // When with_graph=true, collect the memory_ids of top-ranked results
+    // (those with a real memory_id — codebase legacy fallback rows have
+    // memory_id='') and pass them to the Python graph walker. Returns a
+    // combined neighborhood deduped across all seeds.
+    let graphField: unknown = undefined
+    if (with_graph) {
+      const seedIds = results
+        .map((r) => r.memory_id as string)
+        .filter((id) => id && id.length > 10)
+
+      if (seedIds.length > 0) {
+        const graphPayload = {
+          seed_memory_ids: seedIds,
+          graph_max_hops: graph_max_hops ?? 3,
+          graph_max_nodes: graph_max_nodes ?? 50,
+        }
+
+        const graphResult = spawnSync(
+          DEVBRAIN_PYTHON,
+          ['-m', 'graph.deep_search_graph_entry'],
+          {
+            input: JSON.stringify(graphPayload),
+            encoding: 'utf-8',
+            cwd: resolve(import.meta.dirname, '../../factory'),
+            env: { ...process.env },
+          },
+        )
+
+        if (graphResult.status === 0) {
+          try {
+            const parsed = JSON.parse((graphResult.stdout ?? '').toString())
+            if (!parsed.error) {
+              graphField = parsed
+            } else {
+              console.error(`[deep_search] graph walk error: ${parsed.error}`)
+            }
+          } catch {
+            console.error(`[deep_search] graph walk returned unparseable output`)
+          }
+        } else {
+          console.error(`[deep_search] graph walk failed (exit ${graphResult.status}): ${(graphResult.stderr ?? '').toString().slice(0, 400)}`)
+        }
+      } else {
+        graphField = { memories: [], edges: [], seeds: [] }
+      }
+    }
+
+    const responseBody: Record<string, unknown> = {
+      results,
+      hint: results.some((r) => r.has_full_context)
+        ? 'Call get_source_context(chunk_id) for full raw transcript around any result.'
+        : 'No raw session context available for these results.',
+    }
+    if (with_graph) {
+      responseBody.graph = graphField ?? { memories: [], edges: [], seeds: [] }
+    }
+
     return {
       content: [{
         type: 'text',
-        text: JSON.stringify({
-          results,
-          hint: results.some((r) => r.has_full_context)
-            ? 'Call get_source_context(chunk_id) for full raw transcript around any result.'
-            : 'No raw session context available for these results.',
-        }, null, 2),
+        text: JSON.stringify(responseBody, null, 2),
       }],
     }
   },
@@ -568,8 +628,20 @@ server.tool(
       .describe(
         'UUIDs of memories this one replaces. Used for retracting a prior decision when storing its replacement. Accepts either memory.id or legacy id.',
       ),
+    derived_from: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'UUIDs of memories this one was extracted/derived from (e.g. lessons extracted from a session). Phase 5 graph edge type.',
+      ),
+    refined_by: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'UUIDs of memories that sharpen or elaborate this one. Phase 5 graph edge type.',
+      ),
   },
-  async ({ type, project, title, content, category, tags, rationale, alternatives, root_cause, fix_applied, prevention, example_code, depends_on, supersedes }) => {
+  async ({ type, project, title, content, category, tags, rationale, alternatives, root_cause, fix_applied, prevention, example_code, depends_on, supersedes, derived_from, refined_by }) => {
     const projectId = await resolveProjectId(project)
     if (!projectId) {
       return { content: [{ type: 'text', text: `Project "${project}" not found.` }] }
@@ -633,7 +705,8 @@ server.tool(
     // insert. Failures are logged but never block the store. Skipped if
     // the dual-write didn't return a new memory.id (best-effort path).
     const edgeNotes: string[] = []
-    if (memoryId && (depends_on?.length || supersedes?.length)) {
+    const hasEdges = depends_on?.length || supersedes?.length || derived_from?.length || refined_by?.length
+    if (memoryId && hasEdges) {
       for (const target of depends_on ?? []) {
         const toId = await resolveMemoryId(target)
         if (!toId) {
@@ -667,6 +740,37 @@ server.tool(
         // failed enqueue never blocks the store().
         await enqueueCascades(toId, 'supersedes')
       }
+      // Phase 5c: derived_from and refined_by edges. Same idempotency
+      // semantics as depends_on/supersedes (ON CONFLICT DO NOTHING via
+      // the triplet unique constraint). No cascade enqueue — these edge
+      // types don't trigger re-evaluation (they're knowledge-provenance
+      // signals, not dependency-invalidation signals).
+      for (const target of derived_from ?? []) {
+        const toId = await resolveMemoryId(target)
+        if (!toId) {
+          edgeNotes.push(`derived_from: could not resolve "${target.slice(0, 8)}"`)
+          continue
+        }
+        await recordMemoryDependency({
+          fromMemoryId: memoryId,
+          toMemoryId: toId,
+          edgeType: 'derived_from',
+          createdBy: 'mcp:store',
+        })
+      }
+      for (const target of refined_by ?? []) {
+        const toId = await resolveMemoryId(target)
+        if (!toId) {
+          edgeNotes.push(`refined_by: could not resolve "${target.slice(0, 8)}"`)
+          continue
+        }
+        await recordMemoryDependency({
+          fromMemoryId: memoryId,
+          toMemoryId: toId,
+          edgeType: 'refined_by',
+          createdBy: 'mcp:store',
+        })
+      }
       // Future store() trigger points (Phase 3.x — when the tool
       // schema gains archive / applies_when params):
       //   if (params.archived_at && !previousRow?.archived_at) {
@@ -695,6 +799,8 @@ server.tool(
       const parts: string[] = []
       if (depends_on?.length) parts.push(`depends_on=${depends_on.length}`)
       if (supersedes?.length) parts.push(`supersedes=${supersedes.length}`)
+      if (derived_from?.length) parts.push(`derived_from=${derived_from.length}`)
+      if (refined_by?.length) parts.push(`refined_by=${refined_by.length}`)
       return parts.length ? ` Edges: ${parts.join(', ')}.` : ''
     })()
     const noteSummary = edgeNotes.length ? ` (${edgeNotes.join('; ')})` : ''
@@ -928,6 +1034,90 @@ server.tool(
             },
           },
         }, null, 2),
+      }],
+    }
+  },
+)
+
+// ─── Tool: graph_walk ───────────────────────────────────────────────────────
+//
+// Phase 5b: Explore the memory graph from a known memory_id using bounded
+// recursive-CTE traversal (no Apache AGE). Delegates to the Python walker
+// at factory/graph/graph_walk_entry.py via spawnSync — same pattern as
+// the end_session enrichment path.
+//
+// Returns {memories, edges, truncated} from walker.walk(). The Python
+// entry point handles DB connection and serialization.
+
+server.tool(
+  'graph_walk',
+  'Explore the memory graph from a known memory. Returns related memories within max_hops, filtered by edge types. Use when you have a relevant memory_id (from deep_search or store result) and want to see its neighborhood.',
+  {
+    seed_memory_id: z.string().uuid().describe('Starting memory ID (from deep_search or store result)'),
+    edge_types: z
+      .array(z.enum(['cites', 'depends_on', 'supersedes', 'contradicts', 'derived_from', 'refined_by']))
+      .optional()
+      .describe('Edge types to follow. Defaults to strong-signal subset: supersedes, refined_by, derived_from, depends_on.'),
+    max_hops: z.number().min(1).max(6).optional().default(3)
+      .describe('Maximum BFS depth. Default 3; max 6.'),
+    max_nodes: z.number().min(5).max(200).optional().default(50)
+      .describe('Maximum nodes to return (including seed). Default 50; max 200. truncated=true when hit.'),
+    direction: z.enum(['outgoing', 'incoming', 'both']).optional().default('both')
+      .describe('Edge direction: outgoing (follow from→to), incoming (follow to→from), or both. Default both.'),
+    cross_project: z.boolean().optional().default(false)
+      .describe('If true, expand across project boundaries. Default false (same-project only).'),
+  },
+  async ({ seed_memory_id, edge_types, max_hops, max_nodes, direction, cross_project }) => {
+    const payload = {
+      seed_memory_id,
+      edge_types: edge_types ?? null,
+      max_hops: max_hops ?? 3,
+      max_nodes: max_nodes ?? 50,
+      direction: direction ?? 'both',
+      cross_project: cross_project ?? false,
+    }
+
+    const result = spawnSync(
+      DEVBRAIN_PYTHON,
+      ['-m', 'graph.graph_walk_entry'],
+      {
+        input: JSON.stringify(payload),
+        encoding: 'utf-8',
+        cwd: resolve(import.meta.dirname, '../../factory'),
+        env: { ...process.env },
+      },
+    )
+
+    if (result.status !== 0) {
+      return {
+        content: [{
+          type: 'text',
+          text: `graph_walk failed (exit ${result.status}).\nstderr: ${(result.stderr ?? '').toString().slice(0, 800)}`,
+        }],
+      }
+    }
+
+    let parsed: unknown
+    try {
+      parsed = JSON.parse((result.stdout ?? '').toString())
+    } catch {
+      return {
+        content: [{
+          type: 'text',
+          text: `graph_walk returned unparseable output:\n${(result.stdout ?? '').toString().slice(0, 400)}`,
+        }],
+      }
+    }
+
+    const out = parsed as { error?: string; memories?: unknown[]; edges?: unknown[]; truncated?: boolean }
+    if (out.error) {
+      return { content: [{ type: 'text', text: `graph_walk error: ${out.error}` }] }
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(out, null, 2),
       }],
     }
   },
