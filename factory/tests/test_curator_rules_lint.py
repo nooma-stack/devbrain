@@ -52,10 +52,15 @@ def _redirect_postulates_dir(monkeypatch, tmp_path):
 
 
 @pytest.mark.db
-def test_no_rules_returns_empty(conn, monkeypatch, tmp_path):
-    """Clean DB (no profile-tagged rules) -> empty list."""
+def test_no_rules_returns_empty(conn, project_factory, monkeypatch, tmp_path):
+    """Empty test project (no profile-tagged rules) -> empty list.
+
+    Scope to a freshly-created project so seeded rules from migration 023
+    in the canonical 'devbrain' project don't pollute the assertion.
+    """
+    project = project_factory("rl_empty")
     _redirect_postulates_dir(monkeypatch, tmp_path)
-    assert rules_lint.find_unverified_rules(conn) == []
+    assert rules_lint.find_unverified_rules(conn, project_id=project["id"]) == []
 
 
 @pytest.mark.db
@@ -76,7 +81,7 @@ def test_rule_with_uuid_in_postulate_passes(
     )
     _redirect_postulates_dir(monkeypatch, tmp_path)
 
-    assert rules_lint.find_unverified_rules(conn) == []
+    assert rules_lint.find_unverified_rules(conn, project_id=project["id"]) == []
 
 
 @pytest.mark.db
@@ -98,7 +103,7 @@ def test_rule_with_title_slug_in_postulate_passes(
     )
     _redirect_postulates_dir(monkeypatch, tmp_path)
 
-    assert rules_lint.find_unverified_rules(conn) == []
+    assert rules_lint.find_unverified_rules(conn, project_id=project["id"]) == []
 
 
 @pytest.mark.db
@@ -119,7 +124,7 @@ def test_rule_without_postulate_fails(
     _seed_postulate(tmp_path, "unrelated", "# nothing relevant here\n")
     _redirect_postulates_dir(monkeypatch, tmp_path)
 
-    unverified = rules_lint.find_unverified_rules(conn)
+    unverified = rules_lint.find_unverified_rules(conn, project_id=project["id"])
     flagged_ids = {r.id for r in unverified}
     assert rule["id"] in flagged_ids
 
@@ -138,7 +143,7 @@ def test_empty_profiles_rule_skipped(
     )
     _redirect_postulates_dir(monkeypatch, tmp_path)
     # No matching postulate exists, but lint should not flag.
-    assert rules_lint.find_unverified_rules(conn) == []
+    assert rules_lint.find_unverified_rules(conn, project_id=project["id"]) == []
 
 
 @pytest.mark.db
@@ -160,13 +165,21 @@ def test_archived_rule_skipped(
     conn.commit()
     _redirect_postulates_dir(monkeypatch, tmp_path)
 
-    assert rules_lint.find_unverified_rules(conn) == []
+    assert rules_lint.find_unverified_rules(conn, project_id=project["id"]) == []
 
 
 @pytest.mark.db
-def test_run_lint_exit_code_clean(conn, monkeypatch, tmp_path, capsys):
+def test_run_lint_exit_code_clean(
+    conn, project_factory, monkeypatch, tmp_path, capsys
+):
+    """Empty test project + matching postulates dir → exit 0.
+
+    Uses a fresh project to scope away from canonical 'devbrain' seeded
+    rules (which live in production-shape state and aren't subject to
+    test invariants)."""
+    project = project_factory("rl_clean")
     _redirect_postulates_dir(monkeypatch, tmp_path)
-    rc = rules_lint.run_lint(conn)
+    rc = rules_lint.run_lint(conn, project_id=project["id"])
     assert rc == 0
     captured = capsys.readouterr()
     assert "OK" in captured.out
@@ -185,7 +198,7 @@ def test_run_lint_exit_code_violations(
         compliance_profiles=["hipaa"],
     )
     _redirect_postulates_dir(monkeypatch, tmp_path)
-    rc = rules_lint.run_lint(conn)
+    rc = rules_lint.run_lint(conn, project_id=project["id"])
     assert rc == 1
     captured = capsys.readouterr()
     assert str(rule["id"]) in captured.err
@@ -206,7 +219,7 @@ def test_unverified_rule_has_full_payload(
         compliance_profiles=["hipaa", "soc2"],
     )
     _redirect_postulates_dir(monkeypatch, tmp_path)
-    unverified = rules_lint.find_unverified_rules(conn)
+    unverified = rules_lint.find_unverified_rules(conn, project_id=project["id"])
     target = next((r for r in unverified if r.id == rule["id"]), None)
     assert target is not None
     assert target.title == title
