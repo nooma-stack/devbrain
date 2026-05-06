@@ -568,8 +568,20 @@ server.tool(
       .describe(
         'UUIDs of memories this one replaces. Used for retracting a prior decision when storing its replacement. Accepts either memory.id or legacy id.',
       ),
+    derived_from: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'UUIDs of memories this one was extracted/derived from (e.g. lessons extracted from a session). Phase 5 graph edge type.',
+      ),
+    refined_by: z
+      .array(z.string())
+      .optional()
+      .describe(
+        'UUIDs of memories that sharpen or elaborate this one. Phase 5 graph edge type.',
+      ),
   },
-  async ({ type, project, title, content, category, tags, rationale, alternatives, root_cause, fix_applied, prevention, example_code, depends_on, supersedes }) => {
+  async ({ type, project, title, content, category, tags, rationale, alternatives, root_cause, fix_applied, prevention, example_code, depends_on, supersedes, derived_from, refined_by }) => {
     const projectId = await resolveProjectId(project)
     if (!projectId) {
       return { content: [{ type: 'text', text: `Project "${project}" not found.` }] }
@@ -633,7 +645,8 @@ server.tool(
     // insert. Failures are logged but never block the store. Skipped if
     // the dual-write didn't return a new memory.id (best-effort path).
     const edgeNotes: string[] = []
-    if (memoryId && (depends_on?.length || supersedes?.length)) {
+    const hasEdges = depends_on?.length || supersedes?.length || derived_from?.length || refined_by?.length
+    if (memoryId && hasEdges) {
       for (const target of depends_on ?? []) {
         const toId = await resolveMemoryId(target)
         if (!toId) {
@@ -667,6 +680,37 @@ server.tool(
         // failed enqueue never blocks the store().
         await enqueueCascades(toId, 'supersedes')
       }
+      // Phase 5c: derived_from and refined_by edges. Same idempotency
+      // semantics as depends_on/supersedes (ON CONFLICT DO NOTHING via
+      // the triplet unique constraint). No cascade enqueue — these edge
+      // types don't trigger re-evaluation (they're knowledge-provenance
+      // signals, not dependency-invalidation signals).
+      for (const target of derived_from ?? []) {
+        const toId = await resolveMemoryId(target)
+        if (!toId) {
+          edgeNotes.push(`derived_from: could not resolve "${target.slice(0, 8)}"`)
+          continue
+        }
+        await recordMemoryDependency({
+          fromMemoryId: memoryId,
+          toMemoryId: toId,
+          edgeType: 'derived_from',
+          createdBy: 'mcp:store',
+        })
+      }
+      for (const target of refined_by ?? []) {
+        const toId = await resolveMemoryId(target)
+        if (!toId) {
+          edgeNotes.push(`refined_by: could not resolve "${target.slice(0, 8)}"`)
+          continue
+        }
+        await recordMemoryDependency({
+          fromMemoryId: memoryId,
+          toMemoryId: toId,
+          edgeType: 'refined_by',
+          createdBy: 'mcp:store',
+        })
+      }
       // Future store() trigger points (Phase 3.x — when the tool
       // schema gains archive / applies_when params):
       //   if (params.archived_at && !previousRow?.archived_at) {
@@ -695,6 +739,8 @@ server.tool(
       const parts: string[] = []
       if (depends_on?.length) parts.push(`depends_on=${depends_on.length}`)
       if (supersedes?.length) parts.push(`supersedes=${supersedes.length}`)
+      if (derived_from?.length) parts.push(`derived_from=${derived_from.length}`)
+      if (refined_by?.length) parts.push(`refined_by=${refined_by.length}`)
       return parts.length ? ` Edges: ${parts.join(', ')}.` : ''
     })()
     const noteSummary = edgeNotes.length ? ` (${edgeNotes.join('; ')})` : ''

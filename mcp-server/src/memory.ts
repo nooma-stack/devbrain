@@ -126,7 +126,7 @@ export async function resolveMemoryId(uuid: string): Promise<string | null> {
 export async function recordMemoryDependency(args: {
   fromMemoryId: string
   toMemoryId: string
-  edgeType: 'cites' | 'depends_on' | 'supersedes' | 'contradicts'
+  edgeType: 'cites' | 'depends_on' | 'supersedes' | 'contradicts' | 'derived_from' | 'refined_by'
   confidence?: number
   createdBy?: string
   metadata?: Record<string, unknown>
