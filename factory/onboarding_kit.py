@@ -335,12 +335,12 @@ persists both, and self-deletes the bootstrap key entry.
 
 PUBKEY=$(cat ~/.ssh/id_ed25519_devbrain.pub)
 
-ssh -i ~/.ssh/devbrain-bootstrap-{dev_id} \\
-    {ssh_port_flag} \\
-    -o StrictHostKeyChecking=accept-new \\
-    -o UserKnownHostsFile=~/.ssh/known_hosts \\
-    lhtdev@{ssh_host} \\
-    < <(jq -n --arg p "$PUBKEY" --arg t "$OAUTH_TOKEN" '{{pubkey: $p, oauth_token: $t}}')
+jq -n --arg p "$PUBKEY" --arg t "$OAUTH_TOKEN" '{{pubkey: $p, oauth_token: $t}}' \\
+  | ssh -i ~/.ssh/devbrain-bootstrap-{dev_id} \\
+        {ssh_port_flag} \\
+        -o StrictHostKeyChecking=accept-new \\
+        -o UserKnownHostsFile=~/.ssh/known_hosts \\
+        lhtdev@{ssh_host}
 
 # Expected output: {{"status":"ok","dev_id":"{dev_id}","invite_id":"..."}}
 ```
@@ -365,12 +365,12 @@ token format, persists both, and self-deletes the bootstrap key entry.
 
 PUBKEY=$(cat ~/.ssh/id_ed25519_devbrain.pub)
 
-ssh -i ~/.ssh/devbrain-bootstrap-{dev_id} \\
-    {ssh_port_flag} \\
-    -o StrictHostKeyChecking=accept-new \\
-    -o UserKnownHostsFile=~/.ssh/known_hosts \\
-    lhtdev@{ssh_host} \\
-    < <(jq -n --arg p "$PUBKEY" --argjson a "$CODEX_AUTH_JSON" '{{pubkey: $p, codex_auth_json: $a}}')
+jq -n --arg p "$PUBKEY" --argjson a "$CODEX_AUTH_JSON" '{{pubkey: $p, codex_auth_json: $a}}' \\
+  | ssh -i ~/.ssh/devbrain-bootstrap-{dev_id} \\
+        {ssh_port_flag} \\
+        -o StrictHostKeyChecking=accept-new \\
+        -o UserKnownHostsFile=~/.ssh/known_hosts \\
+        lhtdev@{ssh_host}
 
 # Expected output: {{"status":"ok","dev_id":"{dev_id}","invite_id":"..."}}
 ```
@@ -396,12 +396,12 @@ bootstrap key entry.
 
 PUBKEY=$(cat ~/.ssh/id_ed25519_devbrain.pub)
 
-ssh -i ~/.ssh/devbrain-bootstrap-{dev_id} \\
-    {ssh_port_flag} \\
-    -o StrictHostKeyChecking=accept-new \\
-    -o UserKnownHostsFile=~/.ssh/known_hosts \\
-    lhtdev@{ssh_host} \\
-    < <(jq -n --arg p "$PUBKEY" --arg k "$GEMINI_API_KEY" '{{pubkey: $p, gemini_api_key: $k}}')
+jq -n --arg p "$PUBKEY" --arg k "$GEMINI_API_KEY" '{{pubkey: $p, gemini_api_key: $k}}' \\
+  | ssh -i ~/.ssh/devbrain-bootstrap-{dev_id} \\
+        {ssh_port_flag} \\
+        -o StrictHostKeyChecking=accept-new \\
+        -o UserKnownHostsFile=~/.ssh/known_hosts \\
+        lhtdev@{ssh_host}
 
 # Expected output: {{"status":"ok","dev_id":"{dev_id}","invite_id":"..."}}
 ```
@@ -531,7 +531,7 @@ _PHASE0_WINDOWS = """\
 ## Phase 0 — Windows preflight (WSL2 + Ubuntu + apt prereqs)
 
 Phases 1-8 of this kit assume a Linux-shaped shell (bash, ssh, jq,
-process substitution, `~/.ssh/`). On Windows the cleanest path is
+`~/.ssh/`). On Windows the cleanest path is
 **WSL2 + Ubuntu** — the rest of the kit then runs unchanged inside
 the WSL shell.
 
