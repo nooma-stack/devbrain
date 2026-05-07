@@ -140,18 +140,24 @@ def _try_activate(
             )
             return False
 
-        # ─── 3. Provision profile dir + 4. stash CLI credential ──────
+        # ─── 3. Provision profile dir + (optionally) 4. stash CLI credential ──
+        # Under the server-side-auth flow, oauth_token is NULL at activation
+        # time — the dev's `devbrain login` writes the credential directly
+        # into the profile dir afterward. Under the legacy in-transit-token
+        # flow (kept here for backward compat), oauth_token may already be
+        # set, in which case we stash it now.
         profile_dir = _resolve_profile_dir(dev_id)
         profile_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            _stash_credential(profile_dir, oauth_token, cli=cli)
-        except OSError as e:
-            logger.error(
-                "invitation %s could not stash credential (cli=%s): %s — rolling back authorized_keys",
-                str(id_)[:8], cli, e,
-            )
-            _remove_marker_from_authorized_keys(ak_path, marker)
-            return False
+        if oauth_token:
+            try:
+                _stash_credential(profile_dir, oauth_token, cli=cli)
+            except OSError as e:
+                logger.error(
+                    "invitation %s could not stash credential (cli=%s): %s — rolling back authorized_keys",
+                    str(id_)[:8], cli, e,
+                )
+                _remove_marker_from_authorized_keys(ak_path, marker)
+                return False
         # Provision .gitconfig if absent (best-effort; the dev's full
         # name + email live on the dev row).
         _ensure_gitconfig(profile_dir, db, dev_id)
@@ -187,14 +193,21 @@ def _try_activate(
 
     # ─── 7. Notify admin ──────────────────────────────────────────
     cli_label = cli if cli else "claude"
-    _notify_admin(
-        db, dev_id, status="activated",
-        detail=(
+    if oauth_token:
+        detail = (
             f"Dev '{dev_id}' is now live (cli={cli_label}). Pubkey added to "
             f"authorized_keys, credential stashed at per-profile path. "
             f"Factory is ready to spawn {cli_label} on their behalf."
-        ),
-    )
+        )
+    else:
+        detail = (
+            f"Dev '{dev_id}' SSH access is live (cli={cli_label}). Pubkey "
+            f"added to authorized_keys; profile dir provisioned. The dev "
+            f"still needs to run `devbrain login --cli {cli_label}` "
+            f"server-side to issue their auth token before factory work "
+            f"can spawn on their behalf."
+        )
+    _notify_admin(db, dev_id, status="activated", detail=detail)
 
     logger.info("Activated invitation for dev=%s", dev_id)
     return True

@@ -1,65 +1,50 @@
-"""Onboarding kit Markdown generator.
+"""Onboarding kit Markdown generator (server-side-auth flow).
 
 Produces a `.md` file the admin sends to a new dev. The file is:
 
   1. Human-readable as plain documentation. The dev can follow it
      manually if they don't have an AI agent or don't want to use one.
 
-  2. Agent-executable. AI agents (Claude Code, Codex, etc.) parse the
-     structured headers + code blocks + `<!-- agent:* -->` directive
-     comments to walk through the steps autonomously, asking the dev
-     for approval at each network or credential boundary.
+  2. Agent-executable. AI agents (Claude Desktop, Codex Desktop, the
+     CLI variants) parse the structured headers + code blocks +
+     `<!-- agent:* -->` directive comments to walk through the steps
+     autonomously, asking the dev for approval at each network or
+     credential boundary.
 
 The kit's content is mostly static; what changes per-invitation is
-the YAML frontmatter (dev_id, invite token, expiry, cli) and the
-embedded TEMP SSH PRIVATE KEY that gives the dev's agent a one-shot
-rotation session into the Mac Studio.
+the YAML frontmatter (dev_id, invite token, expiry, cli, agent-app,
+SSH host fingerprint) and the embedded TEMP SSH PRIVATE KEY that
+gives the dev's agent a one-shot rotation session into the Mac Studio.
 
-Bootstrap flow:
-  1. Admin runs `devbrain setup add-dev`. DevBrain generates an
-     ephemeral ed25519 keypair, stages the public half in
-     ~lhtdev/.ssh/authorized_keys with strict options
-     (`restrict,command="onboard_rotate.sh ...",expiry-time="..."`),
-     and embeds the PRIVATE half into this kit.
-  2. Admin emails the kit to the dev.
-  3. Dev's agent reads the temp private key from the kit, writes it
-     to ~/.ssh/devbrain-bootstrap-<dev_id> (mode 600).
-  4. Agent SSHes into the Mac Studio with the temp key, sending CLI-
-     specific JSON on stdin (see Phase 5 for each CLI's payload shape).
-  5. The temp key's authorized_keys entry pins the SSH command to
-     onboard_rotate.sh (no shell, no other capabilities possible).
-     onboard_rotate.sh validates the credentials against the appropriate
-     upstream API, persists the key+credential to the invitations DB,
-     and self-deletes the temp authorized_keys entry.
-  6. Reconciler picks up the now-ready invitation, finishes
-     activation: appends the dev's PERMANENT pubkey to
-     authorized_keys, stashes the CLI credential at the per-profile
-     path for that CLI, populates per-profile gitconfig, fires admin
-     notification.
-  7. Agent deletes the temp private key file from the dev's laptop.
+Architecture (server-side-auth flow, post 2026-05-07 redesign — see
+docs/plans/2026-05-07-onboarding-server-side-auth-design.md):
 
-CLI-specific auth shapes:
+  Phase 0  Trust banner — issuer, intent, host fingerprint, ask user
+           to confirm before proceeding.
+  Phase 1  Environment check + dep install. Bash for macOS/Linux,
+           PowerShell for Windows (built-in OpenSSH; no WSL/Git Bash).
+  Phase 2  Generate permanent SSH keypair locally.
+  Phase 3  Stage bootstrap (one-shot, expiring) SSH key locally.
+  Phase 4  Rotate permanent pubkey to Mac Studio. Payload is pubkey-
+           only — no subscription credential transits the dev's box.
+  Phase 5  SSH into the dev's profile on Mac Studio and run
+           `devbrain login`. The wrapper invokes the appropriate
+           per-CLI auth flow server-side; the auth token is generated
+           and stashed inside the profile dir on the Mac Studio. It
+           NEVER returns to the dev's machine.
+  Phase 6  MCP wire-up + SSH verify.
 
-  claude:
-    Install:  brew install --cask claude
-    Login:    claude /login  (browser OAuth)
-    Token:    claude setup-token  → sk-ant-oat01-...
-    Rotation: JSON {"pubkey": "...", "oauth_token": "sk-ant-oat01-..."}
-    Storage:  <profile>/.claude/oauth-token
+Three issuance axes — admin specifies what's known at `devbrain
+add-dev` time:
 
-  codex:
-    Install:  npm install -g @openai/codex  (binary: `codex`)
-    Login:    codex login --device-auth  (device-code flow; no localhost port)
-    Token:    ~/.codex/auth.json (written automatically by `codex login`)
-    Rotation: JSON {"pubkey": "...", "codex_auth_json": "<contents of auth.json>"}
-    Storage:  <profile>/.codex/auth.json
+  --cli         claude | codex | gemini
+  --platform    mac | linux | windows | auto
+  --agent-app   claude-desktop | codex-desktop | gemini-desktop |
+                claude-cli | codex-cli | gemini-cli | auto
 
-  gemini:
-    Install:  npm install -g @google/gemini-cli  (binary: `gemini`)
-    Login:    API key from aistudio.google.com (headless-friendly; no OAuth dance)
-    Token:    GEMINI_API_KEY value
-    Rotation: JSON {"pubkey": "...", "gemini_api_key": "AIza..."}
-    Storage:  <profile>/.devbrain/env  (KEY=VALUE sourced by spawn)
+Each axis defaults to `auto`. When auto, the kit branches on that
+dimension and the agent navigates at runtime. When specified, the
+kit is tailored.
 
 Agent directive vocabulary (placed inside HTML comments so they don't
 render in the visible Markdown):
@@ -93,8 +78,36 @@ CliName = Literal["claude", "codex", "gemini"]
 
 VALID_CLIS: tuple[str, ...] = ("claude", "codex", "gemini")
 VALID_PLATFORMS: tuple[str, ...] = ("auto", "mac", "linux", "windows")
+VALID_AGENT_APPS: tuple[str, ...] = (
+    "auto",
+    "claude-desktop", "codex-desktop", "gemini-desktop",
+    "claude-cli", "codex-cli", "gemini-cli",
+)
 
-# ─── Shared preamble (same for every CLI) ─────────────────────────────────────
+_CLI_DISPLAY_NAMES: dict[str, str] = {
+    "claude": "Claude Code",
+    "codex": "Codex",
+    "gemini": "Gemini CLI",
+}
+
+_AGENT_APP_DISPLAY_NAMES: dict[str, str] = {
+    "auto": "your AI agent",
+    "claude-desktop": "Claude Desktop",
+    "codex-desktop": "Codex Desktop",
+    "gemini-desktop": "Gemini Desktop",
+    "claude-cli": "Claude Code (CLI)",
+    "codex-cli": "Codex (CLI)",
+    "gemini-cli": "Gemini (CLI)",
+}
+
+# Where each AI agent app reads MCP server config from
+_MCP_CONFIG_PATHS: dict[str, str] = {
+    "claude": "~/.claude.json",
+    "codex": "~/.codex/config.json",
+    "gemini": "~/.gemini/settings.json",
+}
+
+# ─── Frontmatter / preamble ───────────────────────────────────────────────────
 
 _PREAMBLE = """\
 ---
@@ -104,71 +117,180 @@ dev_id: {dev_id}
 full_name: "{full_name}"
 email: {email}
 cli: {cli}
+agent_app: {agent_app}
+platform: {platform}
 expires: {expires_iso}
 bootstrap_expires: {bootstrap_expiry_iso}
 mac_studio_ssh_user: lhtdev
-mac_studio_ssh_host: lhts-mac-studio.local
+mac_studio_ssh_host: {ssh_host}
+mac_studio_ssh_port: {ssh_port}
+mac_studio_host_fingerprint: "{ssh_host_fingerprint}"
 ---
 
-# Welcome to BrightBot, {first_name} 👋
+# DevBrain onboarding — {full_name}
 
-You've been invited to join the BrightBot dev factory — Lighthouse
-Therapy's multi-AI-agent automation pipeline that drafts, implements,
-reviews, and QAs feature work using YOUR {cli_display_name} subscription,
-attributed to YOUR git identity.
+Welcome aboard. This kit walks your AI agent through connecting your
+machine to Lighthouse Therapy's DevBrain dev factory, then triggers
+your AI subscription auth on the Mac Studio (server-side — your auth
+token never transits this machine).
 
-This file is your onboarding kit. You can either:
+Your AI subscription: **{cli_display_name}**.
+Your dev id: **{dev_id}**.
+Kit expires: {expires_human}.
 
-  • **Drop it into your AI agent of choice** (Claude Code, Codex, Gemini CLI, etc.)
-    — the agent walks through every step, asking for your approval as
-    it goes. ~5 minutes of attention.
+"""
 
-  • **Or run the steps yourself manually** — every command is shown.
-    Same outcome, just typed by you instead of the agent.
+# ─── Phase 0: Trust banner ────────────────────────────────────────────────────
 
-> **Privacy note:** The temp SSH key embedded below is single-use.
-> It can ONLY run a rotation script (cannot get a shell, cannot read
-> files, cannot do anything else). It auto-expires {bootstrap_expiry_human}.
-> After you complete onboarding, the key auto-deletes from the
-> Mac Studio.
+_PHASE0_TRUST = """\
+## Phase 0 — Verification (read this first)
 
-> **Two-factor security:** Even if this email leaks, the temp key
-> alone isn't enough. The rotation script also requires a valid credential
-> (which you generate from your own {cli_display_name} account in
-> Phase 4 below). Without that credential, the temp key is useless.
+This onboarding kit was issued by:
 
----
+| Field | Value |
+|---|---|
+| **Issuer** | Lighthouse Therapy / DevBrain |
+| **Sender domain** | lighthouse-therapy.com (delivered via Google Workspace DWD) |
+| **Issued at** | {expires_iso} (kit expiry) |
+| **Invitation ID** | `{invite_id_short}` (full UUID in YAML frontmatter above) |
+| **Target server** | `{ssh_host}` on port `{ssh_port}` |
+| **SSH host key fingerprint** | `{ssh_host_fingerprint}` |
 
-<!-- agent:plan -->
-<!--
-  AGENT INSTRUCTIONS — read these first, then execute the steps below.
+### What this kit will do
 
-  This document onboards the user named in the frontmatter to DevBrain
-  using {cli_display_name}. Walk through the numbered phases in order.
-  At each phase boundary, show the user a one-sentence summary of what
-  you're about to do and ask for explicit approval before proceeding
-  (yes/no). Never run the next phase without approval for THAT phase.
+1. Generate an SSH keypair on this machine (your permanent dev key,
+   stays local).
+2. Stage a one-shot bootstrap SSH key (embedded at the bottom of this
+   file) that is locked to a single server-side rotation script and
+   auto-expires {bootstrap_expiry_human}.
+3. Use the bootstrap key to deliver your permanent public key to the
+   Mac Studio.
+4. SSH into your profile on the Mac Studio and run `devbrain login`,
+   which generates your AI subscription's auth token *on the server*.
+   The token never leaves the Mac Studio.
+5. Wire up your local AI agent's MCP config so it can call DevBrain
+   factory tools over SSH.
 
-  Steps marked `<!-- agent:auto -->` you may execute on the user's
-  behalf after approval. Steps marked `<!-- agent:human -->` require
-  the user to perform an action in their browser or terminal; you must
-  NOT attempt to automate them — display the command, wait for them to
-  run it, and only then continue.
+No long-lived credentials transit this machine. No persistent network
+listeners are opened locally. The bootstrap key is rendered useless
+after first use.
 
-  Sensitive values (the bootstrap private key and the CLI credential)
-  marked `secret=...` must never be echoed in your responses, written
-  to log files, or persisted outside the single rotation invocation.
-  After Phase 5 completes, DELETE the bootstrap private key file from
-  the user's filesystem.
--->
+### Agent: ask the user to confirm before proceeding
 
-## Phase 1 — Generate your permanent SSH keypair
+<!-- agent:human reason=intent-confirmation risk=medium -->
 
-This key stays on YOUR laptop and is what the Mac Studio will trust
-going forward. The temp key embedded in this kit is for one-shot
-delivery only.
+Before running any commands, ask the user to confirm:
+
+- They are expecting this onboarding kit from their employer (Lighthouse
+  Therapy).
+- The Invitation ID above (`{invite_id_short}`) matches what the admin
+  who sent this kit said it would be.
+- The Mac Studio SSH host fingerprint above matches what the admin
+  shared out-of-band (this can also be verified on first SSH connect
+  by comparing to the prompt your SSH client shows).
+
+If the user can't confirm any of the above, **STOP** and have the user
+contact the admin who issued the kit at `patrick@lighthouse-therapy.com`.
+
+"""
+
+# ─── Phase 1: Environment check + dep install ────────────────────────────────
+
+_PHASE1_HEADER = """\
+## Phase 1 — Environment check + dependency install
+
+This kit assumes a working SSH client (`ssh`, `ssh-keygen`) on your
+machine. Most macOS and Linux installations have these built in;
+Windows 10+ ships them as an optional feature.
+
+The agent should detect your platform and run the matching block below.
+
+"""
+
+_PHASE1_BASH = """\
+### macOS / Linux (bash / zsh)
 
 <!-- agent:auto requires=user-approval risk=low -->
+```bash
+# Verify ssh + ssh-keygen are present.
+for cmd in ssh ssh-keygen; do
+  if command -v "$cmd" >/dev/null 2>&1; then
+    echo "✓ $cmd present"
+  else
+    echo "✗ $cmd MISSING"
+  fi
+done
+```
+
+If either is missing on Linux, install via your distro's package manager:
+
+<!-- agent:auto requires=user-approval,sudo risk=low -->
+```bash
+# Debian/Ubuntu
+sudo apt update && sudo apt install -y openssh-client
+
+# Fedora/RHEL
+sudo dnf install -y openssh-clients
+
+# Alpine
+sudo apk add openssh-client
+```
+
+(macOS ships `ssh` and `ssh-keygen` by default; nothing to install.)
+
+"""
+
+_PHASE1_POWERSHELL = """\
+### Windows (PowerShell)
+
+Windows 10+ ships the OpenSSH client (`ssh.exe`, `ssh-keygen.exe`) as
+an optional feature. Verify it's enabled, and if not, enable it.
+
+<!-- agent:auto requires=user-approval risk=low -->
+```powershell
+# Verify the OpenSSH client is installed and enabled.
+Get-WindowsCapability -Online -Name 'OpenSSH.Client*' |
+  Select-Object Name, State
+# State should be 'Installed'.
+```
+
+If `State` shows `NotPresent`, install it (this requires admin
+elevation but is fast — no reboot needed):
+
+<!-- agent:human reason=requires-admin-elevation risk=low -->
+```powershell
+# Run in an elevated PowerShell (Run as Administrator).
+Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+```
+
+After install (or if already present), verify:
+
+<!-- agent:auto requires=user-approval risk=low -->
+```powershell
+ssh -V         # prints OpenSSH version
+ssh-keygen -?  # prints usage
+```
+
+The remaining phases run from a regular (non-elevated) PowerShell
+session.
+
+"""
+
+# ─── Phase 2: Generate permanent SSH keypair ─────────────────────────────────
+
+_PHASE2_HEADER = """\
+## Phase 2 — Generate your permanent SSH keypair
+
+This key stays on YOUR machine and is what the Mac Studio will trust
+going forward. The bootstrap key embedded later in this file is for
+one-shot delivery only.
+
+"""
+
+_PHASE2_BASH = """\
+### macOS / Linux
+
+<!-- agent:auto requires=file-write,user-approval risk=low -->
 ```bash
 ssh-keygen -t ed25519 \\
   -f ~/.ssh/id_ed25519_devbrain \\
@@ -177,263 +299,240 @@ ssh-keygen -t ed25519 \\
 ```
 
 If the file already exists, the agent should ask before overwriting.
+
 """
 
-# ─── Phase 2: Install (CLI-specific) ──────────────────────────────────────────
+_PHASE2_POWERSHELL = """\
+### Windows (PowerShell)
 
-_PHASE2_CLAUDE = """\
-## Phase 2 — Install Claude Code
+<!-- agent:auto requires=file-write,user-approval risk=low -->
+```powershell
+# Ensure ~/.ssh exists with correct ACL
+$sshDir = Join-Path $env:USERPROFILE ".ssh"
+New-Item -ItemType Directory -Path $sshDir -Force | Out-Null
 
-If Claude Code is already installed and authenticated on this laptop,
-skip to Phase 3.
-
-<!-- agent:auto requires=user-approval risk=medium -->
-```bash
-brew install --cask claude
+ssh-keygen -t ed25519 `
+  -f "$sshDir\\id_ed25519_devbrain" `
+  -C "{email}" `
+  -N '""'
 ```
 
-Sign in with your Anthropic account (Pro / Max / Team / Enterprise):
+If the file already exists, the agent should ask before overwriting.
 
-<!-- agent:human reason=oauth-browser-required -->
-```bash
-claude /login
-```
-
-This opens a browser for OAuth. Complete the sign-in.
 """
 
-_PHASE2_CODEX = """\
-## Phase 2 — Install Codex
+# ─── Phase 3: Stage bootstrap SSH key ────────────────────────────────────────
 
-If Codex is already installed and authenticated on this laptop,
-skip to Phase 3.
+_PHASE3_HEADER = """\
+## Phase 3 — Stage the bootstrap SSH key locally
 
-<!-- agent:auto requires=user-approval risk=medium -->
-```bash
-npm install -g @openai/codex
-```
+The bootstrap key (embedded at the bottom of this file under
+`bootstrap_private_key:`) is single-use, locked server-side to the
+rotation script, and auto-expires {bootstrap_expiry_human}.
 
-Authenticate via device-code flow (works over SSH — no localhost port needed):
-
-<!-- agent:human reason=device-code-required -->
-```bash
-codex login --device-auth
-```
-
-Codex will print a URL and a one-time code. Open the URL in your browser
-(on any device), enter the code, and confirm. Once the CLI reports success,
-the auth token is written to `~/.codex/auth.json` automatically.
 """
 
-_PHASE2_GEMINI = """\
-## Phase 2 — Install Gemini CLI
-
-If Gemini CLI is already installed and you have an API key, skip to Phase 3.
-
-<!-- agent:auto requires=user-approval risk=medium -->
-```bash
-npm install -g @google/gemini-cli
-```
-
-Get a Gemini API key from Google AI Studio (free tier available):
-
-<!-- agent:human reason=browser-required -->
-Open https://aistudio.google.com/app/apikey in your browser, sign in with
-your Google account, click "Create API key", and copy the resulting key
-(it starts with `AIza...`).
-
-You do **not** need to run `gemini auth login` — DevBrain uses the API key
-directly (headless-friendly, no localhost callback port needed).
-"""
-
-# ─── Phase 3: Generate / capture credential (CLI-specific) ────────────────────
-
-_PHASE3_CLAUDE = """\
-## Phase 3 — Generate a long-lived OAuth token
-
-DevBrain uses this to call Claude on your behalf inside the factory.
-The token is valid for ~1 year, billed against YOUR subscription.
-
-<!-- agent:human reason=oauth-browser-required -->
-```bash
-claude setup-token
-```
-
-Copy the `sk-ant-oat01-...` string. **Do not share it anywhere except
-the rotation step below.** The agent will hold it in memory only and
-discard after Phase 5.
-"""
-
-_PHASE3_CODEX = """\
-## Phase 3 — Capture your Codex auth token
-
-After `codex login --device-auth` completed in Phase 2, the auth token was
-written automatically to `~/.codex/auth.json`.
-
-<!-- agent:auto requires=file-read,user-approval secret=codex_auth_json risk=low -->
-```bash
-# Agent: read the CONTENTS of ~/.codex/auth.json into session memory.
-# Label it `codex_auth_json`. Do NOT print, log, or echo the contents.
-# This file is the credential DevBrain needs — treat it like a password.
-
-cat ~/.codex/auth.json
-```
-
-Keep the JSON content in session memory — you'll send it in Phase 5.
-"""
-
-_PHASE3_GEMINI = """\
-## Phase 3 — Store your Gemini API key
-
-Hold the `AIza...` API key you copied from AI Studio in session memory.
-**Do not paste it into any chat, file, or log.** The agent will use it
-only in Phase 5's rotation call.
-
-<!-- agent:human reason=user-must-paste secret=gemini_api_key risk=medium -->
-Paste your Gemini API key when your agent asks for it. It will be held
-in memory only and discarded after Phase 5 completes.
-"""
-
-# ─── Phase 4: Stage bootstrap key (identical for all CLIs) ────────────────────
-
-_PHASE4 = """\
-## Phase 4 — Stage the bootstrap SSH key locally
-
-The bootstrap key below is single-use, locked to a rotation script,
-and auto-expires {bootstrap_expiry_human}.
+_PHASE3_BASH = """\
+### macOS / Linux
 
 <!-- agent:auto requires=file-write,user-approval target=~/.ssh/devbrain-bootstrap-{dev_id} secret=bootstrap_private_key risk=medium -->
 ```bash
-# Agent: write the contents of `bootstrap_private_key` (below) to
-# ~/.ssh/devbrain-bootstrap-{dev_id}, set mode 0600. Do NOT cat to
-# stdout, do NOT add to ssh-agent, do NOT commit anywhere.
-
-# After Phase 5 completes successfully, the agent will delete this
-# file. The bootstrap key has no value beyond this single rotation.
+# Agent: write the contents of `bootstrap_private_key` (at the bottom
+# of this file) to ~/.ssh/devbrain-bootstrap-{dev_id} and set mode 0600.
+# Do NOT cat to stdout, do NOT add to ssh-agent, do NOT commit.
 
 cat > ~/.ssh/devbrain-bootstrap-{dev_id} <<'BOOTSTRAP_KEY_END'
 {bootstrap_private_key}BOOTSTRAP_KEY_END
 
 chmod 600 ~/.ssh/devbrain-bootstrap-{dev_id}
 ```
+
 """
 
-# ─── Phase 5: Rotate (CLI-specific JSON payload) ──────────────────────────────
+_PHASE3_POWERSHELL = """\
+### Windows (PowerShell)
 
-_PHASE5_CLAUDE = """\
-## Phase 5 — SSH-rotate to your permanent key
+<!-- agent:auto requires=file-write,user-approval target=~/.ssh/devbrain-bootstrap-{dev_id} secret=bootstrap_private_key risk=medium -->
+```powershell
+# Agent: write the contents of `bootstrap_private_key` (at the bottom
+# of this file) to a per-user file under ~/.ssh and tighten the ACL so
+# only the current user can read it. ssh.exe refuses keys with looser
+# permissions on Windows.
 
-This single SSH connection delivers your permanent pubkey + OAuth
-token to the Mac Studio's rotation handler. The handler validates
-the OAuth token by hitting api.anthropic.com (two-factor check),
-persists both, and self-deletes the bootstrap key entry.
+$keyPath = Join-Path $env:USERPROFILE ".ssh\\devbrain-bootstrap-{dev_id}"
 
-<!-- agent:auto requires=user-approval,network,user-paste secret=oauth_token scope=lhts-mac-studio.local risk=medium -->
+# Replace the placeholder block here with the bootstrap_private_key
+# content (between BEGIN OPENSSH PRIVATE KEY and END OPENSSH PRIVATE KEY,
+# inclusive of those markers).
+@'
+{bootstrap_private_key}'@ | Set-Content -Path $keyPath -NoNewline -Encoding ASCII
+
+# Lock down the ACL: remove inheritance, grant only the current user
+icacls $keyPath /inheritance:r | Out-Null
+icacls $keyPath /grant:r ("{{0}}:(R)" -f $env:USERNAME) | Out-Null
+```
+
+"""
+
+# ─── Phase 4: Rotate permanent pubkey to server ──────────────────────────────
+
+_PHASE4_HEADER = """\
+## Phase 4 — Deliver your permanent public key to the Mac Studio
+
+This single SSH connection delivers your permanent SSH **public key**
+(only — no auth token) to the rotation handler. The handler persists
+your pubkey, marks the invitation ready for activation, and self-deletes
+the bootstrap key entry from `authorized_keys`.
+
+Your AI subscription auth happens server-side in Phase 5 — nothing
+about it transits this connection.
+
+"""
+
+_PHASE4_BASH = """\
+### macOS / Linux
+
+<!-- agent:auto requires=user-approval,network scope={ssh_host} risk=medium -->
 ```bash
-# Agent: read $OAUTH_TOKEN from session memory (collected in Phase 3).
-# DO NOT log, persist, or echo it.
-
 PUBKEY=$(cat ~/.ssh/id_ed25519_devbrain.pub)
 
-jq -n --arg p "$PUBKEY" --arg t "$OAUTH_TOKEN" '{{pubkey: $p, oauth_token: $t}}' \\
+printf '{{"pubkey":"%s"}}' "$PUBKEY" \\
   | ssh -i ~/.ssh/devbrain-bootstrap-{dev_id} \\
-        {ssh_port_flag} \\
+        -p {ssh_port} \\
         -o StrictHostKeyChecking=accept-new \\
         -o UserKnownHostsFile=~/.ssh/known_hosts \\
         lhtdev@{ssh_host}
 
-# Expected output: {{"status":"ok","dev_id":"{dev_id}","invite_id":"..."}}
+# Expected response:
+#   {{"status":"ok","dev_id":"{dev_id}","invite_id":"..."}}
 ```
 
-If the response is anything other than `status: ok`, stop and surface
-the error to the user. Common errors:
-  - `oauth_token_rejected_by_anthropic` — the token wasn't valid; re-run `claude setup-token` and retry.
-  - `no_matching_invitation_for_prefix=` — the invitation has expired or been revoked. Contact the admin who sent the kit.
 """
 
-_PHASE5_CODEX = """\
-## Phase 5 — SSH-rotate to your permanent key
+_PHASE4_POWERSHELL = """\
+### Windows (PowerShell)
 
-This single SSH connection delivers your permanent pubkey + Codex auth
-token to the Mac Studio's rotation handler. The handler validates the
-token format, persists both, and self-deletes the bootstrap key entry.
+<!-- agent:auto requires=user-approval,network scope={ssh_host} risk=medium -->
+```powershell
+$pubkey = (Get-Content -Raw "$env:USERPROFILE\\.ssh\\id_ed25519_devbrain.pub").Trim()
+$payload = @{{ pubkey = $pubkey }} | ConvertTo-Json -Compress
 
-<!-- agent:auto requires=user-approval,network,user-paste secret=codex_auth_json scope=lhts-mac-studio.local risk=medium -->
-```bash
-# Agent: read $CODEX_AUTH_JSON from session memory (collected in Phase 3).
-# DO NOT log, persist, or echo it.
+$payload | ssh `
+  -i "$env:USERPROFILE\\.ssh\\devbrain-bootstrap-{dev_id}" `
+  -p {ssh_port} `
+  -o StrictHostKeyChecking=accept-new `
+  -o UserKnownHostsFile="$env:USERPROFILE\\.ssh\\known_hosts" `
+  "lhtdev@{ssh_host}"
 
-PUBKEY=$(cat ~/.ssh/id_ed25519_devbrain.pub)
-
-jq -n --arg p "$PUBKEY" --argjson a "$CODEX_AUTH_JSON" '{{pubkey: $p, codex_auth_json: $a}}' \\
-  | ssh -i ~/.ssh/devbrain-bootstrap-{dev_id} \\
-        {ssh_port_flag} \\
-        -o StrictHostKeyChecking=accept-new \\
-        -o UserKnownHostsFile=~/.ssh/known_hosts \\
-        lhtdev@{ssh_host}
-
-# Expected output: {{"status":"ok","dev_id":"{dev_id}","invite_id":"..."}}
+# Expected response:
+#   {{"status":"ok","dev_id":"{dev_id}","invite_id":"..."}}
 ```
 
-If the response is anything other than `status: ok`, stop and surface
-the error to the user. Common errors:
-  - `codex_auth_json_invalid` — the auth.json content wasn't accepted; re-run `codex login --device-auth` and retry.
-  - `no_matching_invitation_for_prefix=` — the invitation has expired or been revoked. Contact the admin who sent the kit.
 """
 
-_PHASE5_GEMINI = """\
-## Phase 5 — SSH-rotate to your permanent key
+_PHASE4_FOOTER = """\
+If the response is anything other than `status: ok`, **STOP** and
+surface the error to the user. Common errors:
 
-This single SSH connection delivers your permanent pubkey + Gemini API
-key to the Mac Studio's rotation handler. The handler validates the
-API key by hitting the Gemini API, persists both, and self-deletes the
-bootstrap key entry.
+- `pubkey_unsafe` — your SSH pubkey didn't match the expected shape;
+  re-run Phase 2 to regenerate it.
+- `no_matching_invitation_for_prefix=` — the invitation has expired or
+  been revoked. Contact the admin who sent the kit.
 
-<!-- agent:auto requires=user-approval,network,user-paste secret=gemini_api_key scope=lhts-mac-studio.local risk=medium -->
-```bash
-# Agent: read $GEMINI_API_KEY from session memory (collected in Phase 3).
-# DO NOT log, persist, or echo it.
-
-PUBKEY=$(cat ~/.ssh/id_ed25519_devbrain.pub)
-
-jq -n --arg p "$PUBKEY" --arg k "$GEMINI_API_KEY" '{{pubkey: $p, gemini_api_key: $k}}' \\
-  | ssh -i ~/.ssh/devbrain-bootstrap-{dev_id} \\
-        {ssh_port_flag} \\
-        -o StrictHostKeyChecking=accept-new \\
-        -o UserKnownHostsFile=~/.ssh/known_hosts \\
-        lhtdev@{ssh_host}
-
-# Expected output: {{"status":"ok","dev_id":"{dev_id}","invite_id":"..."}}
-```
-
-If the response is anything other than `status: ok`, stop and surface
-the error to the user. Common errors:
-  - `gemini_api_key_rejected` — the API key wasn't valid; get a fresh key from aistudio.google.com and retry.
-  - `no_matching_invitation_for_prefix=` — the invitation has expired or been revoked. Contact the admin who sent the kit.
 """
 
-# ─── Phase 6-8: Cleanup + MCP config + verify (identical for all CLIs) ────────
+# ─── Phase 5: Server-side `devbrain login` ───────────────────────────────────
 
-_PHASES_6_8 = """\
-## Phase 6 — Cleanup
+_PHASE5_BY_CLI: dict[str, str] = {
+    "claude": """\
+## Phase 5 — Issue your Claude OAuth token (server-side)
 
-<!-- agent:auto requires=file-write target=~/.ssh/devbrain-bootstrap-{dev_id} risk=low -->
+You SSH into your profile on the Mac Studio and run `devbrain login`.
+That command runs `claude setup-token` server-side; you'll see an
+OAuth URL printed. Open the URL **in your local browser**, sign in
+with your Anthropic account (Pro / Max / Team / Enterprise), copy the
+verification code from the post-signin page, and paste it back into
+this SSH session. The resulting token is stashed at
+`<profile>/.claude/oauth-token` on the Mac Studio. It never returns
+to this machine.
+
+<!-- agent:auto requires=user-approval,network,user-paste secret=oauth_verification_code scope={ssh_host} risk=medium -->
+""",
+    "codex": """\
+## Phase 5 — Authenticate Codex via device-code (server-side)
+
+You SSH into your profile on the Mac Studio and run `devbrain login`.
+That command runs `codex login --device-auth` server-side; you'll see
+a verification URL and one-time code printed. Open the URL **in your
+local browser**, enter the code, and confirm. The resulting auth.json
+is written at `<profile>/.codex/auth.json` on the Mac Studio. It
+never returns to this machine.
+
+<!-- agent:auto requires=user-approval,network,user-paste scope={ssh_host} risk=medium -->
+""",
+    "gemini": """\
+## Phase 5 — Provide your Gemini API key (server-side)
+
+You SSH into your profile on the Mac Studio and run `devbrain login`.
+That command will prompt you to paste your Gemini API key. Get one
+from https://aistudio.google.com/app/apikey (free tier is fine), open
+the URL **in your local browser**, copy the key (starts with `AIza`),
+and paste it into the SSH prompt. The key is stashed at
+`<profile>/.devbrain/env` on the Mac Studio. It never returns to
+this machine.
+
+<!-- agent:auto requires=user-approval,network,user-paste secret=gemini_api_key scope={ssh_host} risk=medium -->
+""",
+}
+
+_PHASE5_COMMAND = """\
 ```bash
-shred -u ~/.ssh/devbrain-bootstrap-{dev_id} 2>/dev/null || rm -f ~/.ssh/devbrain-bootstrap-{dev_id}
+ssh -i ~/.ssh/id_ed25519_devbrain \\
+    -p {ssh_port} \\
+    -o StrictHostKeyChecking=accept-new \\
+    -t lhtdev@{ssh_host} \\
+    devbrain login --dev {dev_id} --cli {cli}
 ```
 
-(macOS doesn't ship `shred` by default — `rm -f` is the fallback. The
-key was useless after rotation anyway.)
+Windows PowerShell equivalent:
 
-## Phase 7 — Configure your local {cli_display_name} MCP
+```powershell
+ssh -i "$env:USERPROFILE\\.ssh\\id_ed25519_devbrain" `
+    -p {ssh_port} `
+    -o StrictHostKeyChecking=accept-new `
+    -t "lhtdev@{ssh_host}" `
+    devbrain login --dev {dev_id} --cli {cli}
+```
 
-Lets your laptop's {cli_display_name} call DevBrain factory tools (factory_plan,
-factory_status, deep_search) over SSH using your permanent key.
+The `-t` flag is required: `devbrain login` is interactive (you'll be
+asked to paste a code, or an API key, depending on your CLI). The
+agent should keep your SSH session open and help you copy/paste
+between your local browser and the SSH prompt.
+
+After this command exits with `success: true`, your dev profile on
+the Mac Studio has the credential it needs to spawn {cli_display_name}
+on your behalf. The token never came back through this connection.
+
+"""
+
+# ─── Phase 6: MCP wire-up + verify (per-CLI; same on bash/PowerShell) ────────
+
+_PHASE6_HEADER = """\
+## Phase 6 — Wire up your local agent's MCP config + verify SSH
+
+This step lets your **local** AI agent ({agent_app_display}) call DevBrain
+factory tools (factory_plan, factory_status, deep_search) over SSH
+using your permanent key.
+
+"""
+
+_PHASE6_BASH = """\
+### macOS / Linux
 
 <!-- agent:auto requires=user-approval,file-write target={mcp_config_path} risk=low -->
 ```bash
-# Agent: read {mcp_config_path}, MERGE the mcpServers block (don't clobber
-# existing entries), write back.
+# Agent: read {mcp_config_path}, MERGE the mcpServers block (don't
+# clobber other entries), write back.
 
 cat <<'EOF'
 {{
@@ -449,180 +548,145 @@ cat <<'EOF'
 EOF
 ```
 
-After this, restart {cli_display_name}. The DevBrain MCP tools appear in your
-{cli_display_name} session.
+After this, restart {agent_app_display}. The DevBrain MCP tools should
+appear in your session.
 
-## Phase 8 — Verify
+### Verify SSH
 
-<!-- agent:auto requires=user-approval,network risk=low -->
+<!-- agent:auto requires=user-approval,network scope={ssh_host} risk=low -->
 ```bash
-ssh -i ~/.ssh/id_ed25519_devbrain {ssh_port_flag} lhtdev@{ssh_host} whoami
+ssh -i ~/.ssh/id_ed25519_devbrain -p {ssh_port} lhtdev@{ssh_host} whoami
 # Expected output: lhtdev
 ```
 
-You can now SSH into the Mac Studio at any time:
+You can also add the host to `~/.ssh/config` for ergonomics:
 
-```bash
-ssh -i ~/.ssh/id_ed25519_devbrain {ssh_port_flag} lhtdev@{ssh_host}
-# (Add to ~/.ssh/config as `Host mac-studio` for ergonomics.)
+```
+Host mac-studio
+  HostName {ssh_host}
+  Port {ssh_port}
+  User lhtdev
+  IdentityFile ~/.ssh/id_ed25519_devbrain
 ```
 
-Once on the Mac Studio, view the factory dashboard:
+"""
 
-```bash
-factory dashboard
+_PHASE6_POWERSHELL = """\
+### Windows (PowerShell)
+
+<!-- agent:auto requires=user-approval,file-write target={mcp_config_path} risk=low -->
+```powershell
+# Agent: read {mcp_config_path} (Windows path expansion), merge the
+# mcpServers block, write back. ConvertFrom-Json + ConvertTo-Json
+# handle the merge cleanly.
+
+$cfgPath = "{mcp_config_path}".Replace("~", $env:USERPROFILE) -replace "/", "\\"
+$cfg = if (Test-Path $cfgPath) {{
+  Get-Content -Raw $cfgPath | ConvertFrom-Json -AsHashtable
+}} else {{ @{{}} }}
+
+if (-not $cfg.mcpServers) {{ $cfg.mcpServers = @{{}} }}
+$cfg.mcpServers.devbrain = @{{
+  command = "ssh"
+  args = @("-i", "$env:USERPROFILE\\.ssh\\id_ed25519_devbrain",
+           "-p", "{ssh_port}",
+           "lhtdev@{ssh_host}",
+           "/Users/lhtdev/devbrain/mcp-server/run.sh")
+}}
+
+$cfg | ConvertTo-Json -Depth 10 | Set-Content -Path $cfgPath -Encoding UTF8
 ```
 
-Or submit a job:
+After this, restart {agent_app_display}. The DevBrain MCP tools should
+appear in your session.
 
+### Verify SSH
+
+<!-- agent:auto requires=user-approval,network scope={ssh_host} risk=low -->
+```powershell
+ssh -i "$env:USERPROFILE\\.ssh\\id_ed25519_devbrain" -p {ssh_port} `
+    "lhtdev@{ssh_host}" whoami
+# Expected output: lhtdev
+```
+
+"""
+
+_PHASE7_CLEANUP = """\
+## Phase 7 — Cleanup (you're done!)
+
+The bootstrap key is now useless (the server self-deleted its
+`authorized_keys` entry on Phase 4 success and the key file's expiry
+has rolled past). Remove it from this machine:
+
+### macOS / Linux
+
+<!-- agent:auto requires=file-write target=~/.ssh/devbrain-bootstrap-{dev_id} risk=low -->
 ```bash
-factory submit "Add a no-op test that asserts True" --project devbrain --cli {cli}
+shred -u ~/.ssh/devbrain-bootstrap-{dev_id} 2>/dev/null \\
+  || rm -f ~/.ssh/devbrain-bootstrap-{dev_id}
+```
+
+### Windows
+
+<!-- agent:auto requires=file-write target=~/.ssh/devbrain-bootstrap-{dev_id} risk=low -->
+```powershell
+Remove-Item -Force "$env:USERPROFILE\\.ssh\\devbrain-bootstrap-{dev_id}"
 ```
 
 ---
 
 ## You're done!
 
-DevBrain has notified the admin that you've completed onboarding. Ping
-them if you don't get a confirmation message within a few minutes.
+DevBrain has notified the admin that you're activated. Try submitting
+a test job from your local agent:
 
-If anything broke, the kit and your invite token are reusable until
-{expires_human}, BUT the bootstrap SSH key expires earlier
-({bootstrap_expiry_human}). After bootstrap expiry, the admin can
-issue a fresh kit.
+```
+factory submit "Add a no-op test that asserts True" --project devbrain --cli {cli}
+```
 
-Welcome aboard.
+Or run `factory dashboard` after SSHing into the Mac Studio to see the
+factory's job queue.
+
+If anything broke, the kit is reusable until {expires_human}, BUT the
+bootstrap SSH key expires earlier ({bootstrap_expiry_human}). After
+bootstrap expiry, the admin can issue a fresh kit.
+
 """
 
-# ─── Bootstrap private key block (appended at end of kit) ─────────────────────
+# ─── Bootstrap private key block ──────────────────────────────────────────────
 
 _BOOTSTRAP_KEY_BLOCK = """\
 
-<!-- The bootstrap private key below is referenced by Phase 4 above.
-     agent:secret — never echo, log, or transmit outside Phase 4-5. -->
+<!-- The bootstrap private key below is referenced by Phase 3 above.
+     agent:secret — never echo, log, or transmit outside Phase 3-4. -->
 
 ```
 bootstrap_private_key:
 {bootstrap_private_key}```
 """
 
-# ─── CLI display names + MCP config paths ─────────────────────────────────────
 
-_CLI_DISPLAY_NAMES: dict[str, str] = {
-    "claude": "Claude Code",
-    "codex": "Codex",
-    "gemini": "Gemini CLI",
-}
+# ─── Section assembly helpers ─────────────────────────────────────────────────
 
-# The config file each CLI merges mcpServers into
-_MCP_CONFIG_PATHS: dict[str, str] = {
-    "claude": "~/.claude.json",
-    "codex": "~/.codex/config.json",
-    "gemini": "~/.gemini/settings.json",
-}
-
-# ─── Phase 0: Windows preflight (only when platform=windows) ──────────────────
-#
-# Verifies WSL2 + Ubuntu + apt prereqs, installs only what's missing. After
-# Phase 0 completes, the dev reopens their AI agent INSIDE the WSL Ubuntu
-# shell. Phases 1-8 then run as standard bash and "just work".
-
-_PHASE0_WINDOWS = """\
-## Phase 0 — Windows preflight (WSL2 + Ubuntu + apt prereqs)
-
-Phases 1-8 of this kit assume a Linux-shaped shell (bash, ssh, jq,
-`~/.ssh/`). On Windows the cleanest path is
-**WSL2 + Ubuntu** — the rest of the kit then runs unchanged inside
-the WSL shell.
-
-The agent does verify-before-install: each dependency is checked first;
-only missing pieces are installed.
-
-### Step 0.1 — Verify WSL2
-
-<!-- agent:auto requires=user-approval risk=low -->
-```powershell
-# Run in PowerShell.
-wsl --status 2>&1
-# Expected if installed: "Default Distribution: Ubuntu" or similar.
-# If output is "Windows Subsystem for Linux has no installed
-# distributions" or the command isn't found — install per Step 0.2.
-```
-
-### Step 0.2 — Install WSL2 + Ubuntu (only if Step 0.1 reported missing)
-
-<!-- agent:human reason=requires-admin-elevation -->
-```powershell
-# Run in PowerShell as Administrator. Requires reboot afterward.
-wsl --install -d Ubuntu
-# Reboot when prompted, then:
-#   1. Open "Ubuntu" from the Start menu
-#   2. Set a Linux username + password when prompted
-#   3. Once the Ubuntu shell is open, continue to Step 0.3
-```
-
-> If WSL is already installed but the default distro isn't Ubuntu, you
-> can skip the install and just `wsl -d Ubuntu` from PowerShell. The
-> agent should NOT clobber an existing distro choice.
-
-### Step 0.3 — Verify Ubuntu apt prereqs
-
-<!-- agent:auto requires=user-approval risk=low -->
-```bash
-# Run inside the WSL Ubuntu shell.
-for cmd in jq ssh curl openssl; do
-    if command -v $cmd >/dev/null 2>&1; then
-        echo "✓ $cmd present"
-    else
-        echo "✗ $cmd missing"
-    fi
-done
-```
-
-### Step 0.4 — Install missing apt packages (only the ones flagged ✗ above)
-
-<!-- agent:auto requires=user-approval,sudo risk=low -->
-```bash
-# Adjust the package list to ONLY the missing ones from Step 0.3.
-# jq → jq, ssh → openssh-client, curl → curl, openssl → openssl
-sudo apt update
-sudo apt install -y <space-separated-package-names>
-```
-
-### Step 0.5 — Switch your AI agent to WSL
-
-The remaining phases (1-8) run inside this WSL Ubuntu shell. **Reopen
-your AI agent here** — close the Windows-native session and:
-
-- **Codex / Gemini CLI:** install + run them inside WSL (Phase 2 covers this)
-- **Claude Code:** install Claude Code inside WSL (Phase 2 covers this)
-- **Claude Desktop / Codex Desktop apps:** Windows-native is fine, but
-  the kit's bash commands need to execute via your WSL agent session
-
-Once your agent is running inside WSL Ubuntu, continue to Phase 1.
-
----
-
-"""
+def _select_shell_variants(platform: str) -> tuple[bool, bool]:
+    """Return (include_bash, include_powershell) given a platform."""
+    if platform == "windows":
+        return (False, True)
+    if platform in ("mac", "linux"):
+        return (True, False)
+    # auto — include both
+    return (True, True)
 
 
-_PHASE2_BY_CLI: dict[str, str] = {
-    "claude": _PHASE2_CLAUDE,
-    "codex": _PHASE2_CODEX,
-    "gemini": _PHASE2_GEMINI,
-}
-
-_PHASE3_BY_CLI: dict[str, str] = {
-    "claude": _PHASE3_CLAUDE,
-    "codex": _PHASE3_CODEX,
-    "gemini": _PHASE3_GEMINI,
-}
-
-_PHASE5_BY_CLI: dict[str, str] = {
-    "claude": _PHASE5_CLAUDE,
-    "codex": _PHASE5_CODEX,
-    "gemini": _PHASE5_GEMINI,
-}
+def _phase_block(header: str, bash: str, powershell: str, platform: str) -> str:
+    """Assemble a phase by stitching header + selected shell variants."""
+    include_bash, include_ps = _select_shell_variants(platform)
+    parts = [header]
+    if include_bash:
+        parts.append(bash)
+    if include_ps:
+        parts.append(powershell)
+    return "".join(parts)
 
 
 def write_onboarding_kit(
@@ -639,21 +703,30 @@ def write_onboarding_kit(
     bootstrap_expiry: datetime,
     ssh_host: str = "lhts-mac-studio.local",
     ssh_port: int = 22,
+    ssh_host_fingerprint: str = "",
     cli: CliName = "claude",
     platform: str = "auto",
+    agent_app: str = "auto",
 ) -> Path:
     """Render an onboarding kit for one invitation. Returns the path written.
 
-    The file is mode 600 — it embeds a single-use bootstrap SSH private
-    key (locked to the rotation handler, auto-expires) plus the
-    invitation token. Treat as a credential. Email transit, Slack DM,
-    or hand-off are appropriate; broadcast channels are not.
-
     Args:
-        cli: Which AI CLI to generate the kit for. Defaults to 'claude'
-             for backward compatibility. Valid values: 'claude', 'codex',
-             'gemini'. Determines the Install (Phase 2), Login/Token-capture
-             (Phase 3), and SSH rotation payload (Phase 5) sections.
+        cli: AI subscription the dev's factory work runs against
+             ('claude' / 'codex' / 'gemini'). Drives Phase 5's
+             server-side auth flow.
+        platform: Dev's local OS ('mac', 'linux', 'windows', 'auto').
+                  Drives which shell variants (bash / PowerShell)
+                  appear in the kit. 'auto' includes both.
+        agent_app: Which AI agent app the dev will use to consume this
+                   kit ('claude-desktop', 'codex-desktop',
+                   'gemini-desktop', 'claude-cli', 'codex-cli',
+                   'gemini-cli', 'auto'). Affects framing language;
+                   functional behavior is identical across choices.
+        ssh_host_fingerprint: SHA256 fingerprint of the Mac Studio's
+                              SSH host pubkey, included in Phase 0
+                              for the dev to verify on first connect.
+                              Empty string means "not embedded" — the
+                              dev verifies via SSH client prompt only.
     """
     if cli not in VALID_CLIS:
         raise ValueError(f"cli must be one of {VALID_CLIS!r}, got {cli!r}")
@@ -661,11 +734,11 @@ def write_onboarding_kit(
         raise ValueError(
             f"platform must be one of {VALID_PLATFORMS!r}, got {platform!r}"
         )
+    if agent_app not in VALID_AGENT_APPS:
+        raise ValueError(
+            f"agent_app must be one of {VALID_AGENT_APPS!r}, got {agent_app!r}"
+        )
 
-    first_name = full_name.split()[0] if full_name else dev_id
-
-    # Ensure trailing newline on the private key so the heredoc
-    # cat-block produces a clean PEM-formatted file.
     if not bootstrap_private_key.endswith("\n"):
         bootstrap_private_key = bootstrap_private_key + "\n"
 
@@ -677,27 +750,32 @@ def write_onboarding_kit(
         email=email,
         cli=cli,
         cli_display_name=_CLI_DISPLAY_NAMES[cli],
+        agent_app=agent_app,
+        agent_app_display=_AGENT_APP_DISPLAY_NAMES[agent_app],
+        platform=platform,
         mcp_config_path=_MCP_CONFIG_PATHS[cli],
         expires_iso=expires_at.isoformat(),
         expires_human=expires_at.strftime("%Y-%m-%d %H:%M %Z").strip(),
         bootstrap_expiry_iso=bootstrap_expiry.isoformat(),
         bootstrap_expiry_human=bootstrap_expiry.strftime("%Y-%m-%d %H:%M %Z").strip(),
-        first_name=first_name,
         bootstrap_private_key=bootstrap_private_key,
         ssh_host=ssh_host,
         ssh_port=ssh_port,
-        ssh_port_flag=f"-p {ssh_port}",
+        ssh_host_fingerprint=ssh_host_fingerprint or "(verify on first SSH connect)",
     )
 
-    sections: list[str] = [_PREAMBLE]
-    if platform == "windows":
-        sections.append(_PHASE0_WINDOWS)
-    sections += [
-        _PHASE2_BY_CLI[cli],
-        _PHASE3_BY_CLI[cli],
-        _PHASE4,
+    sections: list[str] = [
+        _PREAMBLE,
+        _PHASE0_TRUST,
+        _phase_block(_PHASE1_HEADER, _PHASE1_BASH, _PHASE1_POWERSHELL, platform),
+        _phase_block(_PHASE2_HEADER, _PHASE2_BASH, _PHASE2_POWERSHELL, platform),
+        _phase_block(_PHASE3_HEADER, _PHASE3_BASH, _PHASE3_POWERSHELL, platform),
+        _phase_block(_PHASE4_HEADER, _PHASE4_BASH, _PHASE4_POWERSHELL, platform),
+        _PHASE4_FOOTER,
         _PHASE5_BY_CLI[cli],
-        _PHASES_6_8,
+        _PHASE5_COMMAND,
+        _phase_block(_PHASE6_HEADER, _PHASE6_BASH, _PHASE6_POWERSHELL, platform),
+        _PHASE7_CLEANUP,
         _BOOTSTRAP_KEY_BLOCK,
     ]
     content = "".join(s.format(**fmt_args) for s in sections)
