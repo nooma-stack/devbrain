@@ -10,37 +10,41 @@ the orchestrator's HOME and broader environment stay untouched. Git
 authorship is set explicitly via GIT_CONFIG_GLOBAL + GIT_AUTHOR_* env
 vars on top of the HOME swap (these win over .gitconfig discovery).
 
-Login flow: Claude's auth uses PKCE OAuth. Anthropic's CLI requires the
-user to authorize via a browser ON THE SAME MACHINE as the CLI for the
-flow to auto-complete (the authorize page does some Mac-Studio-side
-handshake we couldn't reverse-engineer; see
-`docs/plans/2026-04-29-overnight-handoff.md` "Phase 6 Outcome" for the
-full investigation). For the multi-dev factory on the Mac Studio, that
-means first-time login requires either (a) RDP / screen-share into the
-shared lhtdev session for the dev to OAuth in Mac Studio's local
-browser, or (b) a future API-key (`--bare`) pivot that sidesteps OAuth
-entirely. After first-time login, the per-profile keychain has tokens
-and ALL subsequent factory operations work over pure SSH.
+Login flow: `claude setup-token` runs server-side inside the dev's
+profile dir, captured via script(1) so the dev's interactive SSH
+session can paste the OAuth verification code while we still scrape
+stdout for the issued token. The token (sk-ant-oat01-...) is stashed
+at <profile>/.claude/oauth-token (mode 600); cli_executor reads it
+into CLAUDE_CODE_OAUTH_TOKEN env before each Claude spawn (env var
+takes precedence over keychain per Anthropic's auth precedence rules).
 
-Credential storage: Claude Code stores OAuth tokens in macOS Keychain
-(service "Claude Code-credentials"). The Security framework resolves
-the user's login keychain via $HOME/Library/Keychains/login.keychain-db,
-so the HOME-swap correctly redirects which keychain is consulted —
-provided that file exists at the swapped path. We provision a per-dev
-keychain at <profile>/Library/Keychains/login.keychain-db on first
-login. The keychain password is stashed at
-<profile>/.claude/.keychain-password (mode 600); it's read by the
-factory's cli_executor before each spawn (the keychain locks between
-subprocess invocations because there's no GUI Security agent in factory
-contexts).
+Auto-browser-launch suppression: claude setup-token tries to open a
+browser before falling back to print-URL. On the Mac Studio (server
+context) any actual browser open would target lhtdev's GUI session,
+not the dev's local browser. We plant a fail-fast `open` and
+`xdg-open` shim at <profile>/.claude/.devbrain-fakebin and prepend
+it to PATH so the auto-open returns nonzero and claude immediately
+falls back to printing the URL.
+
+Earlier (2026-04) attempts used `claude auth login` and concluded
+the browser-on-different-machine flow was impossible. `setup-token`
+is a separate command designed for headless/CI contexts and supports
+the print-URL + paste-code-back path; see
+docs/plans/2026-05-07-onboarding-server-side-auth-design.md.
+
+Keychain provisioning is preserved for compatibility with cli.py's
+reset-keychain command and cli_executor's optional keychain-unlock
+fallback, but the runtime path uses the env var, not the keychain.
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import re
 import secrets
 import subprocess
+import tempfile
 from pathlib import Path
 
 from ai_clis.auth_helpers import git_author_env
@@ -51,6 +55,12 @@ logger = logging.getLogger(__name__)
 # Paths inside the profile directory.
 _KEYCHAIN_REL = Path("Library") / "Keychains" / "login.keychain-db"
 _PASSWORD_REL = Path(".claude") / ".keychain-password"
+_OAUTH_TOKEN_REL = Path(".claude") / "oauth-token"
+_FAKEBIN_REL = Path(".claude") / ".devbrain-fakebin"
+
+# `claude setup-token` prints the issued token verbatim in its output stream.
+# Pattern: sk-ant-oat01- followed by url-safe base64-ish chars.
+_OAUTH_TOKEN_RE = re.compile(r"sk-ant-oat01-[A-Za-z0-9_\-]+")
 
 
 def _read_or_generate_keychain_password(profile_dir: Path) -> str:
@@ -122,6 +132,31 @@ def _ensure_keychain(profile_dir: Path) -> Path:
     return keychain
 
 
+def _extract_oauth_token(text: str) -> str | None:
+    """Find the first sk-ant-oat01-... token in claude setup-token output.
+
+    Captured TTY output from script(1) contains escape sequences and
+    interleaved status lines; just scan for the token pattern.
+    """
+    match = _OAUTH_TOKEN_RE.search(text)
+    return match.group(0) if match else None
+
+
+def _plant_fakebin(profile_dir: Path) -> Path:
+    """Create fail-fast `open` and `xdg-open` shims under the profile dir.
+
+    Returns the bin dir so callers can prepend it to PATH for the spawned
+    claude subprocess. Idempotent.
+    """
+    fakebin = profile_dir / _FAKEBIN_REL
+    fakebin.mkdir(parents=True, exist_ok=True)
+    for cmd in ("open", "xdg-open"):
+        p = fakebin / cmd
+        p.write_text("#!/bin/sh\nexit 1\n")
+        p.chmod(0o755)
+    return fakebin
+
+
 class ClaudeAdapter(AICliAdapter):
     name = "claude"
     oauth_callback_ports = []  # hosted callback at platform.claude.com
@@ -139,10 +174,6 @@ class ClaudeAdapter(AICliAdapter):
         profile_dir.mkdir(parents=True, exist_ok=True)
         (profile_dir / ".claude").mkdir(exist_ok=True)
 
-        # Provision the per-profile keychain BEFORE running claude auth
-        # login. Without this, claude's credential write goes to the
-        # macOS user's login keychain (acct=lhtdev) instead of the
-        # per-profile one — defeating multi-dev isolation.
         try:
             _ensure_keychain(profile_dir)
         except subprocess.CalledProcessError as e:
@@ -152,56 +183,80 @@ class ClaudeAdapter(AICliAdapter):
                 hint=f"Run `devbrain reset-keychain --dev {dev.dev_id}` and re-try.",
             )
 
-        env = {**os.environ, "HOME": str(profile_dir)}
+        fakebin = _plant_fakebin(profile_dir)
+        env = {
+            **os.environ,
+            "HOME": str(profile_dir),
+            "PATH": f"{fakebin}{os.pathsep}{os.environ.get('PATH', '')}",
+            "BROWSER": "/bin/false",
+            "DISPLAY": "",
+        }
+
+        # script(1) gives claude a real pty (so the paste-code-back prompt
+        # works for the dev's interactive SSH session) while logging all
+        # output to a file we scrape for the issued token after exit. macOS
+        # BSD script syntax: `script -q <log> <command...>`.
+        log_dir = profile_dir / ".claude"
+        log_fd, log_path_str = tempfile.mkstemp(
+            dir=str(log_dir), prefix=".setup-token-", suffix=".log"
+        )
+        os.close(log_fd)
+        log_path = Path(log_path_str)
+        os.chmod(log_path, 0o600)
+
         try:
-            # NOTE: This subprocess inherits the parent's stdin/stdout/stderr
-            # so claude's auth UX is fully passed through to the operator.
-            # On Claude Code 2.1.117 this means the OAuth flow only
-            # auto-completes when the dev's browser is ON THE SAME MACHINE
-            # as the CLI (i.e., logged in via RDP/screen-share, not over
-            # plain SSH). We tried four engineering workarounds (PTY paste,
-            # localhost-curl, headless Chromium, pbpaste injection) on
-            # 2026-04-30 — none worked because the auto-completion handshake
-            # depends on browser-on-same-machine state we can't replicate
-            # server-side. See the handoff doc for the full investigation.
-            result = subprocess.run(
-                ["claude", "auth", "login"],
-                env=env,
-                check=False,
-            )
-        except FileNotFoundError:
+            try:
+                result = subprocess.run(
+                    ["script", "-q", str(log_path), "claude", "setup-token"],
+                    env=env,
+                    check=False,
+                )
+            except FileNotFoundError as e:
+                return LoginResult(
+                    success=False,
+                    error=f"binary not found: {e.filename or 'script or claude'}",
+                    hint="Both `script` (system-provided on macOS) and `claude` must be on PATH on the factory host.",
+                )
+
+            if result.returncode != 0:
+                return LoginResult(
+                    success=False,
+                    error=f"claude setup-token exited with code {result.returncode}",
+                    hint=(
+                        "Re-run `devbrain login --dev <id> --cli claude` and complete "
+                        "the OAuth flow: open the printed URL in your local browser, "
+                        "sign in, copy the verification code from the post-signin page, "
+                        "and paste it back into this SSH session."
+                    ),
+                )
+
+            log_text = log_path.read_bytes().decode("utf-8", "replace")
+        finally:
+            try:
+                log_path.unlink()
+            except OSError:
+                pass
+
+        token = _extract_oauth_token(log_text)
+        if token is None:
             return LoginResult(
                 success=False,
-                error="claude CLI not found on PATH",
-                hint="Install Claude Code: https://docs.claude.com/en/docs/claude-code/quickstart",
+                error="claude setup-token completed but no sk-ant-oat01-... token found in captured output",
+                hint="The OAuth flow may not have completed — verify you signed in and pasted the verification code.",
             )
 
-        if result.returncode != 0:
-            return LoginResult(
-                success=False,
-                error=f"claude auth login exited with code {result.returncode}",
-                hint=(
-                    "First-time login requires the dev's browser to be ON THE "
-                    "SAME MACHINE as claude — RDP/screen-share into "
-                    "lhtdev@mac-studio first, then re-run. After tokens land in "
-                    "the per-profile keychain, all factory operations work over SSH."
-                ),
-            )
-
-        if not self.is_logged_in(dev, profile_dir):
-            return LoginResult(
-                success=False,
-                error="claude auth login completed but ~/.claude.json was not written under the profile",
-                hint=f"Check {profile_dir}/.claude.json exists.",
-            )
+        token_path = profile_dir / _OAUTH_TOKEN_REL
+        token_path.parent.mkdir(parents=True, exist_ok=True)
+        token_path.write_text(token)
+        token_path.chmod(0o600)
 
         return LoginResult(success=True)
 
     def is_logged_in(self, dev, profile_dir: Path) -> bool:
-        return (profile_dir / ".claude.json").exists()
+        return (profile_dir / _OAUTH_TOKEN_REL).exists()
 
     def required_dotfiles(self) -> list[str]:
-        return [".claude.json", ".claude/", ".gitconfig"]
+        return [str(_OAUTH_TOKEN_REL), ".claude/", ".gitconfig"]
 
 
 default_register = True
