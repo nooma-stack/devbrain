@@ -1954,7 +1954,11 @@ def _run_multi_dev_section() -> None:
     setup_multi_dev(non_interactive=False)
 
 
-def setup_add_dev(cli: str | None = None, platform: str | None = None) -> None:
+def setup_add_dev(
+    cli: str | None = None,
+    platform: str | None = None,
+    agent_app: str | None = None,
+) -> None:
     """Onboard a new dev: stage row, generate invitation, write kit .md.
 
     The admin runs this on the Mac Studio. They get back a path to a
@@ -2087,6 +2091,49 @@ def setup_add_dev(cli: str | None = None, platform: str | None = None) -> None:
             _warn(f"--platform '{platform}' is not valid. Must be one of: {', '.join(_VALID_PLATFORMS)}")
             raise SystemExit(2)
 
+    # ─── Dev's AI agent app (controls kit framing + email body) ──────────
+    from onboarding_kit import VALID_AGENT_APPS as _VALID_AGENT_APPS
+    if agent_app is None:
+        _agent_app_labels = {
+            "auto":            "Auto / unknown (kit ships generic; email lists install options)",
+            "claude-desktop":  "Claude Desktop",
+            "codex-desktop":   "Codex Desktop",
+            "gemini-desktop":  "Gemini Desktop",
+            "claude-cli":      "Claude Code (CLI)",
+            "codex-cli":       "Codex (CLI)",
+            "gemini-cli":      "Gemini (CLI)",
+        }
+        click.echo()
+        _info("Which AI agent app will the dev use to read this kit?")
+        for i, a in enumerate(_VALID_AGENT_APPS, 1):
+            click.echo(f"    {i}. {_agent_app_labels[a]}")
+        click.echo()
+        while True:
+            raw = _prompt(
+                f"Choice (1-{len(_VALID_AGENT_APPS)} or agent-app name)",
+                default="1",
+            ).strip().lower()
+            if raw in ("1", "auto"):
+                agent_app = "auto"; break
+            elif raw in ("2", "claude-desktop"):
+                agent_app = "claude-desktop"; break
+            elif raw in ("3", "codex-desktop"):
+                agent_app = "codex-desktop"; break
+            elif raw in ("4", "gemini-desktop"):
+                agent_app = "gemini-desktop"; break
+            elif raw in ("5", "claude-cli"):
+                agent_app = "claude-cli"; break
+            elif raw in ("6", "codex-cli"):
+                agent_app = "codex-cli"; break
+            elif raw in ("7", "gemini-cli"):
+                agent_app = "gemini-cli"; break
+            else:
+                _warn(f"'{raw}' is not valid. Pick by number or name.")
+    else:
+        if agent_app not in _VALID_AGENT_APPS:
+            _warn(f"--agent-app '{agent_app}' is not valid. Must be one of: {', '.join(_VALID_AGENT_APPS)}")
+            raise SystemExit(2)
+
     auto_activate = _confirm(
         "Auto-activate this dev when their pubkey + OAuth token arrive? "
         "(no = require manual `devbrain setup activate --dev <id>`)",
@@ -2105,6 +2152,8 @@ def setup_add_dev(cli: str | None = None, platform: str | None = None) -> None:
     click.echo(f"   full_name:     {full_name}")
     click.echo(f"   email:         {email}")
     click.echo(f"   cli:           {cli}")
+    click.echo(f"   platform:      {platform}")
+    click.echo(f"   agent_app:     {agent_app}")
     if slack_handle:
         click.echo(f"   slack:         {slack_handle}")
     click.echo(f"   auto_activate: {auto_activate}")
@@ -2184,6 +2233,26 @@ def setup_add_dev(cli: str | None = None, platform: str | None = None) -> None:
     ak_path.write_text(payload)
     ak_path.chmod(0o600)
 
+    # ─── Discover the Mac Studio's SSH host fingerprint ────────────────
+    # Embedded in the kit's Phase 0 trust banner so the dev (or their
+    # agent) can verify the SSH host on first connect against a value
+    # they got out-of-band.
+    ssh_host_fingerprint = ""
+    host_pubkey_path = Path("/etc/ssh/ssh_host_ed25519_key.pub")
+    if host_pubkey_path.exists():
+        try:
+            result = _sp.run(
+                ["ssh-keygen", "-lf", str(host_pubkey_path)],
+                check=True, capture_output=True, text=True,
+            )
+            # Output: "256 SHA256:abc... root@host (ED25519)"
+            for tok in result.stdout.split():
+                if tok.startswith("SHA256:"):
+                    ssh_host_fingerprint = tok
+                    break
+        except (_sp.CalledProcessError, FileNotFoundError):
+            pass
+
     # ─── Generate the onboarding kit .md ──────────────────────────────
     kit_dir = _DEVBRAIN_HOME / "onboarding"
     kit_dir.mkdir(parents=True, exist_ok=True)
@@ -2203,8 +2272,10 @@ def setup_add_dev(cli: str | None = None, platform: str | None = None) -> None:
         bootstrap_expiry=bootstrap_expires,
         ssh_host=ONBOARDING_SSH_HOST,
         ssh_port=ONBOARDING_SSH_PORT,
+        ssh_host_fingerprint=ssh_host_fingerprint,
         cli=cli,
         platform=platform,
+        agent_app=agent_app,
     )
 
     # ─── Hand back to admin ───────────────────────────────────────────
@@ -2226,6 +2297,7 @@ def setup_add_dev(cli: str | None = None, platform: str | None = None) -> None:
             admin_name=admin_user,
             admin_contact=admin_user,
             cli=cli,
+            agent_app=agent_app,
         )
         if sent:
             _ok(f"Email sent to {email}.")

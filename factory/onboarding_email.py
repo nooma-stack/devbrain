@@ -5,20 +5,16 @@ factory/notifications/channels/ so the credentials only have to be
 configured in one place (config/devbrain.yaml under
 notifications.channels.smtp or notifications.channels.gmail_dwd).
 
-Email body: a short welcome paragraph + 5-step summary + a pointer to
-the attached kit file. The full kit content is delivered as a .md
-attachment (not inlined). The attachment is ~3-15 KB — well within any
-provider's limits — and is trivially saved to disk for the dev to feed
-to their AI agent.
+Email body branches on `agent_app`:
+- specified (claude-desktop / codex-desktop / etc.): tailored "drop
+  the .md into [agent app]" instructions.
+- auto / unknown: lists supported agent apps with install pointers,
+  letting the dev pick.
 
-Why attachment (not inline):
-  - AI agent UIs (Claude Code, Codex, Gemini CLI) all accept file paths
-    on the command line; dragging/pasting a saved .md is the natural
-    onboarding path.
-  - Keeps the visible email body short and scan-friendly for the human.
-  - Avoids the body growing with future kit expansions (multi-CLI kits
-    can get long; the email subject+body stay constant).
-  - Re-send is trivial: the attachment is the same kit file on disk.
+The full kit content is always delivered as a .md attachment (not
+inlined). The attachment is ~10-15 KB — well within any provider's
+limits — and is trivially saved to disk for the dev to feed to their
+AI agent.
 """
 
 from __future__ import annotations
@@ -28,9 +24,71 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-# Email body template. Short by design — full content is in the attachment.
-# Patrick reviews + tweaks via the optional template-override path documented
-# below before the first real send.
+_CLI_DISPLAY_NAMES: dict[str, str] = {
+    "claude": "Claude Code",
+    "codex":  "Codex",
+    "gemini": "Gemini CLI",
+}
+
+_AGENT_APP_DISPLAY_NAMES: dict[str, str] = {
+    "auto":            "your AI agent",
+    "claude-desktop":  "Claude Desktop",
+    "codex-desktop":   "Codex Desktop",
+    "gemini-desktop":  "Gemini Desktop",
+    "claude-cli":      "Claude Code (CLI)",
+    "codex-cli":       "Codex (CLI)",
+    "gemini-cli":      "Gemini (CLI)",
+}
+
+# Per-agent-app: how to drop the kit into the agent
+_AGENT_APP_DROP_INSTRUCTIONS: dict[str, str] = {
+    "claude-desktop": (
+        "Open Claude Desktop, attach the {kit_filename} file to your "
+        "next message (paperclip icon), and tell Claude: \"Please run "
+        "this onboarding kit.\""
+    ),
+    "codex-desktop": (
+        "Open Codex Desktop, attach the {kit_filename} file to your "
+        "next message, and tell Codex: \"Please run this onboarding "
+        "kit.\""
+    ),
+    "gemini-desktop": (
+        "Open Gemini Desktop, attach the {kit_filename} file to your "
+        "next message, and tell Gemini: \"Please run this onboarding "
+        "kit.\""
+    ),
+    "claude-cli": (
+        "Open a terminal, run `claude`, and paste the contents of "
+        "{kit_filename} (or pass it as a path argument: "
+        "`claude < {kit_filename}`)."
+    ),
+    "codex-cli": (
+        "Open a terminal, run `codex`, and paste the contents of "
+        "{kit_filename}."
+    ),
+    "gemini-cli": (
+        "Open a terminal, run `gemini`, and paste the contents of "
+        "{kit_filename}."
+    ),
+}
+
+# Agent-app-agnostic preface for "auto" mode
+_AUTO_AGENT_APP_PREFACE = """\
+**If you don't have an AI agent app yet,** install one of the
+following (any of them can run this kit):
+
+- **Claude Desktop** — https://claude.com/download
+- **Codex Desktop** — https://chatgpt.com/download (includes Codex)
+- **Gemini Desktop** — https://gemini.google.com/app
+
+Once installed, drop the attached {kit_filename} into the app and
+tell the agent: \"Please run this onboarding kit.\"
+
+If you'd rather use a CLI: `claude`, `codex`, or `gemini` will all
+work the same way — just paste the kit's contents at the prompt.
+"""
+
+
 _EMAIL_TEMPLATE = """Welcome to BrightBot, {first_name}!
 
 You've been invited to join the BrightBot dev factory — Lighthouse
@@ -40,33 +98,23 @@ attributed to YOUR git identity.
 
 # How to onboard (~5 minutes)
 
-1. Save the attached file ({kit_filename}) to your laptop.
+{drop_instruction}
 
-2. Drop it into your AI agent ({cli_display_name}, or any agent you prefer).
-   The agent walks through every step, asking for your approval as it goes.
-   (Or run the steps manually — every command is shown in the kit.)
+The kit asks for your approval at each step. It generates an SSH
+keypair on your machine, delivers the public half to the Mac Studio,
+then SSHes you into your profile on the Mac Studio so you can sign
+into your {cli_display_name} subscription server-side. Your auth
+token is generated on the Mac Studio and **never leaves it** — only
+your SSH public key transits this email's chain.
 
-3. The agent generates an SSH keypair, installs {cli_display_name} locally,
-   and prompts you to authorize your credentials.
-
-4. DevBrain auto-activates your account. You'll get a confirmation.
-
-5. SSH into the Mac Studio (`ssh mac-studio`) and run
-   `factory dashboard` — you're in.
-
-The invite token in the kit is single-use and expires in 7 days. Treat
-the kit like a credential — don't broadcast it.
+The bootstrap key in the attached kit is single-use, locked to a
+single rotation script, and auto-expires in 3 days. Treat the kit
+like a credential — don't broadcast it.
 
 If anything breaks, reply to this email or ping {admin_contact}.
 
 — DevBrain (on behalf of {admin_name})
 """
-
-_CLI_DISPLAY_NAMES: dict[str, str] = {
-    "claude": "Claude Code",
-    "codex":  "Codex",
-    "gemini": "Gemini CLI",
-}
 
 
 def _pick_email_channel():
@@ -75,11 +123,6 @@ def _pick_email_channel():
     Preference order:
       1. gmail_dwd  (Google Workspace service account; no password)
       2. smtp       (plain SMTP / Gmail App Password / etc.)
-
-    Only one is expected to be enabled at a time — the setup wizard
-    disables the other when one is configured. But if both are
-    enabled, gmail_dwd wins because it's password-rotation-free and
-    audit-friendly.
     """
     import sys
     from pathlib import Path as _Path
@@ -116,6 +159,18 @@ def _pick_email_channel():
     return None
 
 
+def _build_drop_instruction(agent_app: str, kit_filename: str) -> str:
+    """Return the agent-app-specific 'drop the kit into your agent' block."""
+    if agent_app == "auto":
+        return _AUTO_AGENT_APP_PREFACE.format(kit_filename=kit_filename)
+    template = _AGENT_APP_DROP_INSTRUCTIONS.get(agent_app)
+    if template is None:
+        # Defensive fallback — shouldn't happen if the validator runs first
+        return _AUTO_AGENT_APP_PREFACE.format(kit_filename=kit_filename)
+    rendered = template.format(kit_filename=kit_filename)
+    return f"**To get started:** {rendered}"
+
+
 def send_onboarding_email(
     *,
     to_email: str,
@@ -125,20 +180,18 @@ def send_onboarding_email(
     admin_name: str = "your admin",
     admin_contact: str = "the admin who sent this email",
     cli: str = "claude",
+    agent_app: str = "auto",
 ) -> bool:
     """Send the onboarding kit to the dev as a .md email attachment.
 
-    The email body is a short welcome + 5-step summary. The full kit
-    content is delivered as an attachment named `<dev_id>-onboarding-kit.md`.
-
-    Picks the configured email channel (gmail_dwd preferred, smtp fallback).
-    Returns True on successful delivery, False otherwise. Failures are
-    logged and the kit file is left in place — the admin can re-send via
-    `devbrain send-invite --dev <id>` after fixing config.
-
     Args:
-        cli: AI CLI the dev was invited for. Used to personalise the email
-             body (e.g. "your Codex subscription"). Defaults to 'claude'.
+        cli: AI subscription the dev was invited for. Personalises
+             body wording.
+        agent_app: Which AI agent app the dev will use to run the
+                   kit. When 'auto', the email lists install
+                   pointers for each supported app and lets the dev
+                   pick. Otherwise, the email gives tailored
+                   drop-in instructions for that specific app.
     """
     channel = _pick_email_channel()
     if channel is None:
@@ -152,11 +205,12 @@ def send_onboarding_email(
     first_name = full_name.split()[0] if full_name else dev_id
     cli_display_name = _CLI_DISPLAY_NAMES.get(cli, cli)
     kit_filename = f"{dev_id}-onboarding-kit.md"
+    drop_instruction = _build_drop_instruction(agent_app, kit_filename)
 
     body = _EMAIL_TEMPLATE.format(
         first_name=first_name,
         cli_display_name=cli_display_name,
-        kit_filename=kit_filename,
+        drop_instruction=drop_instruction,
         admin_name=admin_name,
         admin_contact=admin_contact,
     )
@@ -164,10 +218,6 @@ def send_onboarding_email(
     title = f"Welcome to BrightBot — your DevBrain onboarding kit ({cli_display_name})"
 
     # Rename the kit file to the canonical attachment name if it differs.
-    # This avoids surprising filenames (e.g. "alice-onboard.md") when the
-    # attachment lands in the dev's inbox. We use a symlink-free rename
-    # approach: write a copy with the canonical name, send that, leave the
-    # original in place (the admin's reference copy).
     if kit_path.name != kit_filename:
         attachment_path = kit_path.parent / kit_filename
         attachment_path.write_bytes(kit_path.read_bytes())
@@ -185,8 +235,8 @@ def send_onboarding_email(
         logger.error("Email send failed via %s: %s", channel.name, result.error)
         return False
     logger.info(
-        "Onboarding email sent to %s for dev=%s (cli=%s) via %s; "
+        "Onboarding email sent to %s for dev=%s (cli=%s, agent_app=%s) via %s; "
         "kit attached as %s",
-        to_email, dev_id, cli, channel.name, kit_filename,
+        to_email, dev_id, cli, agent_app, channel.name, kit_filename,
     )
     return True
