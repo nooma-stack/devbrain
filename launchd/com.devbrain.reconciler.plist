@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTD/PropertyList-1.0.dtd">
+<!--
+  DevBrain Onboarding Reconciler — launchd agent.
+
+  Runs the reconciler poller (factory/onboard_reconciler.py) under
+  launchd so it stays up across reboots and respawns on crash. The
+  reconciler polls devbrain.invitations every 30s for status='ready'
+  rows and finishes activation: appends the dev's pubkey to
+  ~/.ssh/authorized_keys, provisions the profile dir, optionally
+  stashes a CLI credential (legacy kits) or leaves it for `devbrain
+  login` (post-2026-05-07 redesign), marks the row 'activated'.
+
+  Without this plist installed, ready invitations sit dormant —
+  caught us 2026-05-08 when Mike's pubkey rotation succeeded but
+  he couldn't SSH in because the reconciler hadn't run.
+
+  Logs to ~/Library/Logs/devbrain-reconciler.log (rotate via macOS'
+  built-in log rotation if it grows).
+
+  Install:
+    cp ~/devbrain/launchd/com.devbrain.reconciler.plist \
+       ~/Library/LaunchAgents/com.devbrain.reconciler.plist
+    launchctl load ~/Library/LaunchAgents/com.devbrain.reconciler.plist
+
+  Verify:
+    launchctl list | grep com.devbrain.reconciler
+    tail -f ~/Library/Logs/devbrain-reconciler.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.devbrain.reconciler</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <!-- Same `login -fpq` wrapper as com.devbrain.onboard.plist:
+         routes the agent through the GUI user session so any future
+         TCC permissions (e.g., macOS 26 Local Network for sockets)
+         inherit the right context. The reconciler doesn't currently
+         open listening sockets, but the wrapper is consistent with
+         the rest of the DevBrain launchd jobs. -->
+    <string>/usr/bin/login</string>
+    <string>-fpq</string>
+    <string>lhtdev</string>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>cd /Users/lhtdev/devbrain &amp;&amp; PYTHONPATH=factory exec /Users/lhtdev/devbrain/.venv/bin/python factory/onboard_reconciler.py</string>
+  </array>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Throttle to avoid respawn-storms if the DB is unreachable.
+       Reconciler crashing fast = 10s gate on relaunch attempts. -->
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/lhtdev/Library/Logs/devbrain-reconciler.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/lhtdev/Library/Logs/devbrain-reconciler.log</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/lhtdev/devbrain</string>
+
+  <key>SessionCreate</key>
+  <true/>
+</dict>
+</plist>
