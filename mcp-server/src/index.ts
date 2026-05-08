@@ -13,6 +13,8 @@ import { enqueueCascades, recordMemory, recordMemoryDependency, resolveMemoryId 
 import {
   computeRecencyWarning,
   expandRecencyNeighbors,
+  fetchPrimaryAgeDays,
+  findEarliestOnTopic,
   findSupersedingMemories,
 } from './recency.js'
 import { summarizeSession } from './summarize.js'
@@ -196,8 +198,12 @@ server.tool(
       .describe('Minimum age gap (days) before a chunk qualifies as a recency neighbor. Default 3 — filters out near-duplicates from the same chunking pass.'),
     follow_supersedes: z.boolean().optional().default(true)
       .describe('When true (default), each result is annotated with the latest supersedes-chain replacement (if any), so consumers see the current state — not just the historically-most-similar match.'),
+    earliest_on_topic: z.boolean().optional().default(false)
+      .describe('Opt-in. When true, each result is annotated with the chronologically-earliest memory on the same topic — supports "how did we get here" reasoning during retrospectives + debugging. Off by default to keep responses lean.'),
+    primary_age_floor_days: z.number().min(0).optional().default(30)
+      .describe('Trigger recency_warning when the primary memory itself is at least this many days old, regardless of neighbors. Default 30. Pass a very large number (e.g. 100000) to disable this trigger.'),
   },
-  async ({ query: searchQuery, project, cross_project, source_types, depth, limit, with_graph, graph_max_hops, graph_max_nodes, recency_neighbors, recency_neighbors_k, recency_min_age_days, follow_supersedes }) => {
+  async ({ query: searchQuery, project, cross_project, source_types, depth, limit, with_graph, graph_max_hops, graph_max_nodes, recency_neighbors, recency_neighbors_k, recency_min_age_days, follow_supersedes, earliest_on_topic, primary_age_floor_days }) => {
     const queryEmbedding = await embed(searchQuery)
     const vectorStr = toSqlVector(queryEmbedding)
 
@@ -505,19 +511,45 @@ server.tool(
       ? await findSupersedingMemories(memoryBackedIds)
       : new Map()
 
+    const earliestById = earliest_on_topic && memoryBackedIds.length > 0
+      ? await findEarliestOnTopic(memoryBackedIds)
+      : new Map()
+
+    // primary_age_days powers the topic-age-gap trigger of
+    // computeRecencyWarning AND surfaces directly so consumers can see
+    // absolute age, not just the relative gap to neighbors. Always
+    // computed when there are memory-backed results — single batched
+    // query, near-zero cost.
+    const primaryAgeById = memoryBackedIds.length > 0
+      ? await fetchPrimaryAgeDays(memoryBackedIds)
+      : new Map()
+
     for (let i = 0; i < top.length; i++) {
       const memId = top[i].memory_id
       if (!memId) continue
       const r = results[i]
       const neighbors = recencyById.get(memId)
       const superseder = supersedersById.get(memId)
+      const earliest = earliestById.get(memId)
+      const primaryAgeDays = primaryAgeById.get(memId)
       if (recency_neighbors) {
         r.recency_neighbors = neighbors ?? []
       }
       if (follow_supersedes) {
         r.superseded_by = superseder ?? null
       }
-      r.recency_warning = computeRecencyWarning(superseder, neighbors)
+      if (earliest_on_topic) {
+        r.earliest_on_topic = earliest ?? null
+      }
+      if (primaryAgeDays !== undefined) {
+        r.primary_age_days = primaryAgeDays
+      }
+      r.recency_warning = computeRecencyWarning(
+        superseder,
+        neighbors,
+        primaryAgeDays,
+        primary_age_floor_days ?? 30,
+      )
     }
 
     // Phase 5d: graph neighborhood enrichment.

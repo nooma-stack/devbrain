@@ -245,23 +245,177 @@ SELECT
   return result
 }
 
+export interface EarliestOnTopic {
+  memory_id: string
+  kind: string
+  snippet: string
+  created_at: string
+  similarity: number
+  /**
+   * How many days BEFORE the primary this chunk was created.
+   * Positive value = older than primary. Zero is impossible because
+   * the primary itself is excluded.
+   */
+  age_delta_days: number
+}
+
+/**
+ * Knobs for earliest-on-topic surface.
+ *
+ * Only one chunk is returned per primary — the chronologically earliest
+ * memory whose similarity exceeds the floor. Useful for "how did we get
+ * here" reasoning during retrospectives + debugging: when a recent
+ * decision is recalled, the consumer also gets the original framing of
+ * the same topic so state-change reasoning becomes possible.
+ */
+export interface EarliestOnTopicOptions {
+  /** Cosine-similarity floor. Default 0.5 — slightly stricter than
+   * recency neighbors because we surface only one chunk per primary. */
+  similarityFloor: number
+  /** Minimum days OLDER than primary before a chunk qualifies. Default
+   * 0 (any older). Tightens the result so near-duplicate chunks from
+   * the same chunking pass don't masquerade as the "origin" of a
+   * topic. */
+  minAgeDays: number
+}
+
+export const DEFAULT_EARLIEST_OPTIONS: EarliestOnTopicOptions = {
+  similarityFloor: 0.5,
+  minAgeDays: 0,
+}
+
+/**
+ * For each primary memory_id, return the chronologically EARLIEST
+ * memory row (within the same project, non-archived) whose embedding
+ * similarity to the primary exceeds the floor. The mirror image of
+ * `expandRecencyNeighbors`.
+ */
+export async function findEarliestOnTopic(
+  primaryMemoryIds: string[],
+  opts: EarliestOnTopicOptions = DEFAULT_EARLIEST_OPTIONS,
+): Promise<Map<string, EarliestOnTopic>> {
+  const result = new Map<string, EarliestOnTopic>()
+  if (primaryMemoryIds.length === 0) return result
+
+  // Same overfetch rationale as recency neighbors: ANN gives us
+  // candidates ordered by similarity; we then filter to ones older
+  // than primary and pick the OLDEST. Overfetch wide enough that the
+  // filter doesn't starve.
+  const overfetch = 50
+
+  const sql = `
+WITH primaries AS (
+    SELECT id, created_at, embedding, project_id
+      FROM devbrain.memory
+     WHERE id = ANY($1::uuid[])
+       AND archived_at IS NULL
+       AND embedding IS NOT NULL
+)
+SELECT
+    p.id::text AS primary_id,
+    n.id::text AS neighbor_id,
+    n.kind     AS neighbor_kind,
+    n.content  AS neighbor_content,
+    n.created_at AS neighbor_created_at,
+    1 - (n.embedding <=> p.embedding) AS similarity,
+    EXTRACT(EPOCH FROM (p.created_at - n.created_at)) / 86400.0
+        AS age_delta_days
+  FROM primaries p
+  CROSS JOIN LATERAL (
+        SELECT m.id, m.kind, m.content, m.created_at, m.embedding
+          FROM devbrain.memory m
+         WHERE m.id <> p.id
+           AND m.archived_at IS NULL
+           AND m.embedding IS NOT NULL
+           AND m.project_id = p.project_id
+           AND m.created_at < p.created_at - ($2 || ' days')::interval
+         ORDER BY m.embedding <=> p.embedding
+         LIMIT $3
+       ) n
+ WHERE 1 - (n.embedding <=> p.embedding) >= $4
+ ORDER BY p.id, n.created_at ASC
+`
+  const rows = await query(sql, [
+    primaryMemoryIds,
+    String(opts.minAgeDays),
+    overfetch,
+    opts.similarityFloor,
+  ])
+
+  for (const row of rows.rows) {
+    const primaryId = String(row.primary_id)
+    if (result.has(primaryId)) continue // first row per primary = earliest
+    const content = String(row.neighbor_content)
+    result.set(primaryId, {
+      memory_id: String(row.neighbor_id),
+      kind: String(row.neighbor_kind),
+      snippet: content.length > 240 ? content.slice(0, 240) + '…' : content,
+      created_at: new Date(row.neighbor_created_at as string).toISOString(),
+      similarity: Number(Number(row.similarity).toFixed(4)),
+      age_delta_days: Number(Number(row.age_delta_days).toFixed(1)),
+    })
+  }
+
+  return result
+}
+
 /**
  * Heuristic: should the consumer be warned that this primary may be
- * stale? True if the primary has been superseded OR if any recency
- * neighbor crosses BOTH a high-similarity and a meaningful-age-gap
- * threshold. The consumer (typically an LLM) is meant to treat the
- * warning as a nudge to verify currency, not as authoritative.
+ * stale? Three triggers — any one fires the warning:
+ *
+ *   (a) the primary has an explicit supersedes-chain replacement,
+ *   (b) a recency neighbor exists with high similarity AND a
+ *       meaningful age gap (≥7 days newer at ≥0.55 similarity), or
+ *   (c) the primary itself is older than the absolute-age floor
+ *       (default 30 days) — the "topic-age-gap" mechanism — caller
+ *       might be reasoning from a snapshot that's drifted regardless
+ *       of whether neighbors exist. Pass primaryAgeFloorDays=Infinity
+ *       to disable this trigger.
+ *
+ * The consumer (typically an LLM) is meant to treat the warning as a
+ * nudge to verify currency, not as authoritative.
  */
 export function computeRecencyWarning(
   superseder: SupersedingMemory | undefined,
   neighbors: RecencyNeighbor[] | undefined,
+  primaryAgeDays: number | undefined,
+  primaryAgeFloorDays: number = 30,
 ): boolean {
   if (superseder !== undefined) return true
+  if (
+    primaryAgeDays !== undefined &&
+    Number.isFinite(primaryAgeFloorDays) &&
+    primaryAgeDays >= primaryAgeFloorDays
+  ) {
+    return true
+  }
   if (!neighbors || neighbors.length === 0) return false
-  // Trigger when the closest neighbor is ≥0.55 similar AND ≥7 days
-  // newer — strong signal that recent activity may have overtaken
-  // this primary even without a formal supersedes edge.
   return neighbors.some(
     (n) => n.similarity >= 0.55 && n.age_delta_days >= 7,
   )
+}
+
+/**
+ * Cheap batched query: for a set of primary memory_ids, return how
+ * many days have elapsed since each one was created. Used to populate
+ * the `primary_age_days` field on each result and to drive the
+ * topic-age-gap branch of computeRecencyWarning.
+ */
+export async function fetchPrimaryAgeDays(
+  primaryMemoryIds: string[],
+): Promise<Map<string, number>> {
+  const result = new Map<string, number>()
+  if (primaryMemoryIds.length === 0) return result
+
+  const rows = await query(
+    `SELECT id::text AS id,
+            EXTRACT(EPOCH FROM (now() - created_at)) / 86400.0 AS age_days
+       FROM devbrain.memory
+      WHERE id = ANY($1::uuid[])`,
+    [primaryMemoryIds],
+  )
+  for (const row of rows.rows) {
+    result.set(String(row.id), Number(Number(row.age_days).toFixed(1)))
+  }
+  return result
 }

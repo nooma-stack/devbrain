@@ -387,3 +387,167 @@ def test_supersedes_walk_returns_nothing_for_primary_with_no_edge(
         rows = cur.fetchall()
 
     assert rows == []
+
+
+# ─── Earliest-on-topic ──────────────────────────────────────────────────────
+
+
+_EARLIEST_SQL = """
+WITH primaries AS (
+    SELECT id, created_at, embedding, project_id
+      FROM devbrain.memory
+     WHERE id = ANY(%(ids)s::uuid[])
+       AND archived_at IS NULL
+       AND embedding IS NOT NULL
+)
+SELECT
+    p.id::text AS primary_id,
+    n.id::text AS neighbor_id,
+    1 - (n.embedding <=> p.embedding) AS similarity,
+    EXTRACT(EPOCH FROM (p.created_at - n.created_at)) / 86400.0 AS age_delta_days
+  FROM primaries p
+  CROSS JOIN LATERAL (
+        SELECT m.id, m.created_at, m.embedding
+          FROM devbrain.memory m
+         WHERE m.id <> p.id
+           AND m.archived_at IS NULL
+           AND m.embedding IS NOT NULL
+           AND m.project_id = p.project_id
+           AND m.created_at < p.created_at - (%(min_age_days)s || ' days')::interval
+         ORDER BY m.embedding <=> p.embedding
+         LIMIT %(overfetch)s
+       ) n
+ WHERE 1 - (n.embedding <=> p.embedding) >= %(sim_floor)s
+ ORDER BY p.id, n.created_at ASC
+"""
+
+
+def test_earliest_on_topic_returns_oldest_similar(conn, project_factory):
+    project = project_factory("earliest_basic")
+    topic = _embed({0: 1.0})
+
+    oldest_id = _insert_memory_with_embedding(
+        conn, project_id=project["id"], content="A oldest framing",
+        embedding=topic, created_at="2026-01-01T00:00:00+00",
+    )
+    _insert_memory_with_embedding(
+        conn, project_id=project["id"], content="A middle revision",
+        embedding=topic, created_at="2026-03-01T00:00:00+00",
+    )
+    primary_id = _insert_memory_with_embedding(
+        conn, project_id=project["id"], content="A current state",
+        embedding=topic, created_at="2026-05-08T00:00:00+00",
+    )
+
+    with conn.cursor() as cur:
+        cur.execute(
+            _EARLIEST_SQL,
+            {
+                "ids": [primary_id],
+                "min_age_days": "0",
+                "overfetch": 50,
+                "sim_floor": 0.5,
+            },
+        )
+        rows = cur.fetchall()
+
+    # Two candidates qualify; the SQL returns BOTH ordered earliest-
+    # first. The TS layer takes only the first via Map insertion order
+    # — assert that ordering here.
+    assert len(rows) == 2
+    assert rows[0][1] == oldest_id
+
+
+def test_earliest_on_topic_skips_below_similarity_floor(
+    conn, project_factory,
+):
+    project = project_factory("earliest_sim")
+    topic_a = _embed({0: 1.0})
+    topic_b = _embed({100: 1.0})
+
+    primary_id = _insert_memory_with_embedding(
+        conn, project_id=project["id"], content="A current",
+        embedding=topic_a, created_at="2026-05-08T00:00:00+00",
+    )
+    # Older but on a different topic — should NOT qualify.
+    _insert_memory_with_embedding(
+        conn, project_id=project["id"], content="B unrelated old",
+        embedding=topic_b, created_at="2026-01-01T00:00:00+00",
+    )
+
+    with conn.cursor() as cur:
+        cur.execute(
+            _EARLIEST_SQL,
+            {
+                "ids": [primary_id],
+                "min_age_days": "0",
+                "overfetch": 50,
+                "sim_floor": 0.5,
+            },
+        )
+        rows = cur.fetchall()
+
+    assert rows == []
+
+
+def test_earliest_on_topic_respects_project_scope(conn, project_factory):
+    a = project_factory("earliest_a")
+    b = project_factory("earliest_b")
+    topic = _embed({0: 1.0})
+
+    primary_id = _insert_memory_with_embedding(
+        conn, project_id=a["id"], content="A in project a",
+        embedding=topic, created_at="2026-05-08T00:00:00+00",
+    )
+    # Same topic, older, but in a DIFFERENT project — must not surface.
+    _insert_memory_with_embedding(
+        conn, project_id=b["id"], content="A in project b",
+        embedding=topic, created_at="2026-01-01T00:00:00+00",
+    )
+
+    with conn.cursor() as cur:
+        cur.execute(
+            _EARLIEST_SQL,
+            {
+                "ids": [primary_id],
+                "min_age_days": "0",
+                "overfetch": 50,
+                "sim_floor": 0.5,
+            },
+        )
+        rows = cur.fetchall()
+
+    assert rows == []
+
+
+# ─── primary_age_days ───────────────────────────────────────────────────────
+
+
+def test_primary_age_days_is_nonnegative(conn, project_factory):
+    project = project_factory("age_days")
+    topic = _embed({0: 1.0})
+    fresh_id = _insert_memory_with_embedding(
+        conn, project_id=project["id"], content="just now",
+        embedding=topic,
+    )
+    backdated_id = _insert_memory_with_embedding(
+        conn, project_id=project["id"], content="40 days ago",
+        embedding=topic,
+        created_at="2026-03-29T00:00:00+00",
+    )
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id::text, "
+            "EXTRACT(EPOCH FROM (now() - created_at)) / 86400.0 AS age_days "
+            "FROM devbrain.memory WHERE id = ANY(%s::uuid[])",
+            ([fresh_id, backdated_id],),
+        )
+        rows = {row[0]: float(row[1]) for row in cur.fetchall()}
+
+    assert rows[fresh_id] >= 0
+    assert rows[fresh_id] < 1.0  # inserted moments ago
+    # Backdated row: created_at is 2026-03-29 — at any test runtime
+    # after 2026-04-29, this should be > 30 days. Be tolerant of clock
+    # skew in CI.
+    assert rows[backdated_id] >= 30.0
