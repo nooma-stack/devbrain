@@ -10,6 +10,11 @@ import { z } from 'zod'
 import { query } from './db.js'
 import { embed, toSqlVector } from './embeddings.js'
 import { enqueueCascades, recordMemory, recordMemoryDependency, resolveMemoryId } from './memory.js'
+import {
+  computeRecencyWarning,
+  expandRecencyNeighbors,
+  findSupersedingMemories,
+} from './recency.js'
 import { summarizeSession } from './summarize.js'
 
 // Factory orchestrator runner path
@@ -183,8 +188,16 @@ server.tool(
       .describe('Max BFS depth for graph walk (only when with_graph=true). Default 3.'),
     graph_max_nodes: z.number().min(5).max(200).optional().default(50)
       .describe('Max total nodes in graph result (only when with_graph=true). Default 50.'),
+    recency_neighbors: z.boolean().optional().default(true)
+      .describe('When true (default), each result is annotated with up to recency_neighbors_k newer memory rows on the same topic — surfaces supersession candidates that writers forgot to wire as edges.'),
+    recency_neighbors_k: z.number().min(1).max(10).optional().default(2)
+      .describe('Number of recency neighbors to attach per result. Default 2.'),
+    recency_min_age_days: z.number().min(0).max(3650).optional().default(3)
+      .describe('Minimum age gap (days) before a chunk qualifies as a recency neighbor. Default 3 — filters out near-duplicates from the same chunking pass.'),
+    follow_supersedes: z.boolean().optional().default(true)
+      .describe('When true (default), each result is annotated with the latest supersedes-chain replacement (if any), so consumers see the current state — not just the historically-most-similar match.'),
   },
-  async ({ query: searchQuery, project, cross_project, source_types, depth, limit, with_graph, graph_max_hops, graph_max_nodes }) => {
+  async ({ query: searchQuery, project, cross_project, source_types, depth, limit, with_graph, graph_max_hops, graph_max_nodes, recency_neighbors, recency_neighbors_k, recency_min_age_days, follow_supersedes }) => {
     const queryEmbedding = await embed(searchQuery)
     const vectorStr = toSqlVector(queryEmbedding)
 
@@ -467,6 +480,45 @@ server.tool(
         return r
       }),
     )
+
+    // Recency-neighbor expansion + supersedes auto-walk.
+    //
+    // Codebase legacy fallback rows carry memory_id='' (they live in
+    // devbrain.chunks only). They cannot participate in
+    // memory_dependencies edges, and the recency_min_age_days filter
+    // would skip them anyway since codebase ingest doesn't share the
+    // memory.created_at timeline. We only annotate the memory-backed
+    // results.
+    const memoryBackedIds = top
+      .map((c) => c.memory_id)
+      .filter((id) => id && id.length > 10)
+
+    const recencyById = recency_neighbors && memoryBackedIds.length > 0
+      ? await expandRecencyNeighbors(memoryBackedIds, {
+          k: recency_neighbors_k ?? 2,
+          minAgeDays: recency_min_age_days ?? 3,
+          similarityFloor: 0.4,
+        })
+      : new Map()
+
+    const supersedersById = follow_supersedes && memoryBackedIds.length > 0
+      ? await findSupersedingMemories(memoryBackedIds)
+      : new Map()
+
+    for (let i = 0; i < top.length; i++) {
+      const memId = top[i].memory_id
+      if (!memId) continue
+      const r = results[i]
+      const neighbors = recencyById.get(memId)
+      const superseder = supersedersById.get(memId)
+      if (recency_neighbors) {
+        r.recency_neighbors = neighbors ?? []
+      }
+      if (follow_supersedes) {
+        r.superseded_by = superseder ?? null
+      }
+      r.recency_warning = computeRecencyWarning(superseder, neighbors)
+    }
 
     // Phase 5d: graph neighborhood enrichment.
     //
