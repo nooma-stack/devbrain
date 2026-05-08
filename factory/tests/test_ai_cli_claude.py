@@ -100,6 +100,39 @@ def test_extract_oauth_token_handles_ansi_escapes():
     assert _extract_oauth_token(text) == "sk-ant-oat01-tok_with_dashes-and_underscores"
 
 
+def test_extract_oauth_token_handles_cursor_positioning_inside_token():
+    """Real-world reproduction from the 2026-05-08 E2E test: claude renders
+    the token across visual TTY lines by injecting `\\x1b[1C` (cursor right)
+    and `\\r\\x1b[1B` (CR + cursor down) escapes mid-token. The extractor
+    strips those before matching."""
+    real_world_capture = (
+        "Long-lived authentication token created successfully!\n"
+        "sk-ant-oat\x1b[1C1-fO5B\x1b[1CyG_n4rstUKSfpUzIAT37ppUyqpgXKwjHa6"
+        "fneODMXTqCCA-25WUIqqiE4Al0Zr\r\x1b[1B4TcP0P7q1U-4m6C_x-A-6uvrsAAA\r\x1b[2B"
+        "Store this token securely.\n"
+    )
+    expected = (
+        "sk-ant-oat1-fO5ByG_n4rstUKSfpUzIAT37ppUyqpgXKwjHa6"
+        "fneODMXTqCCA-25WUIqqiE4Al0Zr4TcP0P7q1U-4m6C_x-A-6uvrsAAA"
+    )
+    assert _extract_oauth_token(real_world_capture) == expected
+
+
+def test_extract_oauth_token_accepts_oat_prefix_with_one_digit():
+    """Anthropic's actual prefix observed in the wild is `sk-ant-oat1-`,
+    not `sk-ant-oat01-` as the docs imply. The regex is permissive on
+    the digit run."""
+    text = "Token: sk-ant-oat1-AbCdEf\n"
+    assert _extract_oauth_token(text) == "sk-ant-oat1-AbCdEf"
+
+
+def test_extract_oauth_token_accepts_oat_prefix_with_two_digits():
+    """Documented prefix per Anthropic's auth docs is `sk-ant-oat01-`.
+    Regex still matches it."""
+    text = "Token: sk-ant-oat01-AbCdEf\n"
+    assert _extract_oauth_token(text) == "sk-ant-oat01-AbCdEf"
+
+
 def test_extract_oauth_token_picks_first_match_when_multiple():
     text = "first sk-ant-oat01-FIRST then sk-ant-oat01-SECOND"
     assert _extract_oauth_token(text) == "sk-ant-oat01-FIRST"
@@ -251,7 +284,7 @@ def test_login_returns_failure_on_nonzero_exit(
 def test_login_returns_failure_when_token_not_in_log(
     mock_run, mock_keychain, dev, tmp_path: Path
 ):
-    """If claude exits 0 but no sk-ant-oat01-... in captured output, fail."""
+    """If claude exits 0 but no sk-ant-oatN-... in captured output, fail."""
     def no_token_run(*args, **kwargs):
         cmd = args[0]
         if cmd[0] == "script":
@@ -263,7 +296,7 @@ def test_login_returns_failure_when_token_not_in_log(
     a = ClaudeAdapter()
     result = a.login(dev, tmp_path)
     assert result.success is False
-    assert "no sk-ant-oat01" in result.error
+    assert "no sk-ant-oatN" in result.error
 
 
 @patch("ai_clis.claude._ensure_keychain")

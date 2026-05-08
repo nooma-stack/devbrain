@@ -58,9 +58,21 @@ _PASSWORD_REL = Path(".claude") / ".keychain-password"
 _OAUTH_TOKEN_REL = Path(".claude") / "oauth-token"
 _FAKEBIN_REL = Path(".claude") / ".devbrain-fakebin"
 
-# `claude setup-token` prints the issued token verbatim in its output stream.
-# Pattern: sk-ant-oat01- followed by url-safe base64-ish chars.
-_OAUTH_TOKEN_RE = re.compile(r"sk-ant-oat01-[A-Za-z0-9_\-]+")
+# `claude setup-token` prints the issued token in its TTY output. Two
+# wrinkles caught in the 2026-05-08 E2E test:
+#   1. Anthropic's actual prefix is `sk-ant-oatN-` where N is one or
+#      more digits (observed `sk-ant-oat1-` against claude 2.1.132,
+#      vs `sk-ant-oat01-` shown in their docs). Match a digit run.
+#   2. `script(1)` captures the rendered TTY stream including cursor-
+#      positioning escapes that claude injects MID-TOKEN to display
+#      it across visual lines (`\x1b[1C` cursor right, `\r\x1b[1B`
+#      CR + cursor down 1 = visual line wrap). We strip those so the
+#      token reassembles contiguously, but we LEAVE post-token escapes
+#      like `\x1b[2B` (cursor down 2 = paragraph break) intact so the
+#      regex stops at the right place rather than slurping the next
+#      message ("Store this token securely…").
+_OAUTH_TOKEN_RE = re.compile(r"sk-ant-oat\d+-[A-Za-z0-9_\-]+")
+_TOKEN_NOISE_RE = re.compile(r"\x1b\[1C|\r\x1b\[1B")
 
 
 def _read_or_generate_keychain_password(profile_dir: Path) -> str:
@@ -133,12 +145,16 @@ def _ensure_keychain(profile_dir: Path) -> Path:
 
 
 def _extract_oauth_token(text: str) -> str | None:
-    """Find the first sk-ant-oat01-... token in claude setup-token output.
+    """Find the first sk-ant-oatN-... token in claude setup-token output.
 
-    Captured TTY output from script(1) contains escape sequences and
-    interleaved status lines; just scan for the token pattern.
+    Strips intra-token cursor-positioning escapes (cursor-right and
+    single-line wraps) so the token reassembles contiguously. Post-
+    token escapes (cursor-down-2 and beyond) are deliberately left in
+    place so the regex stops at the message boundary rather than
+    slurping subsequent text.
     """
-    match = _OAUTH_TOKEN_RE.search(text)
+    cleaned = _TOKEN_NOISE_RE.sub("", text)
+    match = _OAUTH_TOKEN_RE.search(cleaned)
     return match.group(0) if match else None
 
 
@@ -241,7 +257,7 @@ class ClaudeAdapter(AICliAdapter):
         if token is None:
             return LoginResult(
                 success=False,
-                error="claude setup-token completed but no sk-ant-oat01-... token found in captured output",
+                error="claude setup-token completed but no sk-ant-oatN-... token found in captured output",
                 hint="The OAuth flow may not have completed — verify you signed in and pasted the verification code.",
             )
 
