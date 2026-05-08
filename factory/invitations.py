@@ -343,7 +343,11 @@ def _looks_like_ssh_pubkey(s: str) -> bool:
 
 
 def _looks_like_oauth_token(s: str) -> bool:
-    return s.startswith("sk-ant-oat01-") or s.startswith("sk-ant-")
+    # Anthropic's real prefix is `sk-ant-oatN-` (observed `sk-ant-oat1-`
+    # against claude 2.1.132; their docs sometimes show `sk-ant-oat01-`).
+    # `sk-ant-` covers both shapes plus any future variants in the same
+    # family without forcing this validator to chase format updates.
+    return s.startswith("sk-ant-")
 
 
 def callback_base_url(invite_id: str, raw_token: str) -> str:

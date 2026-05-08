@@ -310,7 +310,7 @@ def _stash_credential(profile_dir: Path, credential: str, cli: str = "claude") -
 
     Routing by CLI:
       claude: <profile>/.claude/oauth-token
-              Plain text sk-ant-oat01-... value.
+              Plain text sk-ant-oat<N>-... value.
 
       codex:  <profile>/.codex/auth.json
               JSON content of the dev's ~/.codex/auth.json.  The factory

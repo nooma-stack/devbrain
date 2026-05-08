@@ -13,7 +13,7 @@ vars on top of the HOME swap (these win over .gitconfig discovery).
 Login flow: `claude setup-token` runs server-side inside the dev's
 profile dir, captured via script(1) so the dev's interactive SSH
 session can paste the OAuth verification code while we still scrape
-stdout for the issued token. The token (sk-ant-oat01-...) is stashed
+stdout for the issued token. The token (sk-ant-oat<N>-...) is stashed
 at <profile>/.claude/oauth-token (mode 600); cli_executor reads it
 into CLAUDE_CODE_OAUTH_TOKEN env before each Claude spawn (env var
 takes precedence over keychain per Anthropic's auth precedence rules).
