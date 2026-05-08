@@ -269,7 +269,7 @@ After implementation lands, both devs will be re-onboarded under the new flow vi
 
 Suggested sequence (smallest-leverage-test first):
 
-1. **Adapter fix for Claude** (`factory/ai_clis/claude.py`): swap `claude auth login` for `claude setup-token`, parse stdout, stash in `oauth-token` file. Add the PATH-shim trick. End-to-end test: run `devbrain login --dev <test-dev> --cli claude` against a throwaway test profile, complete the OAuth flow, confirm `<profile>/.claude/oauth-token` lands and contains a valid `sk-ant-oat01-...` string.
+1. **Adapter fix for Claude** (`factory/ai_clis/claude.py`): swap `claude auth login` for `claude setup-token`, parse stdout, stash in `oauth-token` file. Add the PATH-shim trick. End-to-end test: run `devbrain login --dev <test-dev> --cli claude` against a throwaway test profile, complete the OAuth flow, confirm `<profile>/.claude/oauth-token` lands and contains a valid `sk-ant-oat\d+-...` string. (Per §11.1, Anthropic's real prefix is `sk-ant-oat1-` not the docs' `sk-ant-oat01-`; regex must be digit-permissive.)
 2. **Trust banner + agent-app axis in template** (`factory/onboarding_kit.py`, `factory/setup.py`): add `_PHASE0_TRUST` constant + `--agent-app` admin arg + dispatch table. Don't change Phase 1+ yet. Verify a generated kit renders correctly with the banner and per-agent-app sections.
 3. **PowerShell variants for each phase** (kit module): add bash+PowerShell pairs to all phases. Test on Windows host (or via Wine if no Windows handy).
 4. **Server-side simplification** (`factory/onboard_rotate.sh`, `factory/onboard_rotate_helper.py`): drop the credential-extraction logic; rotation handler now only persists pubkey.
@@ -294,4 +294,39 @@ Each step lands as a separate PR if scoping allows; otherwise grouped 1-3 / 4-5 
 
 ---
 
-**Sign-off:** ready for implementation. Architecture validated; load-bearing assumption (`claude setup-token` headless flow) empirically confirmed; cleanup of existing dev profiles already executed.
+## 11. Post-Implementation Findings (2026-05-08 E2E)
+
+After PR #112 (Claude adapter) and PR #113 (rest of redesign) shipped + deployed, Patrick drove a real `claude setup-token` flow end-to-end against the Mac Studio adapter using his Max subscription. Three findings worth capturing:
+
+### 11.1 Anthropic's actual token prefix is `sk-ant-oat1-`, NOT `sk-ant-oat01-`
+
+The auth docs at `https://code.claude.com/docs/en/authentication` show example tokens prefixed `sk-ant-oat01-`. The real token issued by claude 2.1.132 was prefixed `sk-ant-oat1-` — single digit. Anchor regexes on `sk-ant-oat\d+-` to be permissive across formats. Fixed in PR #114.
+
+### 11.2 `script(1)`-captured TTY output interleaves cursor-positioning escapes mid-token
+
+Claude renders the issued token across multiple visual TTY lines using `\x1b[1C` (cursor right by 1) and `\r\x1b[1B` (CR + cursor down 1 = visual line wrap). These appear **inside** the token's byte sequence in the captured log. Naïve regex won't see a contiguous token.
+
+Solution: strip just the *intra-token* escapes (`\x1b[1C` and `\r\x1b[1B`) but **leave** the post-token `\x1b[2B` (cursor down 2 = paragraph break) intact, so the regex stops at the message boundary rather than slurping the next line ("Store this token securely…"). Fixed in PR #114.
+
+### 11.3 No documented self-service revocation path for setup-token-issued OAuth tokens
+
+The auth docs describe how to *generate* a long-lived OAuth token via `claude setup-token`, but neither the docs nor the public support site describe a UI to list or revoke previously-issued tokens. Tokens are bound to the user's Pro/Max/Team/Enterprise subscription — distinct from Console API keys (which DO have a revocation page at console.anthropic.com).
+
+Practical mitigations if a setup-token-issued token leaks:
+- Run `claude /logout` then `/login` to regenerate the subscription's OAuth credential set; *may* invalidate older grants (undocumented).
+- Generate a fresh `claude setup-token` — some OAuth flows invalidate prior tokens of the same grant type for the same user.
+- Email Anthropic support for explicit server-side revocation.
+
+Tokens are scoped to inference only (per docs: "cannot establish Remote Control sessions"), which limits blast radius if leaked.
+
+### 11.4 Operational note: `pty` paste-back needs CR (`\r`) to submit, not LF (`\n`)
+
+When orchestrating `claude setup-token` programmatically through a pty (rather than letting a real terminal feed input), pasting the verification code with a trailing `\n` populates the input buffer but doesn't trigger submission. claude waits for `\r` (carriage return) — what a real terminal sends when the user presses Enter. The adapter's `script(1)`-wrapped flow doesn't hit this because the dev's actual terminal sends CR natively; only relevant if you're driving the flow from another process via FIFO-fed stdin (as we did during the E2E probe).
+
+### Sign-off (revised)
+
+Architecture validated end-to-end. Load-bearing assumption (`claude setup-token` headless paste-code-back flow) confirmed against real Anthropic OAuth. Mark + Mike re-onboarded under the new flow with kits sitting in their inboxes.
+
+---
+
+**Sign-off:** Implemented + deployed across PRs #110–#114.
