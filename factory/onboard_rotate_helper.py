@@ -83,6 +83,20 @@ def main() -> int:
 
     inv_id, dev_id, status = row
     print(f"rotated dev={dev_id} invite={str(inv_id)[:8]} cli={cli} status={status}")
+
+    # Inline reconciliation: activate immediately so the dev's pubkey
+    # lands in authorized_keys before they retry SSH. The launchd
+    # reconciler daemon (com.devbrain.reconciler) is a safety net if
+    # this inline path fails for any reason (DB hiccup, transient
+    # filesystem error, mid-handler crash before this point ran). Best-
+    # effort: a failure here doesn't fail the rotate response — the
+    # daemon will pick up the row on its next tick.
+    try:
+        from onboard_reconciler import reconcile_once
+        reconcile_once(db)
+    except Exception as e:
+        print(f"inline-reconcile failed (daemon will retry): {e}", file=sys.stderr)
+
     return 0
 
 

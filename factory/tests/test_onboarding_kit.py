@@ -448,3 +448,90 @@ def test_rotate_helper_rejects_unknown_cli():
 def test_rotate_helper_rejects_missing_pubkey():
     body = {"cli": "claude"}
     assert _run_helper(body) == 2
+
+
+def test_rotate_helper_triggers_inline_reconcile_on_success():
+    """After a successful pubkey rotation, the helper should call
+    `reconcile_once` synchronously so the dev's pubkey lands in
+    authorized_keys before they retry SSH — eliminating the launchd-
+    reconciler-not-running race condition that bit Mike on 2026-05-08."""
+    import io
+    import onboard_rotate_helper as _h
+
+    fake_row = ("some-uuid-here", "alice", "ready")
+
+    mock_cur = MagicMock()
+    mock_cur.fetchone.return_value = fake_row
+    mock_cur.__enter__ = lambda s: s
+    mock_cur.__exit__ = MagicMock(return_value=False)
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cur
+    mock_conn.__enter__ = lambda s: s
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_db = MagicMock()
+    mock_db._conn.return_value = mock_conn
+
+    body = {
+        "pubkey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI alice@example.com",
+        "cli": "claude",
+    }
+
+    original_argv = sys.argv
+    original_stdin = sys.stdin
+    try:
+        sys.argv = ["onboard_rotate_helper.py", "--invite-id-short", "abcd1234"]
+        sys.stdin = io.StringIO(json.dumps(body))
+        with patch("state_machine.FactoryDB", MagicMock(return_value=mock_db)), \
+             patch("config.DATABASE_URL", "postgresql://fake/fake"), \
+             patch("onboard_reconciler.reconcile_once") as mock_reconcile:
+            rc = _h.main()
+    finally:
+        sys.argv = original_argv
+        sys.stdin = original_stdin
+
+    assert rc == 0
+    mock_reconcile.assert_called_once_with(mock_db)
+
+
+def test_rotate_helper_succeeds_even_when_inline_reconcile_raises():
+    """Inline reconciliation is best-effort. If it raises (DB hiccup,
+    permission error, etc.) the helper still returns success — the
+    launchd daemon catches the row on its next tick as fallback."""
+    import io
+    import onboard_rotate_helper as _h
+
+    fake_row = ("some-uuid-here", "alice", "ready")
+
+    mock_cur = MagicMock()
+    mock_cur.fetchone.return_value = fake_row
+    mock_cur.__enter__ = lambda s: s
+    mock_cur.__exit__ = MagicMock(return_value=False)
+    mock_conn = MagicMock()
+    mock_conn.cursor.return_value = mock_cur
+    mock_conn.__enter__ = lambda s: s
+    mock_conn.__exit__ = MagicMock(return_value=False)
+    mock_db = MagicMock()
+    mock_db._conn.return_value = mock_conn
+
+    body = {
+        "pubkey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI alice@example.com",
+        "cli": "claude",
+    }
+
+    original_argv = sys.argv
+    original_stdin = sys.stdin
+    try:
+        sys.argv = ["onboard_rotate_helper.py", "--invite-id-short", "abcd1234"]
+        sys.stdin = io.StringIO(json.dumps(body))
+        with patch("state_machine.FactoryDB", MagicMock(return_value=mock_db)), \
+             patch("config.DATABASE_URL", "postgresql://fake/fake"), \
+             patch("onboard_reconciler.reconcile_once",
+                   side_effect=RuntimeError("simulated transient failure")):
+            rc = _h.main()
+    finally:
+        sys.argv = original_argv
+        sys.stdin = original_stdin
+
+    # Helper still returns 0 — the SSH client gets {"status":"ok"} and
+    # the daemon picks up the still-ready row asynchronously.
+    assert rc == 0
