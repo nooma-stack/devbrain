@@ -379,12 +379,16 @@ def _llm_extract(content: str, *, max_llm_calls: int = 1) -> dict:
         logger.warning("cognify_extract: anthropic SDK not available; skipping LLM")
         return {"lessons": [], "decisions": [], "_usage": _empty_usage}
 
-    api_key = _get_api_key()
-    if not api_key:
-        logger.warning("cognify_extract: no API key configured; skipping LLM")
+    auth_kwargs = _resolve_auth()
+    if auth_kwargs is None:
+        logger.warning(
+            "cognify_extract: no Anthropic credential configured "
+            "(ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_AUTH_TOKEN); "
+            "skipping LLM"
+        )
         return {"lessons": [], "decisions": [], "_usage": _empty_usage}
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(**auth_kwargs)
 
     system_prompt = (
         "You are a structured knowledge extractor. Given raw session content, "
@@ -434,8 +438,19 @@ def _llm_extract(content: str, *, max_llm_calls: int = 1) -> dict:
         return {"lessons": [], "decisions": [], "_usage": _empty_usage}
 
 
+def _resolve_auth() -> dict[str, str] | None:
+    """Resolve Anthropic credential to SDK kwargs (api_key= or auth_token=).
+
+    Accepts a Console API key OR a subscription OAuth token; the SDK
+    routes them through different headers. See cognify._anthropic_auth
+    for the resolution order and accepted env var names.
+    """
+    from cognify._anthropic_auth import resolve_anthropic_auth
+    return resolve_anthropic_auth()
+
+
 def _get_api_key() -> str | None:
-    """Resolve the Anthropic API key from environment or config."""
+    """Deprecated — kept for any external callers. Use _resolve_auth()."""
     import os
     return os.environ.get("ANTHROPIC_API_KEY")
 
