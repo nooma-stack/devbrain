@@ -541,6 +541,7 @@ cat <<'EOF'
       "command": "ssh",
       "args": ["-i", "~/.ssh/id_ed25519_devbrain", "-p", "{ssh_port}",
                "lhtdev@{ssh_host}",
+               "env", "DEVBRAIN_DEV_ID={dev_id}",
                "/Users/lhtdev/devbrain/mcp-server/run.sh"]
     }}
   }}
@@ -591,6 +592,7 @@ $cfg.mcpServers.devbrain = @{{
   args = @("-i", "$env:USERPROFILE\\.ssh\\id_ed25519_devbrain",
            "-p", "{ssh_port}",
            "lhtdev@{ssh_host}",
+           "env", "DEVBRAIN_DEV_ID={dev_id}",
            "/Users/lhtdev/devbrain/mcp-server/run.sh")
 }}
 
