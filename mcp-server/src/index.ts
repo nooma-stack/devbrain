@@ -3,7 +3,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { spawn, spawnSync } from 'child_process'
-import { existsSync, writeFileSync, unlinkSync } from 'fs'
+import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join, resolve } from 'path'
 import { z } from 'zod'
@@ -26,6 +26,61 @@ const FACTORY_RUNNER = resolve(import.meta.dirname, '../../factory/run.py')
 const DEVBRAIN_CLI = resolve(import.meta.dirname, '../../factory/cli.py')
 const DEVBRAIN_PYTHON = resolve(import.meta.dirname, '../../.venv/bin/python')
 const DEVBRAIN_REPO_ROOT = resolve(import.meta.dirname, '../..')
+
+// ─── Per-dev OAuth-token resolution for cognify-on-end_session ──────────────
+//
+// When the MCP server is launched with DEVBRAIN_DEV_ID set in its env (the
+// post-2026-05-11 kit wires this into each dev's local mcpServers entry),
+// background cognify spawns use THAT dev's per-profile OAuth token —
+// billing the LLM passes against the dev's own Max subscription rather than
+// the global token in .env. Falls back to the global token when DEVBRAIN_DEV_ID
+// isn't set (Patrick's BrightBrain MCP entry doesn't set it; cognify there
+// uses the .env token, which is his Max sub).
+function resolvePerDevToken(): { devId: string; token: string } | null {
+  const devId = process.env.DEVBRAIN_DEV_ID
+  if (!devId) return null
+  const tokenPath = resolve(
+    homedir(), 'devbrain', 'profiles', devId, '.claude', 'oauth-token'
+  )
+  if (!existsSync(tokenPath)) return null
+  try {
+    const token = readFileSync(tokenPath, 'utf-8').trim()
+    return token ? { devId, token } : null
+  } catch {
+    return null
+  }
+}
+
+// Spawn `devbrain cognify --pass=extract --project=<slug>` in the background.
+// Detached + stdio:'ignore' so the MCP server's stdio (which carries the JSON-RPC
+// protocol back to the dev's local agent) is never contaminated by cognify
+// output, and end_session's response returns immediately. If cognify itself
+// errors (DB blip, no LLM credential, etc.), the next launchd-scheduled run
+// catches the still-unprocessed session — safe fallback.
+function triggerCognifyExtractInBackground(projectSlug: string): void {
+  const env: NodeJS.ProcessEnv = { ...process.env }
+  const perDev = resolvePerDevToken()
+  if (perDev) {
+    env.CLAUDE_CODE_OAUTH_TOKEN = perDev.token
+    // For log attribution — cognify logs which dev's sub got billed.
+    env.DEVBRAIN_COGNIFY_ATTRIBUTION = perDev.devId
+  }
+  try {
+    const child = spawn(
+      DEVBRAIN_PYTHON,
+      [DEVBRAIN_CLI, 'cognify', '--pass=extract', `--project=${projectSlug}`],
+      {
+        cwd: resolve(import.meta.dirname, '../../factory'),
+        env,
+        detached: true,
+        stdio: 'ignore',
+      },
+    )
+    child.unref()
+  } catch {
+    // Spawn failure is non-fatal — launchd will catch up.
+  }
+}
 
 function runDevbrainCli(args: string[]): { stdout: string; stderr: string; exitCode: number } {
   const result = spawnSync(DEVBRAIN_PYTHON, [DEVBRAIN_CLI, ...args], {
@@ -970,6 +1025,14 @@ server.tool(
       provenanceId: chunkResult.rows[0]?.id ?? null,
     })
 
+    // Trigger a cognify-extract pass in the background so this session's
+    // content gets LLM-derived lessons/decisions promptly — rather than
+    // waiting up to ~24h for the next launchd tick. Bills against the
+    // calling dev's Max sub when DEVBRAIN_DEV_ID is set (per-dev
+    // attribution); otherwise the global .env token. Detached + stdio:
+    // ignore: end_session returns immediately, cognify runs async.
+    triggerCognifyExtractInBackground(project)
+
     // Atlas Step 5e: structured-judgment enrichment.
     //
     // If the agent volunteered cascade_decisions / new_relationships /
@@ -1792,8 +1855,6 @@ server.tool(
 //
 // The URL is the tunnel-exposed loopback address on THIS machine — set up
 // the SSH tunnel separately (e.g., `ssh -L 18900:127.0.0.1:18900 mac-studio`).
-
-import { readFileSync } from 'fs'
 import YAML from 'yaml'
 
 interface AgentBusTarget {

@@ -308,6 +308,26 @@ def test_phase6_verify_command_present_all_clis(tmp_path):
         assert "whoami" in content
 
 
+def test_phase6_mcp_entry_injects_dev_id_env(tmp_path):
+    """Kit's Phase 6 MCP config must include `env DEVBRAIN_DEV_ID=<dev_id>` so
+    the MCP server on Mac Studio knows which dev is calling — used by the
+    cognify-on-end_session trigger to route per-dev OAuth tokens. Asserts
+    BOTH bash heredoc and PowerShell variants carry it."""
+    content = _write(tmp_path, "claude", platform="auto")
+    # bash variant — heredoc'd JSON
+    assert '"env", "DEVBRAIN_DEV_ID=alice"' in content
+    # PowerShell variant — args array
+    assert '"env", "DEVBRAIN_DEV_ID=alice"' in content  # bash heredoc form
+    assert '"DEVBRAIN_DEV_ID=alice"' in content  # PowerShell form
+
+
+def test_phase6_dev_id_substituted_per_kit(tmp_path):
+    """Each kit's MCP entry should have THAT dev's id, not a placeholder."""
+    content = _write(tmp_path, "claude")
+    assert "DEVBRAIN_DEV_ID={dev_id}" not in content  # placeholder leaked
+    assert "DEVBRAIN_DEV_ID=alice" in content        # substituted
+
+
 # ─── Phase 7: Cleanup ────────────────────────────────────────────────────────
 
 def test_phase7_removes_bootstrap_key_all_clis(tmp_path):
