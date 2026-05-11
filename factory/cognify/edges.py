@@ -333,12 +333,12 @@ def _llm_judge_contradiction(
     except ImportError:
         return False, _empty_usage
 
-    import os
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
+    from cognify._anthropic_auth import resolve_anthropic_auth
+    auth_kwargs = resolve_anthropic_auth()
+    if auth_kwargs is None:
         return False, _empty_usage
 
-    client = anthropic.Anthropic(api_key=api_key)
+    client = anthropic.Anthropic(**auth_kwargs)
     prompt = (
         "Do these two memory entries contradict each other? "
         "Reply with only 'YES' or 'NO'.\n\n"
