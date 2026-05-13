@@ -122,6 +122,7 @@ def run_pass(
     *,
     dry_run: bool = False,
     cross_project: bool = False,
+    max_llm_calls: int | None = None,
 ) -> PassResult:
     """Run a single named pass and record it in cognify_run_log.
 
@@ -133,6 +134,10 @@ def run_pass(
         cross_project: only honored by passes that opt in (currently
             'edges' for canonical-rule contradiction sweeps). Other
             passes ignore the flag.
+        max_llm_calls: per-pass override for the LLM-call ceiling. Only
+            honored by LLM-cost passes (extract + edges). Zero-LLM passes
+            (decay, gc, strengthen) ignore it. When None (default), each
+            pass uses its own built-in MAX_LLM_CALLS_PER_PASS constant.
 
     Returns:
         PassResult from the pass.
@@ -155,14 +160,17 @@ def run_pass(
     error_text: str | None = None
 
     try:
-        # Pass-specific kwargs: only forward cross_project to passes that
-        # accept it. The introspection check keeps the signature optional
-        # without forcing every pass to declare it.
+        # Pass-specific kwargs: only forward optional flags to passes
+        # whose .run() signature declares them. Keeps each pass'
+        # signature minimal without forcing every pass to accept every
+        # orchestrator-wide flag.
         kwargs = {"dry_run": dry_run}
         import inspect
         sig = inspect.signature(instance.run)
         if "cross_project" in sig.parameters:
             kwargs["cross_project"] = cross_project
+        if "max_llm_calls" in sig.parameters:
+            kwargs["max_llm_calls"] = max_llm_calls
         result = instance.run(conn, project_id, **kwargs)
     except Exception as exc:
         error_text = traceback.format_exc()[:2000]
@@ -184,6 +192,7 @@ def run_all(
     *,
     dry_run: bool = False,
     cross_project: bool = False,
+    max_llm_calls: int | None = None,
 ) -> dict[str, PassResult]:
     """Run all 5 passes in dependency order.
 
@@ -192,6 +201,8 @@ def run_all(
     flaky LLM in 'extract' doesn't block 'strengthen'.
 
     cross_project is forwarded to passes that accept it (currently 'edges').
+    max_llm_calls is forwarded to LLM-cost passes (extract + edges); zero-
+    LLM passes ignore it.
     """
     _ensure_registry()
     results: dict[str, PassResult] = {}
@@ -199,7 +210,9 @@ def run_all(
         try:
             results[name] = run_pass(
                 conn, name, project_id,
-                dry_run=dry_run, cross_project=cross_project,
+                dry_run=dry_run,
+                cross_project=cross_project,
+                max_llm_calls=max_llm_calls,
             )
         except RuntimeError:
             # Logged inside run_pass; continue to next pass.

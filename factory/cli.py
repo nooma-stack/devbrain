@@ -2884,9 +2884,14 @@ def cmd_rules_lint():
               help="Edges pass only: include canonical 'devbrain' rules library "
                    "as candidate-pair source. Detects when project lessons "
                    "contradict canonical regulatory rules. Other passes ignore.")
+@click.option("--max-llm-calls", "max_llm_calls", type=int, default=None,
+              help="Override the per-pass LLM-call ceiling (extract + edges "
+                   "only; zero-LLM passes ignore). When omitted, each pass "
+                   "uses its built-in default (extract=20, edges=15). "
+                   "Use 0 to skip LLM work entirely.")
 @click.option("--json", "as_json", is_flag=True, default=False,
               help="Emit result as JSON.")
-def cognify_command(pass_name, run_all, project_slug, dry_run, cross_project, as_json):
+def cognify_command(pass_name, run_all, project_slug, dry_run, cross_project, max_llm_calls, as_json):
     """Run one or all cognify passes.
 
     Examples:\n
@@ -2894,7 +2899,9 @@ def cognify_command(pass_name, run_all, project_slug, dry_run, cross_project, as
       devbrain cognify --pass=extract --project=myproject\n
       devbrain cognify --all --project=myproject\n
       devbrain cognify --pass=decay --dry-run\n
-      devbrain cognify --pass=edges --project=brightbot --cross-project
+      devbrain cognify --pass=edges --project=brightbot --cross-project\n
+      devbrain cognify --pass=edges --project=brightbot --max-llm-calls=5\n
+      devbrain cognify --pass=extract --project=brightbot --max-llm-calls=0
     """
     import sys
     from config import DATABASE_URL
@@ -2925,7 +2932,10 @@ def cognify_command(pass_name, run_all, project_slug, dry_run, cross_project, as
     with db._conn() as conn:
         if run_all:
             results = _run_all(
-                conn, project_id, dry_run=dry_run, cross_project=cross_project
+                conn, project_id,
+                dry_run=dry_run,
+                cross_project=cross_project,
+                max_llm_calls=max_llm_calls,
             )
             if as_json:
                 import json as _json
@@ -2942,7 +2952,9 @@ def cognify_command(pass_name, run_all, project_slug, dry_run, cross_project, as
         else:
             result = _run_pass(
                 conn, pass_name, project_id,
-                dry_run=dry_run, cross_project=cross_project,
+                dry_run=dry_run,
+                cross_project=cross_project,
+                max_llm_calls=max_llm_calls,
             )
             if as_json:
                 import json as _json
