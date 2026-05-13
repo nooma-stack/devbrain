@@ -7,7 +7,7 @@ import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join, resolve } from 'path'
 import { z } from 'zod'
-import { query } from './db.js'
+import { query, waitForDb } from './db.js'
 import { embed, toSqlVector } from './embeddings.js'
 import { enqueueCascades, recordMemory, recordMemoryDependency, resolveMemoryId } from './memory.js'
 import {
@@ -2197,6 +2197,31 @@ server.tool(
 // ─── Start server ────────────────────────────────────────────────────────────
 
 async function main() {
+  // Probe the DB before we tell the MCP client we're ready. If the DB
+  // is unreachable (Docker not running, container down, wrong creds),
+  // exit fast with a clear stderr message rather than coming up, letting
+  // the client connect, and then having every tool call hang/return
+  // opaquely on the first query.
+  //
+  // The check can be skipped with DEVBRAIN_MCP_SKIP_DB_PROBE=1 for tests
+  // and recovery scenarios where you genuinely want to start the MCP
+  // without a working DB (e.g. to use tools that don't touch the DB,
+  // or to keep stdio open while you fix Docker in another shell).
+  if (process.env.DEVBRAIN_MCP_SKIP_DB_PROBE !== '1') {
+    try {
+      await waitForDb(5000)
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      console.error('\n[devbrain-mcp] DB unreachable — refusing to start.')
+      console.error(`[devbrain-mcp] ${msg}`)
+      console.error(
+        '[devbrain-mcp] Set DEVBRAIN_MCP_SKIP_DB_PROBE=1 to bypass this ' +
+        'check (tool calls that touch the DB will fail with the same ' +
+        'error message at call time).\n',
+      )
+      process.exit(1)
+    }
+  }
   const transport = new StdioServerTransport()
   await server.connect(transport)
 }
