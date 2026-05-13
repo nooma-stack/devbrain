@@ -77,13 +77,22 @@ class ExtractPass(CognifyPass):
 
     pass_name = "extract"
 
-    def run(self, conn: Any, project_id: Any, *, dry_run: bool = False) -> PassResult:
+    def run(
+        self,
+        conn: Any,
+        project_id: Any,
+        *,
+        dry_run: bool = False,
+        max_llm_calls: int | None = None,
+    ) -> PassResult:
         """Extract lessons/decisions from sessions ingested since last pass.
 
         Args:
             conn: psycopg2 connection.
             project_id: UUID. Required for extract (LLM pass; project-scoped).
             dry_run: if True, compute candidate sessions without extracting.
+            max_llm_calls: per-pass ceiling on LLM calls. When None (default),
+                uses MAX_LLM_CALLS_PER_PASS=20.
 
         Returns:
             PassResult with row counts.
@@ -93,6 +102,8 @@ class ExtractPass(CognifyPass):
                 "cognify_extract requires a project_id "
                 "(it's an LLM-cost pass; always project-scoped)"
             )
+
+        cap = max_llm_calls if max_llm_calls is not None else MAX_LLM_CALLS_PER_PASS
 
         since = _last_successful_run(conn, "extract", project_id)
         candidate_sessions = _sessions_since(conn, project_id, since)
@@ -114,10 +125,10 @@ class ExtractPass(CognifyPass):
         sessions_processed = 0
 
         for session_id in candidate_sessions:
-            if total_llm >= MAX_LLM_CALLS_PER_PASS:
+            if total_llm >= cap:
                 logger.info(
                     "cognify_extract: LLM cap (%d) reached, deferring %d sessions",
-                    MAX_LLM_CALLS_PER_PASS,
+                    cap,
                     len(candidate_sessions) - sessions_processed,
                 )
                 break
@@ -125,7 +136,7 @@ class ExtractPass(CognifyPass):
                 conn,
                 session_id,
                 project_id,
-                max_llm_calls=MAX_LLM_CALLS_PER_PASS - total_llm,
+                max_llm_calls=cap - total_llm,
             )
             total_lessons += result.lessons_created
             total_decisions += result.decisions_created

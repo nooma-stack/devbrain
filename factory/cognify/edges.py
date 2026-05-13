@@ -79,6 +79,7 @@ class EdgesPass(CognifyPass):
         *,
         dry_run: bool = False,
         cross_project: bool = False,
+        max_llm_calls: int | None = None,
     ) -> PassResult:
         if project_id is None:
             raise ValueError(
@@ -86,7 +87,10 @@ class EdgesPass(CognifyPass):
             )
 
         cites_new, contradicts_new, llm_calls = _run_edges(
-            conn, project_id, dry_run=dry_run, cross_project=cross_project
+            conn, project_id,
+            dry_run=dry_run,
+            cross_project=cross_project,
+            max_llm_calls=max_llm_calls,
         )
         return PassResult(
             rows_processed=cites_new + contradicts_new,
@@ -105,17 +109,23 @@ def _run_edges(
     *,
     dry_run: bool = False,
     cross_project: bool = False,
+    max_llm_calls: int | None = None,
 ) -> tuple[int, int, int]:
     """Main edges pass logic. Returns (cites_new, contradicts_new, llm_calls).
 
     cites detection stays strictly project-local (text-pattern match;
     no walker involvement). Only contradicts detection honors
     cross_project when True.
+
+    max_llm_calls: per-pass ceiling on contradicts-detection LLM calls.
+    When None (default), uses MAX_LLM_CALLS_PER_PASS=15. cites detection
+    is zero-LLM and ignores this.
     """
     cites_new = _detect_cites(conn, project_id, dry_run=dry_run)
     contradicts_new, llm_calls = _detect_contradicts(
         conn, project_id, dry_run=dry_run, record_conn=conn,
         cross_project=cross_project,
+        max_llm_calls=max_llm_calls,
     )
     return cites_new, contradicts_new, llm_calls
 
@@ -184,6 +194,7 @@ def _detect_contradicts(
     dry_run: bool = False,
     record_conn: Any = None,
     cross_project: bool = False,
+    max_llm_calls: int | None = None,
 ) -> tuple[int, int]:
     """Detect contradicts edges using Phase 5 graph_walk + LLM judgment.
 
@@ -252,8 +263,9 @@ def _detect_contradicts(
 
     new_edges = 0
     llm_calls = 0
-    for from_id, to_id in candidate_pairs[:MAX_LLM_CALLS_PER_PASS]:
-        if llm_calls >= MAX_LLM_CALLS_PER_PASS:
+    cap = max_llm_calls if max_llm_calls is not None else MAX_LLM_CALLS_PER_PASS
+    for from_id, to_id in candidate_pairs[:cap]:
+        if llm_calls >= cap:
             break
         content_a = content_by_id.get(from_id, "")
         content_b = content_by_id.get(to_id, "")
