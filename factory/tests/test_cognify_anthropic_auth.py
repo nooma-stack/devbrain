@@ -30,7 +30,12 @@ _OAUTH_PREFIX = (
 def _isolated_env(**vars):
     """Strip the target env vars to start clean, then layer in `vars`."""
     base = {k: v for k, v in os.environ.items()
-            if k not in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_AUTH_TOKEN")}
+            if k not in (
+                "ANTHROPIC_API_KEY",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "DEVBRAIN_COGNIFY_OAUTH_TOKEN",
+                "ANTHROPIC_AUTH_TOKEN",
+            )}
     base.update(vars)
     return base
 
@@ -100,6 +105,69 @@ def test_empty_string_env_treated_as_unset():
             "auth_token": "sk-ant-oat1-USE-ME",
             "default_headers": _OAUTH_BETA,
         }
+
+
+# ── DEVBRAIN_COGNIFY_OAUTH_TOKEN (system fallback) ───────────────────────────
+
+
+def test_devbrain_cognify_token_used_when_only_system_token_set():
+    """Launchd / system-only case: no dev token in env. The system
+    fallback DEVBRAIN_COGNIFY_OAUTH_TOKEN wins."""
+    env = _isolated_env(DEVBRAIN_COGNIFY_OAUTH_TOKEN="sk-ant-oat1-SYSTEM")
+    with patch.dict(os.environ, env, clear=True):
+        assert resolve_anthropic_auth() == {
+            "auth_token": "sk-ant-oat1-SYSTEM",
+            "default_headers": _OAUTH_BETA,
+        }
+
+
+def test_dev_token_wins_over_system_token():
+    """End_session case: both dev's session token AND system token are
+    in env (system from .env, dev from session). Dev wins — that's the
+    per-dev attribution feature."""
+    env = _isolated_env(
+        CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat1-DEV-WINS",
+        DEVBRAIN_COGNIFY_OAUTH_TOKEN="sk-ant-oat1-SYSTEM-LOSES",
+    )
+    with patch.dict(os.environ, env, clear=True):
+        assert resolve_anthropic_auth() == {
+            "auth_token": "sk-ant-oat1-DEV-WINS",
+            "default_headers": _OAUTH_BETA,
+        }
+
+
+def test_console_key_still_wins_over_both_oauth_tokens():
+    """Explicit Console key beats any OAuth precedence."""
+    env = _isolated_env(
+        ANTHROPIC_API_KEY="sk-ant-api03-CONSOLE-WINS",
+        CLAUDE_CODE_OAUTH_TOKEN="sk-ant-oat1-DEV-LOSES",
+        DEVBRAIN_COGNIFY_OAUTH_TOKEN="sk-ant-oat1-SYSTEM-LOSES",
+    )
+    with patch.dict(os.environ, env, clear=True):
+        assert resolve_anthropic_auth() == {"api_key": "sk-ant-api03-CONSOLE-WINS"}
+
+
+def test_system_token_wins_over_legacy_anthropic_auth_token():
+    """DEVBRAIN_COGNIFY_OAUTH_TOKEN beats the legacy ANTHROPIC_AUTH_TOKEN
+    name, since it's the more specific (cognify-purpose-built) slot."""
+    env = _isolated_env(
+        DEVBRAIN_COGNIFY_OAUTH_TOKEN="sk-ant-oat1-NEW-SYSTEM",
+        ANTHROPIC_AUTH_TOKEN="sk-ant-oat1-OLD-LEGACY",
+    )
+    with patch.dict(os.environ, env, clear=True):
+        assert resolve_anthropic_auth() == {
+            "auth_token": "sk-ant-oat1-NEW-SYSTEM",
+            "default_headers": _OAUTH_BETA,
+        }
+
+
+def test_system_prefix_present_for_system_token_only():
+    """When only DEVBRAIN_COGNIFY_OAUTH_TOKEN is set (launchd case),
+    the system prefix must still be returned — Anthropic gates on the
+    prefix regardless of which OAuth slot the token came from."""
+    env = _isolated_env(DEVBRAIN_COGNIFY_OAUTH_TOKEN="sk-ant-oat1-SYSTEM")
+    with patch.dict(os.environ, env, clear=True):
+        assert claude_code_system_prefix() == _OAUTH_PREFIX
 
 
 # ── claude_code_system_prefix ────────────────────────────────────────────────

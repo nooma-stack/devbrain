@@ -452,6 +452,64 @@ def setup_cognify_launchd_cmd(project_slug, reload):
         click.echo(f"reloaded {len(installed)} launchd job(s)")
 
 
+@cli.command(name="rotate-token")
+@click.option(
+    "--system", "is_system", is_flag=True, default=False,
+    help="Rotate the system DEVBRAIN_COGNIFY_OAUTH_TOKEN in .env. "
+         "Used by scheduled launchd cognify passes when no dev is "
+         "present. Reloads cognify launchd jobs after replacement.",
+)
+@click.option(
+    "--dev", "dev_id", default=None,
+    help="Rotate the named dev's personal OAuth token at "
+         "profiles/<dev_id>/.claude/oauth-token. Used by that dev's "
+         "interactive sessions and by cognify when triggered from their "
+         "end_session.",
+)
+@click.option(
+    "--no-reload-launchd", "no_reload", is_flag=True, default=False,
+    help="(--system only) Skip the launchctl unload+load step. The "
+         "next plist firing will pick up the new token on its own.",
+)
+def rotate_token_cmd(is_system, dev_id, no_reload):
+    """Mint a fresh OAuth token and atomically replace the target.
+
+    Exactly one of `--system` or `--dev=<id>` must be supplied.
+
+    The rotation runs `claude setup-token` interactively — you'll need
+    to open the printed URL in your browser, sign in, and paste the
+    verification code back. The captured token replaces the target
+    atomically. Prior value is backed up to `<target>.pre-rotate.<ts>`.
+
+    Examples:\n
+      devbrain rotate-token --system\n
+      devbrain rotate-token --dev=mike_courtney\n
+      devbrain rotate-token --system --no-reload-launchd
+    """
+    if is_system == bool(dev_id):
+        raise click.UsageError(
+            "Specify exactly one of --system or --dev=<id>."
+        )
+
+    from rotate_token import rotate_system_token, rotate_dev_token
+
+    if is_system:
+        result = rotate_system_token(reload_launchd=not no_reload)
+    else:
+        result = rotate_dev_token(dev_id)
+
+    if not result.success:
+        click.echo(f"error: {result.error}", err=True)
+        if result.hint:
+            click.echo(f"  hint: {result.hint}", err=True)
+        sys.exit(1)
+
+    click.echo(f"✅ rotated: {result.target_path}")
+    click.echo(f"   new token: {result.token_preview}")
+    if result.backup_path is not None:
+        click.echo(f"   backup:    {result.backup_path}")
+
+
 @cli.command(name="add-channel")
 @click.option("--dev-id", default=None)
 @click.option("--channel", "channel_spec", required=True, help="TYPE:ADDRESS")
