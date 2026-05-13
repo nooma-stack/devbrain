@@ -1,0 +1,106 @@
+name: llm-smoke-test
+
+# Defense against the class of bug from PR #119: code that looks correct
+# in unit tests but 429s the moment it hits live /v1/messages because
+# the auth shape, system-prompt fingerprint, or beta header is subtly
+# wrong.
+#
+# Runs ONE real Anthropic API call against `_llm_extract` with a tiny
+# fixture session. Cost: ~$0.01-0.03 per run.
+#
+# Trigger conditions (ANY of):
+#   1. PR touches files under factory/cognify/, factory/ai_clis/, or
+#      mcp-server/src/ — paths where an auth/LLM regression is most likely.
+#   2. PR is explicitly labeled `llm-smoke-test`.
+#   3. Manual run via workflow_dispatch.
+#
+# Skips:
+#   * PR is from a fork (secret won't be available, would fail every run).
+#   * Repository secret CI_ANTHROPIC_OAUTH_TOKEN is not configured.
+#   * Commit message contains `[skip-llm-smoke]`.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - 'factory/cognify/**'
+      - 'factory/ai_clis/**'
+      - 'mcp-server/src/**'
+      - 'factory/tests/llm_smoke/**'
+      - '.github/workflows/llm-smoke-test.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: llm-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  llm-smoke:
+    name: llm-smoke (real API call)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    # Skip on forks (no secret access) and on opt-out commit messages.
+    # The label gate ALSO runs the job even when paths-filter wouldn't,
+    # so reviewers can request a smoke test on any PR by adding the
+    # `llm-smoke-test` label.
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !contains(github.event.head_commit.message, '[skip-llm-smoke]') &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        github.event.action == 'labeled' && github.event.label.name == 'llm-smoke-test' ||
+        github.event.action != 'labeled'
+      )
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Check secret availability
+        # If the secret isn't configured (forked repo, or admin removed it),
+        # fail clearly rather than hanging or producing a confusing
+        # pytest skip.
+        env:
+          CI_ANTHROPIC_OAUTH_TOKEN: ${{ secrets.CI_ANTHROPIC_OAUTH_TOKEN }}
+        run: |
+          if [ -z "$CI_ANTHROPIC_OAUTH_TOKEN" ]; then
+            echo "::warning::CI_ANTHROPIC_OAUTH_TOKEN secret not configured. Skipping LLM smoke test."
+            echo "Add a subscription OAuth token (sk-ant-oat01-...) to the repo's Actions secrets to enable."
+            exit 0
+          fi
+          echo "Secret is configured (first 20 chars: ${CI_ANTHROPIC_OAUTH_TOKEN:0:20}...)"
+
+      - name: Run LLM smoke test
+        # Expose the secret as CLAUDE_CODE_OAUTH_TOKEN so the existing
+        # cognify._anthropic_auth.resolve_anthropic_auth() picks it up
+        # via the documented env var rather than needing a CI-specific
+        # branch.
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CI_ANTHROPIC_OAUTH_TOKEN }}
+          PYTHONPATH: factory
+        run: |
+          python -m pytest factory/tests/llm_smoke/ -v --tb=short -p no:cacheprovider
+
+      - name: Report cost
+        if: always()
+        run: |
+          echo "::notice::LLM smoke test run complete. Each run is one Sonnet 4.6 call (~\$0.01-0.03)."

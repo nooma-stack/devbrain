@@ -1,0 +1,17 @@
+[Session Summary — auth migration discussion]
+
+Patrick and Claude discussed migrating the BrightBot auth layer from JWT bearer tokens to OAuth 2.0 setup-tokens for the Anthropic API integration.
+
+Key decisions:
+- Replace ANTHROPIC_API_KEY env var with CLAUDE_CODE_OAUTH_TOKEN as the primary credential
+- Console API key remains the fallback for non-subscription workloads
+- Adapter writes token to profiles/<dev>/.claude/oauth-token (atomic; chmod 0600)
+
+Lessons learned:
+- OAuth setup-token tokens have prefix sk-ant-oat\d+- (one or more digits, not fixed)
+- Bearer auth alone is insufficient; Anthropic requires anthropic-beta: oauth-2025-04-20 header
+- The system prompt's first block must be the literal Claude Code SDK fingerprint, or /v1/messages returns 429 with a terse error masquerading as a rate limit
+
+Next steps:
+- Build a rotate-token CLI for system + per-dev token rotation
+- Add CI smoke test exercising the live API path
