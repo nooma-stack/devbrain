@@ -102,6 +102,7 @@ def run_reextract(
 
     total_lessons = 0
     total_decisions = 0
+    failure_counts: dict[str, int] = {}
 
     for sid in sessions:
         result = extract_from_session(
@@ -112,12 +113,19 @@ def run_reextract(
         )
         total_lessons += result.lessons_created
         total_decisions += result.decisions_created
+        if result.failure:
+            failure_counts[result.failure] = failure_counts.get(result.failure, 0) + 1
         # archived count is recorded internally via _archive_prior_extracts.
 
     return {
         "sessions_targeted": len(sessions),
+        # LLM-side naming (what the model produces); DB stores these under
+        # `kind='pattern'`, so `patterns_created` is an alias.
         "lessons_created": total_lessons,
+        "patterns_created": total_lessons,
         "decisions_created": total_decisions,
+        # A4: visibility into silent JSON parse / API failures during reextract.
+        "failure_counts": failure_counts,
     }
 
 
