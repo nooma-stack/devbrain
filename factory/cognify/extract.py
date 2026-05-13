@@ -400,17 +400,27 @@ def _llm_extract(content: str, *, max_llm_calls: int = 1) -> dict:
         "Return only the JSON, no preamble."
     )
 
+    # OAuth path requires the Claude Code SDK fingerprint as the first
+    # system block — without it /v1/messages 429s on subscription tokens.
+    # Console API key path returns None and is unaffected.
+    from cognify._anthropic_auth import claude_code_system_prefix
+    system_blocks: list[dict[str, Any]] = []
+    oauth_prefix = claude_code_system_prefix()
+    if oauth_prefix:
+        system_blocks.append({"type": "text", "text": oauth_prefix})
+    system_blocks.append(
+        {
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        }
+    )
+
     try:
         response = client.messages.create(
             model=_EXTRACT_MODEL,
             max_tokens=2048,
-            system=[
-                {
-                    "type": "text",
-                    "text": system_prompt,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
+            system=system_blocks,
             messages=[
                 {
                     "role": "user",
@@ -438,7 +448,7 @@ def _llm_extract(content: str, *, max_llm_calls: int = 1) -> dict:
         return {"lessons": [], "decisions": [], "_usage": _empty_usage}
 
 
-def _resolve_auth() -> dict[str, str] | None:
+def _resolve_auth() -> dict[str, Any] | None:
     """Resolve Anthropic credential to SDK kwargs (api_key= or auth_token=).
 
     Accepts a Console API key OR a subscription OAuth token; the SDK
