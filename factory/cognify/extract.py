@@ -416,15 +416,22 @@ def _llm_extract(content: str, *, max_llm_calls: int = 1) -> dict:
         }
     )
 
+    # max_tokens=16000: stays under the SDK's ~10-min non-streaming timeout
+    # guard while giving room for rich JSON output on long sessions. Sonnet
+    # 4.6 supports 64K output but anything above ~16K requires streaming.
+    #
+    # Input cap of 200_000 chars (~50K tokens) — Sonnet 4.6 has a 1M context
+    # window, but real session_summaries top out well below 200K chars. The
+    # previous 8K cap silently discarded 95%+ of any non-trivial summary.
     try:
         response = client.messages.create(
             model=_EXTRACT_MODEL,
-            max_tokens=2048,
+            max_tokens=16000,
             system=system_blocks,
             messages=[
                 {
                     "role": "user",
-                    "content": f"Extract lessons and decisions from this session:\n\n{content[:8000]}",
+                    "content": f"Extract lessons and decisions from this session:\n\n{content[:200_000]}",
                 }
             ],
         )
