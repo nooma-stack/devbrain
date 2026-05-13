@@ -333,7 +333,10 @@ def _llm_judge_contradiction(
     except ImportError:
         return False, _empty_usage
 
-    from cognify._anthropic_auth import resolve_anthropic_auth
+    from cognify._anthropic_auth import (
+        claude_code_system_prefix,
+        resolve_anthropic_auth,
+    )
     auth_kwargs = resolve_anthropic_auth()
     if auth_kwargs is None:
         return False, _empty_usage
@@ -344,12 +347,19 @@ def _llm_judge_contradiction(
         "Reply with only 'YES' or 'NO'.\n\n"
         f"Entry A:\n{content_a[:500]}\n\nEntry B:\n{content_b[:500]}"
     )
+    # OAuth path requires the Claude Code SDK fingerprint as the system
+    # prompt — without it /v1/messages 429s on subscription tokens.
+    # Console API key path returns None and the call uses no system prompt.
+    create_kwargs: dict[str, Any] = {
+        "model": _EDGES_MODEL,
+        "max_tokens": 8,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    oauth_prefix = claude_code_system_prefix()
+    if oauth_prefix:
+        create_kwargs["system"] = oauth_prefix
     try:
-        response = client.messages.create(
-            model=_EDGES_MODEL,
-            max_tokens=8,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        response = client.messages.create(**create_kwargs)
         usage = response.usage
         token_usage = {
             "input_tokens": getattr(usage, "input_tokens", 0),
