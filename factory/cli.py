@@ -403,6 +403,55 @@ def setup_multi_dev_cmd(host, port, database, username, password):
         sys.exit(1)
 
 
+@cli.command(name="setup-cognify-launchd")
+@click.option(
+    "--project", "project_slug", required=True,
+    help="Project slug to scope LLM-cost passes (extract, edges, strengthen). "
+         "Must match an existing project in DevBrain.",
+)
+@click.option(
+    "--reload/--no-reload", default=True,
+    help="Run `launchctl unload && launchctl load` on each installed plist. "
+         "Default: yes — picks up the new schedule immediately.",
+)
+def setup_cognify_launchd_cmd(project_slug, reload):
+    """Install + configure the 5 cognify launchd jobs on this user.
+
+    Renders the source plist templates from `factory/cognify/launchd/`
+    (substituting ${DEVBRAIN_HOME}, ${USER}, ${PROJECT_SLUG}, and the
+    credential env block) and writes the resulting plists to
+    ~/Library/LaunchAgents/. chmod 0600 on the two that carry an
+    Anthropic credential (extract + edges); 0644 on the other three.
+
+    The Anthropic credential is resolved from the current env:
+    ANTHROPIC_API_KEY wins; CLAUDE_CODE_OAUTH_TOKEN (or
+    ANTHROPIC_AUTH_TOKEN) is the fallback. Errors if neither is set.
+
+    Idempotent — safe to re-run with the same args.
+
+    Replaces the manual `cp factory/cognify/launchd/*.plist
+    ~/Library/LaunchAgents/` workflow that leaves literal
+    ${PROJECT_SLUG} placeholders in the installed files (the 2026-05-11
+    regression on Mac Studio).
+    """
+    from cognify.setup_launchd import install_cognify_launchd
+    try:
+        installed = install_cognify_launchd(
+            project_slug=project_slug,
+            reload=reload,
+        )
+    except ValueError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(2)
+    except FileNotFoundError as exc:
+        click.echo(f"error: {exc}", err=True)
+        sys.exit(2)
+    for path in installed:
+        click.echo(f"installed: {path}")
+    if reload:
+        click.echo(f"reloaded {len(installed)} launchd job(s)")
+
+
 @cli.command(name="add-channel")
 @click.option("--dev-id", default=None)
 @click.option("--channel", "channel_spec", required=True, help="TYPE:ADDRESS")

@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
     "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- cognify_strengthen: daily graduation + demotion sweep. Zero LLM cost.  -->
-<!-- Placeholders: ${DEVBRAIN_HOME}, ${USER}, ${PROJECT_SLUG} filled by      -->
-<!--   `devbrain setup` or replaced manually before loading.                 -->
+<!-- cognify_strengthen: daily graduation + demotion sweep. Zero LLM cost.   -->
+<!-- Placeholders ${DEVBRAIN_HOME}, ${USER}, ${PROJECT_SLUG} are substituted -->
+<!-- by `devbrain setup-cognify-launchd`. Do NOT cp this file directly into  -->
+<!-- ~/Library/LaunchAgents/ — placeholders won't expand and launchd will    -->
+<!-- fail at runtime with a literal "${PROJECT_SLUG}" error.                 -->
 <plist version="1.0">
 <dict>
     <key>Label</key>

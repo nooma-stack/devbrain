@@ -2,9 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
     "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- cognify_extract: hourly lesson/decision extraction. Up to 20 LLM calls. -->
-<!-- Requires: ANTHROPIC_API_KEY and --project=<slug> for LLM-cost pass.     -->
-<!-- Placeholders: ${DEVBRAIN_HOME}, ${USER}, ${PROJECT_SLUG} are filled in  -->
-<!--   by `devbrain setup` or replaced manually before loading.              -->
+<!-- Requires an Anthropic credential and --project=<slug> for LLM-cost pass.-->
+<!-- Placeholders ${DEVBRAIN_HOME}, ${USER}, ${PROJECT_SLUG}, and the         -->
+<!-- credential-env marker are substituted by                                 -->
+<!-- `devbrain setup-cognify-launchd`. Do NOT cp this file directly into      -->
+<!-- ~/Library/LaunchAgents/ — placeholders won't expand and launchd will     -->
+<!-- fail at runtime with a literal "${PROJECT_SLUG}" error.                  -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -29,8 +32,8 @@
         <string>${DEVBRAIN_HOME}</string>
         <key>PYTHONPATH</key>
         <string>${DEVBRAIN_HOME}/factory</string>
-        <key>ANTHROPIC_API_KEY</key>
-        <string>${ANTHROPIC_API_KEY}</string>
+        <!-- @CREDENTIAL_ENV_BLOCK@ — installer emits ANTHROPIC_API_KEY or  -->
+        <!-- CLAUDE_CODE_OAUTH_TOKEN here based on env at install time.    -->
     </dict>
 
     <key>WorkingDirectory</key>

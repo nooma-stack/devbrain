@@ -1,10 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
     "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- cognify_gc: weekly archive of low-strength orphans. Zero LLM cost.     -->
+<!-- cognify_gc: weekly archive of low-strength orphans. Zero LLM cost.      -->
 <!-- NEVER deletes rows — sets archived_at only (HIPAA audit trail).         -->
-<!-- Placeholders: ${DEVBRAIN_HOME} and ${USER} filled by `devbrain setup`   -->
-<!--   or replaced manually before loading.                                  -->
+<!-- Placeholders ${DEVBRAIN_HOME} and ${USER} are substituted by            -->
+<!-- `devbrain setup-cognify-launchd`. Do NOT cp this file directly into     -->
+<!-- ~/Library/LaunchAgents/ — placeholders won't expand and launchd will    -->
+<!-- fail at runtime.                                                        -->
 <plist version="1.0">
 <dict>
     <key>Label</key>

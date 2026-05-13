@@ -2,9 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
     "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- cognify_decay: hourly time-based strength decay. Zero LLM cost.         -->
-<!-- Install: cp this file to ~/Library/LaunchAgents/ and launchctl load it. -->
-<!-- Placeholders: ${DEVBRAIN_HOME} and ${USER} are filled in by             -->
-<!--   `devbrain setup` (or replace manually before loading).                -->
+<!-- Placeholders ${DEVBRAIN_HOME} and ${USER} are substituted by            -->
+<!-- `devbrain setup-cognify-launchd`. Do NOT cp this file directly into     -->
+<!-- ~/Library/LaunchAgents/ — placeholders won't expand and launchd will    -->
+<!-- fail at runtime.                                                        -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
