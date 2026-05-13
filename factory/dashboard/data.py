@@ -252,3 +252,128 @@ class DashboardData:
                 for r in reports
             ],
         }
+
+    # Pass schedule (seconds between runs). Used to derive `down` state
+    # — if no run has happened within `expected_interval * DOWN_FACTOR`,
+    # we consider the launchd job stopped. Matches the StartInterval
+    # values in factory/cognify/launchd/com.devbrain.cognify-*.plist.
+    _COGNIFY_PASS_SCHEDULE: dict[str, int] = {
+        "extract":    3_600,   # hourly
+        "edges":      21_600,  # every 6h
+        "decay":      3_600,   # hourly
+        "strengthen": 86_400,  # daily
+        "gc":         604_800, # weekly
+    }
+    _DOWN_FACTOR = 3  # >3× expected interval since last run = consider down
+
+    def get_cognify_pass_status(self, project: str | None = None) -> list[dict]:
+        """Return per-pass status rows for the cognify dashboard panel.
+
+        Pulls the most-recent row per pass_name from cognify_run_log and
+        derives a state from its timing + completion + error fields:
+
+          * `running`   — most recent row has started_at but no completed_at
+                          (the pass is currently in flight).
+          * `errored`   — most recent COMPLETED row has a non-null error.
+          * `idle`      — last successful run is within expected_interval;
+                          launchd is firing as expected.
+          * `down`      — last run is older than expected_interval * DOWN_FACTOR.
+                          Suggests launchd isn't firing (plist unloaded, etc.).
+          * `never_run` — no row in cognify_run_log for this pass.
+
+        Returns one dict per pass with keys: pass_name, state, last_run,
+        last_completed, last_rows_processed, last_llm_calls, last_error
+        (truncated), project (slug or None for global passes).
+
+        `project` filter scopes to a specific project_id. Global passes
+        (decay, gc — project_id IS NULL) are always included.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        now = datetime.now(timezone.utc)
+        rows = []
+
+        # Project filter resolves to project_id (or None if not given).
+        project_id = None
+        if project:
+            with self.db._conn() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM devbrain.projects WHERE slug = %s",
+                    (project,),
+                )
+                row = cur.fetchone()
+                project_id = row[0] if row else None
+
+        with self.db._conn() as conn, conn.cursor() as cur:
+            # For each known pass, fetch the most recent row.
+            for pass_name in self._COGNIFY_PASS_SCHEDULE:
+                if project_id is not None:
+                    # Project-scoped passes (extract, edges, strengthen)
+                    # filter to project_id; global passes (decay, gc)
+                    # have project_id IS NULL.
+                    cur.execute(
+                        """
+                        SELECT started_at, completed_at, rows_processed,
+                               llm_calls, error
+                        FROM devbrain.cognify_run_log
+                        WHERE pass_name = %s
+                          AND (project_id = %s OR project_id IS NULL)
+                        ORDER BY started_at DESC
+                        LIMIT 1
+                        """,
+                        (pass_name, project_id),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT started_at, completed_at, rows_processed,
+                               llm_calls, error
+                        FROM devbrain.cognify_run_log
+                        WHERE pass_name = %s
+                        ORDER BY started_at DESC
+                        LIMIT 1
+                        """,
+                        (pass_name,),
+                    )
+                last = cur.fetchone()
+                expected = self._COGNIFY_PASS_SCHEDULE[pass_name]
+
+                if last is None:
+                    rows.append({
+                        "pass_name": pass_name,
+                        "state": "never_run",
+                        "last_run": None,
+                        "last_completed": None,
+                        "last_rows_processed": 0,
+                        "last_llm_calls": 0,
+                        "last_error": None,
+                        "expected_interval_s": expected,
+                    })
+                    continue
+
+                started_at, completed_at, rows_processed, llm_calls, error = last
+
+                # State derivation
+                if completed_at is None:
+                    state = "running"
+                elif error is not None:
+                    state = "errored"
+                else:
+                    age = (now - completed_at).total_seconds()
+                    if age > expected * self._DOWN_FACTOR:
+                        state = "down"
+                    else:
+                        state = "idle"
+
+                rows.append({
+                    "pass_name": pass_name,
+                    "state": state,
+                    "last_run": started_at,
+                    "last_completed": completed_at,
+                    "last_rows_processed": rows_processed or 0,
+                    "last_llm_calls": llm_calls or 0,
+                    "last_error": (error[:200] if error else None),
+                    "expected_interval_s": expected,
+                })
+
+        return rows
