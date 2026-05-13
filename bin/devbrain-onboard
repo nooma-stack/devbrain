@@ -21,13 +21,32 @@ while [[ -L "$_target" ]]; do
 done
 DEVBRAIN_DIR="$(cd "$(dirname "$_target")/.." && pwd)"
 
-# Load .env so PGPASSWORD etc. propagate to the Python service.
-if [[ -f "$DEVBRAIN_DIR/.env" ]]; then
-    set -a
-    # shellcheck disable=SC1091
-    source "$DEVBRAIN_DIR/.env"
-    set +a
-fi
+# Load .env so PGPASSWORD etc. propagate to the Python service. Honors
+# documented precedence (env > .env > defaults): vars already set in the
+# caller's environment are preserved. See bin/devbrain for the rationale.
+_load_dotenv_no_override() {
+    local envfile="$1"
+    [[ -f "$envfile" ]] || return 0
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$line" || "$line" =~ ^# ]] && continue
+        line="${line#export }"
+        key="${line%%=*}"
+        value="${line#*=}"
+        [[ "$key" == "$line" ]] && continue
+        key="${key%%[[:space:]]*}"
+        if [[ "$value" =~ ^\".*\"$ ]]; then
+            value="${value#\"}"; value="${value%\"}"
+        elif [[ "$value" =~ ^\'.*\'$ ]]; then
+            value="${value#\'}"; value="${value%\'}"
+        fi
+        [[ -n "${!key+x}" ]] && continue
+        export "$key=$value"
+    done < "$envfile"
+}
+_load_dotenv_no_override "$DEVBRAIN_DIR/.env"
 
 # Map .env's DEVBRAIN_DB_* names to the standard PG* names that the
 # webhook script reads (matches libpq conventions, simpler test).

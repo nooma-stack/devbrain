@@ -58,16 +58,37 @@ if [[ "${1:-}" == "setup" ]] && [[ "${DEVBRAIN_NO_UPDATE:-}" != "1" ]]; then
     _auto_update
 fi
 
-# Load .env if present. `set -a` auto-exports all variables, so API keys
-# (ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY) and other secrets
-# become environment variables visible to Python + every child process
-# the factory spawns. Without this, keys saved to .env during setup
-# wouldn't be picked up by subprocesses.
-if [[ -f "$DEVBRAIN_DIR/.env" ]]; then
-    set -a
-    # shellcheck disable=SC1091
-    source "$DEVBRAIN_DIR/.env"
-    set +a
-fi
+# Load .env if present. Each KEY=VALUE pair is exported so it's visible
+# to Python and any subprocess the factory spawns. Honors the precedence
+# documented in .env.example: env > .env > config/devbrain.yaml > defaults.
+# A var already set in the caller's environment is preserved; .env only
+# fills in keys that aren't already set.
+#
+# (Previously this was `set -a; source .env; set +a`, which silently
+# clobbered caller-passed env. That broke ops scripts that try to override
+# values inline — e.g., `CLAUDE_CODE_OAUTH_TOKEN=newtok devbrain ...`.)
+_load_dotenv_no_override() {
+    local envfile="$1"
+    [[ -f "$envfile" ]] || return 0
+    local line key value
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$line" || "$line" =~ ^# ]] && continue
+        line="${line#export }"
+        key="${line%%=*}"
+        value="${line#*=}"
+        [[ "$key" == "$line" ]] && continue
+        key="${key%%[[:space:]]*}"
+        if [[ "$value" =~ ^\".*\"$ ]]; then
+            value="${value#\"}"; value="${value%\"}"
+        elif [[ "$value" =~ ^\'.*\'$ ]]; then
+            value="${value#\'}"; value="${value%\'}"
+        fi
+        [[ -n "${!key+x}" ]] && continue
+        export "$key=$value"
+    done < "$envfile"
+}
+_load_dotenv_no_override "$DEVBRAIN_DIR/.env"
 
 exec "$DEVBRAIN_DIR/.venv/bin/python" "$DEVBRAIN_DIR/factory/cli.py" "$@"
