@@ -58,7 +58,16 @@ _EXTRACT_MODEL = "claude-sonnet-4-6"
 
 @dataclass
 class ExtractResult:
-    """Result of extracting lessons/decisions from a single session."""
+    """Result of extracting lessons/decisions from a single session.
+
+    `lessons_created` is the LLM-facing nomenclature — the prompt asks
+    the model to produce "lessons" and we count what it returned. In
+    DB storage these rows land with `kind='pattern'` (the storage-layer
+    naming); see `_upsert_memory(..., kind='pattern', ...)` below. The
+    `patterns_created` attribute is an alias for the same int, exposed
+    so SQL-side code can use the storage name without remembering the
+    LLM-side rename.
+    """
 
     session_id: str
     lessons_created: int = 0
@@ -66,6 +75,12 @@ class ExtractResult:
     skipped_duplicates: int = 0
     llm_calls: int = 0
     memory_ids: list[str] = field(default_factory=list)
+    failure: str | None = None  # None | "api" | "json_parse" | "empty"
+
+    @property
+    def patterns_created(self) -> int:
+        """Alias for lessons_created — matches DB storage kind ('pattern')."""
+        return self.lessons_created
 
 
 @register_pass
@@ -123,6 +138,7 @@ class ExtractPass(CognifyPass):
         total_decisions = 0
         total_llm = 0
         sessions_processed = 0
+        failure_counts: dict[str, int] = {}
 
         for session_id in candidate_sessions:
             if total_llm >= cap:
@@ -142,6 +158,8 @@ class ExtractPass(CognifyPass):
             total_decisions += result.decisions_created
             total_llm += result.llm_calls
             sessions_processed += 1
+            if result.failure:
+                failure_counts[result.failure] = failure_counts.get(result.failure, 0) + 1
 
         rows = total_lessons + total_decisions
         return PassResult(
@@ -150,8 +168,14 @@ class ExtractPass(CognifyPass):
             metadata={
                 "pass": "extract",
                 "sessions_processed": sessions_processed,
+                # LLM-side naming (what the model produces); DB stores these
+                # under `kind='pattern'`, so `patterns_created` is an alias.
                 "lessons_created": total_lessons,
+                "patterns_created": total_lessons,
                 "decisions_created": total_decisions,
+                # A4: surface per-failure-kind counts so silent JSON parse
+                # errors and API failures are visible in the run log.
+                "failure_counts": failure_counts,
                 "since": since.isoformat() if since else None,
             },
         )
@@ -281,6 +305,7 @@ def extract_from_session(
         skipped_duplicates=skipped,
         llm_calls=llm_calls,
         memory_ids=memory_ids,
+        failure=extracted.get("_failure"),
     )
 
 
@@ -434,6 +459,13 @@ def _llm_extract(content: str, *, max_llm_calls: int = 1) -> dict:
     # Input cap of 200_000 chars (~50K tokens) — Sonnet 4.6 has a 1M context
     # window, but real session_summaries top out well below 200K chars. The
     # previous 8K cap silently discarded 95%+ of any non-trivial summary.
+    # Make the LLM call. Distinguish three failure modes so callers can
+    # tell whether a session produced 0 atoms because:
+    #   _failure="api"        the API call itself errored (network/auth/429)
+    #   _failure="json_parse" the model returned non-JSON output
+    #   _failure="empty"      the model returned valid JSON but with empty lists
+    # All three currently degrade gracefully (return empty lists); the
+    # _failure label is for telemetry/diagnostics so we can spot drift.
     try:
         response = client.messages.create(
             model=_EXTRACT_MODEL,
@@ -446,24 +478,50 @@ def _llm_extract(content: str, *, max_llm_calls: int = 1) -> dict:
                 }
             ],
         )
-        usage = response.usage
-        token_usage = {
-            "input_tokens": getattr(usage, "input_tokens", 0),
-            "output_tokens": getattr(usage, "output_tokens", 0),
-            "cache_read_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
-            "cache_write_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
-        }
-        text = response.content[0].text.strip()
-        # Strip markdown code fences if present.
-        if text.startswith("```"):
-            text = "\n".join(text.split("\n")[1:])
-            text = text.rsplit("```", 1)[0].strip()
-        result = json.loads(text)
-        result["_usage"] = token_usage
-        return result
     except Exception as exc:  # noqa: BLE001
-        logger.warning("cognify_extract: LLM call failed: %s", exc)
-        return {"lessons": [], "decisions": [], "_usage": _empty_usage}
+        logger.warning("cognify_extract: LLM API call failed: %s", exc)
+        return {
+            "lessons": [],
+            "decisions": [],
+            "_usage": _empty_usage,
+            "_failure": "api",
+            "_failure_detail": str(exc)[:500],
+        }
+
+    usage = response.usage
+    token_usage = {
+        "input_tokens": getattr(usage, "input_tokens", 0),
+        "output_tokens": getattr(usage, "output_tokens", 0),
+        "cache_read_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
+        "cache_write_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+    }
+    text = response.content[0].text.strip()
+    # Strip markdown code fences if present.
+    if text.startswith("```"):
+        text = "\n".join(text.split("\n")[1:])
+        text = text.rsplit("```", 1)[0].strip()
+    try:
+        result = json.loads(text)
+    except json.JSONDecodeError as exc:
+        # Log a sample of the offending payload so we can spot patterns
+        # (e.g. model returning a refusal, hitting max_tokens mid-string,
+        # wrapping in extra preamble). Keep it short to avoid flooding logs.
+        payload_sample = text[:400] if text else "<empty>"
+        logger.warning(
+            "cognify_extract: JSON parse failed (%s); model output sample: %r",
+            exc, payload_sample,
+        )
+        return {
+            "lessons": [],
+            "decisions": [],
+            "_usage": token_usage,  # the API call DID succeed; preserve spend
+            "_failure": "json_parse",
+            "_failure_detail": f"{exc.__class__.__name__}: {exc}; sample={payload_sample!r}",
+        }
+    result["_usage"] = token_usage
+    if not result.get("lessons") and not result.get("decisions"):
+        result["_failure"] = "empty"
+    return result
 
 
 def _resolve_auth() -> dict[str, Any] | None:
