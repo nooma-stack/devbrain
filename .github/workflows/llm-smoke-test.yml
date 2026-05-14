@@ -96,7 +96,27 @@ jobs:
             echo "Add a subscription OAuth token (sk-ant-oat01-...) to the repo's Actions secrets to enable."
             exit 0
           fi
-          echo "Secret is configured (first 20 chars: ${CI_ANTHROPIC_OAUTH_TOKEN:0:20}...)"
+          # Diagnostics — GitHub masks the full secret value in logs, so we
+          # print indirect signals that don't leak the token but DO catch the
+          # common copy-paste hazards (truncation, embedded whitespace, wrong
+          # prefix). Length + start-marker + end-marker are enough to confirm
+          # the secret is intact without revealing it.
+          TOKEN_LEN=${#CI_ANTHROPIC_OAUTH_TOKEN}
+          echo "Secret length: $TOKEN_LEN chars"
+          echo "Starts with 'sk-ant-oat01-': $(case "$CI_ANTHROPIC_OAUTH_TOKEN" in sk-ant-oat01-*) echo yes;; *) echo no;; esac)"
+          echo "Starts with 'sk-ant-oat1-': $(case "$CI_ANTHROPIC_OAUTH_TOKEN" in sk-ant-oat1-*) echo yes;; *) echo no;; esac)"
+          echo "Starts with 'sk-ant-':      $(case "$CI_ANTHROPIC_OAUTH_TOKEN" in sk-ant-*) echo yes;; *) echo no;; esac)"
+          # Check for leading whitespace (most common paste bug)
+          TRIMMED="$(echo -n "$CI_ANTHROPIC_OAUTH_TOKEN" | sed 's/^[[:space:]]*//' | head -c 1)"
+          FIRST="$(echo -n "$CI_ANTHROPIC_OAUTH_TOKEN" | head -c 1)"
+          if [ "$TRIMMED" != "$FIRST" ]; then
+            echo "::warning::Secret starts with whitespace — strip it from the GitHub Actions secret value."
+          fi
+          # Check for trailing newline (also common)
+          LAST="$(echo -n "$CI_ANTHROPIC_OAUTH_TOKEN" | tail -c 1)"
+          case "$LAST" in
+            [[:space:]]) echo "::warning::Secret ends with whitespace.";;
+          esac
 
       - name: Run LLM smoke test
         # Expose the secret as CLAUDE_CODE_OAUTH_TOKEN so the existing
