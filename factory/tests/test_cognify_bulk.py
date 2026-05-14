@@ -13,6 +13,7 @@ from cognify.bulk import (
     _checkpoint_path_for,
     _load_checkpoint,
     _save_checkpoint,
+    apply_shard,
     discover_all_sessions_with_chunks,
     discover_sessions_needing_atomization,
     run_bulk,
@@ -380,3 +381,96 @@ def test_run_bulk_invokes_progress_callback_per_session(tmp_path, monkeypatch):
         (2, 3, "s-2", 5),
         (3, 3, "s-3", 5),
     ]
+
+
+# ─── Sharding ────────────────────────────────────────────────────────────────
+
+
+def test_apply_shard_partitions_exhaustively_and_disjointly():
+    """Every session lands in exactly one shard; shards don't overlap."""
+    sessions = [f"s-{i:02d}" for i in range(23)]  # non-multiple of M on purpose
+    M = 4
+    shards = [apply_shard(sessions, (n, M)) for n in range(M)]
+    # Concatenation covers every input.
+    combined = sorted(s for shard in shards for s in shard)
+    assert combined == sorted(sessions)
+    # Pairwise disjoint.
+    for i in range(M):
+        for j in range(i + 1, M):
+            assert set(shards[i]).isdisjoint(set(shards[j]))
+
+
+def test_apply_shard_is_deterministic_across_calls():
+    sessions = ["a", "b", "c", "d", "e"]
+    assert apply_shard(sessions, (1, 3)) == apply_shard(sessions, (1, 3))
+
+
+def test_apply_shard_m_equals_1_returns_full_list():
+    sessions = ["a", "b", "c"]
+    assert apply_shard(sessions, (0, 1)) == sessions
+
+
+def test_apply_shard_rejects_negative_n():
+    with pytest.raises(ValueError, match="0 <= N < M"):
+        apply_shard(["a"], (-1, 3))
+
+
+def test_apply_shard_rejects_n_equal_m():
+    with pytest.raises(ValueError, match="0 <= N < M"):
+        apply_shard(["a"], (3, 3))
+
+
+def test_apply_shard_rejects_zero_m():
+    with pytest.raises(ValueError, match="M must be >= 1"):
+        apply_shard(["a"], (0, 0))
+
+
+def test_checkpoint_path_includes_shard_when_provided(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVBRAIN_HOME", str(tmp_path))
+    p = _checkpoint_path_for("brightbot", shard=(3, 10))
+    assert p == tmp_path / ".devbrain" / "cognify-bulk-brightbot-shard-3-of-10.json"
+
+
+def test_checkpoint_path_omits_shard_suffix_when_unsharded(tmp_path, monkeypatch):
+    monkeypatch.setenv("DEVBRAIN_HOME", str(tmp_path))
+    p = _checkpoint_path_for("brightbot")
+    assert p == tmp_path / ".devbrain" / "cognify-bulk-brightbot.json"
+
+
+def test_run_bulk_writes_to_shard_specific_checkpoint(tmp_path, monkeypatch):
+    """Different shards must not stomp each other's checkpoint files."""
+    monkeypatch.setenv("DEVBRAIN_HOME", str(tmp_path))
+
+    sessions = ["s-1", "s-2"]
+    with patch("cognify.extract.extract_from_session",
+               return_value=_build_extract_result(lessons=1, decisions=0, llm_calls=1)):
+        run_bulk(
+            conn=MagicMock(),
+            project_id="proj-1",
+            project_slug="brightbot",
+            sessions=sessions,
+            shard=(2, 10),
+            recycle_every=0,
+        )
+    # On clean completion the checkpoint is removed, so we instead assert
+    # that the shard checkpoint path was used during the run by patching
+    # _save_checkpoint to record calls.
+    saved: list[Path] = []
+
+    def _spy(path, data):
+        saved.append(path)
+
+    with patch("cognify.bulk._save_checkpoint", side_effect=_spy), \
+         patch("cognify.extract.extract_from_session",
+               return_value=_build_extract_result(lessons=1, decisions=0, llm_calls=1)):
+        run_bulk(
+            conn=MagicMock(),
+            project_id="proj-1",
+            project_slug="brightbot",
+            sessions=sessions,
+            shard=(2, 10),
+            recycle_every=0,
+        )
+    assert saved
+    for path in saved:
+        assert path.name == "cognify-bulk-brightbot-shard-2-of-10.json"

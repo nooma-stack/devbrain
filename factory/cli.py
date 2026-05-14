@@ -3117,6 +3117,11 @@ def cognify_reextract_command(
                    "default a Ctrl+C / crash leaves a checkpoint at "
                    "~/.devbrain/cognify-bulk-<project>.json and re-running "
                    "the command picks up where it left off.")
+@click.option("--shard", default=None,
+              help="N/M — process only sessions[N::M] of the sorted session "
+                   "list. Use to parallelize across M concurrent instances "
+                   "(0/M, 1/M, ..., (M-1)/M). Each shard has its own "
+                   "checkpoint file so resumes don't collide.")
 @click.option("--dry-run", is_flag=True, default=False,
               help="Report what would be processed; make no API calls or "
                    "DB writes.")
@@ -3125,7 +3130,7 @@ def cognify_reextract_command(
                    "still goes to stderr).")
 def cognify_bulk_command(
     project_slug, target, since, max_llm_calls, recycle_every,
-    no_resume, dry_run, as_json,
+    no_resume, shard, dry_run, as_json,
 ):
     """Bulk-extract lessons/decisions from an existing chunk history.
 
@@ -3139,7 +3144,8 @@ def cognify_bulk_command(
       devbrain cognify-bulk --project=brightbot --max-llm-calls=200\n
       devbrain cognify-bulk --project=brightbot --since=2026-04-01\n
       devbrain cognify-bulk --project=brightbot --dry-run\n
-      devbrain cognify-bulk --project=brightbot --no-resume
+      devbrain cognify-bulk --project=brightbot --no-resume\n
+      devbrain cognify-bulk --project=brightbot --shard=0/10  (one of 10)
     """
     import sys
     from datetime import datetime, timezone
@@ -3164,8 +3170,24 @@ def cognify_bulk_command(
         except ValueError as exc:
             raise click.ClickException(f"Invalid --since date: {since!r}") from exc
 
+    shard_tuple: tuple[int, int] | None = None
+    if shard:
+        try:
+            n_str, m_str = shard.split("/", 1)
+            n_int, m_int = int(n_str), int(m_str)
+        except (ValueError, AttributeError) as exc:
+            raise click.ClickException(
+                f"Invalid --shard format: {shard!r}, expected N/M (e.g. 0/10)"
+            ) from exc
+        if m_int < 1 or n_int < 0 or n_int >= m_int:
+            raise click.ClickException(
+                f"Invalid --shard={shard}: need 0 <= N < M and M >= 1"
+            )
+        shard_tuple = (n_int, m_int)
+
     sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
     from cognify.bulk import (
+        apply_shard,
         discover_all_sessions_with_chunks,
         discover_sessions_needing_atomization,
         render_stderr_progress,
@@ -3184,10 +3206,15 @@ def cognify_bulk_command(
             )
             reextract_mode = True
 
+        total_discovered = len(sessions)
+        if shard_tuple is not None:
+            sessions = apply_shard(sessions, shard_tuple)
+
         if not sessions:
             msg = (
                 f"cognify-bulk: no sessions match target={target}"
                 + (f" since={since}" if since else "")
+                + (f" shard={shard}" if shard else "")
                 + ". Nothing to do."
             )
             if as_json:
@@ -3200,9 +3227,13 @@ def cognify_bulk_command(
                 click.echo(msg)
             return
 
+        shard_note = (
+            f"  [shard {shard} → {len(sessions)} of {total_discovered}]"
+            if shard_tuple is not None else ""
+        )
         click.echo(
-            f"cognify-bulk: discovered {len(sessions)} session(s) to process "
-            f"(target={target})",
+            f"cognify-bulk: discovered {total_discovered} session(s) "
+            f"(target={target}){shard_note}",
             err=True,
         )
         if dry_run:
@@ -3219,12 +3250,14 @@ def cognify_bulk_command(
             dry_run=dry_run,
             use_checkpoint=not no_resume,
             progress_callback=render_stderr_progress if not dry_run else None,
+            shard=shard_tuple,
         )
 
     # Final summary on stdout.
     summary = {
         "project": project_slug,
         "target": target,
+        "shard": shard,
         "sessions_targeted": result.sessions_targeted,
         "sessions_processed": result.sessions_processed,
         "sessions_skipped_resume": result.sessions_skipped_resume,
