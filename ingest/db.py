@@ -146,13 +146,20 @@ def insert_chunk(
         # SAVEPOINT inside record_memory keeps a memory failure from
         # poisoning this transaction's commit of the legacy chunk row.
         if chunk_id and project_id is not None:
+            # provenance_id = the SOURCE session's UUID (chunks.source_id),
+            # not the chunk row's own UUID. Migration 032 fixed the
+            # historical bug where this was chunk_id; that broke
+            # session-grouped atomization in factory/cognify/. When
+            # source_id is None (e.g. migrate_openclaw_memory.py imports
+            # of pre-chunked markdown), we pass None — the partial
+            # unique index on (provenance_id, kind) excludes NULL.
             record_memory(
                 cur,
                 project_id=project_id,
                 kind="chunk",
                 content=content,
                 embedding_sql=vector_str,
-                provenance_id=chunk_id,
+                provenance_id=source_id,
             )
         conn.commit()
         return chunk_id

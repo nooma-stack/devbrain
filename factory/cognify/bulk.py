@@ -104,23 +104,22 @@ def discover_sessions_needing_atomization(
     *,
     since: datetime | None = None,
 ) -> list[str]:
-    """Return provenance_ids of sessions that have chunks but no active
-    pattern/decision atoms.
+    """Return raw_session UUIDs that have chunks in memory but no active
+    pattern/decision/lesson atoms.
 
-    A session "needs atomization" when:
-      * memory rows exist for its provenance_id (any kind), AND
-      * NO active (archived_at IS NULL) rows of kind 'pattern' or
-        'decision' exist for that provenance_id.
+    Post-migration-032, memory.provenance_id IS raw_sessions.id, so the
+    join is trivial. Only memory rows whose provenance points at a real
+    raw_session are returned — chunks from codebase indexing or
+    headers-only imports (no raw_session) are correctly excluded from
+    atomization.
 
-    The check is project-scoped via project_id.
-
-    `since`: optional cutoff. Only sessions whose oldest chunk was
-    created after `since` are returned. Defaults to None (no filter).
+    `since`: optional cutoff on raw_sessions.started_at (the actual
+    conversation start time, NOT devbrain's ingest time).
     """
     params: list = [project_id]
     where_since = ""
     if since is not None:
-        where_since = "AND m.created_at >= %s"
+        where_since = "AND rs.started_at >= %s"
         params.append(since)
 
     with conn.cursor() as cur:
@@ -128,8 +127,8 @@ def discover_sessions_needing_atomization(
             f"""
             SELECT DISTINCT m.provenance_id::text
             FROM devbrain.memory m
+            JOIN devbrain.raw_sessions rs ON rs.id = m.provenance_id
             WHERE m.project_id = %s
-              AND m.provenance_id IS NOT NULL
               AND m.archived_at IS NULL
               {where_since}
               AND NOT EXISTS (
@@ -152,25 +151,26 @@ def discover_all_sessions_with_chunks(
     *,
     since: datetime | None = None,
 ) -> list[str]:
-    """Every session with chunks in the project, regardless of whether
-    it already has atoms. Used by --target=all (re-processes everything,
-    archiving prior atoms — mirrors cognify-reextract --all semantics)."""
+    """Every raw_session that has chunks in the project, regardless of
+    whether atoms already exist. Used by --target=all (re-processes
+    everything, archiving prior atoms — mirrors cognify-reextract --all
+    semantics)."""
     params: list = [project_id]
     where_since = ""
     if since is not None:
-        where_since = "AND created_at >= %s"
+        where_since = "AND rs.started_at >= %s"
         params.append(since)
 
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            SELECT DISTINCT provenance_id::text
-            FROM devbrain.memory
-            WHERE project_id = %s
-              AND provenance_id IS NOT NULL
-              AND archived_at IS NULL
+            SELECT DISTINCT m.provenance_id::text
+            FROM devbrain.memory m
+            JOIN devbrain.raw_sessions rs ON rs.id = m.provenance_id
+            WHERE m.project_id = %s
+              AND m.archived_at IS NULL
               {where_since}
-            ORDER BY provenance_id::text
+            ORDER BY m.provenance_id::text
             """,
             params,
         )

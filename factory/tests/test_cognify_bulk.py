@@ -104,7 +104,8 @@ def test_discover_all_sessions_with_chunks_returns_strings():
 
 
 def test_discover_passes_since_filter_when_set(monkeypatch):
-    """Confirm the since parameter actually affects SQL execution."""
+    """`--since` must filter on raw_sessions.started_at (real session
+    date), not on memory.created_at (devbrain ingest time)."""
     executed_sql: list[tuple] = []
 
     class _Cur:
@@ -126,8 +127,33 @@ def test_discover_passes_since_filter_when_set(monkeypatch):
     )
     assert len(executed_sql) == 1
     sql, params = executed_sql[0]
-    assert "m.created_at >= %s" in sql
+    assert "rs.started_at >= %s" in sql
+    assert "JOIN devbrain.raw_sessions" in sql
     assert when in params
+
+
+def test_discover_joins_raw_sessions_even_without_since():
+    """Even without --since, discovery must join raw_sessions so chunks
+    from non-session sources (codebase indexer, markdown imports) are
+    excluded from atomization."""
+    executed_sql: list[tuple] = []
+
+    class _Cur:
+        def execute(self, sql, params):
+            executed_sql.append((sql, list(params)))
+        def fetchall(self):
+            return []
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    class _Conn:
+        def cursor(self): return _Cur()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    discover_sessions_needing_atomization(_Conn(), project_id="proj-1")
+    discover_all_sessions_with_chunks(_Conn(), project_id="proj-1")
+    assert all("JOIN devbrain.raw_sessions" in sql for sql, _ in executed_sql)
 
 
 # ─── run_bulk: dry-run + discovery contract ──────────────────────────────────

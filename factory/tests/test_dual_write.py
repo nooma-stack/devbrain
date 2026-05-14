@@ -105,13 +105,18 @@ def test_migration_011_applied(db):
         row = cur.fetchone()
         assert row is not None, "partial unique index missing"
         idxdef = row[0]
-        # Index must be UNIQUE on (provenance_id, kind) WITH the
-        # provenance_id IS NOT NULL predicate — both halves are
-        # required for the inferred-constraint match.
+        # Index must be UNIQUE on (provenance_id, kind). Migration 032
+        # narrowed the predicate to exclude kind='chunk' (many chunks
+        # legitimately share a session's provenance_id) while keeping
+        # uniqueness for atom kinds.
         assert "UNIQUE" in idxdef.upper()
         assert "provenance_id" in idxdef
         assert "kind" in idxdef
         assert "provenance_id IS NOT NULL" in idxdef
+        assert "kind <> 'chunk'" in idxdef or "kind != 'chunk'" in idxdef, (
+            f"migration 032 must narrow the partial index to exclude chunks; "
+            f"current idxdef: {idxdef}"
+        )
 
 
 # ─── 2-6. Dual-write produces a memory row for each kind ─────────────────
@@ -251,44 +256,75 @@ def test_dual_write_session_summary(db):
     assert str(rows[0][2]) == prov
 
 
-def test_dual_write_chunk_via_insert_chunk(db):
-    """kind='chunk' goes through ingest.db.insert_chunk — the actual
-    call site (not record_memory directly). Verifies the dual-write
-    is wired in there AND that the project_id-None guard skips the
-    memory write but keeps the legacy chunk insert."""
+def test_dual_write_chunk_provenance_is_source_session(db):
+    """Migration 032 fixed the bug where chunk dual-writes used
+    `provenance_id = chunk_id` (the chunk row's own UUID) instead of
+    `provenance_id = chunks.source_id` (the originating session UUID).
+
+    The new contract: when source_id is supplied, the memory row's
+    provenance_id IS that source_id. When source_id is None (e.g.
+    markdown imports), provenance_id is NULL.
+    """
     pid = _devbrain_project_id(db)
-    content = f"{TEST_CONTENT_PREFIX}chunk via insert_chunk"
     embedding = [0.5] * 1024
 
-    chunk_id = insert_chunk(
+    # Case A: source_id present → memory.provenance_id == source_id
+    source_session_uuid = "77777777-7777-7777-7777-777777777777"
+    content_a = f"{TEST_CONTENT_PREFIX}chunk with source_id"
+    chunk_id_a = insert_chunk(
+        project_id=pid,
+        source_type="session",
+        source_id=source_session_uuid,
+        source_line_start=None,
+        source_line_end=None,
+        content=content_a,
+        embedding=embedding,
+        token_count=10,
+    )
+    assert chunk_id_a
+
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT kind, provenance_id FROM devbrain.memory "
+            "WHERE content = %s",
+            (content_a,),
+        )
+        rows = cur.fetchall()
+    assert len(rows) == 1
+    assert rows[0][0] == "chunk"
+    assert str(rows[0][1]) == source_session_uuid, (
+        "chunk dual-write must set provenance_id = source_id "
+        "(the source session's UUID), not the chunk row's own UUID"
+    )
+
+    # Case B: source_id=None → memory.provenance_id IS NULL
+    content_b = f"{TEST_CONTENT_PREFIX}chunk no source"
+    chunk_id_b = insert_chunk(
         project_id=pid,
         source_type="session",
         source_id=None,
         source_line_start=None,
         source_line_end=None,
-        content=content,
+        content=content_b,
         embedding=embedding,
         token_count=10,
     )
-    assert chunk_id  # legacy row exists
+    assert chunk_id_b
 
     with db._conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT kind, content, provenance_id, embedding IS NOT NULL "
-            "FROM devbrain.memory WHERE provenance_id = %s",
-            (chunk_id,),
+            "SELECT provenance_id FROM devbrain.memory WHERE content = %s",
+            (content_b,),
         )
         rows = cur.fetchall()
-    assert len(rows) == 1, (
-        "exactly one memory row expected for the chunk dual-write"
+    assert len(rows) == 1
+    assert rows[0][0] is None, (
+        "chunk with no source_id should produce memory row with "
+        "NULL provenance_id (no session to attribute to)"
     )
-    assert rows[0][0] == "chunk"
-    assert rows[0][1] == content
-    assert str(rows[0][2]) == chunk_id
-    assert rows[0][3] is True  # embedding reused, not recomputed null
 
-    # Guard branch: project_id=None must skip the memory write but
-    # still produce a legacy chunk row.
+    # Case C: project_id=None — must skip the memory write but still
+    # produce a legacy chunk row (existing guard preserved).
     null_content = f"{TEST_CONTENT_PREFIX}chunk no project"
     null_chunk_id = insert_chunk(
         project_id=None,
@@ -303,13 +339,52 @@ def test_dual_write_chunk_via_insert_chunk(db):
     assert null_chunk_id  # legacy row still inserted
     with db._conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT 1 FROM devbrain.memory WHERE provenance_id = %s",
-            (null_chunk_id,),
+            "SELECT 1 FROM devbrain.memory WHERE content = %s",
+            (null_content,),
         )
         assert cur.fetchone() is None, (
             "memory.project_id is NOT NULL; the helper must skip dual-"
             "write when project_id is None instead of erroring"
         )
+
+
+def test_dual_write_chunks_share_session_provenance(db):
+    """After migration 032, multiple chunks for the same source session
+    legitimately share one provenance_id (and the partial unique index
+    no longer blocks this for kind='chunk')."""
+    pid = _devbrain_project_id(db)
+    embedding = [0.5] * 1024
+    shared_session = "88888888-8888-8888-8888-888888888888"
+
+    contents = [
+        f"{TEST_CONTENT_PREFIX}shared session chunk 1",
+        f"{TEST_CONTENT_PREFIX}shared session chunk 2",
+        f"{TEST_CONTENT_PREFIX}shared session chunk 3",
+    ]
+    for c in contents:
+        insert_chunk(
+            project_id=pid,
+            source_type="session",
+            source_id=shared_session,
+            source_line_start=None,
+            source_line_end=None,
+            content=c,
+            embedding=embedding,
+            token_count=10,
+        )
+
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM devbrain.memory "
+            "WHERE provenance_id = %s AND kind = 'chunk'",
+            (shared_session,),
+        )
+        count = cur.fetchone()[0]
+    assert count == 3, (
+        f"expected 3 chunks sharing the same session provenance_id, "
+        f"got {count} — partial unique index may be incorrectly blocking "
+        f"multiple chunks per session"
+    )
 
 
 # ─── 7. Idempotency: two dual-writes for the same legacy row → one mem row
