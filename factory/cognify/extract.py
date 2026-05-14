@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
@@ -46,6 +47,14 @@ logger = logging.getLogger(__name__)
 
 # Maximum LLM calls per scheduled pass invocation.
 MAX_LLM_CALLS_PER_PASS = 20
+
+# Retry configuration for transient APIConnectionError. The 2026-05-14
+# marathon-reextract incident showed that long-running cognify processes
+# accumulate stale connections in httpx's internal pool; per-call retries
+# with client recycle defeat that failure mode. Other exception classes
+# (auth, 400, JSONDecodeError) are NOT retried — they won't improve.
+_API_MAX_RETRIES = 3
+_API_BACKOFF_S = (2, 5, 15)  # exponential, applied in order
 
 # Extraction prompt/model version. Bump this integer when the extraction
 # prompt or model changes, then run `devbrain cognify-reextract --since-version=N`
@@ -466,26 +475,66 @@ def _llm_extract(content: str, *, max_llm_calls: int = 1) -> dict:
     #   _failure="empty"      the model returned valid JSON but with empty lists
     # All three currently degrade gracefully (return empty lists); the
     # _failure label is for telemetry/diagnostics so we can spot drift.
-    try:
-        response = client.messages.create(
-            model=_EXTRACT_MODEL,
-            max_tokens=16000,
-            system=system_blocks,
-            messages=[
-                {
-                    "role": "user",
-                    "content": f"Extract lessons and decisions from this session:\n\n{content[:200_000]}",
-                }
-            ],
+    #
+    # APIConnectionError gets per-session retry-with-backoff because we
+    # observed (2026-05-14 incident) that long-running cognify processes
+    # accumulate stale connections in the SDK's internal httpx pool;
+    # marathon `cognify-reextract --all` runs saw the failure rate climb
+    # to ~90% Connection error in the last hours of an 18h run. Recycling
+    # the client (close+new) on each retry forces a fresh httpx pool and
+    # defeats that failure mode. Other exception types are NOT retried —
+    # auth errors, 400s, JSONDecodeErrors won't get better from waiting.
+    response = None
+    api_error: Exception | None = None
+    for attempt in range(_API_MAX_RETRIES):
+        try:
+            response = client.messages.create(
+                model=_EXTRACT_MODEL,
+                max_tokens=16000,
+                system=system_blocks,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": f"Extract lessons and decisions from this session:\n\n{content[:200_000]}",
+                    }
+                ],
+            )
+            break
+        except anthropic.APIConnectionError as exc:
+            api_error = exc
+            if attempt + 1 < _API_MAX_RETRIES:
+                backoff = _API_BACKOFF_S[min(attempt, len(_API_BACKOFF_S) - 1)]
+                logger.warning(
+                    "cognify_extract: APIConnectionError (attempt %d/%d): %s; "
+                    "recycling client + retrying in %ds",
+                    attempt + 1, _API_MAX_RETRIES, exc, backoff,
+                )
+                # Drop the stale client + connection pool, then re-create.
+                try:
+                    client.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(backoff)
+                client = anthropic.Anthropic(**auth_kwargs)
+                continue
+            # Exhausted retries — fall through to error return below.
+        except Exception as exc:  # noqa: BLE001
+            # Non-connection errors (auth, 400, model errors, etc.) —
+            # don't retry; they won't improve from waiting.
+            api_error = exc
+            break
+
+    if response is None:
+        logger.warning(
+            "cognify_extract: LLM API call failed after %d attempts: %s",
+            _API_MAX_RETRIES, api_error,
         )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("cognify_extract: LLM API call failed: %s", exc)
         return {
             "lessons": [],
             "decisions": [],
             "_usage": _empty_usage,
             "_failure": "api",
-            "_failure_detail": str(exc)[:500],
+            "_failure_detail": str(api_error)[:500],
         }
 
     usage = response.usage
