@@ -170,3 +170,107 @@ def test_llm_extract_strips_markdown_fences_before_parsing():
     assert result["decisions"] == [{"title": "D1", "content": "x"}]
     # Fenced+valid JSON with one atom → no failure flag (decisions is non-empty)
     assert "_failure" not in result
+
+
+# ─── APIConnectionError retry-with-backoff (2026-05-14 incident fix) ─────────
+
+
+def test_llm_extract_retries_on_api_connection_error_and_succeeds(monkeypatch):
+    """If the first call raises APIConnectionError but the second
+    succeeds, we get a clean result with no _failure flag. The client
+    should have been recycled (close+new) between attempts."""
+    import anthropic
+    from cognify.extract import _llm_extract
+
+    # Bypass real time.sleep so the test runs fast.
+    monkeypatch.setattr("cognify.extract.time.sleep", lambda *_a, **_kw: None)
+
+    valid_json = json.dumps({
+        "lessons": [{"title": "L", "content": "x"}],
+        "decisions": [],
+    })
+
+    # First call raises, second returns the success response.
+    fake_client = MagicMock()
+    fake_client.messages.create.side_effect = [
+        anthropic.APIConnectionError(request=None),
+        _stub_anthropic_response(valid_json),
+    ]
+
+    auth_patch = patch(
+        "cognify.extract._resolve_auth",
+        return_value={"api_key": "sk-ant-api03-FAKE"},
+    )
+
+    construct_count = {"n": 0}
+
+    def _fake_constructor(*args, **kwargs):
+        construct_count["n"] += 1
+        return fake_client
+
+    construct_patch = patch.object(anthropic, "Anthropic", side_effect=_fake_constructor)
+
+    with auth_patch, construct_patch:
+        result = _llm_extract("content")
+
+    # Extraction succeeded
+    assert "_failure" not in result, f"got: {result}"
+    assert result["lessons"] == [{"title": "L", "content": "x"}]
+    # Two API calls attempted (1 failed + 1 succeeded)
+    assert fake_client.messages.create.call_count == 2
+    # Client should have been recycled — at least 2 constructions
+    # (initial + at least 1 retry recycle)
+    assert construct_count["n"] >= 2
+    # The stale client's close() should have been called during recycle
+    assert fake_client.close.called
+
+
+def test_llm_extract_gives_up_after_max_retries_on_persistent_connection_error(monkeypatch):
+    """If APIConnectionError persists across all retries, return
+    _failure='api'. Test that we don't retry forever."""
+    import anthropic
+    from cognify.extract import _API_MAX_RETRIES, _llm_extract
+
+    monkeypatch.setattr("cognify.extract.time.sleep", lambda *_a, **_kw: None)
+
+    fake_client = MagicMock()
+    fake_client.messages.create.side_effect = anthropic.APIConnectionError(request=None)
+
+    auth_patch = patch(
+        "cognify.extract._resolve_auth",
+        return_value={"api_key": "sk-ant-api03-FAKE"},
+    )
+    construct_patch = patch.object(anthropic, "Anthropic", return_value=fake_client)
+
+    with auth_patch, construct_patch:
+        result = _llm_extract("content")
+
+    assert result.get("_failure") == "api"
+    assert result["lessons"] == []
+    # Used all retries — call count equals _API_MAX_RETRIES exactly
+    assert fake_client.messages.create.call_count == _API_MAX_RETRIES
+
+
+def test_llm_extract_does_not_retry_non_connection_errors(monkeypatch):
+    """A 401 / 400 / random RuntimeError doesn't get retried — those
+    won't get better from waiting, and retrying just wastes time."""
+    from cognify.extract import _llm_extract
+
+    monkeypatch.setattr("cognify.extract.time.sleep", lambda *_a, **_kw: None)
+
+    fake_client = MagicMock()
+    fake_client.messages.create.side_effect = RuntimeError("401 Unauthorized")
+
+    auth_patch = patch(
+        "cognify.extract._resolve_auth",
+        return_value={"api_key": "sk-ant-api03-FAKE"},
+    )
+    import anthropic
+    construct_patch = patch.object(anthropic, "Anthropic", return_value=fake_client)
+
+    with auth_patch, construct_patch:
+        result = _llm_extract("content")
+
+    assert result.get("_failure") == "api"
+    # Single attempt only — non-connection errors don't retry
+    assert fake_client.messages.create.call_count == 1
