@@ -6,10 +6,14 @@ table is best-effort — a memory failure must NOT poison the surrounding
 transaction or roll back the legacy write that is the current source
 of truth.
 
-Idempotency: relies on the partial unique index from migration 011
-(idx_memory_provenance_kind_unique on (provenance_id, kind) WHERE
-provenance_id IS NOT NULL) so two concurrent dual-writes for the same
-legacy row collapse to one memory row via ON CONFLICT DO NOTHING.
+Idempotency: relies on the partial unique index from migration 011,
+narrowed by migration 032 to atoms only:
+idx_memory_provenance_kind_unique on (provenance_id, kind) WHERE
+provenance_id IS NOT NULL AND kind != 'chunk'. Two concurrent
+dual-writes for the same atom row collapse to one memory row via
+ON CONFLICT DO NOTHING. Chunks (which share a session's provenance_id
+post-032) are NOT deduped here — pipeline.py:_process_session calls
+delete_chunks_for_session() before re-ingesting an updated session.
 """
 from __future__ import annotations
 
@@ -79,7 +83,8 @@ def record_memory(
                 (project_id, kind, title, content, embedding,
                  provenance_id, applies_when)
             VALUES (%s, %s, %s, %s, %s::vector, %s, %s::jsonb)
-            ON CONFLICT (provenance_id, kind) WHERE provenance_id IS NOT NULL
+            ON CONFLICT (provenance_id, kind)
+                WHERE provenance_id IS NOT NULL AND kind != 'chunk'
             DO NOTHING
             """,
             (
