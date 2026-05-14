@@ -44,13 +44,22 @@ jobs:
     # The label gate ALSO runs the job even when paths-filter wouldn't,
     # so reviewers can request a smoke test on any PR by adding the
     # `llm-smoke-test` label.
+    #
+    # The fork check only applies to pull_request events — workflow_dispatch
+    # is always trusted (only repo members can trigger it), and head.repo
+    # is empty for non-PR events which would otherwise spuriously skip.
     if: >-
-      github.event.pull_request.head.repo.full_name == github.repository &&
       !contains(github.event.head_commit.message, '[skip-llm-smoke]') &&
       (
         github.event_name == 'workflow_dispatch' ||
-        github.event.action == 'labeled' && github.event.label.name == 'llm-smoke-test' ||
-        github.event.action != 'labeled'
+        (
+          github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          (
+            github.event.action != 'labeled' ||
+            github.event.label.name == 'llm-smoke-test'
+          )
+        )
       )
 
     steps:
