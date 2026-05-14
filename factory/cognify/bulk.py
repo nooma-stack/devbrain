@@ -45,6 +45,14 @@ Typical use:
 
     # Dry run — report what would be processed without making LLM calls:
     devbrain cognify-bulk --project=brightbot --dry-run
+
+    # Parallelize: run 10 instances concurrently, each owning a slice of
+    # the sorted session list. Each shard has its own checkpoint file so
+    # resumes don't conflict:
+    devbrain cognify-bulk --project=brightbot --shard=0/10
+    devbrain cognify-bulk --project=brightbot --shard=1/10
+    ...
+    devbrain cognify-bulk --project=brightbot --shard=9/10
 """
 from __future__ import annotations
 
@@ -169,12 +177,42 @@ def discover_all_sessions_with_chunks(
         return [r[0] for r in cur.fetchall()]
 
 
-def _checkpoint_path_for(project_slug: str) -> Path:
-    """Where the per-project checkpoint file lives."""
+def _checkpoint_path_for(
+    project_slug: str,
+    *,
+    shard: tuple[int, int] | None = None,
+) -> Path:
+    """Where the per-project checkpoint file lives.
+
+    When `shard` is provided as (N, M), the filename includes the shard
+    so parallel instances don't collide on each other's checkpoints.
+    """
     home = Path(os.environ.get("DEVBRAIN_HOME", Path.home()))
     base = home / ".devbrain"
     base.mkdir(parents=True, exist_ok=True)
+    if shard is not None:
+        n, m = shard
+        return base / f"cognify-bulk-{project_slug}-shard-{n}-of-{m}.json"
     return base / f"cognify-bulk-{project_slug}.json"
+
+
+def apply_shard(sessions: list[str], shard: tuple[int, int]) -> list[str]:
+    """Stride-slice `sessions` into shard N of M.
+
+    Given a sorted session list (discover_* already orders by
+    provenance_id), stride-slicing partitions it deterministically across
+    M workers: worker N gets sessions[N::M]. Coverage is exhaustive
+    (every session lands in exactly one shard) and stable across reruns
+    so a crashed shard's checkpoint stays valid.
+
+    Raises ValueError if (N, M) is out of range.
+    """
+    n, m = shard
+    if m < 1:
+        raise ValueError(f"shard total M must be >= 1, got M={m}")
+    if n < 0 or n >= m:
+        raise ValueError(f"shard index N={n} must satisfy 0 <= N < M={m}")
+    return sessions[n::m]
 
 
 def _load_checkpoint(path: Path) -> dict | None:
@@ -209,6 +247,7 @@ def run_bulk(
     dry_run: bool = False,
     use_checkpoint: bool = True,
     progress_callback: Callable[[int, int, dict], None] | None = None,
+    shard: tuple[int, int] | None = None,
 ) -> BulkRunResult:
     """Process `sessions` in order, with checkpoint-resume + client
     recycle + cost cap.
@@ -232,6 +271,10 @@ def run_bulk(
       progress_callback: optional fn(idx, total, last_result_dict) called
         after each session. last_result_dict has keys session_id,
         atoms, failure, llm_calls.
+      shard: when provided as (N, M), the checkpoint filename is suffixed
+        with `-shard-N-of-M` so parallel shards don't share checkpoint
+        state. The session list passed in is NOT re-sliced — callers are
+        responsible for slicing before calling run_bulk (see apply_shard).
     """
     result = BulkRunResult()
     started_at = datetime.now(timezone.utc)
@@ -240,7 +283,7 @@ def run_bulk(
     checkpoint_path: Path | None = None
     completed_set: set[str] = set()
     if use_checkpoint:
-        checkpoint_path = _checkpoint_path_for(project_slug)
+        checkpoint_path = _checkpoint_path_for(project_slug, shard=shard)
         result.checkpoint_path = checkpoint_path
         prior = _load_checkpoint(checkpoint_path)
         if prior and prior.get("project_slug") == project_slug:
