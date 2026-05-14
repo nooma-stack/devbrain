@@ -3093,5 +3093,174 @@ def cognify_reextract_command(
             )
 
 
+@cli.command("cognify-bulk")
+@click.option("--project", "project_slug", required=True,
+              help="Project slug.")
+@click.option("--target", type=click.Choice(["needs-atomization", "all"]),
+              default="needs-atomization",
+              help="needs-atomization (default): only sessions with chunks but "
+                   "NO existing atoms. all: re-process every session "
+                   "(archives prior atoms, mirrors cognify-reextract --all).")
+@click.option("--since", default=None,
+              help="ISO date — filter to sessions whose oldest chunk is "
+                   "newer than this date.")
+@click.option("--max-llm-calls", "max_llm_calls", type=int, default=None,
+              help="Halt after this many LLM calls (cost cap). Combined with "
+                   "checkpoint resume, lets you spread a large bulk run over "
+                   "multiple budgeted invocations.")
+@click.option("--recycle-every", type=int, default=50,
+              help="Pause briefly every N sessions (defense-in-depth against "
+                   "long-running SDK state drift; complements PR #137's "
+                   "per-call retry).")
+@click.option("--no-resume", "no_resume", is_flag=True, default=False,
+              help="Ignore any existing checkpoint and start fresh. By "
+                   "default a Ctrl+C / crash leaves a checkpoint at "
+                   "~/.devbrain/cognify-bulk-<project>.json and re-running "
+                   "the command picks up where it left off.")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Report what would be processed; make no API calls or "
+                   "DB writes.")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Emit the final summary as JSON on stdout (live progress "
+                   "still goes to stderr).")
+def cognify_bulk_command(
+    project_slug, target, since, max_llm_calls, recycle_every,
+    no_resume, dry_run, as_json,
+):
+    """Bulk-extract lessons/decisions from an existing chunk history.
+
+    Resumable + cost-capped + connection-resilient bulk extraction.
+    Designed for catching up first-time atomization on a project with a
+    large existing chunk history (e.g., after a new devbrain install
+    ingests months of prior session JSONLs).
+
+    Examples:\n
+      devbrain cognify-bulk --project=brightbot\n
+      devbrain cognify-bulk --project=brightbot --max-llm-calls=200\n
+      devbrain cognify-bulk --project=brightbot --since=2026-04-01\n
+      devbrain cognify-bulk --project=brightbot --dry-run\n
+      devbrain cognify-bulk --project=brightbot --no-resume
+    """
+    import sys
+    from datetime import datetime, timezone
+
+    db = get_db()
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM devbrain.projects WHERE slug = %s",
+            (project_slug,),
+        )
+        row = cur.fetchone()
+    if not row:
+        raise click.ClickException(f"Project {project_slug!r} not found.")
+    project_id = row[0]
+
+    since_dt = None
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since)
+            if since_dt.tzinfo is None:
+                since_dt = since_dt.replace(tzinfo=timezone.utc)
+        except ValueError as exc:
+            raise click.ClickException(f"Invalid --since date: {since!r}") from exc
+
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
+    from cognify.bulk import (
+        discover_all_sessions_with_chunks,
+        discover_sessions_needing_atomization,
+        render_stderr_progress,
+        run_bulk,
+    )
+
+    with db._conn() as conn:
+        if target == "needs-atomization":
+            sessions = discover_sessions_needing_atomization(
+                conn, project_id, since=since_dt,
+            )
+            reextract_mode = False
+        else:
+            sessions = discover_all_sessions_with_chunks(
+                conn, project_id, since=since_dt,
+            )
+            reextract_mode = True
+
+        if not sessions:
+            msg = (
+                f"cognify-bulk: no sessions match target={target}"
+                + (f" since={since}" if since else "")
+                + ". Nothing to do."
+            )
+            if as_json:
+                import json as _json
+                click.echo(_json.dumps({
+                    "sessions_targeted": 0,
+                    "message": msg,
+                }))
+            else:
+                click.echo(msg)
+            return
+
+        click.echo(
+            f"cognify-bulk: discovered {len(sessions)} session(s) to process "
+            f"(target={target})",
+            err=True,
+        )
+        if dry_run:
+            click.echo("DRY RUN — no API calls or DB writes.", err=True)
+
+        result = run_bulk(
+            conn,
+            project_id,
+            project_slug,
+            sessions=sessions,
+            reextract_mode=reextract_mode,
+            max_llm_calls=max_llm_calls,
+            recycle_every=recycle_every,
+            dry_run=dry_run,
+            use_checkpoint=not no_resume,
+            progress_callback=render_stderr_progress if not dry_run else None,
+        )
+
+    # Final summary on stdout.
+    summary = {
+        "project": project_slug,
+        "target": target,
+        "sessions_targeted": result.sessions_targeted,
+        "sessions_processed": result.sessions_processed,
+        "sessions_skipped_resume": result.sessions_skipped_resume,
+        "sessions_failed": result.sessions_failed,
+        "atoms_created": result.atoms_created,
+        "llm_calls": result.llm_calls,
+        "failure_counts": result.failure_counts,
+        "halted_early": result.halted_early,
+        "halt_reason": result.halt_reason,
+        "elapsed_seconds": round(result.elapsed_seconds, 1),
+        "checkpoint_path": str(result.checkpoint_path)
+            if result.checkpoint_path else None,
+    }
+    if as_json:
+        import json as _json
+        click.echo(_json.dumps(summary, indent=2, default=str))
+    else:
+        click.echo("")
+        click.echo("─" * 60)
+        click.echo(f"cognify-bulk: complete ({result.elapsed_seconds:.1f}s)")
+        click.echo(
+            f"  sessions:  {result.sessions_processed} processed, "
+            f"{result.sessions_failed} failed, "
+            f"{result.sessions_skipped_resume} skipped (resume)"
+        )
+        click.echo(f"  atoms:     {result.atoms_created} created")
+        click.echo(f"  llm calls: {result.llm_calls}")
+        if result.failure_counts:
+            click.echo(f"  failures:  {result.failure_counts}")
+        if result.halted_early:
+            click.echo(f"  halted:    {result.halt_reason}")
+            click.echo(
+                f"  resume:    re-run the same command to continue "
+                f"(checkpoint at {result.checkpoint_path})"
+            )
+
+
 if __name__ == "__main__":
     cli()
