@@ -177,6 +177,57 @@ def delete_chunks_for_session(session_id: str) -> int:
         return count
 
 
+def delete_session(session_id: str) -> dict[str, int]:
+    """Atomically delete a raw_session and all its associated rows.
+
+    The full lineage is `devbrain.raw_sessions.id` (the session UUID)
+    → `devbrain.chunks.source_id` → `devbrain.memory.provenance_id`.
+    None of those edges has an `ON DELETE CASCADE` foreign key
+    (chunks.source_id is polymorphic by design, and memory.provenance_id
+    has no FK at all), so deleting a raw_session row in isolation
+    silently orphans every chunk and memory row that referenced it.
+
+    On 2026-04-09 a one-off cleanup script removed ~414 duplicate
+    raw_sessions but didn't delete the underlying chunks. The cleanup
+    is what migration 036 had to undo (reconstruct 296 truly-unique
+    ghost sessions + drop 92 duplicate orphan chunks). This helper is
+    the sanctioned way to delete a session going forward — use it
+    instead of running ad-hoc DELETEs against raw_sessions.
+
+    Returns a dict with per-table counts: `{'memory', 'chunks',
+    'raw_sessions'}`. Deletes are best-effort: missing session is not
+    an error — the function returns zeros for whichever tables had no
+    rows to delete.
+    """
+    with get_connection() as conn, conn.cursor() as cur:
+        # Order matters: memory rows reference chunk_id via provenance_id
+        # (pre-migration-032) or source_id (post-032). Either way, the
+        # memory row's provenance_id == chunks.source_id == session_id
+        # for chunk-kind rows. Delete memory first so the dual-write
+        # contract stays consistent during the legacy delete.
+        cur.execute(
+            "DELETE FROM devbrain.memory WHERE provenance_id = %s",
+            (session_id,),
+        )
+        memory_deleted = cur.rowcount
+        cur.execute(
+            "DELETE FROM devbrain.chunks WHERE source_id = %s",
+            (session_id,),
+        )
+        chunks_deleted = cur.rowcount
+        cur.execute(
+            "DELETE FROM devbrain.raw_sessions WHERE id = %s",
+            (session_id,),
+        )
+        sessions_deleted = cur.rowcount
+        conn.commit()
+        return {
+            "memory": memory_deleted,
+            "chunks": chunks_deleted,
+            "raw_sessions": sessions_deleted,
+        }
+
+
 def update_session_summary(session_id: str, summary: str) -> None:
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute(

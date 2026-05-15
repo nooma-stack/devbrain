@@ -29,7 +29,7 @@ sys.path.insert(
     0, str(Path(__file__).resolve().parent.parent.parent / "ingest")
 )
 
-from db import insert_chunk  # noqa: E402  (ingest/db.py)
+from db import delete_session, insert_chunk  # noqa: E402  (ingest/db.py)
 from memory_writer import record_memory  # noqa: E402  (ingest/memory_writer.py)
 from state_machine import FactoryDB  # noqa: E402
 
@@ -495,3 +495,96 @@ def test_legacy_survives_memory_failure(db, caplog):
     assert any(
         "dual-write failed" in r.getMessage() for r in warnings
     ), f"expected dual-write WARNING; got: {[r.getMessage() for r in warnings]}"
+
+
+# ─── delete_session() helper — prevents the 2026-04-09-style bug ─────────────
+
+
+def test_delete_session_removes_session_chunks_and_memory(db):
+    """delete_session() atomically cleans up a raw_session, all its
+    chunks, and the corresponding memory rows (since none of those
+    edges has ON DELETE CASCADE). Replaces ad-hoc cleanup scripts."""
+    pid = _devbrain_project_id(db)
+    embedding = [0.1] * 1024
+    session_uuid = "99999999-9999-9999-9999-999999999999"
+
+    # Seed: 1 raw_session row + 3 chunks (which dual-write into memory).
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO devbrain.raw_sessions (
+                id, project_id, source_app, source_path, source_hash,
+                raw_content
+            ) VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (source_app, source_hash) DO NOTHING
+            """,
+            (
+                session_uuid, pid, "claude_code",
+                "test://delete_session", "delete_session_test_hash",
+                f"{TEST_CONTENT_PREFIX}raw content",
+            ),
+        )
+        conn.commit()
+
+    for i in range(3):
+        insert_chunk(
+            project_id=pid,
+            source_type="session",
+            source_id=session_uuid,
+            source_line_start=i * 10,
+            source_line_end=(i + 1) * 10,
+            content=f"{TEST_CONTENT_PREFIX}session chunk {i}",
+            embedding=embedding,
+            token_count=10,
+        )
+
+    # Pre-condition: rows exist in all three tables for this session.
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM devbrain.chunks WHERE source_id = %s",
+            (session_uuid,),
+        )
+        assert cur.fetchone()[0] == 3
+        cur.execute(
+            "SELECT COUNT(*) FROM devbrain.memory WHERE provenance_id = %s",
+            (session_uuid,),
+        )
+        assert cur.fetchone()[0] == 3
+        cur.execute(
+            "SELECT COUNT(*) FROM devbrain.raw_sessions WHERE id = %s",
+            (session_uuid,),
+        )
+        assert cur.fetchone()[0] == 1
+
+    # Act.
+    result = delete_session(session_uuid)
+    assert result == {"memory": 3, "chunks": 3, "raw_sessions": 1}, (
+        f"expected per-table counts to be 3/3/1; got {result}"
+    )
+
+    # Post-condition: nothing left.
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM devbrain.chunks WHERE source_id = %s",
+            (session_uuid,),
+        )
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            "SELECT COUNT(*) FROM devbrain.memory WHERE provenance_id = %s",
+            (session_uuid,),
+        )
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            "SELECT COUNT(*) FROM devbrain.raw_sessions WHERE id = %s",
+            (session_uuid,),
+        )
+        assert cur.fetchone()[0] == 0
+
+
+def test_delete_session_is_safe_when_session_missing(db):
+    """Best-effort contract: deleting a session that doesn't exist
+    returns all-zeros and does not raise. Lets callers idempotently
+    retry."""
+    nonexistent = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    result = delete_session(nonexistent)
+    assert result == {"memory": 0, "chunks": 0, "raw_sessions": 0}
