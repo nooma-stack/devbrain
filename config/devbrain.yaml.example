@@ -68,10 +68,15 @@ ingest:
         # research_agent: someproject
 
     codex:
-      enabled: false  # Enable when adapter is built
+      enabled: false
       watch_paths:
         - "~/.codex"
-      file_pattern: "*.json"
+      # Codex CLI writes JSONL session files (not .json) under
+      # ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl and
+      # ~/.codex/archived_sessions/rollout-*.jsonl.
+      file_pattern: "*.jsonl"
+      # Project detection reads session_meta.cwd from each JSONL and
+      # looks up the slug in ingest.project_mappings above.
       project_detection: path
 
     gemini:
