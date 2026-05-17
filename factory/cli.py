@@ -376,6 +376,98 @@ def install_identity_cmd(dev_id):
     _install_identity(dev_id=dev_id)
 
 
+@cli.command(name="backfill-oauth-receipts")
+@click.option(
+    "--dry-run", is_flag=True, default=False,
+    help="Report what would change without writing.",
+)
+def backfill_oauth_receipts_cmd(dry_run):
+    """Fix Issue #126: backfill `oauth_token_received_at` for devs whose
+    `<profile>/.claude/oauth-token` exists on disk but whose invitation
+    row has NULL `oauth_token_received_at`.
+
+    The bug: `factory/ai_clis/claude.py:login()` wrote the token to
+    disk without updating the DB. Mike Courtney's row on Mac Studio
+    shows `status='activated'` with NULL `oauth_token_received_at`
+    even though his profile has a working token.
+
+    The new claude.py:login() path (this same PR) calls the DB update
+    going forward. This command exists to retroactively fix already-
+    affected rows.
+
+    Scans every profile dir under `<DEVBRAIN_HOME>/profiles/<dev_id>/`,
+    checks for `.claude/oauth-token`, and updates the dev's most
+    recent invitation row with NULL `oauth_token_received_at`.
+    Idempotent — re-running affects zero rows.
+    """
+    from pathlib import Path  # noqa: PLC0415
+    from invitations import record_oauth_token_for_dev  # noqa: PLC0415
+    from profiles import list_profiles  # noqa: PLC0415
+
+    db = get_db()
+    profiles = list_profiles()
+    if not profiles:
+        click.echo("backfill-oauth-receipts: no profiles found.")
+        return
+
+    eligible: list[tuple[str, Path]] = []
+    for prof in profiles:
+        token_path = prof.path / ".claude" / "oauth-token"
+        if token_path.exists() and token_path.stat().st_size > 0:
+            eligible.append((prof.dev_id, token_path))
+
+    if not eligible:
+        click.echo(
+            f"backfill-oauth-receipts: scanned {len(profiles)} profile(s); "
+            f"none have an on-disk .claude/oauth-token. Nothing to do."
+        )
+        return
+
+    if dry_run:
+        click.echo(
+            f"DRY RUN — {len(eligible)} profile(s) have on-disk tokens:"
+        )
+        for dev_id, token_path in eligible:
+            click.echo(f"  {dev_id} → {token_path}")
+        click.echo(
+            "Re-run without --dry-run to update each dev's most recent "
+            "invitation row (only rows with NULL oauth_token_received_at "
+            "are touched; idempotent)."
+        )
+        return
+
+    updated = 0
+    skipped = 0
+    for dev_id, token_path in eligible:
+        try:
+            token_value = token_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            click.echo(f"  {dev_id}: unable to read token file, skipping", err=True)
+            skipped += 1
+            continue
+
+        invitation = record_oauth_token_for_dev(
+            db, dev_id=dev_id, oauth_token=token_value or None,
+        )
+        if invitation is None:
+            click.echo(
+                f"  {dev_id}: no invitation row needs update "
+                f"(either no invitation exists, or all are already recorded)"
+            )
+            skipped += 1
+        else:
+            click.echo(
+                f"  {dev_id}: invitation {str(invitation.id)[:8]} updated "
+                f"(status={invitation.status})"
+            )
+            updated += 1
+
+    click.echo(
+        f"backfill-oauth-receipts: updated {updated} / "
+        f"skipped {skipped} / total {len(eligible)} eligible profile(s)."
+    )
+
+
 @cli.command(name="setup-multi-dev")
 @click.option("--host", required=True, help="Postgres host")
 @click.option("--port", required=True, type=int, help="Postgres port")

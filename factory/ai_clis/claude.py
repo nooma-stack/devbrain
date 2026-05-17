@@ -266,6 +266,28 @@ class ClaudeAdapter(AICliAdapter):
         token_path.write_text(token)
         token_path.chmod(0o600)
 
+        # Issue #126: record the receipt on the dev's invitation row.
+        # The on-disk file is authoritative for the token itself; the
+        # DB column is informational. Best-effort: a DB failure here
+        # must NOT fail the login (the dev is unblocked either way).
+        try:
+            from state_machine import FactoryDB  # noqa: PLC0415
+
+            from invitations import record_oauth_token_for_dev  # noqa: PLC0415
+
+            db = FactoryDB.from_default_config()
+            record_oauth_token_for_dev(db, dev_id=dev.dev_id, oauth_token=token)
+        except Exception as exc:  # noqa: BLE001
+            # We deliberately swallow — login succeeded on the
+            # filesystem, which is the load-bearing artifact. Surface
+            # via logs for observability.
+            import logging  # noqa: PLC0415
+
+            logging.getLogger(__name__).warning(
+                "claude.login: token written to disk for %s but DB "
+                "receipt update failed: %s", dev.dev_id, exc,
+            )
+
         return LoginResult(success=True)
 
     def is_logged_in(self, dev, profile_dir: Path) -> bool:
