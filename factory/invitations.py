@@ -202,6 +202,76 @@ def submit_oauth_token(db, raw_token: str, oauth_token: str) -> Optional[Invitat
     )
 
 
+def record_oauth_token_for_dev(
+    db,
+    dev_id: str,
+    oauth_token: Optional[str] = None,
+) -> Optional[Invitation]:
+    """Mark a dev's most recent invitation as having received an oauth-token.
+
+    Called from `factory/ai_clis/claude.py:login()` (and equivalents)
+    after `claude setup-token` writes a fresh token to the dev's profile
+    directory on disk. Closes Issue #126 — previously the on-disk write
+    happened without any DB update, leaving rows like Mike Courtney's
+    showing `status='activated'` with `NULL oauth_token_received_at`.
+
+    Differs from `submit_oauth_token` in two ways:
+
+      1. Identifies the invitation by `dev_id` (not by `raw_token`
+         hash), because the bootstrap token is already gone by the time
+         `login` runs — the dev is SSH'd in via permanent key.
+      2. Targets the most recent invitation for the dev with NULL
+         `oauth_token_received_at`. Skips invitations that already have
+         a recorded receipt (idempotent re-login is a no-op).
+
+    The `oauth_token` argument is optional — if `None`, only the
+    `oauth_token_received_at` timestamp is set. The on-disk file is the
+    authoritative source for the token value itself; the DB column is
+    informational. This matches the post-PR-146 model where
+    invitations track infrastructure access, not per-app credentials.
+
+    Returns the updated Invitation row, or None if no eligible row
+    existed (e.g. dev has never been invited or all rows already
+    recorded).
+    """
+    if oauth_token is not None:
+        oauth_token = oauth_token.strip()
+        if oauth_token and not _looks_like_oauth_token(oauth_token):
+            logger.warning(
+                "record_oauth_token_for_dev: refusing malformed token for dev %s",
+                dev_id,
+            )
+            return None
+
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH target AS (
+                SELECT id FROM devbrain.invitations
+                WHERE dev_id = %s
+                  AND oauth_token_received_at IS NULL
+                ORDER BY created_at DESC
+                LIMIT 1
+            )
+            UPDATE devbrain.invitations i
+            SET oauth_token = COALESCE(%s, i.oauth_token),
+                oauth_token_received_at = NOW()
+            FROM target
+            WHERE i.id = target.id
+            RETURNING i.id, i.dev_id, i.pubkey, i.pubkey_received_at,
+                      i.oauth_token, i.oauth_token_received_at, i.status,
+                      i.auto_activate, i.email, i.notes, i.created_by,
+                      i.created_at, i.expires_at, i.activated_at
+            """,
+            (dev_id, oauth_token),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        if row is None:
+            return None
+        return _row_to_invitation(row, cur.description)
+
+
 def list_invitations(db, status: Optional[str] = None) -> list[Invitation]:
     """List invitations, newest first. Used by `devbrain setup invitations`."""
     sql = """
