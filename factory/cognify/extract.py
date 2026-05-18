@@ -496,7 +496,18 @@ def _llm_extract(content: str, *, max_llm_calls: int = 1) -> dict:
                     {
                         "role": "user",
                         "content": f"Extract lessons and decisions from this session:\n\n{content[:200_000]}",
-                    }
+                    },
+                    # Prefill the assistant turn with `{` so the model is
+                    # locked into continuing as JSON. Per Anthropic's
+                    # Messages API: when the final message is role=assistant,
+                    # the model's output is a continuation of that string.
+                    # Eliminates the most common json_parse failure mode we
+                    # observed in the 2026-05-17 brightbot run — Sonnet
+                    # abandoning the task and producing conversational
+                    # text, code snippets, or input echoes instead of a
+                    # JSON object. With the prefill, the model can ONLY
+                    # continue as JSON.
+                    {"role": "assistant", "content": "{"},
                 ],
             )
             break
@@ -545,27 +556,29 @@ def _llm_extract(content: str, *, max_llm_calls: int = 1) -> dict:
         "cache_write_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
     }
     text = response.content[0].text.strip()
-    # Strip markdown code fences if present.
-    if text.startswith("```"):
-        text = "\n".join(text.split("\n")[1:])
-        text = text.rsplit("```", 1)[0].strip()
-    try:
-        result = json.loads(text)
-    except json.JSONDecodeError as exc:
+    # Re-attach the prefilled `{` from the assistant turn — the API
+    # response only contains content AFTER the prefill, not the prefill
+    # itself. Without this, every parse would fail on the missing
+    # opening brace.
+    if not text.startswith("{"):
+        text = "{" + text
+    result = _parse_json_with_fallbacks(text)
+    if result is None:
         # Log a sample of the offending payload so we can spot patterns
         # (e.g. model returning a refusal, hitting max_tokens mid-string,
         # wrapping in extra preamble). Keep it short to avoid flooding logs.
         payload_sample = text[:400] if text else "<empty>"
         logger.warning(
-            "cognify_extract: JSON parse failed (%s); model output sample: %r",
-            exc, payload_sample,
+            "cognify_extract: JSON parse failed across all strategies; "
+            "model output sample: %r",
+            payload_sample,
         )
         return {
             "lessons": [],
             "decisions": [],
             "_usage": token_usage,  # the API call DID succeed; preserve spend
             "_failure": "json_parse",
-            "_failure_detail": f"{exc.__class__.__name__}: {exc}; sample={payload_sample!r}",
+            "_failure_detail": f"all parse strategies exhausted; sample={payload_sample!r}",
         }
     result["_usage"] = token_usage
     if not result.get("lessons") and not result.get("decisions"):
@@ -588,6 +601,60 @@ def _get_api_key() -> str | None:
     """Deprecated — kept for any external callers. Use _resolve_auth()."""
     import os
     return os.environ.get("ANTHROPIC_API_KEY")
+
+
+def _parse_json_with_fallbacks(text: str) -> dict | None:
+    """Best-effort parse of an LLM JSON response.
+
+    Tries a sequence of strategies — the first that yields a dict with
+    'lessons' and/or 'decisions' wins. Returns None if all fail.
+
+    1. Direct `json.loads(text)` — the normal happy path. With assistant
+       prefill (`{` as the prefill) this works for ~all real responses.
+    2. Strip markdown code fences (```json ... ``` or ``` ... ```)
+       anywhere in the text. The 2026-05-17 brightbot retry observed
+       Sonnet occasionally pre-amble-ing with "Here's the breakdown:"
+       followed by a fenced block.
+    3. Find the first balanced `{...}` substring in the text and try
+       parsing that. Handles model output that puts JSON in the middle
+       of explanatory prose.
+    """
+    # Strategy 1: direct parse.
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2: strip markdown code fences anywhere in the response.
+    # Patterns we've observed:
+    #   ```json\n{...}\n```
+    #   ```\n{...}\n```
+    import re  # noqa: PLC0415
+
+    fence_match = re.search(
+        r"```(?:json)?\s*\n(.*?)\n```",
+        text,
+        re.DOTALL,
+    )
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Strategy 3: find the largest balanced {…} substring and try parse.
+    # Doesn't try to be clever about nested strings; relies on json.loads
+    # to fail-fast if the candidate isn't actually JSON.
+    first_brace = text.find("{")
+    last_brace = text.rfind("}")
+    if first_brace >= 0 and last_brace > first_brace:
+        candidate = text[first_brace : last_brace + 1]
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+
+    return None
 
 
 def _upsert_memory(
