@@ -84,13 +84,12 @@ def test_returns_none_for_empty_input():
     assert _parse_json_with_fallbacks("   \n   ") is None
 
 
-def test_prefill_reattachment_case():
-    """When extract.py prepends `{` because the prefilled brace was
-    omitted from the API response, the resulting text starts with `{`
-    and parses directly."""
-    # This is what extract.py builds: prefill `{` + Sonnet's continuation
-    reconstructed = '{"lessons": [{"title": "X", "content": "Y"}], "decisions": []}'
-    result = _parse_json_with_fallbacks(reconstructed)
+def test_direct_parse_of_strengthened_user_prompt_response():
+    """With the strengthened user prompt ("first char must be `{`"),
+    Sonnet on the OAuth path is expected to emit pure JSON directly.
+    The happy path goes through strategy 1 (direct json.loads)."""
+    text = '{"lessons": [{"title": "X", "content": "Y"}], "decisions": []}'
+    result = _parse_json_with_fallbacks(text)
     assert result is not None
     assert result["lessons"][0]["title"] == "X"
 
