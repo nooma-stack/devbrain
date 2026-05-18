@@ -603,9 +603,11 @@ def _upsert_memory(
 ) -> tuple[UUID, bool]:
     """Insert an extracted lesson/decision memory row. Returns (id, was_new).
 
-    Idempotency: if a non-archived row with the same (provenance_id, kind)
-    already exists, returns its id with was_new=False. The (provenance_id,
-    kind) UNIQUE constraint in the DB enforces this invariant.
+    Idempotency: if a non-archived row with the same (provenance_id,
+    kind, title) already exists, returns its id with was_new=False.
+    Migration 037's idx_memory_atom_title_unique enforces this at the
+    DB level; this check just avoids the round-trip for the common
+    case.
 
     Memory schema constraints:
     - kind must be in: chunk, decision, pattern, issue, session_summary
@@ -617,19 +619,23 @@ def _upsert_memory(
     """
     # Map semantic kind to valid DB kind values.
     # Lessons → kind='pattern'; decisions → kind='decision'.
-    # Extracted rows do NOT use provenance_id (to avoid the
-    # (provenance_id, kind) UNIQUE constraint collision with raw chunks).
-    # Instead, the source session is tracked via applies_when.source_session.
+    # Migration 037 made provenance_id load-bearing for atoms too —
+    # session_id IS the raw_sessions.id of the source session, and
+    # the new idx_memory_atom_title_unique allows N atoms per
+    # (session, kind) as long as titles differ.
     db_kind = "pattern" if kind == "lesson" else "decision"
 
     # applies_when is a JSONB column for extract-related metadata.
+    # source_session is kept here for backwards compat with any
+    # consumer that reads it directly, but provenance_id is now the
+    # canonical link to the source session.
     applies_when: dict = {"source_session": session_id}
     if reextract and reextract_meta:
         applies_when["reextracted_from"] = reextract_meta
 
-    # Idempotency check: look for an existing extract with the same
-    # source_session, kind, and title. We use applies_when->>'source_session'
-    # since provenance_id is reserved for raw ingest rows.
+    # Idempotency check: same provenance_id + kind + title means we've
+    # already extracted this same atom from this session. Skip the
+    # round-trip and short-circuit; the DB constraint is the backstop.
     with conn.cursor() as cur:
         cur.execute(
             "SELECT id FROM devbrain.memory "
@@ -638,21 +644,23 @@ def _upsert_memory(
             "  AND tier = 'lesson' "
             "  AND title = %s "
             "  AND archived_at IS NULL "
-            "  AND (applies_when->>'source_session') = %s",
+            "  AND provenance_id = %s::uuid",
             (project_id, db_kind, title, session_id),
         )
         existing = cur.fetchone()
     if existing:
         return existing[0], False
 
-    # Insert new extract row (no provenance_id — avoid unique constraint).
+    # Insert new extract row with provenance_id = the source session.
     cols = [
         "project_id", "kind", "title", "content",
         "tier", "strength", "applies_when", "extraction_version",
+        "provenance_id",
     ]
     vals: list = [
         project_id, db_kind, title, content, "lesson", 1.0,
         json.dumps(applies_when), CURRENT_EXTRACTION_VERSION,
+        session_id,
     ]
 
     placeholders = ", ".join(["%s"] * len(cols))

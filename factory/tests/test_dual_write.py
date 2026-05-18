@@ -83,40 +83,56 @@ def _embedding_sql(value: float = 0.0) -> str:
 # ─── 1. Migration 011 applied + index present ────────────────────────────
 
 
-def test_migration_011_applied(db):
-    """If 011 hasn't run, the inferred-constraint ON CONFLICT clause
-    in record_memory will error (Postgres can't match a partial unique
-    index without one). Surface that as a clear failure here."""
+def test_memory_unique_indexes_applied(db):
+    """The dual-write helper's ON CONFLICT clauses rely on two
+    migration-037 indexes:
+
+      idx_memory_session_summary_unique on (provenance_id, kind)
+        WHERE kind='session_summary'
+      idx_memory_atom_title_unique on (provenance_id, kind, title)
+        WHERE kind IN ('pattern','decision','lesson','issue')
+
+    If either is missing, the inferred-constraint ON CONFLICT in
+    record_memory will error. Surface that as a clear failure here.
+    """
     with db._conn() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT 1 FROM devbrain.schema_migrations "
             "WHERE filename = %s",
-            ("011_memory_provenance_unique.sql",),
+            ("037_atom_provenance_linkage.sql",),
         )
         assert cur.fetchone() is not None, (
-            "011_memory_provenance_unique.sql is not recorded in "
+            "037_atom_provenance_linkage.sql is not recorded in "
             "schema_migrations — run `bin/devbrain migrate`"
         )
+
         cur.execute(
-            "SELECT indexdef FROM pg_indexes "
+            "SELECT indexname, indexdef FROM pg_indexes "
             "WHERE schemaname = 'devbrain' AND tablename = 'memory' "
-            "AND indexname = 'idx_memory_provenance_kind_unique'"
+            "AND indexname IN ('idx_memory_session_summary_unique', "
+            "                  'idx_memory_atom_title_unique')"
         )
-        row = cur.fetchone()
-        assert row is not None, "partial unique index missing"
-        idxdef = row[0]
-        # Index must be UNIQUE on (provenance_id, kind). Migration 032
-        # narrowed the predicate to exclude kind='chunk' (many chunks
-        # legitimately share a session's provenance_id) while keeping
-        # uniqueness for atom kinds.
-        assert "UNIQUE" in idxdef.upper()
-        assert "provenance_id" in idxdef
-        assert "kind" in idxdef
-        assert "provenance_id IS NOT NULL" in idxdef
-        assert "kind <> 'chunk'" in idxdef or "kind != 'chunk'" in idxdef, (
-            f"migration 032 must narrow the partial index to exclude chunks; "
-            f"current idxdef: {idxdef}"
+        rows = {r[0]: r[1] for r in cur.fetchall()}
+
+        assert "idx_memory_session_summary_unique" in rows, (
+            "session_summary unique index missing"
         )
+        sumdef = rows["idx_memory_session_summary_unique"]
+        assert "UNIQUE" in sumdef.upper()
+        assert "provenance_id" in sumdef
+        assert "session_summary" in sumdef
+
+        assert "idx_memory_atom_title_unique" in rows, (
+            "atom title-aware unique index missing"
+        )
+        atomdef = rows["idx_memory_atom_title_unique"]
+        assert "UNIQUE" in atomdef.upper()
+        assert "title" in atomdef
+        # The predicate enumerates atom kinds; presence of any of them
+        # is enough for the smoke test.
+        assert any(
+            kind in atomdef for kind in ("pattern", "decision", "lesson")
+        ), f"atom index predicate doesn't reference atom kinds: {atomdef}"
 
 
 # ─── 2-6. Dual-write produces a memory row for each kind ─────────────────
@@ -391,11 +407,13 @@ def test_dual_write_chunks_share_session_provenance(db):
 
 
 def test_idempotency_two_calls_one_row(db):
-    """The partial unique index turns retry storms into no-ops.
-    First write wins (DO NOTHING); second write's payload is silently
-    discarded."""
+    """Two writes with the same (provenance_id, kind, title) collapse
+    to one row via ON CONFLICT DO NOTHING. The first write wins;
+    second write's payload is silently discarded. (Different titles
+    are not deduped — see test_atom_many_titles_coexist_per_session.)"""
     pid = _devbrain_project_id(db)
     prov = "55555555-5555-5555-5555-555555555555"
+    same_title = f"{TEST_CONTENT_PREFIX}idempotent title"
     first = f"{TEST_CONTENT_PREFIX}idempotent first"
     second = f"{TEST_CONTENT_PREFIX}idempotent second"
 
@@ -405,6 +423,7 @@ def test_idempotency_two_calls_one_row(db):
             project_id=pid,
             kind="decision",
             content=first,
+            title=same_title,
             embedding_sql=_embedding_sql(0.6),
             provenance_id=prov,
         )
@@ -413,6 +432,7 @@ def test_idempotency_two_calls_one_row(db):
             project_id=pid,
             kind="decision",
             content=second,
+            title=same_title,
             embedding_sql=_embedding_sql(0.7),
             provenance_id=prov,
         )
@@ -428,7 +448,42 @@ def test_idempotency_two_calls_one_row(db):
     assert len(rows) == 1, (
         f"expected exactly one row after dedup; got {len(rows)}"
     )
-    assert rows[0][0] == first  # first write wins under DO NOTHING
+    # First write wins.
+    assert rows[0][0] == first
+
+
+def test_atom_many_titles_coexist_per_session(db):
+    """Migration 037 relaxed the atom uniqueness from (provenance_id,
+    kind) to (provenance_id, kind, title). A session may produce many
+    atoms of the same kind — each with a distinct title."""
+    pid = _devbrain_project_id(db)
+    shared_session = "66666666-6666-6666-6666-666666666666"
+
+    for i in range(3):
+        with db._conn() as conn, conn.cursor() as cur:
+            record_memory(
+                cur,
+                project_id=pid,
+                kind="decision",
+                content=f"{TEST_CONTENT_PREFIX}decision body {i}",
+                title=f"{TEST_CONTENT_PREFIX}decision title {i}",
+                embedding_sql=_embedding_sql(0.5),
+                provenance_id=shared_session,
+            )
+            conn.commit()
+
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM devbrain.memory "
+            "WHERE provenance_id = %s AND kind = 'decision'",
+            (shared_session,),
+        )
+        count = cur.fetchone()[0]
+    assert count == 3, (
+        f"expected 3 distinct-title decisions to coexist on one session; "
+        f"got {count} — the (provenance_id, kind, title) unique index "
+        f"may not be matching ON CONFLICT correctly"
+    )
 
 
 # ─── 8. Memory failure does NOT roll back the legacy commit ──────────────
