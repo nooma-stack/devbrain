@@ -40,7 +40,11 @@ from typing import Any
 from uuid import UUID
 
 from cognify.orchestrator import CognifyPass, PassResult, register_pass
-from observability.pricing import SONNET_4_6, compute_cost_usd
+from observability.pricing import (
+    SONNET_4_6,
+    compute_cost_usd,
+    get_pricing,
+)
 from observability.spend import record_spend
 
 logger = logging.getLogger(__name__)
@@ -210,6 +214,7 @@ def extract_from_session(
     *,
     max_llm_calls: int = MAX_LLM_CALLS_PER_PASS,
     reextract: bool = False,
+    model: str | None = None,
 ) -> ExtractResult:
     """Extract lessons and decisions from a single session's memory chunks.
 
@@ -221,6 +226,10 @@ def extract_from_session(
         max_llm_calls: upper bound on LLM calls this function may make.
         reextract: if True, archive existing lessons/decisions for this
             session before re-extracting (for reextract_cli).
+        model: optional Anthropic model id override (e.g.
+            "claude-opus-4-7"). Defaults to _EXTRACT_MODEL (Sonnet 4.6).
+            Lets callers run a more capable model on sessions that
+            failed json_parse with Sonnet — at higher cost per call.
 
     Returns:
         ExtractResult with counts.
@@ -243,14 +252,21 @@ def extract_from_session(
         return ExtractResult(session_id=session_id)
 
     # Call LLM for extraction.
-    extracted = _llm_extract(combined, max_llm_calls=max_llm_calls)
+    effective_model = model or _EXTRACT_MODEL
+    extracted = _llm_extract(
+        combined, max_llm_calls=max_llm_calls, model=effective_model,
+    )
     llm_calls = 1  # one call per session for v1
 
-    # Record spend for this LLM call.
+    # Record spend for this LLM call. Use the pricing registry to
+    # look up the right rates; fall back to SONNET_4_6 if the caller
+    # passed an unfamiliar model so we still bill something rather
+    # than crash.
     usage = extracted.get("_usage", {})
     if any(usage.get(k, 0) for k in ("input_tokens", "output_tokens")):
+        pricing = get_pricing(effective_model) or SONNET_4_6
         cost = compute_cost_usd(
-            SONNET_4_6,
+            pricing,
             input_tokens=usage.get("input_tokens", 0),
             output_tokens=usage.get("output_tokens", 0),
             cache_read_tokens=usage.get("cache_read_tokens", 0),
@@ -260,7 +276,7 @@ def extract_from_session(
             conn,
             project_id=project_id,
             pass_name="extract",
-            model=_EXTRACT_MODEL,
+            model=effective_model,
             input_tokens=usage.get("input_tokens", 0),
             output_tokens=usage.get("output_tokens", 0),
             cache_read_tokens=usage.get("cache_read_tokens", 0),
@@ -398,7 +414,12 @@ def _combine_chunks(chunks: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
-def _llm_extract(content: str, *, max_llm_calls: int = 1) -> dict:
+def _llm_extract(
+    content: str,
+    *,
+    max_llm_calls: int = 1,
+    model: str = _EXTRACT_MODEL,
+) -> dict:
     """Call the LLM to extract structured lessons and decisions.
 
     Returns a dict with keys:
@@ -489,7 +510,7 @@ def _llm_extract(content: str, *, max_llm_calls: int = 1) -> dict:
     for attempt in range(_API_MAX_RETRIES):
         try:
             response = client.messages.create(
-                model=_EXTRACT_MODEL,
+                model=model,
                 max_tokens=16000,
                 system=system_blocks,
                 messages=[

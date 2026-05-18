@@ -241,7 +241,7 @@ def test_run_bulk_counts_failures_by_kind(tmp_path, monkeypatch):
     sessions = ["good-1", "fail-api-1", "fail-json-1", "good-2", "fail-api-2"]
     monkeypatch.setenv("DEVBRAIN_HOME", str(tmp_path))
 
-    def _per_session(conn, sid, pid, *, reextract):
+    def _per_session(conn, sid, pid, *, reextract, **kwargs):
         if "fail-api" in sid:
             return _build_extract_result(lessons=0, decisions=0, llm_calls=1, failure="api")
         if "fail-json" in sid:
@@ -358,7 +358,7 @@ def test_run_bulk_preserves_checkpoint_when_any_failure(tmp_path, monkeypatch):
     monkeypatch.setenv("DEVBRAIN_HOME", str(tmp_path))
     sessions = ["good-1", "fail-1"]
 
-    def _per_session(conn, sid, pid, *, reextract):
+    def _per_session(conn, sid, pid, *, reextract, **kwargs):
         if sid == "fail-1":
             return _build_extract_result(lessons=0, decisions=0, llm_calls=1, failure="api")
         return _build_extract_result(lessons=1, decisions=1, llm_calls=1)
@@ -376,6 +376,54 @@ def test_run_bulk_preserves_checkpoint_when_any_failure(tmp_path, monkeypatch):
     ckpt_path = _checkpoint_path_for("failtest")
     assert result.sessions_failed == 1
     assert ckpt_path.exists()  # preserved for retry
+
+
+# ─── Model override ─────────────────────────────────────────────────────────
+
+
+def test_run_bulk_forwards_model_to_extract(tmp_path, monkeypatch):
+    """The --model flag must thread all the way down to extract_from_session.
+    Without this wiring, --model=claude-opus-4-7 would silently use Sonnet."""
+    monkeypatch.setenv("DEVBRAIN_HOME", str(tmp_path))
+    sessions = ["sess-A"]
+    seen_kwargs: list[dict] = []
+
+    def _capture(conn, sid, pid, *, reextract, **kwargs):
+        seen_kwargs.append({"reextract": reextract, **kwargs})
+        return _build_extract_result(lessons=1, decisions=0, llm_calls=1)
+
+    with patch("cognify.extract.extract_from_session", side_effect=_capture):
+        run_bulk(
+            conn=MagicMock(),
+            project_id="proj-1",
+            project_slug="modeltest",
+            sessions=sessions,
+            model="claude-opus-4-7",
+            use_checkpoint=False,
+            recycle_every=0,
+        )
+    assert seen_kwargs == [{"reextract": False, "model": "claude-opus-4-7"}]
+
+
+def test_run_bulk_default_model_is_none(tmp_path, monkeypatch):
+    """Default behavior: model=None is passed (extract.py picks Sonnet)."""
+    monkeypatch.setenv("DEVBRAIN_HOME", str(tmp_path))
+    seen_kwargs: list[dict] = []
+
+    def _capture(conn, sid, pid, *, reextract, **kwargs):
+        seen_kwargs.append({"reextract": reextract, **kwargs})
+        return _build_extract_result(lessons=1, decisions=0, llm_calls=1)
+
+    with patch("cognify.extract.extract_from_session", side_effect=_capture):
+        run_bulk(
+            conn=MagicMock(),
+            project_id="proj-1",
+            project_slug="defaulttest",
+            sessions=["sess-A"],
+            use_checkpoint=False,
+            recycle_every=0,
+        )
+    assert seen_kwargs == [{"reextract": False, "model": None}]
 
 
 # ─── Progress callback ──────────────────────────────────────────────────────

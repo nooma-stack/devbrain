@@ -55,9 +55,24 @@ SONNET_4_6 = ModelPricing(
     cache_write_per_mtok=3.75,
 )
 
+# claude-opus-4-7 (as of 2026-05-18):
+#   Input:        $15.00 / Mtok   (5x Sonnet)
+#   Output:       $75.00 / Mtok   (5x Sonnet)
+#   Cache read:   $1.50 / Mtok
+#   Cache write:  $18.75 / Mtok
+# Source: https://www.anthropic.com/pricing
+OPUS_4_7 = ModelPricing(
+    model="claude-opus-4-7",
+    input_per_mtok=15.00,
+    output_per_mtok=75.00,
+    cache_read_per_mtok=1.50,
+    cache_write_per_mtok=18.75,
+)
+
 # Registry: model string → pricing. Extend as new models are added.
 _PRICING_REGISTRY: dict[str, ModelPricing] = {
     SONNET_4_6.model: SONNET_4_6,
+    OPUS_4_7.model: OPUS_4_7,
 }
 
 
