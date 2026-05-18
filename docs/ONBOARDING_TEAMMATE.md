@@ -10,6 +10,26 @@ For *replacing your own machine* (single-user move), see
 [MIGRATING.md](MIGRATING.md). That covers `export-memory` /
 `import-memory`. This doc covers the steady-state team scenario.
 
+> **The onboarding model in one line** (per the 2026-05-17 redesign,
+> [docs/plans/2026-05-17-onboarding-ssh-invitation-only.md][redesign]):
+> *An invitation gets the dev's agent SSH'd into Mac Studio. From
+> there, the agent self-services per-app auth via `devbrain login
+> --cli=X` — one command per CLI it wants set up. Adding a new CLI
+> later is just another `devbrain login`; no new invitation needed.*
+>
+> Per-app credentials live in the dev's profile dir at
+> `<DEVBRAIN_HOME>/profiles/<dev_id>/{.claude,.codex,.gemini}/`. The
+> Mac Studio's `brightbot-service@` SA orchestrates server-side CLI
+> spawning under those profiles.
+>
+> **Claude Desktop** (the GUI app) is **not** in scope for this flow.
+> Its auth runs entirely inside the app on the dev's local machine
+> (browser → `claude://` URL-scheme handoff → token in local macOS
+> keychain). Use it locally; the Mac Studio profile orchestrates the
+> Claude Code CLI, which is different.
+>
+> [redesign]: plans/2026-05-17-onboarding-ssh-invitation-only.md
+
 ---
 
 ## Architecture in one diagram
@@ -144,6 +164,10 @@ the full_name. If you skip this step, `devbrain login` will prompt for
 your git author identity instead of pulling it from your Dev record.
 
 ## Step 4 — Provision your per-CLI logins
+
+You pick which CLIs to set up. Each `devbrain login --cli=X` is
+independent — set up one now, add more later by re-running the
+command on a future SSH session (no new invitation needed).
 
 ```bash
 devbrain login --dev alice                # logs in all 3 CLIs

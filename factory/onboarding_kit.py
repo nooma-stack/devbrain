@@ -442,10 +442,43 @@ surface the error to the user. Common errors:
 """
 
 # ─── Phase 5: Server-side `devbrain login` ───────────────────────────────────
+#
+# Per the 2026-05-17 onboarding redesign (docs/plans/2026-05-17-
+# onboarding-ssh-invitation-only.md), invitations are SSH-only; the
+# dev's agent self-services per-app auth via `devbrain login --cli=X`.
+# A dev may want one app today and another later — both flows use the
+# same SSH access, no new invitation required.
+#
+# The kit therefore shows ALL per-CLI Phase-5 recipes. The dev picks
+# which to run (one, several, or all). Adding a new app later =
+# re-run the relevant recipe; no admin orchestration needed.
+
+_PHASE5_PREAMBLE = """\
+## Phase 5 — Set up each AI CLI you'll use on this Mac Studio profile
+
+You've SSH'd in (Phase 4). Now run one or more `devbrain login`
+recipes — one per AI CLI you want set up on this profile. Each is
+independent; you can run any subset now and the rest later by SSHing
+back in with your permanent key. The invitation kit isn't needed
+again — your permanent SSH key is the credential.
+
+**Pick the recipe(s) below that match the CLI(s) you'll use:**
+- 🤖 **Claude Code CLI** (most common) — see Phase 5a
+- 🤖 **Codex CLI** — see Phase 5b
+- 🤖 **Gemini CLI** — see Phase 5c
+
+> **Note on Claude Desktop:** the Desktop app's auth flow runs entirely
+> *inside the app on your local machine* (browser → `claude://` URL
+> scheme handoff → app captures token → macOS keychain on your laptop).
+> There's no SSH-driven flow for it; sign in via the app on your local
+> machine if you want to use it. The Mac Studio profile orchestrates
+> *server-side* CLI work, which doesn't involve Claude Desktop.
+
+"""
 
 _PHASE5_BY_CLI: dict[str, str] = {
     "claude": """\
-## Phase 5 — Issue your Claude OAuth token (server-side)
+## Phase 5a — Issue your Claude OAuth token (server-side)
 
 You SSH into your profile on the Mac Studio and run `devbrain login`.
 That command runs `claude setup-token` server-side; you'll see an
@@ -459,7 +492,7 @@ to this machine.
 <!-- agent:auto requires=user-approval,network,user-paste secret=oauth_verification_code scope={ssh_host} risk=medium -->
 """,
     "codex": """\
-## Phase 5 — Authenticate Codex via device-code (server-side)
+## Phase 5b — Authenticate Codex via device-code (server-side)
 
 You SSH into your profile on the Mac Studio and run `devbrain login`.
 That command runs `codex login --device-auth` server-side; you'll see
@@ -471,7 +504,7 @@ never returns to this machine.
 <!-- agent:auto requires=user-approval,network,user-paste scope={ssh_host} risk=medium -->
 """,
     "gemini": """\
-## Phase 5 — Provide your Gemini API key (server-side)
+## Phase 5c — Provide your Gemini API key (server-side)
 
 You SSH into your profile on the Mac Studio and run `devbrain login`.
 That command will prompt you to paste your Gemini API key. Get one
@@ -523,6 +556,19 @@ _PHASE6_HEADER = """\
 This step lets your **local** AI agent ({agent_app_display}) call DevBrain
 factory tools (factory_plan, factory_status, deep_search) over SSH
 using your permanent key.
+
+> **Multi-CLI note:** the snippet below targets `{cli_display_name}`
+> (the primary CLI selected for this invitation). If you ran more
+> than one Phase 5 recipe — e.g. you set up both Claude Code CLI and
+> Codex CLI on the Mac Studio profile — you'll want a matching MCP
+> entry in *each* of your **local** agents' config files. The Mac
+> Studio side is already done by Phase 5; only the local config
+> files need duplicating.
+>
+> Local MCP config locations by CLI:
+> - Claude Code: `~/.claude/.mcp.json` (or via `claude mcp add`)
+> - Codex: `~/.codex/config.toml`
+> - Gemini: `~/.gemini/settings.json` (mcpServers block)
 
 """
 
@@ -766,7 +812,20 @@ def write_onboarding_kit(
         ssh_host_fingerprint=ssh_host_fingerprint or "(verify on first SSH connect)",
     )
 
-    sections: list[str] = [
+    # Phase 5: pre-format ALL per-CLI recipes (5a/5b/5c) with their
+    # own --cli value. Multi-target dev experience per the 2026-05-17
+    # onboarding redesign. The kit primary `cli` parameter is no
+    # longer load-bearing for kit content; it's informational on the
+    # invitation row only.
+    phase5_chunks: list[str] = [_PHASE5_PREAMBLE.format(**fmt_args)]
+    for sub_cli in ("claude", "codex", "gemini"):
+        sub_fmt = {**fmt_args, "cli": sub_cli,
+                   "cli_display_name": _CLI_DISPLAY_NAMES[sub_cli]}
+        phase5_chunks.append(_PHASE5_BY_CLI[sub_cli].format(**sub_fmt))
+        phase5_chunks.append(_PHASE5_COMMAND.format(**sub_fmt))
+    phase5_content = "".join(phase5_chunks)
+
+    templated_sections_before: list[str] = [
         _PREAMBLE,
         _PHASE0_TRUST,
         _phase_block(_PHASE1_HEADER, _PHASE1_BASH, _PHASE1_POWERSHELL, platform),
@@ -774,13 +833,18 @@ def write_onboarding_kit(
         _phase_block(_PHASE3_HEADER, _PHASE3_BASH, _PHASE3_POWERSHELL, platform),
         _phase_block(_PHASE4_HEADER, _PHASE4_BASH, _PHASE4_POWERSHELL, platform),
         _PHASE4_FOOTER,
-        _PHASE5_BY_CLI[cli],
-        _PHASE5_COMMAND,
+    ]
+    templated_sections_after: list[str] = [
         _phase_block(_PHASE6_HEADER, _PHASE6_BASH, _PHASE6_POWERSHELL, platform),
         _PHASE7_CLEANUP,
         _BOOTSTRAP_KEY_BLOCK,
     ]
-    content = "".join(s.format(**fmt_args) for s in sections)
+
+    content = (
+        "".join(s.format(**fmt_args) for s in templated_sections_before)
+        + phase5_content
+        + "".join(s.format(**fmt_args) for s in templated_sections_after)
+    )
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content)
