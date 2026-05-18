@@ -248,6 +248,7 @@ def run_bulk(
     use_checkpoint: bool = True,
     progress_callback: Callable[[int, int, dict], None] | None = None,
     shard: tuple[int, int] | None = None,
+    model: str | None = None,
 ) -> BulkRunResult:
     """Process `sessions` in order, with checkpoint-resume + client
     recycle + cost cap.
@@ -321,6 +322,7 @@ def run_bulk(
                 session_id,
                 project_id,
                 reextract=reextract_mode,
+                model=model,
             )
         except Exception as exc:  # noqa: BLE001
             # extract_from_session normally returns failure as a field,

@@ -3214,6 +3214,13 @@ def cognify_reextract_command(
                    "list. Use to parallelize across M concurrent instances "
                    "(0/M, 1/M, ..., (M-1)/M). Each shard has its own "
                    "checkpoint file so resumes don't collide.")
+@click.option("--model", default=None,
+              help="Override the extraction model (default: claude-sonnet-4-6). "
+                   "Useful for re-trying json_parse-stuck sessions with a more "
+                   "capable model (e.g. --model=claude-opus-4-7 at ~5x cost). "
+                   "Pricing for the new model must be registered in "
+                   "factory/observability/pricing.py — unknown models fall "
+                   "back to Sonnet's pricing for the spend log.")
 @click.option("--dry-run", is_flag=True, default=False,
               help="Report what would be processed; make no API calls or "
                    "DB writes.")
@@ -3222,7 +3229,7 @@ def cognify_reextract_command(
                    "still goes to stderr).")
 def cognify_bulk_command(
     project_slug, target, since, max_llm_calls, recycle_every,
-    no_resume, shard, dry_run, as_json,
+    no_resume, shard, model, dry_run, as_json,
 ):
     """Bulk-extract lessons/decisions from an existing chunk history.
 
@@ -3343,6 +3350,7 @@ def cognify_bulk_command(
             use_checkpoint=not no_resume,
             progress_callback=render_stderr_progress if not dry_run else None,
             shard=shard_tuple,
+            model=model,
         )
 
     # Final summary on stdout.
@@ -3350,6 +3358,7 @@ def cognify_bulk_command(
         "project": project_slug,
         "target": target,
         "shard": shard,
+        "model": model or "(default)",
         "sessions_targeted": result.sessions_targeted,
         "sessions_processed": result.sessions_processed,
         "sessions_skipped_resume": result.sessions_skipped_resume,
