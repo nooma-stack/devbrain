@@ -495,19 +495,28 @@ def _llm_extract(content: str, *, max_llm_calls: int = 1) -> dict:
                 messages=[
                     {
                         "role": "user",
-                        "content": f"Extract lessons and decisions from this session:\n\n{content[:200_000]}",
+                        "content": (
+                            "Extract lessons and decisions from this session. "
+                            "Respond with ONLY a single JSON object — no preamble, "
+                            "no explanatory text, no markdown code fences. The "
+                            "first character of your response must be `{` and the "
+                            "last character must be `}`. Schema: "
+                            '{"lessons": [{"title": str, "content": str}], '
+                            '"decisions": [{"title": str, "content": str}]}.\n\n'
+                            "Session:\n\n"
+                            f"{content[:200_000]}"
+                        ),
                     },
-                    # Prefill the assistant turn with `{` so the model is
-                    # locked into continuing as JSON. Per Anthropic's
-                    # Messages API: when the final message is role=assistant,
-                    # the model's output is a continuation of that string.
-                    # Eliminates the most common json_parse failure mode we
-                    # observed in the 2026-05-17 brightbot run — Sonnet
-                    # abandoning the task and producing conversational
-                    # text, code snippets, or input echoes instead of a
-                    # JSON object. With the prefill, the model can ONLY
-                    # continue as JSON.
-                    {"role": "assistant", "content": "{"},
+                    # IMPORTANT: do NOT add an assistant prefill here.
+                    # The Claude OAuth (Max subscription / Claude Code SDK)
+                    # auth path does not support assistant message prefill
+                    # and returns HTTP 400 "This model does not support
+                    # assistant message prefill. The conversation must end
+                    # with a user message." Confirmed via the failing
+                    # llm-smoke run on PR #151 against the OAuth path
+                    # (2026-05-18). The retry fix relies instead on a
+                    # strengthened user prompt + the _parse_json_with_
+                    # fallbacks helper below.
                 ],
             )
             break
@@ -556,12 +565,13 @@ def _llm_extract(content: str, *, max_llm_calls: int = 1) -> dict:
         "cache_write_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
     }
     text = response.content[0].text.strip()
-    # Re-attach the prefilled `{` from the assistant turn — the API
-    # response only contains content AFTER the prefill, not the prefill
-    # itself. Without this, every parse would fail on the missing
-    # opening brace.
-    if not text.startswith("{"):
-        text = "{" + text
+    # The OAuth path doesn't allow assistant prefill (see comment above
+    # the messages.create call) so the response is whatever Sonnet
+    # emitted. _parse_json_with_fallbacks handles:
+    #   - direct {...} JSON (the happy path with the strengthened user
+    #     prompt steering Sonnet toward JSON-only output)
+    #   - markdown ```json fences anywhere in the response
+    #   - JSON embedded in prose (substring search)
     result = _parse_json_with_fallbacks(text)
     if result is None:
         # Log a sample of the offending payload so we can spot patterns
