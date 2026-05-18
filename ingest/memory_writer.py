@@ -6,14 +6,22 @@ table is best-effort — a memory failure must NOT poison the surrounding
 transaction or roll back the legacy write that is the current source
 of truth.
 
-Idempotency: relies on the partial unique index from migration 011,
-narrowed by migration 032 to atoms only:
-idx_memory_provenance_kind_unique on (provenance_id, kind) WHERE
-provenance_id IS NOT NULL AND kind != 'chunk'. Two concurrent
-dual-writes for the same atom row collapse to one memory row via
-ON CONFLICT DO NOTHING. Chunks (which share a session's provenance_id
-post-032) are NOT deduped here — pipeline.py:_process_session calls
-delete_chunks_for_session() before re-ingesting an updated session.
+Idempotency depends on `kind`. Migration 037 split the historical
+broad-atom index into two narrower ones:
+
+  * `idx_memory_session_summary_unique` on (provenance_id, kind)
+    WHERE kind='session_summary' — one summary row per session.
+  * `idx_memory_atom_title_unique` on (provenance_id, kind, title)
+    WHERE kind IN ('pattern','decision','lesson','issue') — many
+    atoms per (session, kind) allowed, identical re-extractions fold.
+  * Chunks (kind='chunk') have no unique constraint — many per
+    session by design. pipeline.py:_process_session calls
+    delete_chunks_for_session() before re-ingesting an updated
+    session, so chunk re-runs don't accumulate.
+
+record_memory picks the right ON CONFLICT target based on `kind`.
+Two concurrent dual-writes for the same atom row collapse via
+ON CONFLICT DO NOTHING; chunks just insert as new rows.
 """
 from __future__ import annotations
 
@@ -75,17 +83,34 @@ def record_memory(
     # already InFailedSqlTransaction, even SAVEPOINT raises — and the
     # docstring's best-effort guarantee must hold regardless of caller-
     # side transaction state.
+    # Pick the ON CONFLICT shape per kind (migration 037).
+    _ATOM_KINDS = {"pattern", "decision", "lesson", "issue"}
+    if kind == "session_summary":
+        on_conflict = (
+            "ON CONFLICT (provenance_id, kind) "
+            "WHERE provenance_id IS NOT NULL AND kind = 'session_summary' "
+            "DO NOTHING"
+        )
+    elif kind in _ATOM_KINDS:
+        on_conflict = (
+            "ON CONFLICT (provenance_id, kind, title) "
+            "WHERE provenance_id IS NOT NULL "
+            "  AND kind IN ('pattern', 'decision', 'lesson', 'issue') "
+            "DO NOTHING"
+        )
+    else:
+        # Chunks (and any future non-deduped kind) just insert.
+        on_conflict = ""
+
     try:
         cur.execute(f"SAVEPOINT {_SAVEPOINT_NAME}")
         cur.execute(
-            """
+            f"""
             INSERT INTO devbrain.memory
                 (project_id, kind, title, content, embedding,
                  provenance_id, applies_when)
             VALUES (%s, %s, %s, %s, %s::vector, %s, %s::jsonb)
-            ON CONFLICT (provenance_id, kind)
-                WHERE provenance_id IS NOT NULL AND kind != 'chunk'
-            DO NOTHING
+            {on_conflict}
             """,
             (
                 project_id, kind, title, content, embedding_sql,
