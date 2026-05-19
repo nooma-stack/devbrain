@@ -83,6 +83,54 @@ function triggerCognifyExtractInBackground(projectSlug: string): void {
   }
 }
 
+// Spawn `devbrain cognify-fanout --max-sessions=1` in the background.
+//
+// Opt-in via DEVBRAIN_FANOUT_ON_END_SESSION=1 because every fan-out
+// classifier call is one LLM round-trip (~$0.05–0.15 each, billed to
+// the dev's per-dev Max subscription). Heavy interactive users may
+// prefer to let the 60-min launchd cadence batch fan-out work instead.
+//
+// When enabled, this fires AFTER the cognify_extract spawn above —
+// extract creates the atoms / session_summary row that fan-out reads,
+// so ordering matters. We don't `await` extract (it's detached too),
+// but fan-out's discovery query naturally excludes sessions without
+// chunks, so a fresh session that hasn't been atomized yet will simply
+// be skipped this tick and picked up by the next launchd run.
+//
+// --max-sessions=1 keeps each fire-and-forget invocation cheap: at most
+// ONE classifier call per end_session, scoped to whichever new session
+// the discovery query finds first.
+function triggerFanoutInBackground(projectSlug: string): void {
+  if (process.env.DEVBRAIN_FANOUT_ON_END_SESSION !== '1') {
+    return
+  }
+  const env: NodeJS.ProcessEnv = { ...process.env }
+  const perDev = resolvePerDevToken()
+  if (perDev) {
+    env.CLAUDE_CODE_OAUTH_TOKEN = perDev.token
+    env.DEVBRAIN_COGNIFY_ATTRIBUTION = perDev.devId
+  }
+  try {
+    const child = spawn(
+      DEVBRAIN_PYTHON,
+      [
+        DEVBRAIN_CLI, 'cognify-fanout',
+        `--project=${projectSlug}`,
+        '--max-sessions=1',
+      ],
+      {
+        cwd: resolve(import.meta.dirname, '../../factory'),
+        env,
+        detached: true,
+        stdio: 'ignore',
+      },
+    )
+    child.unref()
+  } catch {
+    // Spawn failure is non-fatal — launchd's 60-min cadence will catch up.
+  }
+}
+
 function runDevbrainCli(args: string[]): { stdout: string; stderr: string; exitCode: number } {
   const result = spawnSync(DEVBRAIN_PYTHON, [DEVBRAIN_CLI, ...args], {
     encoding: 'utf-8',
@@ -1033,6 +1081,13 @@ server.tool(
     // attribution); otherwise the global .env token. Detached + stdio:
     // ignore: end_session returns immediately, cognify runs async.
     triggerCognifyExtractInBackground(project)
+
+    // Optionally trigger fan-out classification too — no-ops unless
+    // DEVBRAIN_FANOUT_ON_END_SESSION=1 is set. Surfaces cross-project
+    // content in this session into other projects' deep_search results
+    // without waiting on the 60-min launchd cadence. One LLM call per
+    // end_session — heavy users can leave it off and rely on launchd.
+    triggerFanoutInBackground(project)
 
     // Atlas Step 5e: structured-judgment enrichment.
     //
