@@ -329,3 +329,182 @@ If fan-out produces noisy/spammy summaries:
 The destination project's normal data is unaffected: fan-out only writes
 NEW rows tagged via the `derived_from` edge. Existing rows in any
 destination project keep their content, edges, and ranking signals.
+
+---
+
+## 12. Addendum (2026-05-19) — locked specification + build plan
+
+Decisions resolved in the 2026-05-18 working session that turn this
+design into a buildable spec. Updates §10's open questions and pins
+the classifier shape + schema + PR breakdown.
+
+### 12.1 Locked decisions
+
+| # | Decision |
+|---|---|
+| A1 | Whole-session relevance threshold: **0.30** (already locked, confirmed today). |
+| A2 | Within-section relevance threshold: **0.75** — the classifier identifies topic sections inside the session and only assigns a section to a project when that section is ≥75% about the project. Forces the model to reason section-by-section instead of treating the whole session as a soup. |
+| A3 | Per-dev **home project** replaces the deferred §6 inbox. Schema: `slug='home-<dev_id>'`, `name='<Full Name> — home'`, ACL owner = that dev. Created lazily on first end_session that has no clear project signal. **Patrick gets `home-patrickkelly` like every other dev** — no special-case bypass. |
+| A4 | Canonical project_id assignment **never moves** for existing rows. Today's `raw_sessions.project_id` (whatever the agent picked at end_session) stays put. Fan-out only ADDS per-project summary rows; it does NOT rewrite source ownership. Rationale: `provenance_id` chains in `memory` already point at the canonical row; reassigning canonical would invalidate atom-to-session lineage for thousands of atoms. |
+| A5 | New-session canonical assignment fallback: agent's pick if present, else `home-<dev_id>`. If neither classifier nor agent surfaces any project ≥0.30 → canonical stays `home-<dev_id>`; fan-out emits zero rows. |
+| A6 | Source-of-truth row for the `derived_from` edge: edges go from fan-out `memory(kind='session_summary')` → source `memory(kind='session_summary')` row in the canonical project. NOT directly to `raw_sessions` — keeps the graph homogeneous (memory→memory edges, per Phase 5). |
+| A7 | Backfill scope: **all-time** (~3,000 raw_sessions today). Sonnet 4.6 classifier with warm-prompt-cached project taxonomy; estimated $15–40 total. Idempotent partial unique index makes re-runs safe. |
+| A8 | Per-project focused summary length: 200–800 chars per project entry, model-judged. Long enough to retain useful detail, short enough that 5 fan-out rows from one session stay storage-cheap. |
+| A9 | Embedding model: **same `snowflake-arctic-embed2`** as the rest of `memory` — consistent vector space across project searches. |
+| A10 | Launchd cadence: `cognify_fanout` runs every **60 min**, gated to only process raw_sessions where `cognify_extract` has already completed (so atoms exist and the session is settled). Independent of `cognify_extract`'s 30-min cadence. |
+
+### 12.2 Classifier prompt + JSON output schema
+
+**Single LLM call per session.** The prompt structure forces section-aware
+reasoning even though output is a flat per-project list — the model is
+asked to identify sections internally, score per-section, then aggregate.
+
+```
+SYSTEM: You are classifying a developer's work session into the projects
+        it discussed. Available projects + descriptions:
+        {{taxonomy_json}}  — list of {slug, name, description}.
+
+USER: Session content follows. Do this internally:
+        (1) Identify topic sections (groups of consecutive turns about
+            one subject — could be 1 section or 6, the model decides).
+        (2) For each section, score per-project relevance 0.0–1.0.
+            A section counts as "belonging" to a project only when its
+            within-section score ≥ 0.75.
+        (3) Aggregate to session-level per-project relevance = fraction
+            of session sections that belong to that project. Drop
+            projects below 0.30.
+        (4) For each kept project, write a 200–800-char focused summary
+            of the relevant sections' content, in the dev's voice.
+
+      Return ONLY JSON (no commentary, no markdown fences):
+
+      {
+        "sections": [
+          {"start_turn": int, "end_turn": int, "topic": str,
+           "project_scores": {"<slug>": 0.0-1.0, ...}}
+        ],
+        "per_project": [
+          {"project_slug": str,
+           "session_relevance": 0.0-1.0,    // >= 0.30 to emit
+           "section_count": int,             // sections >= 0.75 for this project
+           "focused_summary": str}
+        ]
+      }
+
+      <<< SESSION CONTENT >>>
+      {{session_json}}
+```
+
+Output validation: drop entries where `session_relevance < 0.30` (defense
+in depth — model might emit them anyway). Drop entries whose `project_slug`
+isn't in the live taxonomy.
+
+### 12.3 Schema delta (migration 039)
+
+```sql
+-- Per-dev home projects. One row per dev_id at backfill time + one row
+-- per future dev_id at first cognify_fanout encounter.
+INSERT INTO devbrain.projects (id, slug, name, description, created_at)
+SELECT gen_random_uuid(),
+       'home-' || dev_id,
+       COALESCE(full_name, dev_id) || ' — home',
+       'Auto-managed catch-all for ' || dev_id || ' sessions with no other clear project. Phase 8.',
+       now()
+FROM devbrain.devs
+WHERE NOT EXISTS (
+    SELECT 1 FROM devbrain.projects p WHERE p.slug = 'home-' || devs.dev_id
+);
+
+-- Idempotency seal: one fan-out row per (source raw_session, target project).
+-- Uses fanout_source_session_id (added below) so the index covers exactly
+-- "this fan-out has already written into this project for this source."
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_fanout_unique
+    ON devbrain.memory (fanout_source_session_id, project_id)
+    WHERE kind = 'session_summary'
+      AND tier = 'memory'
+      AND archived_at IS NULL
+      AND fanout_source_session_id IS NOT NULL;
+
+-- Fan-out attribution column (lets us tell fan-out rows apart from
+-- agent-volunteered session_summary rows for the dashboard panel,
+-- and powers the idempotency index above).
+ALTER TABLE devbrain.memory
+    ADD COLUMN IF NOT EXISTS fanout_source_session_id UUID
+    REFERENCES devbrain.raw_sessions(id);
+
+COMMENT ON COLUMN devbrain.memory.fanout_source_session_id IS
+    'Set on Phase 8 fan-out rows: the raw_session whose content was '
+    'classified into this project. NULL for non-fan-out memory rows.';
+```
+
+### 12.4 Canonical assignment policy (clarifies §2 decision #1)
+
+```
+End-of-session path (live):
+  if agent_chose_project: canonical = agent_pick
+  else:                   canonical = home-<dev_id>   (lazily created)
+  → fan-out runs on the next cognify_fanout tick, regardless of canonical
+
+Existing rows (backfill):
+  canonical stays put. Period. Even when classifier disagrees:
+    e.g. session is canonical=brightbot, classifier says
+    {brightbot: 0.25, devbrain: 0.50, lht-vps: 0.45} — none clear 0.30
+    in brightbot, devbrain leads
+    → canonical STILL brightbot. Fan-out writes rows in devbrain + lht-vps.
+    Original session keeps its provenance chain.
+
+  This trades "perfect classification of historical canonical" for
+  "no rewrite of provenance_id pointers on ~2,900 sessions." The cost
+  is that historical canonicals occasionally look weird; the alternative
+  cost is an additional migration with FK-aware atom-relabeling, which
+  is much higher-risk.
+
+Edge case — orphan dev_id:
+  Some pre-PR-146 sessions have no associated dev_id (lhtdev, codex
+  sessions from early ingest). Backfill assigns them to `home-orphan`
+  (created in 039) so they're not lost. Going forward, every adapter
+  attaches dev_id at ingest time, so home-orphan stops accumulating.
+```
+
+### 12.5 PR breakdown
+
+Three PRs, each with clear "done when" criteria. Sized for ~half-day each.
+
+**PR 1 — Foundation** (closes when):
+- Migration 039 applied (home-* projects backfilled, fan-out indexes created, `fanout_source_session_id` column live)
+- `factory/cognify/fanout.py` module with `classify_session(session_id, conn) -> list[ClassificationResult]` helper — pure function, no DB writes
+- `factory/cognify/fanout_prompt.py` with the prompt template + taxonomy renderer
+- Tests: mock-LLM tests for classifier output validation; live-DB tests for migration 039 idempotency
+- No fan-out rows written yet; this PR is "the spec exists in code, but nothing emits"
+
+**PR 2 — Pass + CLI**:
+- `factory/cognify/fanout.py::run_fanout(conn, project_filter=None, since=None, model=...)` — the writer (calls `classify_session`, inserts fan-out memory rows + `derived_from` edges, records spend in `cognify_spend_log`)
+- `bin/devbrain cognify-fanout [--project=X] [--since=YYYY-MM-DD] [--model=...] [--dry-run] [--shard=N/M]` CLI
+- `launchd/com.devbrain.cognify-fanout.plist` template (60-min cadence)
+- Tests: end-to-end against live DB for a 3-session synthetic fixture; idempotency re-run test; partial-failure resume test
+- Done when: `bin/devbrain cognify-fanout --dry-run` reports a plausible scope; `--project=devbrain` writes rows that show up in `deep_search`
+
+**PR 3 — Backfill + verification**:
+- One-shot backfill script: `scripts/backfill_fanout_all_time.sh` — shards across N workers, logs progress, supports resume
+- Verification postulates: P_fanout_no_canonical_rewrite, P_fanout_idempotent, P_fanout_relevance_threshold_honored, P_fanout_home_project_orphan_handling
+- Dashboard panel update: existing SessionsPanel optionally shows "X fan-out rows from this session" link
+- Done when: all ~3,000 raw_sessions processed, every postulate passes, ad-hoc `deep_search(project=devbrain, query='brightbot routing')` surfaces relevant cross-project hits with breadcrumbs
+
+### 12.6 Resolutions for §10 open questions
+
+| §10 # | Question | Resolution |
+|---|---|---|
+| 1 | Threshold value | 0.30 session-level, 0.75 within-section (see A1, A2) |
+| 2 | Inbox project | Replaced by per-dev home project (A3) |
+| 3 | Backfill scope | All-time (A7) |
+| 4 | Classifier model selection | Sonnet 4.6 default; `--model=claude-opus-4-7` for stuck cases (mirrors today's cognify-bulk pattern) |
+| 5 | Compliance profile inheritance | Locked at design-doc decision #4 (target project's profiles, not source's) — confirmed |
+| 6 | Re-run semantics on partial completion | Partial unique index on `fanout_source_session_id` + per-session classifier checkpoint (A6, 12.3) |
+
+### 12.7 What's still soft
+
+These don't block PR 1 but are worth revisiting after PR 2 lands:
+
+- **Classifier confidence calibration.** The 0.30 / 0.75 thresholds are educated guesses. After 200–500 sessions of real fan-out data, audit a sample manually + adjust if precision/recall is off.
+- **Home project promotion.** If a dev's home project accumulates a coherent topic-cluster, the right move might be promoting that into a real project. Out of scope for Phase 8; revisit in Phase 9.
+- **Per-section retention in fan-out output.** Today fan-out emits ONE row per (session, target_project). If sections turn out to be conceptually distinct enough to warrant separate rows, we can split into per-section fan-out — but that doubles storage and complicates `derived_from` graph queries. Defer.
