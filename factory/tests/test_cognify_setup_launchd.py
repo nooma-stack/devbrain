@@ -200,7 +200,7 @@ def test_render_does_not_carry_placeholder_for_project_in_no_project_plists():
 # ─── install_cognify_launchd ─────────────────────────────────────────────────
 
 
-def test_install_writes_all_five_plists(tmp_path):
+def test_install_writes_all_plists(tmp_path):
     cred = CredentialChoice("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-FAKE")
     installed = install_cognify_launchd(
         project_slug="brightbot",
@@ -210,7 +210,9 @@ def test_install_writes_all_five_plists(tmp_path):
         target_dir=tmp_path,
         reload=False,
     )
-    assert len(installed) == 5
+    # 6 plists post-Phase-8: 3 SQL-only (decay/strengthen/gc) +
+    # 3 LLM-cost (extract/edges/fanout).
+    assert len(installed) == len(ALL_PLISTS)
     assert {p.name for p in installed} == set(ALL_PLISTS)
     for p in installed:
         assert p.exists()
@@ -280,8 +282,8 @@ def test_install_with_reload_invokes_launchctl(tmp_path):
         reload=True,
         runner=fake_run,
     )
-    # Two calls per plist (unload + load) × 5 plists = 10
-    assert len(calls) == 10
+    # Two calls per plist (unload + load) × len(ALL_PLISTS).
+    assert len(calls) == 2 * len(ALL_PLISTS)
     # Each pair should be (launchctl unload <path>) then (launchctl load <path>)
     for unload_call, load_call in zip(calls[0::2], calls[1::2]):
         assert unload_call[0:2] == ("launchctl", "unload")
