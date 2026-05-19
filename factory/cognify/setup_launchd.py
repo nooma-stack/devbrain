@@ -59,9 +59,10 @@ _NO_CRED_PLISTS = (
 _CRED_PLISTS = (
     "com.devbrain.cognify-extract.plist",
     "com.devbrain.cognify-edges.plist",
+    "com.devbrain.cognify-fanout.plist",  # Phase 8 cross-project fan-out
 )
 
-# All five, in installation order.
+# All cognify plists, in installation order.
 ALL_PLISTS = _NO_CRED_PLISTS + _CRED_PLISTS
 
 # The marker the credential block replaces. Multi-line; the installer
