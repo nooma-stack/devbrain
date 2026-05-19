@@ -2211,6 +2211,89 @@ server.tool(
   },
 )
 
+// ─── Tool: breadcrumb (Phase 8 follow-up — long-session narrative tracker) ──
+
+server.tool(
+  'breadcrumb',
+  'Drop a mid-session progress marker. Call at meaningful milestones in a ' +
+    'long session (decision made, problem solved, direction change). ' +
+    "Multiple breadcrumbs sharing the same conversation_uuid chain into a " +
+    "narrative the final end_session can fold in. Generate conversation_uuid " +
+    "ONCE per conversation (e.g. crypto.randomUUID()) and reuse it across " +
+    "every breadcrumb + the eventual end_session call.",
+  {
+    project: z.string().describe('Project slug'),
+    conversation_uuid: z.string().uuid()
+      .describe('UUID generated once at session start; reused across all breadcrumb + end_session calls in this conversation.'),
+    title: z.string().min(1).max(200)
+      .describe('Short marker title (≤200 chars).'),
+    content: z.string().min(1).max(4000)
+      .describe('Breadcrumb body — what was decided/learned/changed at this point.'),
+    seq: z.number().int().optional()
+      .describe('Optional sequence number. Defaults to the count of existing breadcrumbs with this conversation_uuid + 1.'),
+  },
+  async ({ project, conversation_uuid, title, content, seq }) => {
+    const projectId = await resolveProjectId(project)
+    if (!projectId) {
+      return { content: [{ type: 'text', text: `Project "${project}" not found.` }] }
+    }
+
+    // Resolve seq: caller-provided wins; otherwise count existing breadcrumbs
+    // for this conversation and use (count + 1).
+    let effectiveSeq = seq
+    if (effectiveSeq === undefined) {
+      const countRes = await query<{ n: number }>(
+        `SELECT COUNT(*)::int AS n FROM devbrain.memory
+         WHERE kind = 'session_breadcrumb'
+           AND provenance_id = $1
+           AND archived_at IS NULL`,
+        [conversation_uuid],
+      )
+      effectiveSeq = (countRes.rows[0]?.n ?? 0) + 1
+    }
+
+    const embedText = `${title}\n${content}`
+    const embedding = await embed(embedText)
+    const vectorStr = toSqlVector(embedding)
+
+    const appliesWhen = {
+      conversation_uuid,
+      seq: effectiveSeq,
+      source: 'mcp:breadcrumb',
+    }
+
+    const result = await query<{ id: string }>(
+      `INSERT INTO devbrain.memory
+         (project_id, kind, title, content, embedding,
+          provenance_id, tier, strength, applies_when)
+       VALUES ($1, 'session_breadcrumb', $2, $3, $4::vector,
+               $5, 'memory', 1.0, $6::jsonb)
+       RETURNING id`,
+      [
+        projectId, title, content, vectorStr,
+        conversation_uuid, JSON.stringify(appliesWhen),
+      ],
+    )
+    const id = result.rows[0]?.id ?? null
+
+    if (!id) {
+      return { content: [{ type: 'text', text: 'breadcrumb: insert returned no row (unexpected).' }] }
+    }
+
+    return {
+      content: [{
+        type: 'text',
+        text:
+          `breadcrumb #${effectiveSeq} stored for conversation ` +
+          `${conversation_uuid.slice(0, 8)}… (id=${id.slice(0, 8)}…). ` +
+          `Use the same conversation_uuid on subsequent breadcrumb + ` +
+          `end_session calls to keep the chain intact.`,
+      }],
+    }
+  },
+)
+
+
 // ─── Start server ────────────────────────────────────────────────────────────
 
 async function main() {
