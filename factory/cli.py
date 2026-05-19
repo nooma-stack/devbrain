@@ -2315,6 +2315,103 @@ def upgrade(
 # ─── Onboarding admin commands (Phase 6) ────────────────────────────────────
 
 
+@cli.command(name="invite")
+@click.argument("dev_id")
+@click.option("--full-name", required=True, help="Dev's display name.")
+@click.option("--email", required=True, help="Email — kit destination + dev contact.")
+@click.option(
+    "--cli", "cli_hint", default="claude", show_default=True,
+    help="Free-text annotation: which AI CLI the kit messaging targets. "
+         "Per PR #146 the post-SSH-bootstrap flow is agent-driven, so this "
+         "is just kit/email phrasing, not a load-bearing routing field.",
+)
+@click.option(
+    "--platform", "platform_hint", default="auto", show_default=True,
+    type=click.Choice(["auto", "mac", "linux", "windows"]),
+    help="Dev's local OS (kit prepends Windows/WSL2 preflight when 'windows').",
+)
+@click.option(
+    "--agent-app", "agent_app_hint", default="auto", show_default=True,
+    type=click.Choice([
+        "auto", "claude-desktop", "codex-desktop", "gemini-desktop",
+        "claude-cli", "codex-cli", "gemini-cli",
+    ]),
+    help="Which AI agent app the dev will read the kit in (controls kit framing + email body).",
+)
+@click.option("--slack", default=None, help="Slack handle (optional).")
+@click.option("--notes", default=None, help="Free-text notes attached to the invitation row.")
+@click.option(
+    "--ttl-days", default=7, show_default=True, type=int,
+    help="Invitation expiry, in days from now.",
+)
+@click.option(
+    "--auto-activate/--no-auto-activate", default=True, show_default=True,
+    help="When set, the reconciler auto-activates the dev once pubkey + "
+         "OAuth token arrive. With --no-auto-activate the admin must run "
+         "`devbrain activate --dev <id>` after both are received.",
+)
+@click.option(
+    "--email-now/--no-email-now", default=False, show_default=True,
+    help="Send the kit to the dev's email immediately on creation. Default off "
+         "for non-interactive use (Use `devbrain send-invite --dev <id>` later "
+         "if you want to email it).",
+)
+def invite_cmd(
+    dev_id, full_name, email, cli_hint, platform_hint, agent_app_hint,
+    slack, notes, ttl_days, auto_activate, email_now,
+):
+    """Non-interactive onboarding: stage dev + invitation + kit in one shot.
+
+    Use when you want to script invitations from CI, an admin tool, or a
+    config-file-driven add-dev flow. For the guided experience use
+    `devbrain setup add-dev` (which prompts for missing values).
+
+    Example:
+
+        devbrain invite alice \\
+          --full-name "Alice Example" --email alice@example.com \\
+          --cli claude --agent-app claude-cli --notes "FERPA team"
+
+    Returns nonzero on validation failure (invalid dev_id, malformed
+    email, etc.); the invitation row + bootstrap key are created in a
+    single side-effecting call, so a partial-failure leaves no half-state.
+    """
+    import re
+
+    from profiles import DEV_ID_RE
+
+    if not DEV_ID_RE.fullmatch(dev_id):
+        click.echo(
+            f"Error: '{dev_id}' is not a valid dev_id "
+            "(lowercase, [a-z0-9_-], 1-64 chars).",
+            err=True,
+        )
+        raise click.exceptions.Exit(2)
+    if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        click.echo(f"Error: '{email}' doesn't look like a valid email.", err=True)
+        raise click.exceptions.Exit(2)
+
+    # Late import — setup pulls in heavy click + yaml deps.
+    from setup import finalize_invitation_and_kit
+
+    inv_id_short, kit_path = finalize_invitation_and_kit(
+        dev_id=dev_id,
+        full_name=full_name,
+        email=email,
+        slack_handle=slack,
+        cli=cli_hint,
+        platform=platform_hint,
+        agent_app=agent_app_hint,
+        auto_activate=auto_activate,
+        notes=notes,
+        ttl_days=ttl_days,
+        email_now=email_now,
+        echo=click.echo,
+    )
+    # Helper already printed the success summary; just confirm exit-code clean.
+    _ = (inv_id_short, kit_path)
+
+
 @cli.command(name="invitations")
 @click.option(
     "--status", default=None,
