@@ -3,6 +3,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { spawn, spawnSync } from 'child_process'
+import { randomUUID } from 'crypto'
 import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join, resolve } from 'path'
@@ -1052,15 +1053,22 @@ server.tool(
     // session LEARNED" surface. They're orthogonal — agents that
     // upgrade pass the new params, older callers see no change.
     let enrichmentReport = ''
-    if (
-      session_id !== undefined &&
-      ((cascade_decisions?.length ?? 0) > 0 ||
-       (new_relationships?.length ?? 0) > 0 ||
-       (lesson_candidates?.length ?? 0) > 0)
-    ) {
+    // Always invoke the curator entry point so end_session_log captures
+    // a row for every session (Issue #135 — powers the dashboard
+    // "recently-ended sessions" panel). Empty-judgment payloads still
+    // produce a log row + drain the cascade queue (handle_* handlers
+    // early-return on empty lists). session_id is auto-generated when
+    // the agent doesn't pass one, sacrificing idempotency for those
+    // calls but keeping the log surface complete.
+    const effectiveSessionId = session_id ?? randomUUID()
+    const callingDevId = process.env.DEVBRAIN_DEV_ID || null
+    const callingCli = process.env.DEVBRAIN_MCP_CLI || null
+    {
       const enrichmentPayload = {
         project_id: projectId,
-        session_id,
+        session_id: effectiveSessionId,
+        dev_id: callingDevId,
+        cli: callingCli,
         cascade_decisions: cascade_decisions ?? [],
         new_relationships: new_relationships ?? [],
         lesson_candidates: lesson_candidates ?? [],
@@ -1075,15 +1083,24 @@ server.tool(
           env: { ...process.env },
         },
       )
+      const hasJudgment = (
+        (cascade_decisions?.length ?? 0) > 0 ||
+        (new_relationships?.length ?? 0) > 0 ||
+        (lesson_candidates?.length ?? 0) > 0
+      )
       if (result.status !== 0) {
         // Surface the error — judgment is the user-facing primary work
         // here; if the agent opted into structured enrichment they need
-        // to know it failed so they can retry.
+        // to know it failed so they can retry. (Also surface failures
+        // even for log-only calls — silent log failures hide problems.)
         enrichmentReport = (
           `\n\nWARNING: end_session enrichment failed (exit ${result.status}).` +
           `\nstderr: ${(result.stderr ?? '').toString().slice(0, 800)}`
         )
-      } else {
+      } else if (hasJudgment) {
+        // Only surface success details when the agent volunteered
+        // judgment; the "always-on log row" case stays silent to keep
+        // end_session responses concise.
         try {
           const parsed = JSON.parse((result.stdout ?? '').toString())
           const drained = parsed.cascades_drained ?? 0

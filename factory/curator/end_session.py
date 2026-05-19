@@ -206,8 +206,14 @@ def end_session_idempotent_handler(
     or the next factory job.
     """
     session_id = payload["session_id"]
+    # dev_id + cli are attribution columns added in migration 038.
+    # Excluded from the payload_hash so existing idempotency keys still match
+    # when the MCP server starts passing them on already-logged sessions.
+    dev_id = payload.get("dev_id")
+    cli = payload.get("cli")
+    hashable = {k: v for k, v in payload.items() if k not in ("dev_id", "cli")}
     payload_hash = hashlib.sha256(
-        _json.dumps(payload, sort_keys=True, default=str).encode()
+        _json.dumps(hashable, sort_keys=True, default=str).encode()
     ).hexdigest()
 
     # Idempotency check.
@@ -275,10 +281,13 @@ def end_session_idempotent_handler(
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO devbrain.end_session_log "
-            "(session_id, payload_hash, project_id, result) "
-            "VALUES (%s, %s, %s, %s::jsonb) "
+            "(session_id, payload_hash, project_id, result, dev_id, cli) "
+            "VALUES (%s, %s, %s, %s::jsonb, %s, %s) "
             "ON CONFLICT (session_id, payload_hash) DO NOTHING",
-            (session_id, payload_hash, project_id, _json.dumps(result)),
+            (
+                session_id, payload_hash, project_id, _json.dumps(result),
+                dev_id, cli,
+            ),
         )
     conn.commit()
     return result

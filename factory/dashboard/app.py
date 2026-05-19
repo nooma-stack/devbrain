@@ -27,6 +27,7 @@ from dashboard.widgets.events_panel import RecentEventsPanel
 from dashboard.widgets.locks_panel import FileLocksPanel
 from dashboard.widgets.completed_panel import RecentCompletedPanel
 from dashboard.widgets.cognify_panel import CognifyPanel
+from dashboard.widgets.sessions_panel import SessionsPanel
 from dashboard.widgets.job_detail import JobDetailScreen
 
 REFRESH_INTERVAL = 2.0  # seconds
@@ -74,6 +75,7 @@ class DashboardApp(App):
             yield RecentEventsPanel(id="events-panel", classes="panel")
             yield FileLocksPanel(id="locks-panel", classes="panel")
             yield CognifyPanel(id="cognify-panel", classes="panel")
+            yield SessionsPanel(id="sessions-panel", classes="panel")
             yield RecentCompletedPanel(id="completed-panel", classes="panel")
         yield Footer()
 
@@ -90,11 +92,13 @@ class DashboardApp(App):
             locks = self.data.get_active_locks(project=self.current_project)
             completed = self.data.get_recent_completed(project=self.current_project)
             cognify_passes = self.data.get_cognify_pass_status(project=self.current_project)
+            recent_sessions = self.data.get_recent_sessions(project=self.current_project)
 
             self.query_one("#jobs-panel", ActiveJobsPanel).update_jobs(jobs)
             self.query_one("#events-panel", RecentEventsPanel).update_events(events)
             self.query_one("#locks-panel", FileLocksPanel).update_locks(locks)
             self.query_one("#cognify-panel", CognifyPanel).update_passes(cognify_passes)
+            self.query_one("#sessions-panel", SessionsPanel).update_sessions(recent_sessions)
             self.query_one("#completed-panel", RecentCompletedPanel).update_completed(completed)
         except Exception as e:
             self.notify(f"Refresh error: {e}", severity="error")
