@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- cognify_fanout: cross-project fan-out classifier (Phase 8).        -->
+<!-- Every 60 min: discovers sessions lacking active fan-out rows,      -->
+<!-- runs the LLM classifier, writes per-project focused-summary rows.  -->
+<!-- Idempotent via the partial unique on                               -->
+<!-- (memory.fanout_source_session_id, project_id).                     -->
+<!-- Placeholders ${DEVBRAIN_HOME}, ${USER}, and the credential-env     -->
+<!-- marker are substituted by `devbrain setup-cognify-launchd`.        -->
+<!-- Note: fan-out is global (no --project arg) — the classifier picks  -->
+<!-- targets per-session from the taxonomy.                             -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.devbrain.cognify-fanout</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>${DEVBRAIN_HOME}/.venv/bin/python</string>
+        <string>${DEVBRAIN_HOME}/factory/cli.py</string>
+        <string>cognify</string>
+        <string>--pass=fanout</string>
+    </array>
+
+    <!-- Run every 60 min. Cadence intentionally slower than          -->
+    <!-- cognify_extract (30 min) so fan-out always runs against     -->
+    <!-- settled atom state.                                          -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DEVBRAIN_HOME</key>
+        <string>${DEVBRAIN_HOME}</string>
+        <key>PYTHONPATH</key>
+        <string>${DEVBRAIN_HOME}/factory</string>
+        <!-- @CREDENTIAL_ENV_BLOCK@ — installer emits ANTHROPIC_API_KEY  -->
+        <!-- or CLAUDE_CODE_OAUTH_TOKEN here based on env at install     -->
+        <!-- time.                                                       -->
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>${DEVBRAIN_HOME}/factory</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/${USER}/.devbrain/logs/cognify-fanout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/${USER}/.devbrain/logs/cognify-fanout.err</string>
+
+    <key>ThrottleInterval</key>
+    <integer>300</integer>
+</dict>
+</plist>

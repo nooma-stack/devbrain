@@ -3493,5 +3493,162 @@ def cognify_bulk_command(
             )
 
 
+# ─── Phase 8: cognify_fanout ────────────────────────────────────────────────
+
+
+@cli.command("cognify-fanout")
+@click.option(
+    "--project", "project_slug", default=None,
+    help="Project slug — restrict discovery to sessions whose canonical "
+         "project_id matches. Omit to fan-out across all projects.",
+)
+@click.option(
+    "--since", default=None,
+    help="ISO date — only process raw_sessions with started_at >= this date. "
+         "Omit for all-time backfill scope.",
+)
+@click.option(
+    "--max-sessions", type=int, default=None,
+    help="Cap discovery at N sessions. Useful for budgeted runs / smoke tests.",
+)
+@click.option(
+    "--shard", default=None,
+    help="N/M — process only sessions[i % M == N] of the sorted session list. "
+         "Use to parallelize across M concurrent instances (0/M, 1/M, ...).",
+)
+@click.option(
+    "--model", default=None,
+    help="Override the classifier model (default: claude-sonnet-4-6). Use "
+         "claude-opus-4-7 to retry sessions whose Sonnet output failed "
+         "json_parse. Pricing must be registered in "
+         "factory/observability/pricing.py — unknown models fall back to "
+         "Sonnet pricing for the spend log.",
+)
+@click.option(
+    "--dry-run", is_flag=True, default=False,
+    help="Report discovery scope only. No LLM calls. No DB writes.",
+)
+@click.option(
+    "--json", "as_json", is_flag=True, default=False,
+    help="Emit the final summary as JSON on stdout.",
+)
+def cognify_fanout_command(
+    project_slug, since, max_sessions, shard, model, dry_run, as_json,
+):
+    """Cross-project fan-out (Phase 8). Classifies each session into the
+    projects it actually discussed and writes per-project focused-summary
+    rows so single-project deep_search finds cross-project content.
+
+    Examples:
+
+      devbrain cognify-fanout --dry-run                       # size scope
+      devbrain cognify-fanout --since=2026-04-01              # last month
+      devbrain cognify-fanout --project=brightbot             # canonical filter
+      devbrain cognify-fanout --shard=0/4                     # parallel worker 1
+      devbrain cognify-fanout --model=claude-opus-4-7         # retry stuck cases
+
+    Reads the locked thresholds (0.30 session-level, 0.75 within-section)
+    from factory/cognify/fanout_prompt.py. Idempotent against the partial
+    unique index from migration 039 — safe to re-run.
+    """
+    import json
+    import sys
+    from datetime import datetime, timezone
+
+    from cognify.fanout import (  # noqa: PLC0415
+        run_fanout, DEFAULT_MODEL,
+    )
+
+    db = get_db()
+
+    project_id = None
+    if project_slug:
+        with db._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM devbrain.projects WHERE slug = %s",
+                (project_slug,),
+            )
+            row = cur.fetchone()
+        if not row:
+            raise click.ClickException(f"Project {project_slug!r} not found.")
+        project_id = row[0]
+
+    since_dt = None
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since)
+            if since_dt.tzinfo is None:
+                since_dt = since_dt.replace(tzinfo=timezone.utc)
+        except ValueError as exc:
+            raise click.ClickException(f"Invalid --since date: {since!r}") from exc
+
+    shard_tuple: tuple[int, int] | None = None
+    if shard:
+        try:
+            n_str, m_str = shard.split("/", 1)
+            shard_tuple = (int(n_str), int(m_str))
+        except (ValueError, AttributeError) as exc:
+            raise click.ClickException(
+                f"--shard must be N/M (e.g. 0/4); got {shard!r}"
+            ) from exc
+
+    effective_model = model or DEFAULT_MODEL
+
+    def _on_progress(idx, total, info):
+        rows = info.get("rows", 0)
+        failure = info.get("failure")
+        sid = info.get("session_id", "?")[:8]
+        status = (
+            f"FAILED ({failure})" if failure else f"{rows} fan-out rows"
+        )
+        click.echo(
+            f"cognify-fanout: [{idx:>4}/{total:>4}] {sid}…  {status}",
+            err=True,
+        )
+
+    with db._conn() as conn:
+        result = run_fanout(
+            conn,
+            project_id=project_id,
+            since=since_dt,
+            model=effective_model,
+            dry_run=dry_run,
+            shard=shard_tuple,
+            max_sessions=max_sessions,
+            progress_callback=_on_progress if not as_json else None,
+        )
+
+    summary = {
+        "sessions_discovered": result.sessions_discovered,
+        "sessions_processed": result.sessions_processed,
+        "sessions_failed": result.sessions_failed,
+        "sessions_skipped": result.sessions_skipped,
+        "rows_emitted": result.rows_emitted,
+        "llm_calls": result.llm_calls,
+        "failure_counts": result.failure_counts,
+        "dry_run": result.dry_run,
+    }
+
+    if as_json:
+        click.echo(json.dumps(summary, indent=2))
+        return
+
+    click.echo("", err=True)
+    click.echo("─" * 60, err=True)
+    click.echo(
+        f"cognify-fanout: complete"
+        + (" (DRY RUN)" if dry_run else "")
+        + f"\n  discovered:  {result.sessions_discovered}"
+        + f"\n  processed:   {result.sessions_processed}"
+        + f"\n  skipped:     {result.sessions_skipped}"
+        + f"\n  failed:      {result.sessions_failed}"
+        + f"\n  rows:        {result.rows_emitted}"
+        + f"\n  llm calls:   {result.llm_calls}"
+        + (f"\n  failures:    {result.failure_counts}"
+           if result.failure_counts else ""),
+        err=True,
+    )
+
+
 if __name__ == "__main__":
     cli()

@@ -313,6 +313,401 @@ def _clip_summary(text: str) -> str:
     return cut.rstrip() + "…"
 
 
+# ─── PR 2 additions: writer + pass registration ─────────────────────────────
+
+
+@dataclass
+class FanoutResult:
+    """Aggregate outcome of a run_fanout invocation."""
+
+    sessions_discovered: int = 0
+    sessions_processed: int = 0
+    sessions_failed: int = 0
+    sessions_skipped: int = 0       # idempotency / no-content / no-targets
+    rows_emitted: int = 0           # fan-out memory rows written
+    llm_calls: int = 0
+    failure_counts: dict = field(default_factory=dict)
+    dry_run: bool = False
+
+
+def discover_sessions_needing_fanout(
+    conn: Any,
+    *,
+    project_id: Any = None,
+    since=None,
+    limit: int | None = None,
+) -> list[str]:
+    """raw_sessions that lack any active fan-out memory row.
+
+    Discovery rule: a session "needs fan-out" when:
+      * it has at least one chunk in `devbrain.chunks` (atomized — there's
+        content for the classifier to read),
+      * AND no active memory row exists with
+        `fanout_source_session_id = rs.id`. The classifier has not yet
+        been run, or it ran and produced zero targets (in which case
+        we skip rather than re-classify — see §12.7 calibration note).
+
+    Optional filters:
+      * `project_id` scopes to sessions whose canonical project_id matches.
+      * `since` is a datetime cutoff on `raw_sessions.started_at`.
+      * `limit` caps the discover return for shard/dry-run sizing.
+    """
+    where = ["EXISTS (SELECT 1 FROM devbrain.chunks c WHERE c.source_id = rs.id)"]
+    params: list = []
+
+    if project_id is not None:
+        where.append("rs.project_id = %s")
+        params.append(project_id)
+    if since is not None:
+        where.append("rs.started_at >= %s")
+        params.append(since)
+
+    # Anti-join: skip sessions that already have a fan-out row.
+    where.append(
+        "NOT EXISTS ("
+        " SELECT 1 FROM devbrain.memory m "
+        " WHERE m.fanout_source_session_id = rs.id "
+        "   AND m.archived_at IS NULL "
+        ")"
+    )
+
+    sql = (
+        "SELECT rs.id::text "
+        "FROM devbrain.raw_sessions rs "
+        "WHERE " + " AND ".join(where) + " "
+        "ORDER BY rs.started_at DESC NULLS LAST"
+    )
+    if limit is not None:
+        sql += f" LIMIT {int(limit)}"
+
+    with conn.cursor() as cur:
+        cur.execute(sql, params)
+        return [r[0] for r in cur.fetchall()]
+
+
+def apply_shard(sessions: list[str], shard: tuple[int, int] | None) -> list[str]:
+    """Stride-slice for parallel runs. shard=(N, M) returns sessions where
+    index % M == N. Mirrors cognify-bulk's apply_shard so the operator
+    mental model is consistent.
+    """
+    if shard is None:
+        return sessions
+    n, m = shard
+    if m <= 0 or not (0 <= n < m):
+        raise ValueError(f"shard must be (N, M) with 0 <= N < M; got {shard}")
+    return [s for i, s in enumerate(sessions) if i % m == n]
+
+
+def _insert_fanout_row(
+    conn: Any,
+    *,
+    project_id_target: Any,
+    source_session_id: str,
+    classification: ProjectClassification,
+    embedding: list[float] | None,
+) -> str | None:
+    """Insert one fan-out memory row. Returns the new row's id, or None on
+    a DO NOTHING collision (already present — idempotent re-run).
+
+    Inheritance: compliance_profiles are pulled from the TARGET project
+    so cross-project rule isolation holds (§12 design decision #4).
+    """
+    # Title = "<project_slug> session: <date> · <relevance>"
+    # Short, scannable in deep_search results. The content holds the
+    # focused_summary itself.
+    title = f"Cross-project session ({classification.session_relevance:.2f})"
+
+    # Pull target project's compliance_profiles. The projects table stores
+    # the per-project allowlist as `compliance_profiles_enabled` (text[]);
+    # we propagate that array onto the fan-out row's compliance_profiles
+    # column so cross-project rule isolation holds (§12 design decision #4).
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT compliance_profiles_enabled FROM devbrain.projects "
+            "WHERE id = %s",
+            (project_id_target,),
+        )
+        row = cur.fetchone()
+    target_profiles = (row[0] if row else None) or []
+
+    # applies_when records the per-fan-out metadata for traceability.
+    applies_when = {
+        "fanout_source_session": source_session_id,
+        "session_relevance": classification.session_relevance,
+        "section_count": classification.section_count,
+        "source_pass": "cognify_fanout",
+    }
+
+    cols = [
+        "project_id", "kind", "title", "content", "tier", "strength",
+        "applies_when", "fanout_source_session_id", "compliance_profiles",
+    ]
+    vals: list = [
+        project_id_target, "session_summary", title,
+        classification.focused_summary, "memory", 1.0,
+        _json_dumps(applies_when), source_session_id, target_profiles,
+    ]
+    placeholders = ["%s"] * len(cols)
+
+    if embedding is not None:
+        cols.insert(4, "embedding")
+        vals.insert(4, embedding)
+        placeholders.insert(4, "%s::vector")
+
+    # ON CONFLICT must repeat the partial index predicate verbatim
+    # (Postgres requires matching the inference clause for partial
+    # unique indexes).
+    sql = (
+        "INSERT INTO devbrain.memory (" + ", ".join(cols) + ") "
+        "VALUES (" + ", ".join(placeholders) + ") "
+        "ON CONFLICT (fanout_source_session_id, project_id) "
+        "  WHERE kind = 'session_summary' "
+        "    AND tier = 'memory' "
+        "    AND archived_at IS NULL "
+        "    AND fanout_source_session_id IS NOT NULL "
+        "  DO NOTHING "
+        "RETURNING id"
+    )
+    with conn.cursor() as cur:
+        cur.execute(sql, vals)
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _resolve_project_id_by_slug(conn: Any, slug: str) -> str | None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM devbrain.projects WHERE slug = %s",
+            (slug,),
+        )
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _embed_summary(text: str) -> list[float] | None:
+    """Compute an embedding for the focused summary via Ollama.
+
+    Returns None if Ollama is unreachable — the fan-out row is still
+    written (sans embedding) so search via metadata/title still works;
+    a subsequent `cognify reembed` pass can backfill the vector.
+    """
+    try:
+        import json
+        import urllib.request
+        # Re-resolve config at call-time so test envs can monkeypatch.
+        try:
+            from ingest.config import OLLAMA_URL, EMBED_MODEL  # noqa: PLC0415
+        except ImportError:
+            # Fallback: ingest package not on path (shouldn't happen under
+            # devbrain's standard installs, but be tolerant in CI).
+            import os  # noqa: PLC0415
+            OLLAMA_URL = os.environ.get("DEVBRAIN_OLLAMA_URL", "http://localhost:11434")
+            EMBED_MODEL = os.environ.get("DEVBRAIN_EMBEDDING_MODEL", "snowflake-arctic-embed2")
+        data = json.dumps({"model": EMBED_MODEL, "input": text}).encode()
+        req = urllib.request.Request(
+            f"{OLLAMA_URL}/api/embed",
+            data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            payload = json.loads(resp.read())
+        return payload["embeddings"][0]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("cognify_fanout: embedding failed (%s); writing row without vector", exc)
+        return None
+
+
+def _json_dumps(obj: dict) -> str:
+    import json
+    return json.dumps(obj, default=str)
+
+
+def run_fanout(
+    conn: Any,
+    *,
+    project_id: Any = None,
+    since=None,
+    model: str = DEFAULT_MODEL,
+    dry_run: bool = False,
+    shard: tuple[int, int] | None = None,
+    max_sessions: int | None = None,
+    progress_callback=None,
+) -> FanoutResult:
+    """Run the Phase 8 cross-project fan-out pass.
+
+    For each discovered raw_session:
+      1. Classify via the LLM (one call) into per-project relevance + summary.
+      2. For each per_project entry, write a `kind='session_summary'`
+         memory row into the target project with `fanout_source_session_id`
+         set. Compliance profiles inherited from the target.
+      3. Record spend in `cognify_spend_log` (one row per classifier call).
+
+    Idempotency: the (fanout_source_session_id, project_id) partial unique
+    index from migration 039 collapses re-emissions into DO NOTHING.
+
+    No `memory_dependencies` edges are emitted today. The
+    `fanout_source_session_id` FK column is the linkage; an explicit
+    `derived_from` edge would only be valuable for multi-hop graph
+    walks, which can be added later without changing this writer.
+
+    Returns FanoutResult with counts. ``dry_run=True`` walks discovery
+    + reports counts but skips the LLM call and DB writes.
+    """
+    from observability.spend import record_spend  # noqa: PLC0415
+    from observability.pricing import (  # noqa: PLC0415
+        get_pricing, compute_cost_usd, SONNET_4_6,
+    )
+
+    result = FanoutResult(dry_run=dry_run)
+
+    sessions = discover_sessions_needing_fanout(
+        conn, project_id=project_id, since=since, limit=max_sessions,
+    )
+    sessions = apply_shard(sessions, shard)
+    result.sessions_discovered = len(sessions)
+
+    if dry_run or not sessions:
+        return result
+
+    pricing = get_pricing(model) or SONNET_4_6
+
+    for idx, session_id in enumerate(sessions, start=1):
+        try:
+            classification = classify_session(session_id, conn, model=model)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("cognify_fanout: classify_session raised on %s", session_id)
+            result.sessions_failed += 1
+            result.failure_counts["exception"] = result.failure_counts.get("exception", 0) + 1
+            if progress_callback:
+                progress_callback(idx, len(sessions), {
+                    "session_id": session_id, "failure": "exception", "rows": 0,
+                })
+            continue
+
+        # Spend tracking — record even on per-project=empty results since
+        # the LLM call happened. Skip when classifier short-circuited
+        # before the API call (no_taxonomy/no_session/no_content/no_auth).
+        usage = classification.usage
+        if any(usage.get(k, 0) for k in ("input_tokens", "output_tokens")):
+            cost = compute_cost_usd(
+                pricing,
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+                cache_read_tokens=usage.get("cache_read_tokens", 0),
+                cache_write_tokens=usage.get("cache_write_tokens", 0),
+            )
+            try:
+                record_spend(
+                    conn,
+                    project_id=project_id,
+                    pass_name="fanout",
+                    model=model,
+                    input_tokens=usage.get("input_tokens", 0),
+                    output_tokens=usage.get("output_tokens", 0),
+                    cache_read_tokens=usage.get("cache_read_tokens", 0),
+                    cache_write_tokens=usage.get("cache_write_tokens", 0),
+                    cost_usd=cost,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("cognify_fanout: record_spend failed on %s", session_id)
+
+            result.llm_calls += 1
+
+        if classification.failure:
+            if classification.failure == "empty":
+                # Empty → the classifier ran but no target cleared 0.30.
+                # Count as skipped, not failed (no rework needed; the
+                # session legitimately doesn't fan out).
+                result.sessions_skipped += 1
+            else:
+                result.sessions_failed += 1
+                key = classification.failure
+                result.failure_counts[key] = result.failure_counts.get(key, 0) + 1
+            if progress_callback:
+                progress_callback(idx, len(sessions), {
+                    "session_id": session_id,
+                    "failure": classification.failure,
+                    "rows": 0,
+                })
+            continue
+
+        # Happy path: write fan-out rows.
+        rows_for_session = 0
+        for pc in classification.per_project:
+            target_pid = _resolve_project_id_by_slug(conn, pc.project_slug)
+            if not target_pid:
+                # Project was in taxonomy at classification time but
+                # disappeared between then and write (rare). Skip rather
+                # than crash.
+                logger.warning(
+                    "cognify_fanout: target project %r vanished mid-run; skip",
+                    pc.project_slug,
+                )
+                continue
+            embedding = _embed_summary(pc.focused_summary)
+            new_id = _insert_fanout_row(
+                conn,
+                project_id_target=target_pid,
+                source_session_id=session_id,
+                classification=pc,
+                embedding=embedding,
+            )
+            if new_id is not None:
+                rows_for_session += 1
+
+        conn.commit()
+        result.sessions_processed += 1
+        result.rows_emitted += rows_for_session
+
+        if progress_callback:
+            progress_callback(idx, len(sessions), {
+                "session_id": session_id,
+                "rows": rows_for_session,
+                "failure": None,
+            })
+
+    return result
+
+
+# ─── Pass registration (orchestrator framework) ─────────────────────────────
+
+
+def _register_fanout_pass() -> None:
+    """Late-binding registration with the cognify orchestrator.
+
+    Imported lazily by orchestrator._ensure_registry() so the import
+    graph stays acyclic.
+    """
+    from cognify.orchestrator import CognifyPass, PassResult, register_pass
+
+    @register_pass
+    class FanoutPass(CognifyPass):
+        pass_name = "fanout"
+
+        def run(
+            self, conn, project_id, *, dry_run: bool = False,
+        ) -> "PassResult":
+            res = run_fanout(conn, project_id=project_id, dry_run=dry_run)
+            return PassResult(
+                rows_processed=res.rows_emitted,
+                llm_calls=res.llm_calls,
+                metadata={
+                    "pass": "fanout",
+                    "sessions_discovered": res.sessions_discovered,
+                    "sessions_processed": res.sessions_processed,
+                    "sessions_failed": res.sessions_failed,
+                    "sessions_skipped": res.sessions_skipped,
+                    "failure_counts": res.failure_counts,
+                },
+                dry_run=dry_run,
+            )
+
+    return FanoutPass
+
+
+_register_fanout_pass()
+
+
 # Re-export thresholds at module level for callers/tests that want to
 # assert against the locked spec without reaching into fanout_prompt.
 __all__ = [
@@ -321,5 +716,9 @@ __all__ = [
     "DEFAULT_MODEL",
     "ProjectClassification",
     "ClassificationResult",
+    "FanoutResult",
     "classify_session",
+    "run_fanout",
+    "discover_sessions_needing_fanout",
+    "apply_shard",
 ]
