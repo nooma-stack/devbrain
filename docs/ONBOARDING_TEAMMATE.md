@@ -177,7 +177,24 @@ devbrain login --dev alice --cli codex
 devbrain login --dev alice --cli gemini
 ```
 
-Each CLI's login flow:
+### Browser-required auth from a headless SSH session
+
+All three supported CLIs (claude / codex / gemini) handle the "browser
+lives on YOUR laptop, code execution lives on the Mac Studio" gap by
+**printing a URL** that you open locally. There is no localhost
+callback over the tunnel; you finish OAuth in your local browser, then
+paste a verification code (or the OAuth picks up via Anthropic's hosted
+callback at `platform.claude.com`) back into the SSH session. The
+adapters block the auto-launch path (`BROWSER=/bin/false`, `DISPLAY=""`)
+so you always get the printable URL.
+
+**Claude Desktop (the GUI app) is NOT supported as an SSH-tunnel target.**
+Claude Desktop is designed to run as a local app on your own machine, not
+to be driven through SSH. If your workflow needs Claude Desktop, install
+it on your laptop and sign in there with your own subscription —
+DevBrain doesn't manage that.
+
+### Per-CLI specifics
 
 - **Codex**: prints a verification URL + short code. Open the URL in your
   laptop browser, enter the code, return to the SSH terminal. No

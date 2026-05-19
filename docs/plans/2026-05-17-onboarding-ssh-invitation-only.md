@@ -199,11 +199,28 @@ Genuinely small set after the simplification:
    Useful for kit messaging ("you wanted claude-code") but not
    load-bearing. Recommend: yes, as a free-text annotation, no
    enum, no enforcement.
+
+   **RESOLVED (2026-05-19)** — `devbrain invite <dev_id>` shipped as
+   a non-interactive top-level command with `--cli` accepted as a
+   free-text annotation (default `"claude"`). Enforcement stays out
+   of the column; the kit/email body uses the hint for phrasing only.
+   See `factory/cli.py:invite_cmd` and
+   `factory/setup.py:finalize_invitation_and_kit`.
+
 2. **Browser-required auth flows in headless mode.** Some agent apps
    (claude-desktop) require a browser. The agent might not have one.
    Recommend: surface a clear interactive handoff to the human dev
    ("open this URL on your laptop, paste the code back"). Don't try
    to automate browsers from the dev's agent.
+
+   **RESOLVED (2026-05-19)** — All three supported adapters
+   (`claude.py` / `codex.py` / `gemini.py`) already block auto-launch
+   (`BROWSER=/bin/false`, `DISPLAY=""`) and print a URL for the dev
+   to open in their laptop browser. Claude Desktop is explicitly
+   NOT supported as an SSH-tunnel target — it's a local GUI app and
+   devs install it directly on their own machine. Documented in
+   `docs/ONBOARDING_TEAMMATE.md` §"Browser-required auth from a
+   headless SSH session".
 
 Both are minor compared to PR #131's 6 open questions, all of which
 dissolve here.

@@ -2165,6 +2165,90 @@ def setup_add_dev(
         _warn("Cancelled.")
         return
 
+    inv_id_short, kit_path = finalize_invitation_and_kit(
+        dev_id=dev_id,
+        full_name=full_name,
+        email=email,
+        slack_handle=slack_handle,
+        cli=cli,
+        platform=platform,
+        agent_app=agent_app,
+        auto_activate=auto_activate,
+        notes=notes,
+        ttl_days=7,
+        email_now=_confirm(f"Email the kit to {email} now?", default=True),
+        admin_name=None,  # helper resolves from $USER
+        echo=click.echo,
+    )
+
+    click.echo()
+    _info(
+        "The raw invite token is embedded inside the kit file — DevBrain "
+        "stores only its hash. If the kit is lost, run "
+        "`devbrain setup add-dev` again to issue a fresh one (revoke the "
+        "previous one with `devbrain revoke-invite <id>`)."
+    )
+
+
+def finalize_invitation_and_kit(
+    *,
+    dev_id: str,
+    full_name: str,
+    email: str,
+    slack_handle: str | None = None,
+    cli: str = "claude",
+    platform: str = "auto",
+    agent_app: str = "auto",
+    auto_activate: bool = True,
+    notes: str | None = None,
+    ttl_days: int = 7,
+    email_now: bool = False,
+    admin_name: str | None = None,
+    echo=None,
+) -> tuple[str, Path]:
+    """Non-interactive core of the onboarding flow.
+
+    Registers the dev, stages the invitation, generates the bootstrap
+    SSH keypair, appends it to authorized_keys, writes the kit, and
+    (optionally) emails it. Pure I/O — no prompts. Used by:
+      * ``setup_add_dev`` (the interactive wizard, which collects args
+        via _prompt/_confirm then calls here)
+      * ``devbrain invite`` (cli.py — fully scripted, all args via flags)
+
+    Returns ``(invitation_id_short, kit_path)``. Side effects:
+      * inserts rows in ``devbrain.devs`` + ``devbrain.invitations``
+      * appends a bootstrap ed25519 entry to ``~/.ssh/authorized_keys``
+      * writes the kit markdown under ``<DEVBRAIN_HOME>/onboarding/``
+      * (if ``email_now``) sends the kit via the configured SMTP/Gmail DWD
+
+    ``echo`` is an optional output callable (e.g. ``click.echo``). When
+    None the helper stays silent — the caller is responsible for any
+    user-facing summary. ``admin_name`` defaults to ``$USER`` /
+    ``getpass.getuser()`` (recorded as ``created_by`` on the invitation
+    row + signs the email).
+    """
+    import getpass
+    import os as _os
+    import subprocess as _sp
+    import tempfile as _tempfile
+    from datetime import timezone as _tz, timedelta as _td
+
+    from invitations import (
+        callback_base_url,
+        create_invitation,
+    )
+    from onboarding_kit import write_onboarding_kit
+    from state_machine import FactoryDB
+    from config import (
+        DATABASE_URL,
+        DEVBRAIN_HOME as _DEVBRAIN_HOME,
+        ONBOARDING_SSH_HOST,
+        ONBOARDING_SSH_PORT,
+    )
+
+    _echo = echo or (lambda *_a, **_k: None)
+    admin_user = admin_name or _os.environ.get("USER") or getpass.getuser()
+
     # ─── Stage the dev row + invitation ───────────────────────────────
     db = FactoryDB(DATABASE_URL)
 
@@ -2183,8 +2267,8 @@ def setup_add_dev(
         auto_activate=auto_activate,
         email=email,
         notes=notes,
-        created_by=_os.environ.get("USER") or getpass.getuser(),
-        ttl_days=7,
+        created_by=admin_user,
+        ttl_days=ttl_days,
         cli=cli,
     )
 
@@ -2278,17 +2362,18 @@ def setup_add_dev(
         agent_app=agent_app,
     )
 
-    # ─── Hand back to admin ───────────────────────────────────────────
-    click.echo()
-    _ok(f"Dev '{dev_id}' staged.")
-    _ok(f"Invitation id: {inv.id[:8]} (expires {inv.expires_at:%Y-%m-%d %H:%M %Z})")
-    _ok(f"Onboarding kit: {kit_path}")
-    click.echo()
+    _echo("")
+    _echo(f"✅ Dev '{dev_id}' staged.")
+    _echo(
+        f"   Invitation id: {inv.id[:8]} "
+        f"(expires {inv.expires_at:%Y-%m-%d %H:%M %Z})"
+    )
+    _echo(f"   Onboarding kit: {kit_path}")
+    _echo("")
 
     # ─── Optionally email the kit ────────────────────────────────────
-    if _confirm(f"Email the kit to {email} now?", default=True):
+    if email_now:
         from onboarding_email import send_onboarding_email
-        admin_user = _os.environ.get("USER") or getpass.getuser()
         sent = send_onboarding_email(
             to_email=email,
             dev_id=dev_id,
@@ -2300,26 +2385,20 @@ def setup_add_dev(
             agent_app=agent_app,
         )
         if sent:
-            _ok(f"Email sent to {email}.")
+            _echo(f"✅ Email sent to {email}.")
         else:
-            _warn(
-                "Email not sent (SMTP unconfigured or delivery failed). "
+            _echo(
+                f"⚠ Email not sent (SMTP unconfigured or delivery failed). "
                 f"Send the kit manually, or fix SMTP and re-run: "
                 f"devbrain send-invite --dev {dev_id}"
             )
     else:
-        _info(
-            f"Skipping auto-send. Email the kit yourself, or run later: "
+        _echo(
+            f"   Skipping auto-send. Email the kit yourself, or run later: "
             f"devbrain send-invite --dev {dev_id}"
         )
 
-    click.echo()
-    _info(
-        "The raw invite token is embedded inside the kit file — DevBrain "
-        "stores only its hash. If the kit is lost, run "
-        "`devbrain setup add-dev` again to issue a fresh one (revoke the "
-        "previous one with `devbrain revoke-invite <id>`)."
-    )
+    return invite_id_short, kit_path
 
 
 # (menu label, section key, runner callable)
