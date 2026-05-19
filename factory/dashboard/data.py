@@ -377,3 +377,61 @@ class DashboardData:
                 })
 
         return rows
+
+    def get_recent_sessions(
+        self, project: str | None = None, limit: int = 10,
+    ) -> list[dict]:
+        """Recent end_session_log rows for the Active Sessions panel.
+
+        Issue #135 — surfaces (session_id, dev_id, cli, project_slug,
+        applied_at) so the dashboard can show "who ended which session
+        on which CLI, when." Rows with NULL dev_id/cli are pre-038 or
+        local (non-SSH) sessions; they render as "—" so the gap is
+        visible rather than silently inferred.
+
+        Dedupes by session_id (returning the most-recent payload_hash
+        per session) because a session_id can show up twice when the
+        agent retries end_session with a different payload — the
+        enrichment-bearing payload is the one we want to surface.
+
+        `project` is a slug filter; None means "all projects."
+        """
+        project_filter = ""
+        params: list = []
+        if project:
+            project_filter = "AND p.slug = %s"
+            params.append(project)
+
+        params.append(limit)
+        sql = f"""
+        SELECT DISTINCT ON (esl.session_id)
+            esl.session_id, esl.dev_id, esl.cli, esl.applied_at,
+            p.slug AS project_slug
+        FROM devbrain.end_session_log esl
+        JOIN devbrain.projects p ON p.id = esl.project_id
+        WHERE TRUE {project_filter}
+        ORDER BY esl.session_id, esl.applied_at DESC
+        """
+        # Wrap to re-order by applied_at globally after the DISTINCT ON
+        # collapse. DISTINCT ON requires ORDER BY (session_id, ...) so
+        # we can't sort globally inside the same query.
+        sql = f"""
+        SELECT * FROM (
+            {sql}
+        ) deduped
+        ORDER BY applied_at DESC
+        LIMIT %s
+        """
+
+        rows: list[dict] = []
+        with self.db._conn() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            for r in cur.fetchall():
+                rows.append({
+                    "session_id": r[0],
+                    "dev_id": r[1],
+                    "cli": r[2],
+                    "applied_at": r[3],
+                    "project_slug": r[4],
+                })
+        return rows

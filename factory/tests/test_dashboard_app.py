@@ -15,11 +15,13 @@ async def test_dashboard_mounts():
 
 @pytest.mark.asyncio
 async def test_dashboard_shows_all_panels():
-    """All four panels are mounted on the dashboard."""
+    """All panels are mounted on the dashboard."""
     from dashboard.widgets.jobs_panel import ActiveJobsPanel
     from dashboard.widgets.events_panel import RecentEventsPanel
     from dashboard.widgets.locks_panel import FileLocksPanel
     from dashboard.widgets.completed_panel import RecentCompletedPanel
+    from dashboard.widgets.cognify_panel import CognifyPanel
+    from dashboard.widgets.sessions_panel import SessionsPanel
 
     app = DashboardApp()
     async with app.run_test() as pilot:
@@ -28,6 +30,8 @@ async def test_dashboard_shows_all_panels():
         assert app.query_one(RecentEventsPanel) is not None
         assert app.query_one(FileLocksPanel) is not None
         assert app.query_one(RecentCompletedPanel) is not None
+        assert app.query_one(CognifyPanel) is not None
+        assert app.query_one(SessionsPanel) is not None
 
 
 @pytest.mark.asyncio
