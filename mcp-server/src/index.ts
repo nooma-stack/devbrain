@@ -2266,26 +2266,150 @@ server.tool(
   },
 )
 
-// ─── Tool: breadcrumb (Phase 8 follow-up — long-session narrative tracker) ──
+// ─── Session-narrative tools (Phase 8 follow-up) ────────────────────────────
+//
+// start_session   — anchor a conversation with its intent at seq=0
+// breadcrumb      — mid-session progress markers at seq=1..N
+// end_session     — final summary (separate tool above; takes session_id)
+//
+// All three share the same `conversation_uuid` so deep_search /
+// graph-walking can recover the whole chain.
+
+/**
+ * Shared writer for kind='session_breadcrumb' rows. Used by both
+ * start_session (seq=0, is_session_start=true) and breadcrumb (seq>=1).
+ *
+ * Returns the new memory.id, the resolved conversation_uuid (matches
+ * input or freshly-generated), and the resolved seq.
+ */
+async function writeBreadcrumbRow(args: {
+  projectId: string
+  conversationUuid: string
+  title: string
+  content: string
+  seq: number
+  isSessionStart: boolean
+}): Promise<{ id: string | null; seq: number }> {
+  const embedText = `${args.title}\n${args.content}`
+  const embedding = await embed(embedText)
+  const vectorStr = toSqlVector(embedding)
+
+  const appliesWhen: Record<string, unknown> = {
+    conversation_uuid: args.conversationUuid,
+    seq: args.seq,
+    source: 'mcp:breadcrumb',
+  }
+  if (args.isSessionStart) {
+    appliesWhen.is_session_start = true
+  }
+
+  const result = await query<{ id: string }>(
+    `INSERT INTO devbrain.memory
+       (project_id, kind, title, content, embedding,
+        provenance_id, tier, strength, applies_when)
+     VALUES ($1, 'session_breadcrumb', $2, $3, $4::vector,
+             $5, 'memory', 1.0, $6::jsonb)
+     RETURNING id`,
+    [
+      args.projectId, args.title, args.content, vectorStr,
+      args.conversationUuid, JSON.stringify(appliesWhen),
+    ],
+  )
+  return {
+    id: result.rows[0]?.id ?? null,
+    seq: args.seq,
+  }
+}
+
+
+server.tool(
+  'start_session',
+  'Anchor a new conversation chain with an intent statement. Call this ' +
+    "ONCE per conversation, right after reading the user's first prompt + " +
+    "loading project context. Returns a conversation_uuid you reuse across " +
+    'every subsequent breadcrumb + end_session call to keep the chain ' +
+    'linked.\n\nUsage pattern:\n' +
+    "  1. (first turn) call get_project_context, then start_session(project, intent)\n" +
+    "  2. save the returned conversation_uuid in your working memory\n" +
+    "  3. at meaningful milestones, call breadcrumb(project, conversation_uuid, ...)\n" +
+    '  4. at end_session, pass conversation_uuid as session_id.\n\n' +
+    'If you forget to call start_session, the first breadcrumb auto-creates ' +
+    'a UUID — but the intent anchor (seq=0) is lost, so calling start_session ' +
+    'explicitly is strongly preferred.',
+  {
+    project: z.string().describe('Project slug'),
+    intent: z.string().min(1).max(2000)
+      .describe(
+        "1–3 sentence summary of what the user is asking. The first " +
+          "breadcrumb in the chain — anchors search results so deep_search " +
+          "by intent words later surfaces the whole conversation arc.",
+      ),
+    conversation_uuid: z.string().uuid().optional()
+      .describe(
+        'Optional pre-generated UUID. Most callers omit this and let the ' +
+          "server generate one. Pass it explicitly only when you have a " +
+          "lab-native session id you want to reuse (Claude Code's JSONL " +
+          "filename UUID, etc.).",
+      ),
+  },
+  async ({ project, intent, conversation_uuid }) => {
+    const projectId = await resolveProjectId(project)
+    if (!projectId) {
+      return { content: [{ type: 'text', text: `Project "${project}" not found.` }] }
+    }
+
+    const conv = conversation_uuid ?? randomUUID()
+    const title = intent.length > 200 ? intent.slice(0, 197) + '...' : intent
+    const { id } = await writeBreadcrumbRow({
+      projectId,
+      conversationUuid: conv,
+      title,
+      content: intent,
+      seq: 0,
+      isSessionStart: true,
+    })
+
+    if (!id) {
+      return { content: [{ type: 'text', text: 'start_session: insert returned no row (unexpected).' }] }
+    }
+    return {
+      content: [{
+        type: 'text',
+        text:
+          `Session anchored. conversation_uuid=${conv}\n\n` +
+          `Reuse this UUID on every subsequent breadcrumb + end_session ` +
+          `call to chain the conversation. The intent breadcrumb (seq=0) ` +
+          `was stored at id=${id.slice(0, 8)}….`,
+      }],
+    }
+  },
+)
+
 
 server.tool(
   'breadcrumb',
   'Drop a mid-session progress marker. Call at meaningful milestones in a ' +
     'long session (decision made, problem solved, direction change). ' +
     "Multiple breadcrumbs sharing the same conversation_uuid chain into a " +
-    "narrative the final end_session can fold in. Generate conversation_uuid " +
-    "ONCE per conversation (e.g. crypto.randomUUID()) and reuse it across " +
-    "every breadcrumb + the eventual end_session call.",
+    "narrative the final end_session can fold in.\n\n" +
+    "Prefer to call start_session(project, intent) ONCE at conversation " +
+    "start and reuse the returned conversation_uuid here. If conversation_uuid " +
+    "is omitted, the server auto-generates one and returns it — but the " +
+    "intent anchor (seq=0) is lost, so an explicit start_session is preferred.",
   {
     project: z.string().describe('Project slug'),
-    conversation_uuid: z.string().uuid()
-      .describe('UUID generated once at session start; reused across all breadcrumb + end_session calls in this conversation.'),
+    conversation_uuid: z.string().uuid().optional()
+      .describe(
+        'UUID returned by start_session at conversation start; omit only ' +
+          'on the first breadcrumb of an un-anchored chain (server will ' +
+          'auto-generate one and return it for reuse).',
+      ),
     title: z.string().min(1).max(200)
       .describe('Short marker title (≤200 chars).'),
     content: z.string().min(1).max(4000)
       .describe('Breadcrumb body — what was decided/learned/changed at this point.'),
     seq: z.number().int().optional()
-      .describe('Optional sequence number. Defaults to the count of existing breadcrumbs with this conversation_uuid + 1.'),
+      .describe('Optional sequence number. Defaults to (count of existing breadcrumbs with this conversation_uuid) + 1.'),
   },
   async ({ project, conversation_uuid, title, content, seq }) => {
     const projectId = await resolveProjectId(project)
@@ -2293,8 +2417,13 @@ server.tool(
       return { content: [{ type: 'text', text: `Project "${project}" not found.` }] }
     }
 
-    // Resolve seq: caller-provided wins; otherwise count existing breadcrumbs
-    // for this conversation and use (count + 1).
+    const conv = conversation_uuid ?? randomUUID()
+    const isAutoGenerated = conversation_uuid === undefined
+
+    // Resolve seq: caller-provided wins; otherwise count existing
+    // breadcrumbs for this conversation. For a freshly auto-generated
+    // UUID the count is always 0 → seq=1, but the query is cheap and
+    // keeps the code-path symmetric.
     let effectiveSeq = seq
     if (effectiveSeq === undefined) {
       const countRes = await query<{ n: number }>(
@@ -2302,47 +2431,38 @@ server.tool(
          WHERE kind = 'session_breadcrumb'
            AND provenance_id = $1
            AND archived_at IS NULL`,
-        [conversation_uuid],
+        [conv],
       )
       effectiveSeq = (countRes.rows[0]?.n ?? 0) + 1
     }
 
-    const embedText = `${title}\n${content}`
-    const embedding = await embed(embedText)
-    const vectorStr = toSqlVector(embedding)
-
-    const appliesWhen = {
-      conversation_uuid,
+    const { id } = await writeBreadcrumbRow({
+      projectId,
+      conversationUuid: conv,
+      title,
+      content,
       seq: effectiveSeq,
-      source: 'mcp:breadcrumb',
-    }
-
-    const result = await query<{ id: string }>(
-      `INSERT INTO devbrain.memory
-         (project_id, kind, title, content, embedding,
-          provenance_id, tier, strength, applies_when)
-       VALUES ($1, 'session_breadcrumb', $2, $3, $4::vector,
-               $5, 'memory', 1.0, $6::jsonb)
-       RETURNING id`,
-      [
-        projectId, title, content, vectorStr,
-        conversation_uuid, JSON.stringify(appliesWhen),
-      ],
-    )
-    const id = result.rows[0]?.id ?? null
+      isSessionStart: false,
+    })
 
     if (!id) {
       return { content: [{ type: 'text', text: 'breadcrumb: insert returned no row (unexpected).' }] }
     }
+
+    const reuseHint = isAutoGenerated
+      ? `\n\n⚠ conversation_uuid was auto-generated (no start_session call observed). ` +
+        `Reuse ${conv} on every subsequent breadcrumb + end_session call to ` +
+        `keep the chain intact. Consider calling start_session at the top of ` +
+        `your next conversation to capture intent.`
+      : ` Reuse the same conversation_uuid on subsequent breadcrumb + ` +
+        `end_session calls to keep the chain intact.`
 
     return {
       content: [{
         type: 'text',
         text:
           `breadcrumb #${effectiveSeq} stored for conversation ` +
-          `${conversation_uuid.slice(0, 8)}… (id=${id.slice(0, 8)}…). ` +
-          `Use the same conversation_uuid on subsequent breadcrumb + ` +
-          `end_session calls to keep the chain intact.`,
+          `${conv.slice(0, 8)}… (id=${id.slice(0, 8)}…).${reuseHint}`,
       }],
     }
   },
