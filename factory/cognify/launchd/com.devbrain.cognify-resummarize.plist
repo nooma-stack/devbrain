@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- cognify_resummarize: upgrade Ollama session summaries to Sonnet      -->
+<!-- when end_session was never called. 60-min cadence — conversations    -->
+<!-- need to be "settled" (no JSONL writes in last 30 min) before they    -->
+<!-- become candidates, so the cadence below is intentionally slower.     -->
+<!-- See factory/cognify/resummarize.py for design notes.                 -->
+<!-- Placeholders ${DEVBRAIN_HOME}, ${USER}, and the credential-env       -->
+<!-- marker are substituted by `devbrain setup-cognify-launchd`.          -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.devbrain.cognify-resummarize</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>${DEVBRAIN_HOME}/.venv/bin/python</string>
+        <string>${DEVBRAIN_HOME}/factory/cli.py</string>
+        <string>cognify</string>
+        <string>--pass=resummarize</string>
+    </array>
+
+    <!-- Run every 60 min. -->
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DEVBRAIN_HOME</key>
+        <string>${DEVBRAIN_HOME}</string>
+        <key>PYTHONPATH</key>
+        <string>${DEVBRAIN_HOME}/factory</string>
+        <!-- @CREDENTIAL_ENV_BLOCK@ — installer emits ANTHROPIC_API_KEY  -->
+        <!-- or CLAUDE_CODE_OAUTH_TOKEN here based on env at install     -->
+        <!-- time.                                                       -->
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>${DEVBRAIN_HOME}/factory</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/${USER}/.devbrain/logs/cognify-resummarize.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/${USER}/.devbrain/logs/cognify-resummarize.err</string>
+
+    <key>ThrottleInterval</key>
+    <integer>300</integer>
+</dict>
+</plist>

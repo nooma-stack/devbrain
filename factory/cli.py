@@ -3650,5 +3650,132 @@ def cognify_fanout_command(
     )
 
 
+# ─── cognify_resummarize ────────────────────────────────────────────────────
+
+
+@cli.command("cognify-resummarize")
+@click.option(
+    "--project", "project_slug", default=None,
+    help="Project slug — restrict discovery to sessions in this project. "
+         "Omit to process all projects.",
+)
+@click.option(
+    "--since", default=None,
+    help="ISO date — only consider raw_sessions created on/after this date.",
+)
+@click.option(
+    "--max-sessions", type=int, default=None,
+    help="Cap discovery at N sessions. Useful for budgeted runs / smoke tests.",
+)
+@click.option(
+    "--model", default=None,
+    help="Override the summarizer model (default: claude-sonnet-4-6). "
+         "Pricing for the model must be registered in "
+         "factory/observability/pricing.py.",
+)
+@click.option(
+    "--dry-run", is_flag=True, default=False,
+    help="Report what would be processed. No LLM calls, no writes.",
+)
+@click.option(
+    "--json", "as_json", is_flag=True, default=False,
+    help="Emit the final summary as JSON on stdout.",
+)
+def cognify_resummarize_command(
+    project_slug, since, max_sessions, model, dry_run, as_json,
+):
+    """Upgrade Ollama session summaries to Sonnet for orphan-of-end_session
+    sessions.
+
+    Targets raw_sessions where the ingest watcher wrote an Ollama
+    summary but no end_session call ever landed. Cost: ~$0.01–0.02 per
+    session at Sonnet's 9.6K avg input. Idempotent via summary_source
+    marker — re-running won't touch already-upgraded rows.
+
+    Examples:
+
+      devbrain cognify-resummarize --dry-run                    # size scope
+      devbrain cognify-resummarize --max-sessions=50            # small batch
+      devbrain cognify-resummarize --since=2026-04-01           # last month
+      devbrain cognify-resummarize --project=brightbot          # one project
+    """
+    import json
+    from datetime import datetime, timezone
+
+    from cognify.resummarize import run_resummarize, DEFAULT_MODEL  # noqa: PLC0415
+
+    db = get_db()
+
+    project_id = None
+    if project_slug:
+        with db._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM devbrain.projects WHERE slug = %s",
+                (project_slug,),
+            )
+            row = cur.fetchone()
+        if not row:
+            raise click.ClickException(f"Project {project_slug!r} not found.")
+        project_id = row[0]
+
+    since_dt = None
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since)
+            if since_dt.tzinfo is None:
+                since_dt = since_dt.replace(tzinfo=timezone.utc)
+        except ValueError as exc:
+            raise click.ClickException(f"Invalid --since date: {since!r}") from exc
+
+    effective_model = model or DEFAULT_MODEL
+
+    def _on_progress(idx, total, info):
+        failure = info.get("failure")
+        sid = info.get("session_id", "?")[:8]
+        status = f"FAILED ({failure})" if failure else "upgraded → sonnet"
+        click.echo(
+            f"cognify-resummarize: [{idx:>4}/{total:>4}] {sid}…  {status}",
+            err=True,
+        )
+
+    with db._conn() as conn:
+        result = run_resummarize(
+            conn,
+            project_id=project_id,
+            since=since_dt,
+            model=effective_model,
+            dry_run=dry_run,
+            max_sessions=max_sessions,
+            progress_callback=_on_progress if not as_json else None,
+        )
+
+    summary = {
+        "sessions_discovered": result.sessions_discovered,
+        "sessions_processed": result.sessions_processed,
+        "sessions_failed": result.sessions_failed,
+        "llm_calls": result.llm_calls,
+        "failure_counts": result.failure_counts,
+        "dry_run": result.dry_run,
+    }
+
+    if as_json:
+        click.echo(json.dumps(summary, indent=2))
+        return
+
+    click.echo("", err=True)
+    click.echo("─" * 60, err=True)
+    click.echo(
+        "cognify-resummarize: complete"
+        + (" (DRY RUN)" if dry_run else "")
+        + f"\n  discovered: {result.sessions_discovered}"
+        + f"\n  upgraded:   {result.sessions_processed}"
+        + f"\n  failed:     {result.sessions_failed}"
+        + f"\n  llm calls:  {result.llm_calls}"
+        + (f"\n  failures:   {result.failure_counts}"
+           if result.failure_counts else ""),
+        err=True,
+    )
+
+
 if __name__ == "__main__":
     cli()

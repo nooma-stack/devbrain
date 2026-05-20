@@ -60,6 +60,7 @@ _CRED_PLISTS = (
     "com.devbrain.cognify-extract.plist",
     "com.devbrain.cognify-edges.plist",
     "com.devbrain.cognify-fanout.plist",  # Phase 8 cross-project fan-out
+    "com.devbrain.cognify-resummarize.plist",  # Sonnet upgrade for orphan-of-end_session
 )
 
 # All cognify plists, in installation order.
