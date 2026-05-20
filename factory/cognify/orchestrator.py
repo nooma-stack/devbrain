@@ -99,6 +99,7 @@ def _ensure_registry() -> None:
     from cognify import edges as _  # noqa: F401
     from cognify import strengthen as _  # noqa: F401
     from cognify import fanout as _  # noqa: F401  # Phase 8 fan-out
+    from cognify import resummarize as _  # noqa: F401  # Sonnet summary upgrade
 
 
 def register_pass(cls: type[CognifyPass]) -> type[CognifyPass]:
@@ -110,7 +111,7 @@ def register_pass(cls: type[CognifyPass]) -> type[CognifyPass]:
 
 # ── Dependency order ──────────────────────────────────────────────────────
 
-PASS_ORDER = ["decay", "gc", "extract", "edges", "strengthen", "fanout"]
+PASS_ORDER = ["decay", "gc", "extract", "edges", "strengthen", "fanout", "resummarize"]
 
 
 # ── Main entrypoints ──────────────────────────────────────────────────────

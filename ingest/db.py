@@ -228,10 +228,24 @@ def delete_session(session_id: str) -> dict[str, int]:
         }
 
 
-def update_session_summary(session_id: str, summary: str) -> None:
+def update_session_summary(
+    session_id: str, summary: str, *, source: str = "ollama",
+) -> None:
+    """Persist a freshly-generated summary on raw_sessions.
+
+    Args:
+        session_id: raw_sessions.id (UUID).
+        summary: the new summary text.
+        source: which summarizer produced it. The ingest pipeline calls
+            with the default 'ollama'; cognify_resummarize passes
+            'sonnet' (or 'opus'). Stored on the new summary_source
+            column from migration 041 so the resummarize pass can find
+            Ollama-source rows that need upgrading.
+    """
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute(
-            "UPDATE devbrain.raw_sessions SET summary = %s WHERE id = %s",
-            (summary, session_id),
+            "UPDATE devbrain.raw_sessions "
+            "SET summary = %s, summary_source = %s WHERE id = %s",
+            (summary, source, session_id),
         )
         conn.commit()
