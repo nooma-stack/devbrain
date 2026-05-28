@@ -67,6 +67,12 @@ def _resolve_watch_dirs() -> list[Path]:
 
 WATCH_DIRS = _resolve_watch_dirs()
 
+# Path components whose presence means "skip" — transient/irrelevant trees that
+# generate filesystem churn (npm/codex temp installs) or vcs internals. A file
+# under one of these (e.g. a node_modules LICENSE.md created+deleted in the same
+# instant) crashed the watcher on 2026-05-18 and stopped all ingestion.
+_SKIP_DIRS = {"node_modules", ".tmp", ".git", ".venv", "__pycache__"}
+
 
 def scan_all():
     """One-shot scan of all known session directories."""
@@ -84,8 +90,16 @@ def scan_all():
             + list(watch_dir.rglob("session-*.json"))
             + list(watch_dir.rglob("*.md"))
         ):
-            # Skip tiny files (< 1KB likely empty/corrupt)
-            if path.stat().st_size < 1024:
+            # Skip churny/irrelevant trees (npm/codex temp installs, vcs).
+            if _SKIP_DIRS & set(path.parts):
+                continue
+            # Skip tiny files (< 1KB likely empty/corrupt). A transient file may
+            # vanish between rglob and stat — don't let that abort the scan.
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            if size < 1024:
                 continue
 
             total += 1
@@ -93,7 +107,7 @@ def scan_all():
             if adapter is None:
                 continue
 
-            print(f"\n[{total}] {path.name} ({path.stat().st_size // 1024}KB)")
+            print(f"\n[{total}] {path.name} ({size // 1024}KB)")
             if ingest_file(path):
                 ingested += 1
 
@@ -118,18 +132,33 @@ class SessionFileHandler(FileSystemEventHandler):
         self._handle(Path(event.src_path))
 
     def _handle(self, path: Path):
-        if path.suffix not in (".jsonl", ".json", ".md"):
-            return
-        if path.suffix == ".json" and not path.name.startswith("session-"):
-            return
-        if path.stat().st_size < 1024:
-            return
-
-        print(f"\n[watch] Detected: {path.name}")
+        # An unhandled exception here kills the watchdog observer thread and
+        # silently stops all ingestion (KeepAlive won't fire — the process is
+        # still alive, just deaf). So the entire body is exception-safe.
         try:
-            ingest_file(path)
-        except Exception as e:
-            print(f"[watch] Error ingesting {path.name}: {e}")
+            if path.suffix not in (".jsonl", ".json", ".md"):
+                return
+            if path.suffix == ".json" and not path.name.startswith("session-"):
+                return
+            # Ignore churny/irrelevant trees — npm/codex temp installs create and
+            # delete files in the same instant (the 2026-05-18 crash was a
+            # vanished node_modules LICENSE.md), and we never want vcs internals.
+            if _SKIP_DIRS & set(path.parts):
+                return
+            try:
+                size = path.stat().st_size
+            except OSError:
+                return  # file vanished before we could stat it (transient temp)
+            if size < 1024:
+                return
+
+            print(f"\n[watch] Detected: {path.name}")
+            try:
+                ingest_file(path)
+            except Exception as e:
+                print(f"[watch] Error ingesting {path.name}: {e}")
+        except Exception as e:  # last-resort guard — never kill the observer
+            print(f"[watch] Handler error on {path}: {e}")
 
 
 def watch():
