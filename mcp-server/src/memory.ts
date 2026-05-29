@@ -47,25 +47,52 @@ export interface RecordMemoryArgs {
 
 export async function recordMemory(args: RecordMemoryArgs): Promise<string | null> {
   try {
-    // Single round-trip: try to insert; on conflict (existing row for this
-    // provenance), fall through to a SELECT for the existing id. The CTE
-    // approach is cheaper than insert-then-select-on-conflict and handles
-    // the no-provenance case too (when provenance_id is NULL the partial
-    // unique index doesn't fire, so the INSERT path always succeeds).
+    // Per-kind ON CONFLICT — migration 037 replaced the broad
+    // (provenance_id, kind) unique index with two narrower partial indexes,
+    // so the conflict target MUST match the kind (mirrors
+    // ingest/memory_writer.py:record_memory). Using the old broad target
+    // throws "no unique constraint matching ON CONFLICT" once the broad index
+    // is absent (the correct post-037 state) — which silently broke every
+    // dual-write into devbrain.memory.
+    //   * session_summary           → unique on (provenance_id, kind)
+    //   * pattern/decision/lesson/issue → unique on (provenance_id, kind, title)
+    //   * chunks (and any other)    → no unique index → plain insert
+    const ATOM_KINDS = ['pattern', 'decision', 'lesson', 'issue']
+    let onConflict: string
+    let dedupSelect: string
+    if (args.kind === 'session_summary') {
+      onConflict =
+        "ON CONFLICT (provenance_id, kind) " +
+        "WHERE provenance_id IS NOT NULL AND kind = 'session_summary' DO NOTHING"
+      dedupSelect =
+        "SELECT id FROM devbrain.memory " +
+        "WHERE provenance_id = $6 AND kind = $2 " +
+        "AND NOT EXISTS (SELECT 1 FROM inserted) LIMIT 1"
+    } else if (ATOM_KINDS.includes(args.kind)) {
+      onConflict =
+        "ON CONFLICT (provenance_id, kind, title) " +
+        "WHERE provenance_id IS NOT NULL " +
+        "AND kind IN ('pattern','decision','lesson','issue') DO NOTHING"
+      dedupSelect =
+        "SELECT id FROM devbrain.memory " +
+        "WHERE provenance_id = $6 AND kind = $2 AND title IS NOT DISTINCT FROM $3 " +
+        "AND NOT EXISTS (SELECT 1 FROM inserted) LIMIT 1"
+    } else {
+      // chunks etc.: no unique index post-037 → plain insert, no dedup.
+      onConflict = ''
+      dedupSelect = 'SELECT NULL::uuid AS id WHERE false'
+    }
     const result = await query<{ id: string }>(
       `WITH inserted AS (
          INSERT INTO devbrain.memory
              (project_id, kind, title, content, embedding, provenance_id)
          VALUES ($1, $2, $3, $4, $5::vector, $6)
-         ON CONFLICT (provenance_id, kind) WHERE provenance_id IS NOT NULL
-         DO NOTHING
+         ${onConflict}
          RETURNING id
        )
        SELECT id FROM inserted
        UNION ALL
-       SELECT id FROM devbrain.memory
-       WHERE provenance_id = $6 AND kind = $2 AND NOT EXISTS (SELECT 1 FROM inserted)
-       LIMIT 1`,
+       ${dedupSelect}`,
       [
         args.projectId,
         args.kind,
