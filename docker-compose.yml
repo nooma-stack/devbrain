@@ -25,6 +25,7 @@ services:
     restart: unless-stopped
     volumes:
       - devbrain-pgdata:/var/lib/postgresql/data
+      - devbrain-wal-archive:/wal_archive
       - ./migrations:/docker-entrypoint-initdb.d:ro
     environment:
       POSTGRES_USER: ${DEVBRAIN_DB_USER:-devbrain}
@@ -42,3 +43,4 @@ services:
 
 volumes:
   devbrain-pgdata:
+  devbrain-wal-archive:
