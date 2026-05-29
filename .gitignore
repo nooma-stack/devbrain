@@ -24,3 +24,4 @@ profiles/
 # Git worktrees — used for isolated feature work (using-git-worktrees skill)
 .worktrees/
 /onboarding/
+backups/
