@@ -16,7 +16,11 @@ and output schema.
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
+import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
@@ -34,9 +38,167 @@ from cognify.fanout_prompt import (
 
 logger = logging.getLogger(__name__)
 
-# Default model. Mirrors the cognify-bulk default. Switch to
-# claude-opus-4-7 via the model= kwarg for stuck-case retries.
-DEFAULT_MODEL = "claude-sonnet-4-6"
+# Default classifier model. Routes to the codex CLI backend
+# (schema-constrained JSON → no json_parse drops; ChatGPT-sub auth). Override
+# with DEVBRAIN_FANOUT_MODEL. On a codex `api` failure (quota/timeout/error)
+# we fall back to DEVBRAIN_FANOUT_FALLBACK (default Sonnet) so cross-project
+# fan-out never silently drops sessions. Mirrors cognify_extract.
+DEFAULT_MODEL = os.environ.get("DEVBRAIN_FANOUT_MODEL", "codex")
+_FANOUT_FALLBACK = os.environ.get("DEVBRAIN_FANOUT_FALLBACK", "claude-sonnet-4-6")
+
+# JSON Schema for the classifier's final response. OpenAI strict structured
+# output (codex --output-schema) requires every object to set
+# additionalProperties:false + list ALL props in `required`, and forbids
+# dynamic-key objects. The `sections` field in fanout_prompt's shape uses a
+# dynamic-key `project_scores` map (incompatible) and is only advisory anyway
+# (run_fanout consumes `per_project` exclusively; validate_output tolerates
+# missing sections). So we constrain just the load-bearing `per_project`.
+_FANOUT_OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["per_project"],
+    "properties": {
+        "per_project": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "project_slug", "session_relevance",
+                    "section_count", "focused_summary",
+                ],
+                "properties": {
+                    "project_slug": {"type": "string"},
+                    "session_relevance": {"type": "number"},
+                    "section_count": {"type": "integer"},
+                    "focused_summary": {"type": "string"},
+                },
+            },
+        },
+    },
+}
+
+
+def _codex_classify(
+    system_text: str, user_text: str, *, model: str | None = None,
+) -> tuple[dict | None, str | None, str | None]:
+    """Run the fanout classifier via `codex exec --output-schema`.
+
+    Returns (parsed_dict | None, failure | None, failure_detail). Schema-
+    constrained so the output is guaranteed-parseable JSON (no json_parse).
+    Mirrors cognify_extract._codex_extract; codex bills the ChatGPT-sub login
+    so there's no token spend to record.
+    """
+    from cognify.extract import _CODEX_BIN, _CODEX_TIMEOUT_S  # noqa: PLC0415
+
+    if not _CODEX_BIN or not os.path.exists(_CODEX_BIN):
+        return None, "api", f"codex binary not found at {_CODEX_BIN}"
+
+    prompt = system_text + "\n\n" + user_text
+    with tempfile.TemporaryDirectory(prefix="fanout-codex-") as wd:
+        schema_path = os.path.join(wd, "schema.json")
+        out_path = os.path.join(wd, "out.json")
+        with open(schema_path, "w") as fh:
+            json.dump(_FANOUT_OUTPUT_SCHEMA, fh)
+        cmd = [
+            _CODEX_BIN, "exec", "--sandbox", "read-only",
+            "--skip-git-repo-check", "--ephemeral", "-C", wd,
+            "--output-schema", schema_path, "-o", out_path,
+        ]
+        if model and model.lower() != "codex":
+            cmd += ["-m", model]
+        cmd.append(prompt)
+        try:
+            proc = subprocess.run(
+                cmd, stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=_CODEX_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            return None, "api", "codex exec timeout"
+        if not os.path.exists(out_path):
+            return None, "api", (
+                f"codex no output (rc={proc.returncode}): "
+                f"{(proc.stderr or '')[-300:]}"
+            )
+        try:
+            with open(out_path) as fh:
+                return json.load(fh), None, None
+        except (json.JSONDecodeError, OSError) as exc:
+            return None, "json_parse", str(exc)[:200]
+
+
+def _anthropic_classify(
+    system_text: str, user_text: str, *, model: str, max_retries: int = 3,
+) -> tuple[dict | None, str | None, str | None, dict | None]:
+    """Classify via the Anthropic SDK. Returns (parsed, failure, detail, usage).
+
+    Best-effort JSON parse (no schema/prefill on the OAuth path) — this is the
+    json_parse-prone path codex avoids; kept as the fallback.
+    """
+    try:
+        import anthropic  # noqa: PLC0415
+    except ImportError:
+        return None, "no_auth", "anthropic SDK not installed", None
+
+    from cognify._anthropic_auth import claude_code_system_prefix  # noqa: PLC0415
+    from cognify.extract import (  # noqa: PLC0415
+        _parse_json_with_fallbacks,
+        _resolve_auth,
+    )
+
+    auth_kwargs = _resolve_auth()
+    if auth_kwargs is None:
+        return None, "no_auth", None, None
+
+    system_blocks: list[dict[str, Any]] = []
+    oauth_prefix = claude_code_system_prefix()
+    if oauth_prefix:
+        system_blocks.append({"type": "text", "text": oauth_prefix})
+    system_blocks.append(
+        {"type": "text", "text": system_text, "cache_control": {"type": "ephemeral"}}
+    )
+
+    client = anthropic.Anthropic(**auth_kwargs)
+    response = None
+    api_error: Exception | None = None
+    for _ in range(max_retries):
+        try:
+            response = client.messages.create(
+                model=model,
+                max_tokens=MAX_OUTPUT_TOKENS,
+                system=system_blocks,
+                messages=[{"role": "user", "content": user_text}],
+            )
+            break
+        except anthropic.APIConnectionError as exc:
+            api_error = exc
+            client = anthropic.Anthropic(**auth_kwargs)  # recycle stale pool
+            continue
+        except Exception as exc:  # noqa: BLE001
+            api_error = exc
+            break
+
+    if response is None:
+        return None, "api", type(api_error).__name__ + ": " + str(api_error)[:200], None
+
+    usage = getattr(response, "usage", None)
+    usage_d = None
+    if usage is not None:
+        usage_d = {
+            "input_tokens": getattr(usage, "input_tokens", 0) or 0,
+            "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+            "cache_read_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
+            "cache_write_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
+        }
+
+    text = "".join(
+        b.text for b in (response.content or [])
+        if getattr(b, "type", None) == "text"
+    ).strip()
+    parsed = _parse_json_with_fallbacks(text)
+    if parsed is None:
+        return None, "json_parse", f"all parse strategies exhausted; sample={text[:400]!r}", usage_d
+    return parsed, None, None, usage_d
 
 # Max output tokens. 4K is plenty for the JSON shape: even with 6
 # sections + 5 per_project entries × 800 chars summary, the response
@@ -189,94 +351,54 @@ def classify_session(
 
     valid_slugs = {p["slug"] for p in taxonomy}
 
-    # 2. Resolve Anthropic auth.
-    try:
-        import anthropic  # noqa: PLC0415
-    except ImportError:
-        result.failure = "no_auth"
-        result.failure_detail = "anthropic SDK not installed"
-        return result
-
-    from cognify.extract import _resolve_auth  # noqa: PLC0415
-
-    auth_kwargs = _resolve_auth()
-    if auth_kwargs is None:
-        result.failure = "no_auth"
-        return result
-
-    # 3. Build prompt + make the call.
+    # 2. Build prompt.
     system_text = build_system_prompt(render_taxonomy(taxonomy))
     user_text = build_user_message(session_text)
 
-    # OAuth path needs the Claude Code system-prefix; console API key path
-    # returns None and is unaffected. Mirrors cognify_extract's setup.
-    from cognify._anthropic_auth import claude_code_system_prefix  # noqa: PLC0415
+    # 3. Classify. Prefer codex (schema-constrained JSON → no json_parse
+    #    drops); fall back to Anthropic on a codex `api` failure
+    #    (quota/timeout/error) so fan-out never silently drops a session.
+    from cognify.extract import _routes_to_codex  # noqa: PLC0415
 
-    system_blocks: list[dict[str, Any]] = []
-    oauth_prefix = claude_code_system_prefix()
-    if oauth_prefix:
-        system_blocks.append({"type": "text", "text": oauth_prefix})
-    system_blocks.append(
-        {
-            "type": "text",
-            "text": system_text,
-            "cache_control": {"type": "ephemeral"},
-        }
-    )
-
-    client = anthropic.Anthropic(**auth_kwargs)
-    response = None
-    api_error: Exception | None = None
-    for attempt in range(max_retries):
-        try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=MAX_OUTPUT_TOKENS,
-                system=system_blocks,
-                messages=[{"role": "user", "content": user_text}],
-            )
-            break
-        except anthropic.APIConnectionError as exc:
-            api_error = exc
-            # Recycle the client on retry to clear stale httpx pool —
-            # same pattern as cognify_extract's _API_MAX_RETRIES loop.
-            client = anthropic.Anthropic(**auth_kwargs)
-            continue
-        except Exception as exc:  # noqa: BLE001
-            api_error = exc
-            break
-
-    if response is None:
-        result.failure = "api"
-        result.failure_detail = type(api_error).__name__ + ": " + str(api_error)[:200]
-        return result
-
-    # 4. Record usage for spend tracking (caller writes the spend row).
-    usage = getattr(response, "usage", None)
-    if usage is not None:
-        result.usage = {
-            "input_tokens": getattr(usage, "input_tokens", 0) or 0,
-            "output_tokens": getattr(usage, "output_tokens", 0) or 0,
-            "cache_read_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
-            "cache_write_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
-        }
-
-    # 5. Parse + validate.
-    text_blocks = [
-        b.text for b in (response.content or [])
-        if getattr(b, "type", None) == "text"
-    ]
-    text = "".join(text_blocks).strip()
-
-    from cognify.extract import _parse_json_with_fallbacks  # noqa: PLC0415
-
-    parsed = _parse_json_with_fallbacks(text)
-    if parsed is None:
-        result.failure = "json_parse"
-        result.failure_detail = (
-            f"all parse strategies exhausted; sample={text[:400]!r}"
+    parsed: dict | None = None
+    effective_model = model
+    if _routes_to_codex(effective_model):
+        parsed, c_fail, c_detail = _codex_classify(
+            system_text, user_text, model=effective_model,
         )
-        return result
+        # codex bills the ChatGPT-sub login — no token spend to record.
+        result.usage = {
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_write_tokens": 0,
+        }
+        if parsed is None:
+            if (
+                c_fail == "api"
+                and _FANOUT_FALLBACK
+                and _FANOUT_FALLBACK.lower() not in ("none", "")
+                and not _routes_to_codex(_FANOUT_FALLBACK)
+            ):
+                logger.warning(
+                    "cognify_fanout: codex failed (%s); falling back to %s",
+                    (c_detail or "")[:160], _FANOUT_FALLBACK,
+                )
+                effective_model = _FANOUT_FALLBACK
+            else:
+                result.failure = c_fail
+                result.failure_detail = c_detail
+                return result
+
+    if parsed is None:
+        # Anthropic SDK path — primary for claude-* models, or codex fallback.
+        parsed, a_fail, a_detail, a_usage = _anthropic_classify(
+            system_text, user_text, model=effective_model, max_retries=max_retries,
+        )
+        if a_usage is not None:
+            result.usage = a_usage
+        if parsed is None:
+            result.failure = a_fail
+            result.failure_detail = a_detail
+            return result
 
     validated = validate_output(parsed, valid_slugs)
     result.sections = validated["sections"]
