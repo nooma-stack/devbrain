@@ -34,6 +34,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
+import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -65,8 +69,66 @@ _API_BACKOFF_S = (2, 5, 15)  # exponential, applied in order
 # to reprocess existing rows. Starts at 1 per Phase 6 design §6.
 CURRENT_EXTRACTION_VERSION = 1
 
-# Model used for extraction. Must match a key in observability/pricing.py.
-_EXTRACT_MODEL = "claude-sonnet-4-6"
+# Default extraction model. Routes to the codex CLI backend (schema-constrained
+# JSON → no json_parse failures; runs on the local ChatGPT-sub auth). Override
+# with DEVBRAIN_EXTRACT_MODEL (e.g. "claude-sonnet-4-6" for the Anthropic SDK
+# path, or an explicit OpenAI id like "gpt-5"). The Anthropic path is preserved
+# and still used whenever a claude-* model is requested.
+_EXTRACT_MODEL = os.environ.get("DEVBRAIN_EXTRACT_MODEL", "codex")
+
+# ── Codex (OpenAI CLI) extraction backend ──────────────────────────────────
+# When the requested model routes here (model == "codex" or an OpenAI model id
+# like "gpt-5"/"o3"), extraction is delegated to the local `codex exec` CLI
+# instead of the Anthropic SDK. We use codex's --output-schema (JSON-Schema-
+# constrained final response) + --output-last-message, which GUARANTEES clean
+# parseable JSON — eliminating the json_parse failures the Anthropic OAuth path
+# (no assistant-prefill) suffers. codex auths via the local ChatGPT-subscription
+# login, so there's no per-token billing and no separate API key.
+_CODEX_BIN = os.environ.get("DEVBRAIN_CODEX_BIN") or shutil.which("codex") \
+    or "/opt/homebrew/bin/codex"
+_CODEX_TIMEOUT_S = int(os.environ.get("DEVBRAIN_CODEX_TIMEOUT_S", "240"))
+
+# JSON Schema for the extractor's final response — same shape the Anthropic
+# path parses ({lessons:[{title,content}], decisions:[...]}).
+_CODEX_OUTPUT_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["lessons", "decisions"],
+    "properties": {
+        "lessons": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["title", "content"],
+                "properties": {
+                    "title": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+            },
+        },
+        "decisions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["title", "content"],
+                "properties": {
+                    "title": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+            },
+        },
+    },
+}
+
+
+def _routes_to_codex(model: str | None) -> bool:
+    """True when the requested model should be handled by the codex CLI."""
+    if not model:
+        return False
+    m = model.lower()
+    return m == "codex" or m.startswith(("gpt-", "gpt5", "o3", "o4", "codex-"))
 
 
 @dataclass
@@ -251,11 +313,16 @@ def extract_from_session(
     if not combined.strip():
         return ExtractResult(session_id=session_id)
 
-    # Call LLM for extraction.
+    # Call LLM for extraction. Route to the codex CLI (schema-constrained,
+    # reliable JSON) when the requested model is "codex"/an OpenAI id;
+    # otherwise use the Anthropic SDK path.
     effective_model = model or _EXTRACT_MODEL
-    extracted = _llm_extract(
-        combined, max_llm_calls=max_llm_calls, model=effective_model,
-    )
+    if _routes_to_codex(effective_model):
+        extracted = _codex_extract(combined, model=effective_model)
+    else:
+        extracted = _llm_extract(
+            combined, max_llm_calls=max_llm_calls, model=effective_model,
+        )
     llm_calls = 1  # one call per session for v1
 
     # Record spend for this LLM call. Use the pricing registry to
@@ -412,6 +479,90 @@ def _combine_chunks(chunks: list[dict]) -> str:
         else:
             parts.append(content)
     return "\n\n".join(parts)
+
+
+def _codex_extract(content: str, *, model: str | None = None) -> dict:
+    """Extract lessons/decisions via the local `codex exec` CLI.
+
+    Returns the same dict shape as `_llm_extract`:
+      {"lessons": [...], "decisions": [...], "_usage": {...}, "_failure": ...}
+
+    Uses codex's --output-schema (constrains the model's FINAL response to our
+    JSON schema) + --output-last-message (captures only that final answer, no
+    agent chatter), run in a read-only, ephemeral, non-git sandbox so it never
+    touches the filesystem or waits on approvals. stdin is closed (codex exec
+    otherwise blocks reading stdin even when a prompt arg is given).
+
+    codex bills against the local ChatGPT-subscription login → no token spend
+    to record, so _usage is zeroed (the caller's spend block then no-ops).
+    """
+    empty_usage = {
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_read_tokens": 0, "cache_write_tokens": 0,
+    }
+    if not _CODEX_BIN or not os.path.exists(_CODEX_BIN):
+        logger.warning("cognify_extract(codex): codex binary not found at %s", _CODEX_BIN)
+        return {"lessons": [], "decisions": [], "_usage": empty_usage,
+                "_failure": "api", "_failure_detail": "codex binary missing"}
+
+    prompt = (
+        "You are a structured knowledge extractor. From the dev session below, "
+        "extract generalizable lessons and the specific architecture/implementation "
+        "decisions that were made. Each item needs a short title (<= 80 chars) and "
+        "a detailed content string. Return ONLY the structured object matching the "
+        "provided schema.\n\nSession:\n\n" + content[:200_000]
+    )
+
+    with tempfile.TemporaryDirectory(prefix="cognify-codex-") as wd:
+        schema_path = os.path.join(wd, "schema.json")
+        out_path = os.path.join(wd, "out.json")
+        with open(schema_path, "w") as fh:
+            json.dump(_CODEX_OUTPUT_SCHEMA, fh)
+
+        cmd = [
+            _CODEX_BIN, "exec",
+            "--sandbox", "read-only",
+            "--skip-git-repo-check",
+            "--ephemeral",
+            "-C", wd,
+            "--output-schema", schema_path,
+            "-o", out_path,
+        ]
+        # An explicit OpenAI model id (gpt-5/o3/…) overrides codex's default.
+        if model and model.lower() != "codex":
+            cmd += ["-m", model]
+        cmd.append(prompt)
+
+        try:
+            proc = subprocess.run(
+                cmd, stdin=subprocess.DEVNULL,
+                capture_output=True, text=True, timeout=_CODEX_TIMEOUT_S,
+            )
+        except subprocess.TimeoutExpired:
+            return {"lessons": [], "decisions": [], "_usage": empty_usage,
+                    "_failure": "api", "_failure_detail": "codex exec timeout"}
+
+        if not os.path.exists(out_path):
+            tail = (proc.stderr or "")[-400:]
+            return {"lessons": [], "decisions": [], "_usage": empty_usage,
+                    "_failure": "api",
+                    "_failure_detail": f"codex produced no output (rc={proc.returncode}): {tail}"}
+        try:
+            with open(out_path) as fh:
+                result = json.load(fh)
+        except (json.JSONDecodeError, OSError) as exc:
+            return {"lessons": [], "decisions": [], "_usage": empty_usage,
+                    "_failure": "json_parse", "_failure_detail": str(exc)[:300]}
+
+    if not isinstance(result, dict):
+        return {"lessons": [], "decisions": [], "_usage": empty_usage,
+                "_failure": "json_parse", "_failure_detail": "non-object output"}
+    result.setdefault("lessons", [])
+    result.setdefault("decisions", [])
+    result["_usage"] = empty_usage
+    if not result.get("lessons") and not result.get("decisions"):
+        result["_failure"] = "empty"
+    return result
 
 
 def _llm_extract(

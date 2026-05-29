@@ -61,12 +61,34 @@ import time
 logger = logging.getLogger(__name__)
 
 
-_INSERT_MEMORY_SQL = """
+# Per-kind INSERT SQL. Migration 037 replaced the broad
+# (provenance_id, kind) unique index with two narrower partial indexes, so the
+# ON CONFLICT target MUST match the kind being inserted (matching
+# ingest/memory_writer.py:record_memory):
+#   * atoms (pattern/decision/lesson/issue) — unique on (provenance_id, kind, title)
+#   * session_summary                       — unique on (provenance_id, kind)
+#   * chunks                                — NO unique index (many chunks share a
+#       session's provenance_id post-migration-032); de-dup on re-run is handled
+#       by the NOT EXISTS guard in backfill_chunks' SELECT, not ON CONFLICT.
+_INSERT_BASE_SQL = """
     INSERT INTO devbrain.memory
         (project_id, kind, title, content, embedding, provenance_id,
          created_at, applies_when)
     VALUES (%s, %s, %s, %s, %s::vector, %s, %s, %s::jsonb)
-    ON CONFLICT (provenance_id, kind) WHERE provenance_id IS NOT NULL
+"""
+
+_INSERT_CHUNK_SQL = _INSERT_BASE_SQL  # chunks: no ON CONFLICT (see note above)
+
+_INSERT_ATOM_SQL = _INSERT_BASE_SQL + """
+    ON CONFLICT (provenance_id, kind, title)
+    WHERE provenance_id IS NOT NULL
+      AND kind IN ('pattern', 'decision', 'lesson', 'issue')
+    DO NOTHING
+"""
+
+_INSERT_SUMMARY_SQL = _INSERT_BASE_SQL + """
+    ON CONFLICT (provenance_id, kind)
+    WHERE provenance_id IS NOT NULL AND kind = 'session_summary'
     DO NOTHING
 """
 
@@ -89,12 +111,18 @@ def _new_counts() -> dict:
 
 
 def _ensure_schema(db) -> None:
-    """Verify devbrain.memory + idx_memory_provenance_kind_unique exist.
+    """Verify devbrain.memory + the post-migration-037 atom unique index exist.
 
-    Raises RuntimeError with a hint to run `bin/devbrain migrate` if
-    either is missing. Called once from `backfill_all` and from each
-    per-table entry point so direct callers (tests, scripts) get the
-    same protection.
+    Raises RuntimeError with a hint to run `bin/devbrain migrate` if either is
+    missing. Called once from `backfill_all` and from each per-table entry
+    point so direct callers (tests, scripts) get the same protection.
+
+    IMPORTANT: this checks `idx_memory_atom_title_unique` (migration 037), NOT
+    the historical `idx_memory_provenance_kind_unique` (migration 011), which
+    037 deliberately DROPPED. A 2026-05-28 incident occurred when this guard
+    still required the old index: an operator "fixed" the missing-index error
+    by re-creating the broad (provenance_id, kind) index and hard-deleting
+    76k rows to satisfy it. Do not reinstate that requirement.
     """
     with db._conn() as conn, conn.cursor() as cur:
         cur.execute(
@@ -109,13 +137,15 @@ def _ensure_schema(db) -> None:
         cur.execute(
             "SELECT 1 FROM pg_indexes "
             "WHERE schemaname = 'devbrain' AND tablename = 'memory' "
-            "AND indexname = 'idx_memory_provenance_kind_unique'"
+            "AND indexname = 'idx_memory_atom_title_unique'"
         )
         if cur.fetchone() is None:
             raise RuntimeError(
-                "idx_memory_provenance_kind_unique index is missing — "
-                "run `bin/devbrain migrate` first (P2.b / migration 011); "
-                "without it the ON CONFLICT clause cannot infer a constraint."
+                "idx_memory_atom_title_unique index is missing — "
+                "run `bin/devbrain migrate` first (migration 037). Do NOT "
+                "re-create the old idx_memory_provenance_kind_unique index; "
+                "037 dropped it on purpose (atoms are unique by "
+                "(provenance_id, kind, title), not (provenance_id, kind))."
             )
 
 
@@ -208,6 +238,7 @@ def _run_batched_backfill(
     row_to_insert_args,
     batch_size: int,
     skip_filters,
+    insert_sql: str = _INSERT_ATOM_SQL,
 ) -> dict:
     """Generic keyset-paged loop shared by all per-table backfills.
 
@@ -280,7 +311,7 @@ def _run_batched_backfill(
                 # iterate so we can tally inserted vs. dup precisely.
                 inserted_this_batch = 0
                 for args in batch_args:
-                    cur.execute(_INSERT_MEMORY_SQL, args)
+                    cur.execute(insert_sql, args)
                     if cur.rowcount == 1:
                         inserted_this_batch += 1
                 conn.commit()
@@ -345,23 +376,37 @@ def backfill_chunks(
             scan_where=_CHUNK_BACKFILL_WHERE,
         )
 
+    # provenance_id = the SOURCE SESSION (chunks.source_id) when present, else
+    # the chunk's own id (openclaw/note imports have source_id=NULL and aren't
+    # sessions). This matches migration 032: chunks of one session share that
+    # session's provenance so cognify groups by session, not per-chunk. Writing
+    # `chunks.id` here (the pre-032 bug) is exactly what broke session grouping
+    # in the 2026-05-28 incident. The NOT EXISTS guard makes re-runs idempotent
+    # without a unique index (chunks have none post-037).
     select_sql = f"""
-        SELECT id, project_id, content, embedding::text, created_at
-        FROM devbrain.chunks
-        WHERE id > %s
+        SELECT c.id, c.project_id, c.content, c.embedding::text, c.created_at,
+               COALESCE(c.source_id, c.id) AS prov
+        FROM devbrain.chunks c
+        WHERE c.id > %s
           AND {_CHUNK_BACKFILL_WHERE}
-        ORDER BY id
+          AND NOT EXISTS (
+              SELECT 1 FROM devbrain.memory m
+              WHERE m.kind = 'chunk'
+                AND m.provenance_id = COALESCE(c.source_id, c.id)
+                AND m.content = c.content
+          )
+        ORDER BY c.id
         LIMIT %s
     """
 
     def to_args(row, counts):
-        chunk_id, project_id, content, embedding_text, created_at = row
+        chunk_id, project_id, content, embedding_text, created_at, prov = row
         if project_id is None:
             counts["skipped_no_project"] += 1
             return None
         return (
             str(project_id), "chunk", None, content, embedding_text,
-            str(chunk_id), created_at, None,
+            str(prov), created_at, None,
         )
 
     return _run_batched_backfill(
@@ -370,6 +415,7 @@ def backfill_chunks(
         row_to_insert_args=to_args,
         batch_size=batch_size,
         skip_filters=["project_id IS NULL", _CHUNK_BACKFILL_WHERE],
+        insert_sql=_INSERT_CHUNK_SQL,
     )
 
 
@@ -606,6 +652,7 @@ def backfill_raw_sessions(
         row_to_insert_args=to_args,
         batch_size=batch_size,
         skip_filters=["project_id IS NULL", "summary IS NULL"],
+        insert_sql=_INSERT_SUMMARY_SQL,
     )
 
 
