@@ -76,6 +76,12 @@ CURRENT_EXTRACTION_VERSION = 1
 # and still used whenever a claude-* model is requested.
 _EXTRACT_MODEL = os.environ.get("DEVBRAIN_EXTRACT_MODEL", "codex")
 
+# When the primary extractor is codex and it fails with an `api` failure
+# (ChatGPT usage-limit / timeout / codex error), fall back to this Anthropic
+# model so extraction never stalls on a quota wall. Set DEVBRAIN_EXTRACT_FALLBACK
+# to "" / "none" to disable the fallback.
+_FALLBACK_MODEL = os.environ.get("DEVBRAIN_EXTRACT_FALLBACK", "claude-sonnet-4-6")
+
 # ── Codex (OpenAI CLI) extraction backend ──────────────────────────────────
 # When the requested model routes here (model == "codex" or an OpenAI model id
 # like "gpt-5"/"o3"), extraction is delegated to the local `codex exec` CLI
@@ -319,6 +325,28 @@ def extract_from_session(
     effective_model = model or _EXTRACT_MODEL
     if _routes_to_codex(effective_model):
         extracted = _codex_extract(combined, model=effective_model)
+        # Fall back to Anthropic when codex hits a usage-limit / timeout /
+        # error ("api"), so a ChatGPT quota wall can't stall extraction. We
+        # only fall back on "api" (not "empty"): an empty result is a valid
+        # "this session had nothing to extract", not a failure to retry.
+        if (
+            extracted.get("_failure") == "api"
+            and _FALLBACK_MODEL
+            and _FALLBACK_MODEL.lower() not in ("none", "")
+            and not _routes_to_codex(_FALLBACK_MODEL)
+        ):
+            logger.warning(
+                "cognify_extract: codex failed (%s); falling back to %s",
+                (extracted.get("_failure_detail") or "")[:160], _FALLBACK_MODEL,
+            )
+            fallback = _llm_extract(
+                combined, max_llm_calls=max_llm_calls, model=_FALLBACK_MODEL,
+            )
+            # Use the fallback only if it actually succeeded; otherwise keep
+            # codex's failure so telemetry reflects the primary backend.
+            if not fallback.get("_failure"):
+                extracted = fallback
+                effective_model = _FALLBACK_MODEL  # spend block bills the right model
     else:
         extracted = _llm_extract(
             combined, max_llm_calls=max_llm_calls, model=effective_model,
