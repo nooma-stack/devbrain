@@ -480,6 +480,28 @@ def import_from_dict(
             conn.rollback()
         else:
             conn.commit()
+            # ivfflat centroids are computed at index BUILD time — a bulk
+            # import can leave most new rows in poorly-matched clusters,
+            # silently collapsing deep_search recall for exactly the
+            # imported data (observed 2026-06-12: 66k imported rows
+            # invisible to semantic search until REINDEX). Rebuild when
+            # the import grew the table materially.
+            inserted = results["memory"]["inserted"]
+            if inserted >= 1000:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT count(*) FROM devbrain.memory")
+                    total = cur.fetchone()[0]
+                    if inserted >= max(1000, total // 20):
+                        logger.info(
+                            "[import] %d rows inserted (%d total) — "
+                            "rebuilding ivfflat index + ANALYZE",
+                            inserted, total,
+                        )
+                        cur.execute(
+                            "REINDEX INDEX devbrain.idx_memory_embedding"
+                        )
+                        cur.execute("ANALYZE devbrain.memory")
+                conn.commit()
     except Exception:
         conn.rollback()
         raise
