@@ -54,6 +54,7 @@ _DEFAULTS: dict = {
     "ingest": {
         "adapters": {},
         "project_mappings": {},
+        "auto_project_roots": [],
     },
     "factory": {},
     "notifications": {},
@@ -117,3 +118,6 @@ SUMMARIZE_MODEL = _config["summarization"]["model"]
 SUMMARIZE_URL = _config["summarization"]["url"]
 ADAPTER_CONFIG = _config["ingest"].get("adapters", {})
 PROJECT_MAPPINGS = _config["ingest"].get("project_mappings", {})
+# Workspace roots (glob patterns, e.g. "/Users/*/lighthouse") under which the
+# next path segment names the project — auto-created on first sight.
+AUTO_PROJECT_ROOTS = _config["ingest"].get("auto_project_roots", [])

@@ -15,7 +15,7 @@ from adapters.gemini import GeminiAdapter
 from adapters.markdown_memory import MarkdownMemoryAdapter
 from adapters.openclaw import OpenClawAdapter
 from chunker import chunk_text
-from db import delete_chunks_for_session, get_project_id, get_existing_session_id, insert_chunk, insert_raw_session, session_exists, update_session_summary
+from db import delete_chunks_for_session, get_or_create_project_id, get_existing_session_id, insert_chunk, insert_raw_session, session_exists, update_session_summary
 from embeddings import embed, embed_batch
 
 ADAPTERS = [ClaudeCodeAdapter(), OpenClawAdapter(), CodexAdapter(), GeminiAdapter(), MarkdownMemoryAdapter()]
@@ -67,10 +67,12 @@ def ingest_file(path: Path, *, force: bool = False) -> bool:
 
 def _process_session(session: UniversalSession, source_path: Path, source_hash: str, *, is_update: bool = False) -> bool:
     """Store raw session, chunk, embed, and store chunks."""
-    # Resolve project
+    # Resolve project — adapters only emit slugs from explicit mappings or
+    # the auto-project-roots convention, so an unknown slug means a new
+    # workspace folder: materialize it rather than orphaning the session.
     project_id = None
     if session.project_slug:
-        project_id = get_project_id(session.project_slug)
+        project_id = get_or_create_project_id(session.project_slug)
 
     # Structured USF JSON for raw_content storage (structured access later)
     # Strip NUL bytes — PostgreSQL TEXT columns reject them

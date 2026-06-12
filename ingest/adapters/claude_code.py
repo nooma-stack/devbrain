@@ -8,16 +8,43 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from config import PROJECT_MAPPINGS
+import re
+from fnmatch import fnmatch
+
+from config import AUTO_PROJECT_ROOTS, PROJECT_MAPPINGS
 
 from .base import TranscriptAdapter, UniversalMessage, UniversalSession
+
+
+def _auto_root_slug(absolute_path: str) -> str | None:
+    """Derive a project slug from a workspace-root convention.
+
+    AUTO_PROJECT_ROOTS holds glob patterns like "/Users/*/lighthouse".
+    When a session path sits under a matching root, the next path
+    segment names the project (lighthouse/brightbot/... -> brightbot),
+    auto-created downstream on first sight. Convention: project folders
+    directly under a root should avoid dashes — the Claude Code
+    transcript-dir encoding turns dashes into slashes, which would split
+    the folder name before it reaches us.
+    """
+    segs = Path(absolute_path).parts
+    for pattern in AUTO_PROJECT_ROOTS:
+        pat_segs = Path(pattern).parts
+        if len(segs) <= len(pat_segs):
+            continue
+        if all(fnmatch(s, p) for s, p in zip(segs, pat_segs)):
+            slug = segs[len(pat_segs)].lower()
+            slug = re.sub(r"[^a-z0-9_-]+", "-", slug).strip("-")
+            return slug or None
+    return None
 
 
 def _lookup_slug(absolute_path: str) -> str | None:
     """Map an absolute filesystem path to a project slug via config.
 
-    Tries exact match first, then longest-prefix match, returning None
-    when no mapping applies (sessions not tied to a configured project).
+    Tries exact match first, then longest-prefix match, then the
+    auto-project-root convention. Returns None when nothing applies
+    (sessions not tied to a configured project).
     """
     expanded = {
         str(Path(k).expanduser()): v for k, v in PROJECT_MAPPINGS.items()
@@ -28,10 +55,10 @@ def _lookup_slug(absolute_path: str) -> str | None:
         (path, slug) for path, slug in expanded.items()
         if absolute_path.startswith(path) and slug
     ]
-    if not matches:
-        return None
-    matches.sort(key=lambda x: len(x[0]), reverse=True)  # longest prefix wins
-    return matches[0][1]
+    if matches:
+        matches.sort(key=lambda x: len(x[0]), reverse=True)  # longest prefix wins
+        return matches[0][1]
+    return _auto_root_slug(absolute_path)
 
 
 class ClaudeCodeAdapter:

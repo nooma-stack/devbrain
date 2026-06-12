@@ -22,6 +22,28 @@ def get_project_id(slug: str) -> str | None:
         return str(row[0]) if row else None
 
 
+def get_or_create_project_id(slug: str) -> str:
+    """Resolve a slug to a project id, creating the project on first sight.
+
+    Supports the auto-project-roots convention: a session arriving from a
+    new workspace folder (e.g. lighthouse/website) materializes its
+    project row instead of falling into the orphan bucket. Idempotent
+    under concurrent ingest via ON CONFLICT.
+    """
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO devbrain.projects (slug, name)
+            VALUES (%s, %s)
+            ON CONFLICT (slug) DO NOTHING
+            """,
+            (slug, slug),
+        )
+        conn.commit()
+        cur.execute("SELECT id FROM devbrain.projects WHERE slug = %s", (slug,))
+        return str(cur.fetchone()[0])
+
+
 def session_exists(source_app: str, source_hash: str) -> bool:
     with get_connection() as conn, conn.cursor() as cur:
         cur.execute(
