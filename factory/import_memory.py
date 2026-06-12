@@ -249,13 +249,16 @@ def _upsert_devs(cur, devs: list[dict]) -> dict[str, int]:
 def _insert_memory(
     cur, memory: list[dict], slug_to_id: dict[str, str],
 ) -> dict[str, int]:
-    """Insert memory rows, target-less ON CONFLICT DO NOTHING.
+    """Insert memory rows, deduped by content-level natural key.
 
-    Dedup is enforced by whatever unique indexes exist on the table —
-    since migration 037 split the (provenance_id, kind) index into
-    per-kind partial indexes, a targeted ON CONFLICT can no longer
-    infer them (its predicate is weaker than each index's), so the
-    insert must stay target-less to match all of them.
+    The unique indexes can't carry import idempotency: migration 037's
+    per-kind partial indexes only cover three kinds (and only rows with
+    a provenance_id), so every other row would re-insert on each
+    import — observed 2026-06-12 when a second run of the same export
+    duplicated ~50k rows. The INSERT therefore anti-joins on
+    (project_id, kind, provenance_id, title, md5(content)) — served by
+    idx_memory_import_dedup (migration 044) — and keeps a target-less
+    ON CONFLICT DO NOTHING as a race/index backstop.
 
     Embedding round-trips via the pgvector text literal — bit-equal to
     the source on re-export. ``applies_when`` keeps its JSON shape.
@@ -272,12 +275,20 @@ def _insert_memory(
              compliance_profiles, current_streak,
              graduated_at, demoted_at, effective_hit_count,
              last_cascade_at)
-        VALUES (%s, %s, %s, %s, %s::vector,
-                %s, %s, %s, %s::jsonb,
-                %s, %s, %s, %s, %s,
-                %s::text[], %s,
-                %s, %s, %s,
-                %s)
+        SELECT %s, %s, %s, %s, %s::vector,
+               %s, %s, %s, %s::jsonb,
+               %s, %s, %s, %s, %s,
+               %s::text[], %s,
+               %s, %s, %s,
+               %s
+        WHERE NOT EXISTS (
+            SELECT 1 FROM devbrain.memory mm
+            WHERE mm.project_id = %s
+              AND mm.kind = %s
+              AND coalesce(mm.provenance_id::text, '') = coalesce(%s::text, '')
+              AND coalesce(mm.title, '') = coalesce(%s, '')
+              AND md5(mm.content) = md5(%s)
+        )
         ON CONFLICT DO NOTHING
     """
     for m in memory:
@@ -320,6 +331,12 @@ def _insert_memory(
                 m.get("demoted_at"),
                 m.get("effective_hit_count", 0),
                 m.get("last_cascade_at"),
+                # NOT EXISTS natural-key params
+                project_id,
+                m["kind"],
+                m.get("provenance_id"),
+                m.get("title"),
+                m["content"],
             ),
         )
         if cur.rowcount == 1:
