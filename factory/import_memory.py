@@ -249,7 +249,13 @@ def _upsert_devs(cur, devs: list[dict]) -> dict[str, int]:
 def _insert_memory(
     cur, memory: list[dict], slug_to_id: dict[str, str],
 ) -> dict[str, int]:
-    """Insert memory rows, ON CONFLICT on (provenance_id, kind).
+    """Insert memory rows, target-less ON CONFLICT DO NOTHING.
+
+    Dedup is enforced by whatever unique indexes exist on the table —
+    since migration 037 split the (provenance_id, kind) index into
+    per-kind partial indexes, a targeted ON CONFLICT can no longer
+    infer them (its predicate is weaker than each index's), so the
+    insert must stay target-less to match all of them.
 
     Embedding round-trips via the pgvector text literal — bit-equal to
     the source on re-export. ``applies_when`` keeps its JSON shape.
@@ -272,8 +278,7 @@ def _insert_memory(
                 %s::text[], %s,
                 %s, %s, %s,
                 %s)
-        ON CONFLICT (provenance_id, kind) WHERE provenance_id IS NOT NULL
-        DO NOTHING
+        ON CONFLICT DO NOTHING
     """
     for m in memory:
         counts["scanned"] += 1
