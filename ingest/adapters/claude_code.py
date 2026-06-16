@@ -66,7 +66,12 @@ class ClaudeCodeAdapter:
     file_patterns = ["*.jsonl"]
 
     def detect(self, file_path: Path) -> bool:
-        return file_path.suffix == ".jsonl" and ".claude" in str(file_path)
+        s = str(file_path)
+        # ".claude" for local sessions; "ingest-incoming" for remote-dev
+        # transcripts shipped to the drop zone (whose path has no .claude).
+        return file_path.suffix == ".jsonl" and (
+            ".claude" in s or "ingest-incoming" in s
+        )
 
     def detect_project(self, file_path: Path) -> str | None:
         """Infer project from the encoded-path directory.
