@@ -134,6 +134,78 @@ def test_memory_unique_indexes_applied(db):
             kind in atomdef for kind in ("pattern", "decision", "lesson")
         ), f"atom index predicate doesn't reference atom kinds: {atomdef}"
 
+        # Migration 045: the chunk dual-write's ON CONFLICT relies on a
+        # partial unique index keyed on (provenance_id, kind, md5(content)).
+        cur.execute(
+            "SELECT indexdef FROM pg_indexes "
+            "WHERE schemaname = 'devbrain' AND tablename = 'memory' "
+            "AND indexname = 'idx_memory_chunk_dedup_unique'"
+        )
+        chunkrow = cur.fetchone()
+        assert chunkrow is not None, (
+            "idx_memory_chunk_dedup_unique missing — run "
+            "`bin/devbrain migrate` (migration 045)"
+        )
+        chunkdef = chunkrow[0]
+        assert "UNIQUE" in chunkdef.upper()
+        assert "provenance_id" in chunkdef
+        assert "md5" in chunkdef.lower()
+        assert "chunk" in chunkdef
+
+
+def test_dual_write_chunk_is_idempotent(db):
+    """Re-running the chunk dual-write for the same (provenance_id,
+    content) must NOT create a second memory row — migration 045's
+    ON CONFLICT (provenance_id, kind, md5(content)) DO NOTHING. This is
+    the guard whose absence let BrightBrain accumulate 257k duplicate
+    chunk rows (one chunk had 824 copies)."""
+    pid = _devbrain_project_id(db)
+    prov = "55555555-5555-5555-5555-555555555555"
+    content = f"{TEST_CONTENT_PREFIX}chunk idempotent body"
+    emb = _embedding_sql(0.5)
+
+    # Two separate transactions, same natural key — simulates a backfill
+    # re-run over an already-ingested chunk.
+    for _ in range(2):
+        with db._conn() as conn, conn.cursor() as cur:
+            record_memory(
+                cur,
+                project_id=pid,
+                kind="chunk",
+                content=content,
+                embedding_sql=emb,
+                provenance_id=prov,
+            )
+            conn.commit()
+
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM devbrain.memory WHERE content = %s",
+            (content,),
+        )
+        (n,) = cur.fetchone()
+    assert n == 1, f"chunk dual-write not idempotent: {n} rows for one key"
+
+    # Different content under the SAME provenance (session) is a distinct
+    # chunk and MUST still insert — provenance alone is not the key.
+    content2 = f"{TEST_CONTENT_PREFIX}chunk idempotent body TWO"
+    with db._conn() as conn, conn.cursor() as cur:
+        record_memory(
+            cur, project_id=pid, kind="chunk", content=content2,
+            embedding_sql=emb, provenance_id=prov,
+        )
+        conn.commit()
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM devbrain.memory "
+            "WHERE provenance_id = %s AND content LIKE %s",
+            (prov, f"{TEST_CONTENT_PREFIX}chunk idempotent body%"),
+        )
+        (n2,) = cur.fetchone()
+    assert n2 == 2, (
+        "distinct content under one provenance must remain distinct rows"
+    )
+
 
 # ─── 2-6. Dual-write produces a memory row for each kind ─────────────────
 

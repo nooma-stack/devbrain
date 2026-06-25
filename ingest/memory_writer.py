@@ -98,8 +98,27 @@ def record_memory(
             "  AND kind IN ('pattern', 'decision', 'lesson', 'issue') "
             "DO NOTHING"
         )
+    elif kind == "chunk":
+        # Chunks dedup on (provenance_id, kind, md5(content)) — the
+        # natural key for a re-ingested legacy chunk. provenance_id is
+        # the *source session* UUID (migration 032), so a session has
+        # many distinct chunks under one provenance; the content hash is
+        # what distinguishes (and dedups) them. Provenance-scoped, so
+        # identical text from *different* sessions is preserved (cf. the
+        # divergent-provenance rationale in migration 044). Backed by
+        # idx_memory_chunk_dedup_unique (migration 045). Without this the
+        # chunk dual-write had no ON CONFLICT, so every re-run of the
+        # chunk backfill re-inserted every chunk — observed 2026-06-25:
+        # BrightBrain's memory table was 83% duplicate chunk rows (one
+        # chunk had 824 copies), flooding deep_search's top-K with stale
+        # duplicates that tripped recency_warning on every query.
+        on_conflict = (
+            "ON CONFLICT (provenance_id, kind, md5(content)) "
+            "WHERE provenance_id IS NOT NULL AND kind = 'chunk' "
+            "DO NOTHING"
+        )
     else:
-        # Chunks (and any future non-deduped kind) just insert.
+        # Any future non-deduped kind just inserts.
         on_conflict = ""
 
     try:
