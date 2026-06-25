@@ -20,6 +20,7 @@ from cognify.edges import (
     EDGE_TYPE_CITES,
     _detect_cites,
     _insert_edge,
+    _load_memories,
     _normalize_title,
 )
 
@@ -220,3 +221,45 @@ def test_cites_single_memory_no_cross_reference(conn, project_factory):
     found = _detect_cites(conn, project["id"])
 
     assert found == 0
+
+
+@pytest.mark.db
+def test_cites_substring_not_word_boundary_no_edge(conn, project_factory):
+    """A title that appears only as a substring of a LARGER word must NOT
+    cite. This guards the substring pre-filter added for performance: the
+    cheap `in` check passes (the title is a substring), but the
+    word-boundary regex must still reject it — so no edge is created."""
+    project = project_factory("cites_substr")
+    # "Auth" is a substring of "Authentication" but not a whole word there.
+    m_a = _insert_mem(
+        conn, project["id"], "Caller",
+        "We rely on Authentication throughout the service."
+    )
+    m_b = _insert_mem(conn, project["id"], "Auth", "The Auth subsystem.")
+
+    found = _detect_cites(conn, project["id"])
+
+    assert found == 0
+    assert _edge_count(conn, m_a, m_b, EDGE_TYPE_CITES) == 0
+
+
+@pytest.mark.db
+def test_cites_shared_memories_snapshot_equivalent(conn, project_factory):
+    """Passing a pre-loaded `memories` snapshot (the edges-pass load-once
+    path) produces the identical cite count as letting _detect_cites load
+    its own. dry_run avoids inserting so both paths see the same data."""
+    project = project_factory("cites_snapshot")
+    _insert_mem(
+        conn, project["id"], "Impl Notes",
+        "We chose OAuthStrategy and also FeatureFlags."
+    )
+    _insert_mem(conn, project["id"], "OAuthStrategy", "Details.")
+    _insert_mem(conn, project["id"], "FeatureFlags", "More details.")
+
+    internal = _detect_cites(conn, project["id"], dry_run=True)
+    snapshot = _load_memories(conn, project["id"])
+    shared = _detect_cites(
+        conn, project["id"], dry_run=True, memories=snapshot
+    )
+
+    assert internal == shared >= 2

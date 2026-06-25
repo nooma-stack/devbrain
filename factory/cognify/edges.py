@@ -121,11 +121,18 @@ def _run_edges(
     When None (default), uses MAX_LLM_CALLS_PER_PASS=15. cites detection
     is zero-LLM and ignores this.
     """
-    cites_new = _detect_cites(conn, project_id, dry_run=dry_run)
+    # Load the project's non-archived memory once and share it with both
+    # detectors — within a single pass the snapshot is identical, so the
+    # previous two separate full-table reads were pure duplication.
+    memories = _load_memories(conn, project_id)
+    cites_new = _detect_cites(
+        conn, project_id, dry_run=dry_run, memories=memories
+    )
     contradicts_new, llm_calls = _detect_contradicts(
         conn, project_id, dry_run=dry_run, record_conn=conn,
         cross_project=cross_project,
         max_llm_calls=max_llm_calls,
+        memories=memories,
     )
     return cites_new, contradicts_new, llm_calls
 
@@ -134,16 +141,20 @@ def _run_edges(
 
 
 def _detect_cites(
-    conn: Any, project_id: Any, *, dry_run: bool = False
+    conn: Any, project_id: Any, *, dry_run: bool = False, memories: list | None = None
 ) -> int:
     """Detect cites edges via text pattern matching.
 
     A cites edge is inferred when memory row A's content contains a
     reference pattern that matches memory row B's title (case-insensitive,
     normalised). Deterministic; zero LLM cost.
+
+    `memories` lets the caller pass a pre-loaded snapshot so the edges
+    pass reads the table only once; when None it loads its own (keeps the
+    direct-call test contract).
     """
-    # Load all non-archived memory rows for the project.
-    memories = _load_memories(conn, project_id)
+    if memories is None:
+        memories = _load_memories(conn, project_id)
     if len(memories) < 2:
         return 0
 
@@ -154,20 +165,43 @@ def _detect_cites(
             norm = _normalize_title(m["title"])
             if norm:
                 title_index[norm] = m["id"]
+    if not title_index:
+        return 0
+
+    # Pre-compile each title's word-boundary pattern ONCE. Previously the
+    # inner loop rebuilt `re.escape(title)` + re-compiled on every
+    # (row, title) pair; with thousands of distinct titles this blew past
+    # Python's 512-entry regex cache and recompiled constantly (the cause
+    # of the multi-hour single-core peg). Same patterns, same matches.
+    compiled: dict[str, "re.Pattern[str]"] = {
+        norm: re.compile(r"\b" + re.escape(norm) + r"\b", re.IGNORECASE)
+        for norm in title_index
+    }
 
     new_edges = 0
     for m in memories:
         content = m.get("content") or ""
+        if not content:
+            continue
+        # Cheap substring pre-filter: a \bTITLE\b match is impossible
+        # unless the (already-lowercased) title appears as a substring of
+        # the lowercased content, so the C-level `in` test skips the regex
+        # for the vast majority of pairs WITHOUT changing which edges are
+        # produced (the regex still confirms the word boundary).
+        content_lower = content.lower()
+        m_id = m["id"]
         for norm_title, target_id in title_index.items():
-            if target_id == m["id"]:
+            if target_id == m_id:
                 continue
-            if re.search(r"\b" + re.escape(norm_title) + r"\b", content, re.IGNORECASE):
+            if norm_title not in content_lower:
+                continue
+            if compiled[norm_title].search(content):
                 if dry_run:
                     new_edges += 1
                     continue
                 inserted = _insert_edge(
                     conn,
-                    from_id=m["id"],
+                    from_id=m_id,
                     to_id=target_id,
                     edge_type=EDGE_TYPE_CITES,
                     confidence=0.7,
@@ -195,6 +229,7 @@ def _detect_contradicts(
     record_conn: Any = None,
     cross_project: bool = False,
     max_llm_calls: int | None = None,
+    memories: list | None = None,
 ) -> tuple[int, int]:
     """Detect contradicts edges using Phase 5 graph_walk + LLM judgment.
 
@@ -217,7 +252,9 @@ def _detect_contradicts(
         canonical regulatory rule. When False (default), traversal stays
         strict same-project (P3-aligned).
     """
-    all_memories = _load_memories(conn, project_id)
+    all_memories = (
+        memories if memories is not None else _load_memories(conn, project_id)
+    )
     if len(all_memories) < 2:
         return 0, 0
 
@@ -230,10 +267,17 @@ def _detect_contradicts(
         # project that only has 'decision' rows). Cost ceiling still applies.
         seed_memories = all_memories
 
+    # Only candidate_pairs[:cap] is ever LLM-judged, so stop walking seeds
+    # once we have `cap` pairs — the walks (4 DB round-trips each) are the
+    # expensive part, and pairs are appended in deterministic seed order so
+    # the first `cap` are identical either way.
+    cap = max_llm_calls if max_llm_calls is not None else MAX_LLM_CALLS_PER_PASS
     candidate_pairs: list[tuple[UUID, UUID]] = []
     seen: set[frozenset] = set()
 
     for m in seed_memories:
+        if len(candidate_pairs) >= cap:
+            break
         result = walk(
             conn,
             seed_memory_id=m["id"],
@@ -263,7 +307,6 @@ def _detect_contradicts(
 
     new_edges = 0
     llm_calls = 0
-    cap = max_llm_calls if max_llm_calls is not None else MAX_LLM_CALLS_PER_PASS
     for from_id, to_id in candidate_pairs[:cap]:
         if llm_calls >= cap:
             break
