@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import defaultdict
 from typing import Any
 from uuid import UUID
 
@@ -168,47 +169,61 @@ def _detect_cites(
     if not title_index:
         return 0
 
-    # Pre-compile each title's word-boundary pattern ONCE. Previously the
-    # inner loop rebuilt `re.escape(title)` + re-compiled on every
-    # (row, title) pair; with thousands of distinct titles this blew past
-    # Python's 512-entry regex cache and recompiled constantly (the cause
-    # of the multi-hour single-core peg). Same patterns, same matches.
-    compiled: dict[str, "re.Pattern[str]"] = {
-        norm: re.compile(r"\b" + re.escape(norm) + r"\b", re.IGNORECASE)
-        for norm in title_index
-    }
+    # Index titles by their FIRST word, and pre-compile each title's
+    # word-boundary pattern ONCE.
+    #
+    # Exactness: a `\bTITLE\b` match is impossible unless TITLE's first word
+    # appears as a whole word in the content — the leading `\b` plus the
+    # non-word char that follows the first word *inside* TITLE force that
+    # word to be a maximal `\w`-run in the content. So we only test titles
+    # whose first word is present in the content's word set, turning the old
+    # O(rows × all-titles) scan into O(rows × content-words × small-bucket)
+    # WITHOUT changing which edges are produced (the regex still confirms the
+    # full boundary match). This replaces the per-(row,title) substring scan
+    # that, while cheap per op, still ran rows×titles times.
+    titles_by_first_word: dict[str, list[tuple[str, UUID]]] = defaultdict(list)
+    compiled: dict[str, "re.Pattern[str]"] = {}
+    for norm_title, target_id in title_index.items():
+        first = re.match(r"\w+", norm_title)
+        if first is None:
+            continue  # no leading word char → can never \b-match
+        titles_by_first_word[first.group()].append((norm_title, target_id))
+        compiled[norm_title] = re.compile(
+            r"\b" + re.escape(norm_title) + r"\b", re.IGNORECASE
+        )
 
     new_edges = 0
     for m in memories:
         content = m.get("content") or ""
         if not content:
             continue
-        # Cheap substring pre-filter: a \bTITLE\b match is impossible
-        # unless the (already-lowercased) title appears as a substring of
-        # the lowercased content, so the C-level `in` test skips the regex
-        # for the vast majority of pairs WITHOUT changing which edges are
-        # produced (the regex still confirms the word boundary).
         content_lower = content.lower()
         m_id = m["id"]
-        for norm_title, target_id in title_index.items():
-            if target_id == m_id:
-                continue
-            if norm_title not in content_lower:
-                continue
-            if compiled[norm_title].search(content):
-                if dry_run:
-                    new_edges += 1
+        # Only titles whose first word is a whole word in this content can
+        # match. Each title lives in exactly one first-word bucket, and each
+        # distinct content word is visited once, so every (row, target) pair
+        # is considered at most once — same as iterating all titles, fewer
+        # candidates. The substring `in` then the regex confirm the rest.
+        for word in set(re.findall(r"\w+", content_lower)):
+            for norm_title, target_id in titles_by_first_word.get(word, ()):
+                if target_id == m_id:
                     continue
-                inserted = _insert_edge(
-                    conn,
-                    from_id=m_id,
-                    to_id=target_id,
-                    edge_type=EDGE_TYPE_CITES,
-                    confidence=0.7,
-                    created_by="cognify_edges",
-                )
-                if inserted:
-                    new_edges += 1
+                if norm_title not in content_lower:
+                    continue
+                if compiled[norm_title].search(content):
+                    if dry_run:
+                        new_edges += 1
+                        continue
+                    inserted = _insert_edge(
+                        conn,
+                        from_id=m_id,
+                        to_id=target_id,
+                        edge_type=EDGE_TYPE_CITES,
+                        confidence=0.7,
+                        created_by="cognify_edges",
+                    )
+                    if inserted:
+                        new_edges += 1
 
     return new_edges
 

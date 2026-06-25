@@ -16,6 +16,9 @@ import uuid
 
 import pytest
 
+import random
+import re as _re
+
 from cognify.edges import (
     EDGE_TYPE_CITES,
     _detect_cites,
@@ -23,6 +26,29 @@ from cognify.edges import (
     _load_memories,
     _normalize_title,
 )
+
+
+def _reference_cites_edges(mems):
+    """The ORIGINAL O(N×T) cites logic, returning the set of (from, to)
+    string-id pairs. Used to prove the optimized _detect_cites is exactly
+    equivalent. `mems` is a list of dicts with str 'id', 'title', 'content'."""
+    title_index = {}
+    for m in mems:
+        if m["title"]:
+            norm = _normalize_title(m["title"])
+            if norm:
+                title_index[norm] = m["id"]
+    edges = set()
+    for m in mems:
+        content = m["content"] or ""
+        for norm_title, target_id in title_index.items():
+            if target_id == m["id"]:
+                continue
+            if _re.search(
+                r"\b" + _re.escape(norm_title) + r"\b", content, _re.IGNORECASE
+            ):
+                edges.add((m["id"], target_id))
+    return edges
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -263,3 +289,59 @@ def test_cites_shared_memories_snapshot_equivalent(conn, project_factory):
     )
 
     assert internal == shared >= 2
+
+
+@pytest.mark.db
+def test_cites_equivalence_vs_reference_random(conn, project_factory):
+    """The first-word-index _detect_cites must produce the EXACT same edge
+    set as the original O(N×T) regex scan, over randomized data that stresses
+    the tricky cases: word-bounded hits, case differences, multi-word titles,
+    titles glued inside a larger word (substring but no boundary → no edge),
+    and untitled source rows. Compares the real DB edges to a reference."""
+    rng = random.Random(20260625)
+    project = project_factory("cites_equiv_rand")
+
+    # Distinct titles (no normalized-title collisions → no last-wins ambiguity).
+    titles = [
+        "OAuthStrategy", "Auth", "Feature Flags", "DB-Migration", "retry logic",
+        "CacheLayer", "Cache", "Login Flow", "login", "RBAC",
+    ]
+    mems = []
+    # 10 titled rows (one per title) + 15 untitled rows; every row gets content
+    # that embeds random titles in random forms.
+    plan = [(t, True) for t in titles] + [(None, False) for _ in range(15)]
+    rng.shuffle(plan)
+    for title, _titled in plan:
+        parts = ["lorem ipsum dolor"]
+        for _ in range(rng.randint(0, 4)):
+            t = rng.choice(titles)
+            mode = rng.randint(0, 3)
+            if mode == 0:
+                parts.append(t)                       # word-bounded → edge
+            elif mode == 1:
+                parts.append(t.upper())               # case-insensitive → edge
+            elif mode == 2:
+                parts.append("xx" + t.replace(" ", "") + "yy")  # glued → no edge
+            else:
+                parts.append(t.lower())               # word-bounded lower → edge
+        content = " ".join(parts) + " the end."
+        mems.append({"title": title, "content": content})
+
+    for m in mems:
+        m["id"] = str(_insert_mem(conn, project["id"], m["title"], m["content"]))
+
+    _detect_cites(conn, project["id"])
+
+    ids = [m["id"] for m in mems]
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT from_memory_id, to_memory_id FROM devbrain.memory_dependencies "
+            "WHERE edge_type = %s AND from_memory_id = ANY(%s::uuid[])",
+            (EDGE_TYPE_CITES, ids),
+        )
+        actual = {(str(a), str(b)) for a, b in cur.fetchall()}
+
+    reference = _reference_cites_edges(mems)
+
+    assert actual == reference
+    assert reference  # sanity: the random data actually produced some edges
