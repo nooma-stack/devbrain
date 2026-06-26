@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
+from cognify.embedding import embed_text
 from cognify.fanout_prompt import (
     SESSION_RELEVANCE_THRESHOLD,
     SUMMARY_MAX_CHARS,
@@ -611,32 +612,10 @@ def _embed_summary(text: str) -> list[float] | None:
 
     Returns None if Ollama is unreachable — the fan-out row is still
     written (sans embedding) so search via metadata/title still works;
-    a subsequent `cognify reembed` pass can backfill the vector.
+    a subsequent reembed pass can backfill the vector. Thin wrapper over
+    the shared cognify.embedding.embed_text (single source of truth).
     """
-    try:
-        import json
-        import urllib.request
-        # Re-resolve config at call-time so test envs can monkeypatch.
-        try:
-            from ingest.config import OLLAMA_URL, EMBED_MODEL  # noqa: PLC0415
-        except ImportError:
-            # Fallback: ingest package not on path (shouldn't happen under
-            # devbrain's standard installs, but be tolerant in CI).
-            import os  # noqa: PLC0415
-            OLLAMA_URL = os.environ.get("DEVBRAIN_OLLAMA_URL", "http://localhost:11434")
-            EMBED_MODEL = os.environ.get("DEVBRAIN_EMBEDDING_MODEL", "snowflake-arctic-embed2")
-        data = json.dumps({"model": EMBED_MODEL, "input": text}).encode()
-        req = urllib.request.Request(
-            f"{OLLAMA_URL}/api/embed",
-            data=data,
-            headers={"Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            payload = json.loads(resp.read())
-        return payload["embeddings"][0]
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("cognify_fanout: embedding failed (%s); writing row without vector", exc)
-        return None
+    return embed_text(text)
 
 
 def _json_dumps(obj: dict) -> str:

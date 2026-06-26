@@ -42,6 +42,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from cognify.embedding import embed_text, to_vector_literal
+
 logger = logging.getLogger(__name__)
 
 
@@ -176,18 +178,37 @@ def handle_lesson_candidates(
         return
     with conn.cursor() as cur:
         for c in candidates:
-            cur.execute(
-                "INSERT INTO devbrain.memory "
-                "(project_id, kind, title, content, tier, strength, "
-                " applies_when) "
-                "VALUES (%s, 'pattern', %s, %s, 'lesson', 1.0, %s::jsonb)",
-                (
-                    session_project_id,
-                    c.title,
-                    c.content,
-                    _json.dumps(c.applies_when),
-                ),
-            )
+            # Embed so deep_search can find the lesson (it filters
+            # embedding IS NOT NULL). Graceful None if Ollama is down — the
+            # row is still written and a reembed pass backfills the vector.
+            emb = embed_text(f"{c.title}\n{c.content}" if c.title else c.content)
+            if emb is not None:
+                cur.execute(
+                    "INSERT INTO devbrain.memory "
+                    "(project_id, kind, title, content, tier, strength, "
+                    " applies_when, embedding) "
+                    "VALUES (%s, 'pattern', %s, %s, 'lesson', 1.0, %s::jsonb, %s::vector)",
+                    (
+                        session_project_id,
+                        c.title,
+                        c.content,
+                        _json.dumps(c.applies_when),
+                        to_vector_literal(emb),
+                    ),
+                )
+            else:
+                cur.execute(
+                    "INSERT INTO devbrain.memory "
+                    "(project_id, kind, title, content, tier, strength, "
+                    " applies_when) "
+                    "VALUES (%s, 'pattern', %s, %s, 'lesson', 1.0, %s::jsonb)",
+                    (
+                        session_project_id,
+                        c.title,
+                        c.content,
+                        _json.dumps(c.applies_when),
+                    ),
+                )
     conn.commit()
 
 
