@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import uuid
 from pathlib import Path
 
 import pytest
@@ -29,7 +30,7 @@ sys.path.insert(
     0, str(Path(__file__).resolve().parent.parent.parent / "ingest")
 )
 
-from db import delete_session, insert_chunk  # noqa: E402  (ingest/db.py)
+from db import delete_session, insert_chunk, insert_raw_session  # noqa: E402  (ingest/db.py)
 from memory_writer import record_memory  # noqa: E402  (ingest/memory_writer.py)
 from state_machine import FactoryDB  # noqa: E402
 
@@ -715,3 +716,61 @@ def test_delete_session_is_safe_when_session_missing(db):
     nonexistent = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
     result = delete_session(nonexistent)
     assert result == {"memory": 0, "chunks": 0, "raw_sessions": 0}
+
+
+def test_session_ingest_transaction_is_atomic(db):
+    """insert_raw_session + insert_chunk share a caller cursor and commit
+    together. A rolled-back ingest leaves NOTHING — so the source-hash gate
+    re-ingests the session cleanly instead of stranding a half-indexed one."""
+    pid = _devbrain_project_id(db)
+    shash = f"atomic_test_{uuid.uuid4().hex}"
+    content = f"{TEST_CONTENT_PREFIX}atomic chunk"
+
+    def _ingest(commit: bool) -> str:
+        conn = db._conn()
+        try:
+            with conn.cursor() as cur:
+                sid = insert_raw_session(
+                    project_id=pid, source_app="claude_code",
+                    source_path="test://atomic", source_hash=shash,
+                    session_id=None, model_used=None, started_at=None,
+                    ended_at=None, message_count=1,
+                    raw_content=f"{TEST_CONTENT_PREFIX}raw", summary=None,
+                    files_touched=[], cur=cur,
+                )
+                assert sid
+                insert_chunk(
+                    project_id=pid, source_type="session", source_id=sid,
+                    source_line_start=0, source_line_end=1, content=content,
+                    embedding=[0.1] * 1024, token_count=3, cur=cur,
+                )
+            conn.commit() if commit else conn.rollback()
+            return sid
+        finally:
+            conn.close()
+
+    # Rolled back → nothing in any of the three tables.
+    _ingest(commit=False)
+    with db._conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT count(*) FROM devbrain.raw_sessions WHERE source_hash=%s", (shash,)
+        )
+        assert cur.fetchone()[0] == 0
+        cur.execute("SELECT count(*) FROM devbrain.memory WHERE content=%s", (content,))
+        assert cur.fetchone()[0] == 0
+
+    # Committed → raw_session + chunk + dual-written memory all land together.
+    sid = _ingest(commit=True)
+    try:
+        with db._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM devbrain.memory WHERE content=%s AND kind='chunk'",
+                (content,),
+            )
+            assert cur.fetchone()[0] == 1
+            cur.execute(
+                "SELECT count(*) FROM devbrain.raw_sessions WHERE source_hash=%s", (shash,)
+            )
+            assert cur.fetchone()[0] == 1
+    finally:
+        delete_session(sid)
