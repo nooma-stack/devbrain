@@ -433,11 +433,25 @@ def extract_from_session(
 
 
 def _last_successful_run(conn: Any, pass_name: str, project_id: Any):
-    """Return the started_at of the most recent successful extract run, or None."""
+    """Return the started_at of the most recent *completed* successful run, or None.
+
+    Must require `completed_at IS NOT NULL`, not just `error IS NULL`. The
+    orchestrator inserts+commits the run-log row at pass START (error and
+    completed_at both NULL), so an `error IS NULL` filter alone matches the
+    CURRENT in-progress run — extract would read its own row, get
+    since=now, and process zero sessions every time (observed 2026-06-26:
+    extract had been a silent no-op, rows_processed=0 every hour). It also
+    matches a crashed run that never recorded its error, which would
+    advance the watermark past sessions it never extracted (silent loss).
+    Requiring a non-NULL completed_at restricts the watermark to runs that
+    actually finished cleanly; re-extraction is idempotent (ON CONFLICT),
+    so a slightly-too-old watermark only costs harmless reprocessing.
+    """
     with conn.cursor() as cur:
         cur.execute(
             "SELECT started_at FROM devbrain.cognify_run_log "
-            "WHERE pass_name = %s AND project_id = %s AND error IS NULL "
+            "WHERE pass_name = %s AND project_id = %s "
+            "  AND completed_at IS NOT NULL AND error IS NULL "
             "ORDER BY started_at DESC LIMIT 1",
             (pass_name, project_id),
         )
