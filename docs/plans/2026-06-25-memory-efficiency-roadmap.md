@@ -15,23 +15,25 @@ Legend: ✅ shipped · 🔜 queued · 🧪 needs clean-DB validation · 🐛 cor
   the chunk dual-write had no `ON CONFLICT`, so re-running the backfill
   duplicated every chunk (BrightBrain hit 83% dup chunk rows, one chunk 824×).
   Fixed; live BrightBrain cleaned 341k→84k rows, ivfflat reindexed.
-- ✅ **#1 `edges` cites pass efficiency** (this PR). The O(N×T) regex double-loop
-  re-compiled patterns past Python's 512-entry regex cache and pegged a core
-  ~36h on the bloated table. Behavior-preserving fixes: load the project's
-  memory **once** (was read twice), **pre-compile** each title pattern once, add
-  a lowercase **substring pre-filter** before the word-boundary regex (a
-  `\bTITLE\b` match is impossible unless TITLE is a substring, so the C-level
-  `in` skips the regex for nearly all pairs without changing which edges are
-  produced), and **early-exit** the contradiction seed-walks once `cap` pairs
-  exist (only `candidate_pairs[:cap]` is ever judged). Regression tests added
-  for the substring/word-boundary semantics and the load-once snapshot path.
+- ✅ **#1 `edges` cites pass efficiency** (PRs #165 + #166). The O(N×T) regex
+  double-loop re-compiled patterns past Python's 512-entry regex cache and
+  pegged a core ~36h. Fixed in two behavior-preserving passes: #165 = load
+  memory **once** (was read twice), **pre-compile** patterns, substring
+  pre-filter, contradiction-walk early-exit. #166 = **first-word inverted
+  index** (a `\bTITLE\b` match needs TITLE's first word present as a whole word,
+  so only test titles in that bucket) → O(rows × content-words). Verified on the
+  Studio: the cites scan over 84k rows × 21k titles went **36h-pegging → 74s**.
+  A randomized equivalence test asserts byte-identical edges vs the original.
+- ✅ **#2 embedding index → HNSW** (migration 046, PR #167). NOTE: the original
+  "ivfflat caps at 63% recall, HNSW ~95%" claim was a **measurement artifact** —
+  an id-overlap metric mis-read tied/duplicate embeddings as misses. The
+  tie-robust metric shows ivfflat (probes=10) AND HNSW (ef_search=40) both at
+  **distance-recall@10 = 1.000, ~1ms p50** on live data. Retrieval was never
+  broken. Switched to HNSW anyway for the marginal wins at equal recall/latency:
+  ~half the size (337 vs 656 MB) and no `probes` tuning. ivfflat.probes reset.
 
 ## Behavior-preserving efficiency wins (queued)
 
-- 🔜 **#2 ivfflat recall/size**: rebuild `idx_memory_embedding` `lists=100 → ~256`,
-  add `WHERE archived_at IS NULL`, and `SET LOCAL ivfflat.probes=10` in the
-  search transaction (default probes=1 scans one list). Improves recall (the
-  same retrieval, better) and shrinks the 656 MB index. Rebuild is online-able.
 - 🔜 **#3 ingest one-txn-per-session**: keep embedding *outside* the txn, then
   write `raw_session + all chunks + dual-write` in ONE per-session transaction
   with `execute_values` (today: a new connection + commit per chunk). Session
