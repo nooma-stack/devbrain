@@ -43,6 +43,46 @@ def _insert_run_log(conn, project_id, *, started, completed, error=None):
 
 
 @pytest.mark.db
+def test_upsert_memory_embeds_atom(conn, project_factory, monkeypatch):
+    """Extracted atoms must be embedded so deep_search (which filters
+    embedding IS NOT NULL) can find them. Regression: _upsert_memory used
+    to insert decision/pattern rows with no vector, leaving ~22k atoms
+    invisible to search."""
+    import cognify.extract as ex
+
+    project = project_factory("extract_embed")
+    sid = str(uuid.uuid4())
+
+    # Ollama up → embedding present.
+    monkeypatch.setattr(ex, "embed_text", lambda text: [0.05] * 1024)
+    mid, was_new = ex._upsert_memory(
+        conn, project_id=project["id"], kind="decision",
+        title="Embed Me", content="a decision worth finding", session_id=sid,
+    )
+    assert was_new
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT embedding IS NOT NULL FROM devbrain.memory WHERE id = %s",
+            (mid,),
+        )
+        assert cur.fetchone()[0] is True
+
+    # Ollama down → row still written (graceful), just without a vector.
+    monkeypatch.setattr(ex, "embed_text", lambda text: None)
+    sid2 = str(uuid.uuid4())
+    mid2, _ = ex._upsert_memory(
+        conn, project_id=project["id"], kind="lesson",
+        title="No Ollama", content="written without a vector", session_id=sid2,
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT embedding IS NULL FROM devbrain.memory WHERE id = %s",
+            (mid2,),
+        )
+        assert cur.fetchone()[0] is True
+
+
+@pytest.mark.db
 def test_last_successful_run_ignores_in_progress_and_crashed(conn, project_factory):
     """The watermark must come only from COMPLETED, error-free runs.
 

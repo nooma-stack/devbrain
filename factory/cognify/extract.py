@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
+from cognify.embedding import embed_text, to_vector_literal
 from cognify.orchestrator import CognifyPass, PassResult, register_pass
 from observability.pricing import (
     SONNET_4_6,
@@ -954,7 +955,18 @@ def _upsert_memory(
         session_id,
     ]
 
-    placeholders = ", ".join(["%s"] * len(cols))
+    # Embed the atom so deep_search (which filters embedding IS NOT NULL)
+    # can find it. Skipping this is what left ~22k decision/pattern atoms
+    # invisible to search. embed_text degrades to None if Ollama is down —
+    # the row is still written and a reembed pass backfills the vector.
+    placeholders_list = ["%s"] * len(cols)
+    emb = embed_text(f"{title}\n{content}" if title else content)
+    if emb is not None:
+        cols.append("embedding")
+        vals.append(to_vector_literal(emb))
+        placeholders_list.append("%s::vector")
+
+    placeholders = ", ".join(placeholders_list)
     with conn.cursor() as cur:
         cur.execute(
             f"INSERT INTO devbrain.memory ({', '.join(cols)}) "
