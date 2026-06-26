@@ -494,11 +494,11 @@ def import_from_dict(
                     if inserted >= max(1000, total // 20):
                         logger.info(
                             "[import] %d rows inserted (%d total) — "
-                            "rebuilding ivfflat index + ANALYZE",
+                            "rebuilding embedding index + ANALYZE",
                             inserted, total,
                         )
                         cur.execute(
-                            "REINDEX INDEX devbrain.idx_memory_embedding"
+                            "REINDEX INDEX devbrain.idx_memory_embedding_hnsw"
                         )
                         cur.execute("ANALYZE devbrain.memory")
                 conn.commit()
