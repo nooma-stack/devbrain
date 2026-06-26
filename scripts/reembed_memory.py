@@ -22,10 +22,12 @@ import sys
 import time
 from pathlib import Path
 
-# Make ingest + factory importable regardless of CWD.
+# ingest/embeddings.py does a bare `from config import ...`, so ingest/ must
+# be the FIRST sys.path entry — adding factory/ too would shadow ingest's
+# config.py with factory/config.py (which lacks EMBED_MODEL). ingest is all
+# this script needs.
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT / "ingest"))
-sys.path.insert(0, str(_ROOT / "factory"))
 
 import psycopg2  # noqa: E402
 
