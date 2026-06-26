@@ -15,7 +15,7 @@ from adapters.gemini import GeminiAdapter
 from adapters.markdown_memory import MarkdownMemoryAdapter
 from adapters.openclaw import OpenClawAdapter
 from chunker import chunk_text
-from db import delete_chunks_for_session, get_or_create_project_id, get_existing_session_id, insert_chunk, insert_raw_session, session_exists, update_session_summary
+from db import delete_chunks_for_session, get_connection, get_or_create_project_id, get_existing_session_id, insert_chunk, insert_raw_session, session_exists, update_session_summary
 from embeddings import embed, embed_batch
 
 ADAPTERS = [ClaudeCodeAdapter(), OpenClawAdapter(), CodexAdapter(), GeminiAdapter(), MarkdownMemoryAdapter()]
@@ -65,6 +65,27 @@ def ingest_file(path: Path, *, force: bool = False) -> bool:
     return _process_session(session, path, fhash, is_update=is_update)
 
 
+def _embed_chunks(chunks) -> list[list[float]]:
+    """Embed all chunk texts (batched, with per-text fallback) BEFORE the write
+    transaction, so the slow Ollama calls hold no DB locks. A failed embed
+    falls back to a zero vector so one bad chunk doesn't abort the whole
+    session (a reembed pass backfills it)."""
+    embeddings: list[list[float]] = []
+    batch_size = 10
+    for i in range(0, len(chunks), batch_size):
+        texts = [c.content for c in chunks[i : i + batch_size]]
+        try:
+            embeddings.extend(embed_batch(texts))
+        except Exception as e:  # noqa: BLE001
+            print(f"  Embedding batch failed, falling back to individual: {e}")
+            for text in texts:
+                try:
+                    embeddings.append(embed(text))
+                except Exception:  # noqa: BLE001
+                    embeddings.append([0.0] * 1024)
+    return embeddings
+
+
 def _process_session(session: UniversalSession, source_path: Path, source_hash: str, *, is_update: bool = False) -> bool:
     """Store raw session, chunk, embed, and store chunks."""
     # Resolve project — adapters only emit slugs from explicit mappings or
@@ -83,58 +104,43 @@ def _process_session(session: UniversalSession, source_path: Path, source_hash: 
 
     print(f"  {'Updating' if is_update else 'Storing'} raw session ({session.message_count} messages, {len(raw_json)} chars JSON)...")
 
-    # Store or update raw session — raw_content gets the structured JSON
-    session_db_id = insert_raw_session(
-        project_id=project_id,
-        source_app=session.source_app,
-        source_path=str(source_path),
-        source_hash=source_hash,
-        session_id=session.session_id,
-        model_used=session.model,
-        started_at=session.started_at,
-        ended_at=session.ended_at,
-        message_count=session.message_count,
-        raw_content=raw_json,
-        summary=None,  # Summarization handled separately
-        files_touched=session.files_changed,
-    )
-
-    if not session_db_id:
-        print(f"  Already exists (hash collision), skipping.")
-        return False
-
-    # If updating, delete old chunks so we re-embed the full session
-    if is_update:
-        delete_chunks_for_session(session_db_id)
-        print(f"  Cleared old chunks for re-embedding")
-
-    # Chunk the text
+    # Chunk + embed BEFORE opening the write transaction so the (slow) Ollama
+    # calls hold no DB locks.
     chunks = chunk_text(raw_text)
     print(f"  Chunking: {len(chunks)} chunks")
+    embeddings = _embed_chunks(chunks)
 
-    if not chunks:
-        return True
-
-    # Embed chunks in batches
-    batch_size = 10
+    # One transaction per session: raw_session + chunks + their memory
+    # dual-writes commit together. A crash mid-ingest then leaves the session
+    # atomically ABSENT (the source-hash gate re-ingests it cleanly on the next
+    # scan) instead of committing raw_session first and stranding a
+    # half-indexed session the hash gate would never re-complete.
+    session_db_id = ""
     total_stored = 0
-
-    for i in range(0, len(chunks), batch_size):
-        batch = chunks[i : i + batch_size]
-        texts = [c.content for c in batch]
-
-        try:
-            embeddings = embed_batch(texts)
-        except Exception as e:
-            print(f"  Embedding batch failed, falling back to individual: {e}")
-            embeddings = []
-            for text in texts:
-                try:
-                    embeddings.append(embed(text))
-                except Exception:
-                    embeddings.append([0.0] * 1024)
-
-        for chunk, emb in zip(batch, embeddings):
+    with get_connection() as conn, conn.cursor() as cur:
+        session_db_id = insert_raw_session(
+            project_id=project_id,
+            source_app=session.source_app,
+            source_path=str(source_path),
+            source_hash=source_hash,
+            session_id=session.session_id,
+            model_used=session.model,
+            started_at=session.started_at,
+            ended_at=session.ended_at,
+            message_count=session.message_count,
+            raw_content=raw_json,
+            summary=None,  # Summarization handled separately
+            files_touched=session.files_changed,
+            cur=cur,
+        )
+        if not session_db_id:
+            print(f"  Already exists (hash collision), skipping.")
+            return False
+        # If updating, delete old chunks so we re-embed the full session.
+        if is_update:
+            delete_chunks_for_session(session_db_id, cur=cur)
+            print(f"  Cleared old chunks for re-embedding")
+        for chunk, emb in zip(chunks, embeddings):
             insert_chunk(
                 project_id=project_id,
                 source_type="session",
@@ -144,8 +150,10 @@ def _process_session(session: UniversalSession, source_path: Path, source_hash: 
                 content=chunk.content,
                 embedding=emb,
                 token_count=chunk.token_count,
+                cur=cur,
             )
             total_stored += 1
+        conn.commit()
 
     print(f"  Stored {total_stored} embedded chunks")
 

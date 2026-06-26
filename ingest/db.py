@@ -80,59 +80,148 @@ def insert_raw_session(
     raw_content: str,
     summary: str | None,
     files_touched: list[str],
+    cur=None,
 ) -> str:
-    with get_connection() as conn, conn.cursor() as cur:
-        # Check if this session already exists (by session_id, not hash)
-        # If so, UPDATE it instead of creating a duplicate
-        existing_id = None
-        if session_id:
-            cur.execute(
-                "SELECT id FROM devbrain.raw_sessions WHERE source_app = %s AND session_id = %s ORDER BY created_at DESC LIMIT 1",
-                (source_app, session_id),
-            )
-            row = cur.fetchone()
-            existing_id = row[0] if row else None
+    """Insert or update the raw_sessions row. When `cur` is given, runs on the
+    caller's cursor without committing (so raw_session + chunks land in one
+    transaction); otherwise self-manages a connection + commit."""
+    if cur is not None:
+        return _insert_raw_session_on_cursor(
+            cur, project_id=project_id, source_app=source_app,
+            source_path=source_path, source_hash=source_hash,
+            session_id=session_id, model_used=model_used,
+            started_at=started_at, ended_at=ended_at,
+            message_count=message_count, raw_content=raw_content,
+            summary=summary, files_touched=files_touched,
+        )
+    with get_connection() as conn, conn.cursor() as own_cur:
+        result = _insert_raw_session_on_cursor(
+            own_cur, project_id=project_id, source_app=source_app,
+            source_path=source_path, source_hash=source_hash,
+            session_id=session_id, model_used=model_used,
+            started_at=started_at, ended_at=ended_at,
+            message_count=message_count, raw_content=raw_content,
+            summary=summary, files_touched=files_touched,
+        )
+        own_cur.connection.commit()
+        return result
 
-        if existing_id:
-            # Update existing session with new content
-            cur.execute(
-                """
-                UPDATE devbrain.raw_sessions
-                SET source_hash = %s, source_path = %s, message_count = %s,
-                    raw_content = %s, ended_at = %s, files_touched = %s::jsonb
-                WHERE id = %s
-                RETURNING id
-                """,
-                (
-                    source_hash, source_path, message_count,
-                    raw_content, ended_at, psycopg2.extras.Json(files_touched),
-                    existing_id,
-                ),
-            )
-            row = cur.fetchone()
-            conn.commit()
-            return str(row[0]) if row else ""
-        else:
-            # Insert new session
-            cur.execute(
-                """
-                INSERT INTO devbrain.raw_sessions
-                    (project_id, source_app, source_path, source_hash, session_id,
-                     model_used, started_at, ended_at, message_count, raw_content,
-                     summary, files_touched)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
-                ON CONFLICT (source_app, source_hash) DO NOTHING
-                RETURNING id
-                """,
-                (
-                    project_id, source_app, source_path, source_hash, session_id,
-                    model_used, started_at, ended_at, message_count, raw_content,
-                    summary, psycopg2.extras.Json(files_touched),
-                ),
-            )
-            row = cur.fetchone()
-            conn.commit()
-            return str(row[0]) if row else ""
+
+def _insert_raw_session_on_cursor(
+    cur,
+    *,
+    project_id: str | None,
+    source_app: str,
+    source_path: str,
+    source_hash: str,
+    session_id: str | None,
+    model_used: str | None,
+    started_at: str | None,
+    ended_at: str | None,
+    message_count: int,
+    raw_content: str,
+    summary: str | None,
+    files_touched: list[str],
+) -> str:
+    """raw_sessions insert-or-update on a caller-owned cursor (no commit)."""
+    # Check if this session already exists (by session_id, not hash).
+    # If so, UPDATE it instead of creating a duplicate.
+    existing_id = None
+    if session_id:
+        cur.execute(
+            "SELECT id FROM devbrain.raw_sessions WHERE source_app = %s AND session_id = %s ORDER BY created_at DESC LIMIT 1",
+            (source_app, session_id),
+        )
+        row = cur.fetchone()
+        existing_id = row[0] if row else None
+
+    if existing_id:
+        # Update existing session with new content
+        cur.execute(
+            """
+            UPDATE devbrain.raw_sessions
+            SET source_hash = %s, source_path = %s, message_count = %s,
+                raw_content = %s, ended_at = %s, files_touched = %s::jsonb
+            WHERE id = %s
+            RETURNING id
+            """,
+            (
+                source_hash, source_path, message_count,
+                raw_content, ended_at, psycopg2.extras.Json(files_touched),
+                existing_id,
+            ),
+        )
+        row = cur.fetchone()
+        return str(row[0]) if row else ""
+    else:
+        # Insert new session
+        cur.execute(
+            """
+            INSERT INTO devbrain.raw_sessions
+                (project_id, source_app, source_path, source_hash, session_id,
+                 model_used, started_at, ended_at, message_count, raw_content,
+                 summary, files_touched)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            ON CONFLICT (source_app, source_hash) DO NOTHING
+            RETURNING id
+            """,
+            (
+                project_id, source_app, source_path, source_hash, session_id,
+                model_used, started_at, ended_at, message_count, raw_content,
+                summary, psycopg2.extras.Json(files_touched),
+            ),
+        )
+        row = cur.fetchone()
+        return str(row[0]) if row else ""
+
+
+def _insert_chunk_on_cursor(
+    cur,
+    *,
+    project_id: str | None,
+    source_type: str,
+    source_id: str | None,
+    source_line_start: int | None,
+    source_line_end: int | None,
+    content: str,
+    vector_str: str,
+    token_count: int,
+) -> str:
+    """INSERT the chunk + dual-write its memory row on the given cursor.
+    Does NOT commit — the caller owns the transaction."""
+    cur.execute(
+        """
+        INSERT INTO devbrain.chunks
+            (project_id, source_type, source_id, source_line_start,
+             source_line_end, content, embedding, token_count)
+        VALUES (%s, %s, %s, %s, %s, %s, %s::vector, %s)
+        RETURNING id
+        """,
+        (
+            project_id, source_type, source_id, source_line_start,
+            source_line_end, content, vector_str, token_count,
+        ),
+    )
+    row = cur.fetchone()
+    chunk_id = str(row[0]) if row else ""
+    # P2.b dual-write: skip when project_id is None (chunks.project_id
+    # is nullable but devbrain.memory.project_id is NOT NULL). The
+    # SAVEPOINT inside record_memory keeps a memory failure from
+    # poisoning this transaction's commit of the legacy chunk row.
+    if chunk_id and project_id is not None:
+        # provenance_id = the SOURCE session's UUID (chunks.source_id),
+        # not the chunk row's own UUID (migration 032). When source_id is
+        # None (markdown imports), we pass None — the partial unique index
+        # on (provenance_id, kind) excludes NULL.
+        record_memory(
+            cur,
+            project_id=project_id,
+            kind="chunk",
+            content=content,
+            embedding_sql=vector_str,
+            provenance_id=source_id,
+        )
+    return chunk_id
 
 
 def insert_chunk(
@@ -145,56 +234,41 @@ def insert_chunk(
     content: str,
     embedding: list[float],
     token_count: int,
+    cur=None,
 ) -> str:
+    """Insert a chunk + dual-write its memory row.
+
+    When `cur` is given, runs on the caller's cursor without committing so a
+    whole session can be ingested in one transaction (a crash then leaves the
+    session atomically absent rather than half-indexed, which the source-hash
+    gate would otherwise never re-complete). When `cur` is None, manages its
+    own connection + commit (the legacy per-chunk-durable behavior used by the
+    standalone importers)."""
     vector_str = f"[{','.join(str(v) for v in embedding)}]"
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO devbrain.chunks
-                (project_id, source_type, source_id, source_line_start,
-                 source_line_end, content, embedding, token_count)
-            VALUES (%s, %s, %s, %s, %s, %s, %s::vector, %s)
-            RETURNING id
-            """,
-            (
-                project_id, source_type, source_id, source_line_start,
-                source_line_end, content, vector_str, token_count,
-            ),
-        )
-        row = cur.fetchone()
-        chunk_id = str(row[0]) if row else ""
-        # P2.b dual-write: skip when project_id is None (chunks.project_id
-        # is nullable but devbrain.memory.project_id is NOT NULL). The
-        # SAVEPOINT inside record_memory keeps a memory failure from
-        # poisoning this transaction's commit of the legacy chunk row.
-        if chunk_id and project_id is not None:
-            # provenance_id = the SOURCE session's UUID (chunks.source_id),
-            # not the chunk row's own UUID. Migration 032 fixed the
-            # historical bug where this was chunk_id; that broke
-            # session-grouped atomization in factory/cognify/. When
-            # source_id is None (e.g. migrate_openclaw_memory.py imports
-            # of pre-chunked markdown), we pass None — the partial
-            # unique index on (provenance_id, kind) excludes NULL.
-            record_memory(
-                cur,
-                project_id=project_id,
-                kind="chunk",
-                content=content,
-                embedding_sql=vector_str,
-                provenance_id=source_id,
-            )
+    kw = dict(
+        project_id=project_id, source_type=source_type, source_id=source_id,
+        source_line_start=source_line_start, source_line_end=source_line_end,
+        content=content, vector_str=vector_str, token_count=token_count,
+    )
+    if cur is not None:
+        return _insert_chunk_on_cursor(cur, **kw)
+    with get_connection() as conn, conn.cursor() as own_cur:
+        chunk_id = _insert_chunk_on_cursor(own_cur, **kw)
         conn.commit()
         return chunk_id
 
 
-def delete_chunks_for_session(session_id: str) -> int:
-    """Delete all chunks for a session (before re-embedding on update)."""
-    with get_connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            "DELETE FROM devbrain.chunks WHERE source_id = %s",
-            (session_id,),
+def delete_chunks_for_session(session_id: str, cur=None) -> int:
+    """Delete all chunks for a session (before re-embedding on update).
+    Runs on the caller's cursor (no commit) when `cur` is given."""
+    if cur is not None:
+        cur.execute("DELETE FROM devbrain.chunks WHERE source_id = %s", (session_id,))
+        return cur.rowcount
+    with get_connection() as conn, conn.cursor() as own_cur:
+        own_cur.execute(
+            "DELETE FROM devbrain.chunks WHERE source_id = %s", (session_id,)
         )
-        count = cur.rowcount
+        count = own_cur.rowcount
         conn.commit()
         return count
 
