@@ -232,7 +232,7 @@ def test_memory_embedding_dim(db):
 def test_memory_indexes_exist(db):
     expected = {
         "idx_memory_project_kind",
-        "idx_memory_embedding",
+        "idx_memory_embedding_hnsw",  # was idx_memory_embedding (ivfflat) until migration 046
         "idx_memory_strength",
         "idx_memory_applies_when",
         "idx_memory_provenance",
