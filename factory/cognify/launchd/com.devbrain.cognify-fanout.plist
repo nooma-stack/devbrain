@@ -35,6 +35,12 @@
         <string>${DEVBRAIN_HOME}</string>
         <key>PYTHONPATH</key>
         <string>${DEVBRAIN_HOME}/factory</string>
+        <!-- launchd's default PATH omits Homebrew, so the codex CLI (a   -->
+        <!-- `#!/usr/bin/env node` script) fails with "env: node: No such -->
+        <!-- file or directory" under launchd and falls back to the       -->
+        <!-- rate-limited Anthropic path.                                 -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <!-- @CREDENTIAL_ENV_BLOCK@ — installer emits ANTHROPIC_API_KEY  -->
         <!-- or CLAUDE_CODE_OAUTH_TOKEN here based on env at install     -->
         <!-- time.                                                       -->
