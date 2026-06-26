@@ -555,6 +555,11 @@ server.tool(
       top.map(async (cand) => {
         const r: Record<string, unknown> = {
           chunk_id: cand.chunk_id,
+          // memory_id surfaces the unified-table id (and is what with_graph
+          // seeds the graph walk from). Codebase fallback rows carry '' —
+          // the seed extraction filters those out by length. Without this
+          // field the with_graph seedIds were always empty (silently dead).
+          memory_id: cand.memory_id,
           content: cand.content,
           score: Number(cand.score.toFixed(4)),
           source_type: cand.source_type,
