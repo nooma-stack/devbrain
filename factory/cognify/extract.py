@@ -95,6 +95,16 @@ _CODEX_BIN = os.environ.get("DEVBRAIN_CODEX_BIN") or shutil.which("codex") \
     or "/opt/homebrew/bin/codex"
 _CODEX_TIMEOUT_S = int(os.environ.get("DEVBRAIN_CODEX_TIMEOUT_S", "240"))
 
+# Model passed to `codex exec` when the extract model is the "codex" sentinel.
+# We must pass an EXPLICIT -m: as of 2026-06-02 OpenAI retired the
+# `-codex`-suffixed models (gpt-5.x-codex) for ChatGPT-account auth, and the
+# codex CLI's built-in default is one of those — so letting codex pick its
+# default 400s with "model is not supported when using Codex with a ChatGPT
+# account" on every call. gpt-5.4-mini is the current ChatGPT-account-eligible
+# model (verified working on the Studio); gpt-5.5 needs a newer codex CLI.
+# Override via env when the slug rotates again.
+_CODEX_DEFAULT_MODEL = os.environ.get("DEVBRAIN_CODEX_MODEL", "gpt-5.4-mini")
+
 # JSON Schema for the extractor's final response — same shape the Anthropic
 # path parses ({lessons:[{title,content}], decisions:[...]}).
 _CODEX_OUTPUT_SCHEMA = {
@@ -571,9 +581,12 @@ def _codex_extract(content: str, *, model: str | None = None) -> dict:
             "--output-schema", schema_path,
             "-o", out_path,
         ]
-        # An explicit OpenAI model id (gpt-5/o3/…) overrides codex's default.
-        if model and model.lower() != "codex":
-            cmd += ["-m", model]
+        # Always pass an explicit -m. A caller-supplied OpenAI id wins;
+        # otherwise the "codex" sentinel maps to _CODEX_DEFAULT_MODEL rather
+        # than codex's built-in default (a retired -codex model that 400s for
+        # ChatGPT-account auth — see _CODEX_DEFAULT_MODEL).
+        codex_model = model if (model and model.lower() != "codex") else _CODEX_DEFAULT_MODEL
+        cmd += ["-m", codex_model]
         cmd.append(prompt)
 
         try:
