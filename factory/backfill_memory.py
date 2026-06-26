@@ -67,9 +67,14 @@ logger = logging.getLogger(__name__)
 # ingest/memory_writer.py:record_memory):
 #   * atoms (pattern/decision/lesson/issue) — unique on (provenance_id, kind, title)
 #   * session_summary                       — unique on (provenance_id, kind)
-#   * chunks                                — NO unique index (many chunks share a
-#       session's provenance_id post-migration-032); de-dup on re-run is handled
-#       by the NOT EXISTS guard in backfill_chunks' SELECT, not ON CONFLICT.
+#   * chunks                                — unique on (provenance_id, kind,
+#       md5(content)) since migration 045 (a session's chunks share its
+#       provenance_id post-032, so the content hash is the distinguishing key).
+#       The NOT EXISTS guard in backfill_chunks' SELECT is the cheap pre-filter;
+#       the ON CONFLICT below is the race-safe backstop and is REQUIRED now that
+#       the unique index exists — otherwise a concurrent insert between the
+#       NOT EXISTS check and this INSERT raises a unique violation and the
+#       batch-failure path discards the whole batch's good inserts.
 _INSERT_BASE_SQL = """
     INSERT INTO devbrain.memory
         (project_id, kind, title, content, embedding, provenance_id,
@@ -77,7 +82,11 @@ _INSERT_BASE_SQL = """
     VALUES (%s, %s, %s, %s, %s::vector, %s, %s, %s::jsonb)
 """
 
-_INSERT_CHUNK_SQL = _INSERT_BASE_SQL  # chunks: no ON CONFLICT (see note above)
+_INSERT_CHUNK_SQL = _INSERT_BASE_SQL + """
+    ON CONFLICT (provenance_id, kind, md5(content))
+    WHERE provenance_id IS NOT NULL AND kind = 'chunk'
+    DO NOTHING
+"""
 
 _INSERT_ATOM_SQL = _INSERT_BASE_SQL + """
     ON CONFLICT (provenance_id, kind, title)

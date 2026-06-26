@@ -519,3 +519,31 @@ def test_backfill_all_then_rerun_inserts_zero(db):
     backfill_memory.backfill_all(db, batch_size=200)
     second = backfill_memory.backfill_all(db, batch_size=200)
     assert second["TOTAL"]["inserted"] == 0
+
+
+def test_insert_chunk_sql_idempotent(db):
+    """The chunk INSERT must be idempotent on (provenance_id, kind,
+    md5(content)) via ON CONFLICT DO NOTHING — required since migration 045's
+    unique index, so a re-run or a race can't raise a unique violation that
+    discards a whole backfill batch. Focused on the SQL, not the slow
+    whole-table backfill scan."""
+    pid = _devbrain_project_id(db)
+    prov = str(uuid.uuid4())
+    content = f"{TEST_CONTENT_PREFIX}chunk idempotency body"
+    emb = _embedding_sql(0.1)
+
+    def _ins(c: str) -> int:
+        with db._conn() as conn, conn.cursor() as cur:
+            cur.execute(
+                backfill_memory._INSERT_CHUNK_SQL,
+                (pid, "chunk", None, c, emb, prov,
+                 datetime.now(timezone.utc), None),
+            )
+            rc = cur.rowcount
+            conn.commit()
+        return rc
+
+    assert _ins(content) == 1          # first insert
+    assert _ins(content) == 0          # same key → ON CONFLICT DO NOTHING
+    # Different content under the SAME provenance is a distinct chunk.
+    assert _ins(content + " TWO") == 1
