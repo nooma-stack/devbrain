@@ -32,53 +32,55 @@ Legend: ✅ shipped · 🔜 queued · 🧪 needs clean-DB validation · 🐛 cor
   broken. Switched to HNSW anyway for the marginal wins at equal recall/latency:
   ~half the size (337 vs 656 MB) and no `probes` tuning. ivfflat.probes reset.
 
-## Behavior-preserving efficiency wins (queued)
+## Behavior-preserving efficiency wins
 
-- 🔜 **#3 ingest one-txn-per-session**: keep embedding *outside* the txn, then
-  write `raw_session + all chunks + dual-write` in ONE per-session transaction
-  with `execute_values` (today: a new connection + commit per chunk). Session
-  size profile checked — max 660 chunks / 1.1 MB, only 3 sessions >500, none
-  >1000 — so no commit boundary needed. This flips the invariant from
-  "partially-visible session that can't self-complete" (the hash gate skips a
-  crashed session on retry) to "atomically present or absent" — strictly better
-  for recall completeness and extract fidelity. Only cost: a mid-session crash
-  re-ingests from scratch (rare). No commit boundary unless giant sessions appear.
-- 🧪 **#4 `backfill_chunks` ON CONFLICT**: now that migration 045's unique index
-  exists, `backfill_chunks`' plain INSERT raises a unique violation on a dup and
-  the batch-failure path loses the whole batch's good inserts. Add
-  `ON CONFLICT (provenance_id, kind, md5(content)) … DO NOTHING` to match the
-  live path. NOTE: split out of the #1 PR — the existing
-  `test_backfill_chunks_inserts_to_memory` runs a slow (~4 min) whole-table
-  backfill and is environment-sensitive on a populated laptop DB; do this with
-  a focused clean-DB test and address the integration test's full-table scan.
-- 🔜 **#5 cognify per-(pass,project) advisory lock** (mirror the migration
-  runner): stops a manual `devbrain cognify` from double-spending LLM while the
-  scheduled run is mid-flight (correctness is saved today only by `ON CONFLICT`).
-- 🔜 **#6 circuit breaker on passes**: pre-load row-count guard + wall-clock cap
-  so a single pegged pass can't silently starve its launchd cadence again.
-- 🔜 **#7 `deep_search_graph_entry` single multi-seed CTE** instead of N
-  sequential `walk()` calls (3N → ~3 round-trips), reproducing the min-hop dedup.
-- 🔜 **#8** add `btree(project_id, created_at) WHERE archived_at IS NULL` for the
-  recency-neighbor / project-context queries now doing sort/ANN-filter.
-- 🔜 **#9 minor**: `findEarliestOnTopic`/recency LATERAL `DISTINCT ON` to cut
-  transfer; `breadcrumb` seq via `MAX+1` in the INSERT (avoid per-call COUNT).
+- ✅ **#3 ingest one-txn-per-session** (PR #176). Embed all chunks up front, then
+  write `raw_session + chunks + dual-writes` in ONE transaction. A crash now
+  leaves the session atomically absent (hash gate re-ingests cleanly) instead of
+  stranding a half-indexed session. db.py helpers take an optional `cur`;
+  pipeline restarts the ingest watcher to pick up the new code. Atomicity test added.
+- ✅ **#4 `backfill_chunks` ON CONFLICT** (PR #173). `ON CONFLICT
+  (provenance_id, kind, md5(content)) DO NOTHING` — race-safe under the 045
+  unique index, with a focused idempotency test (not the slow whole-table scan).
+- ✅ **#5 cognify per-(pass,project) advisory lock** (PR #171). A manual
+  `devbrain cognify` racing the scheduled run now skips instead of double-spending.
+- ✅ **#6 slow-pass warning** (PR #171). Logs when a pass exceeds
+  `DEVBRAIN_COGNIFY_SLOW_WARN_S`. (Hard kill deferred — needs a watchdog; the
+  cites O(N×T) fix already removed the known offender.)
 
-## Correctness bugs (change wrong behavior — schedule deliberately)
+## Correctness bugs — all fixed
 
-- 🐛 **`with_graph=true` is silently dead**: `deep_search` reads `r.memory_id`
-  from the result objects, which never set that field, so `seedIds` is always
-  empty and the graph-enrichment subprocess never runs (`index.ts:668` vs the
-  correct `top[i].memory_id` at `:632`).
-- 🐛 **`extract` watermark poisoning**: `_last_successful_run` keys on
-  `error IS NULL`, but the run-log row is committed with NULL error *at start*
-  (`orchestrator.py:239`). A crashed/in-progress run looks "successful" → its
-  sessions are never re-extracted (silent memory loss) or a gap opens under
-  overlap. Fix: predicate on `completed_at IS NOT NULL AND error IS NULL`.
-- 🐛 **~26% of non-archived memory rows have no embedding** (≈65,850 / 89,372)
-  → invisible to `deep_search`. Identify which kinds (likely extract-inserted
-  lessons/decisions) — likely a backfill/embed gap.
-- 🐛 **Ollama `embed` has no timeout** → any tool call (search/store/breadcrumb)
-  hangs indefinitely if Ollama stalls. Add `AbortSignal.timeout()`.
+- ✅ **`with_graph=true` was silently dead** (PR #175). deep_search seeded the
+  graph from `results.map(r => r.memory_id)`, but result objects lacked
+  `memory_id` → empty seeds. Added `memory_id` to each result.
+- ✅ **`extract` watermark poisoning** (PR #169). It read its own in-progress
+  run-log row → `since=now` → 0 sessions every run; the pass had **never** once
+  produced a row. Fixed to `completed_at IS NOT NULL AND error IS NULL`.
+- ✅ **~22k decision/pattern atoms had no embedding** (PR #170). Not a generic
+  "26%": the extract/curator atom-insert paths never embedded. Added a shared
+  `cognify.embedding.embed_text`, wired into extract/curator/fanout, and
+  backfilled all existing rows via `scripts/reembed_memory.py` (0 left).
+- ✅ **Ollama `embed` no timeout** (PR #175). Added `AbortSignal.timeout` (30s).
+
+## Deferred micro-optimizations (measure first — low ROI)
+
+Not done deliberately: each is a speculative tweak on a now-working path; adding
+indexes/complexity without a measured bottleneck has its own cost.
+
+- **#7 `deep_search_graph_entry` single multi-seed CTE** (N walks → 1). Only
+  matters now that `with_graph` works; revisit if graph latency shows up.
+- **#8 `btree(project_id, created_at) WHERE archived_at IS NULL`** — adds
+  write-time cost on every insert for an unmeasured read gain. Measure first.
+- **#9 `findEarliestOnTopic` `DISTINCT ON`; `breadcrumb` seq via `MAX+1`** —
+  micro-wins; the COUNT/overfetch costs are negligible at current scale.
+
+## Open data follow-up (needs a go/no-go — LLM cost/time)
+
+- **Extract backlog**: the extract pass was a no-op since it was wrapped by the
+  run-log, so ~6,662 BrightBot sessions were never atomized. The code is fixed
+  (forward), but catching up the backlog needs `cognify-bulk --project=brightbot`
+  (codex backend = no token cost, but a multi-hour resumable job on the shared
+  Studio). Flagged for a go-ahead, not auto-started.
 
 ## Notes for whoever picks this up
 
