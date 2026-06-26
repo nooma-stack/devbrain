@@ -42,6 +42,46 @@ def _insert_run_log(conn, project_id, *, started, completed, error=None):
     return rid
 
 
+def test_codex_extract_always_passes_explicit_model(monkeypatch):
+    """codex exec must get an explicit -m. The 'codex' sentinel maps to
+    _CODEX_DEFAULT_MODEL, NOT codex's built-in default (a retired -codex
+    model that 400s for ChatGPT-account auth). Regression for the
+    2026-06-26 'not supported when using Codex with a ChatGPT account'
+    outage that made extract fail every session."""
+    import subprocess
+
+    import cognify.extract as ex
+
+    captured = {}
+
+    class _Proc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def _fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        # Write the schema-shaped output the caller reads back.
+        for i, tok in enumerate(cmd):
+            if tok == "-o":
+                with open(cmd[i + 1], "w") as fh:
+                    fh.write('{"lessons": [], "decisions": []}')
+        return _Proc()
+
+    monkeypatch.setattr(subprocess, "run", _fake_run)
+
+    # Sentinel "codex" → must pass the configured default, not nothing.
+    ex._codex_extract("some session text", model="codex")
+    cmd = captured["cmd"]
+    assert "-m" in cmd, "codex exec must always receive an explicit -m"
+    assert cmd[cmd.index("-m") + 1] == ex._CODEX_DEFAULT_MODEL
+
+    # An explicit model id wins over the sentinel default.
+    ex._codex_extract("some session text", model="gpt-5.5")
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("-m") + 1] == "gpt-5.5"
+
+
 @pytest.mark.db
 def test_upsert_memory_embeds_atom(conn, project_factory, monkeypatch):
     """Extracted atoms must be embedded so deep_search (which filters
