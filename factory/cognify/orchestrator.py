@@ -19,8 +19,11 @@ No raw PHI from memory.content flows into cognify_run_log rows.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
+import time
 import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -157,9 +160,21 @@ def run_pass(
     pass_cls = _PASS_REGISTRY[pass_name]
     instance = pass_cls()
 
+    # Skip if another instance already holds this (pass, project) — keeps a
+    # manual run from racing the scheduled one and double-spending LLM. Dry
+    # runs are read-only, so they don't contend. No run-log row is written
+    # for a skipped run, so the watermark isn't touched.
+    if not dry_run and not _try_pass_lock(conn, pass_name, project_id):
+        logger.info(
+            "cognify pass %s (project=%s) already running elsewhere; skipping",
+            pass_name, project_id,
+        )
+        return PassResult(metadata={"pass": pass_name, "skipped": "lock_held"})
+
     log_id = _start_run_log(conn, pass_name, project_id)
     result = PassResult()
     error_text: str | None = None
+    started = time.monotonic()
 
     try:
         # Pass-specific kwargs: only forward optional flags to passes
@@ -179,6 +194,15 @@ def run_pass(
         logger.exception("cognify pass %s failed", pass_name)
     finally:
         _complete_run_log(conn, log_id, result, error_text, dry_run=dry_run)
+        elapsed = time.monotonic() - started
+        if elapsed > _SLOW_PASS_WARN_S:
+            logger.warning(
+                "cognify pass %s (project=%s) took %.0fs (> %ds) — it may be "
+                "starving its schedule; investigate",
+                pass_name, project_id, elapsed, _SLOW_PASS_WARN_S,
+            )
+        if not dry_run:
+            _release_pass_lock(conn, pass_name, project_id)
 
     if error_text:
         raise RuntimeError(
@@ -223,6 +247,42 @@ def run_all(
 
 
 # ── Run log helpers ──────────────────────────────────────────────────────
+
+
+# A cognify pass that runs longer than this logs a warning — with the
+# per-pass advisory lock, the next scheduled run skips while this one is
+# still going, so a silently-pegged pass starves its own cadence. Override
+# via env. (A hard kill would need a watchdog; this is observability.)
+_SLOW_PASS_WARN_S = int(os.environ.get("DEVBRAIN_COGNIFY_SLOW_WARN_S", "1800"))
+
+
+def _pass_lock_key(pass_name: str, project_id: Any) -> int:
+    """Stable 63-bit signed advisory-lock key for a (pass, project) pair."""
+    digest = hashlib.sha256(f"cognify:{pass_name}:{project_id}".encode()).digest()
+    return int.from_bytes(digest[:8], "big", signed=True)
+
+
+def _try_pass_lock(conn: Any, pass_name: str, project_id: Any) -> bool:
+    """Try to acquire the session advisory lock for this (pass, project).
+
+    Session-level (not xact) so it survives the run-log commits during the
+    pass; released explicitly in run_pass's finally, or on connection close
+    if the process dies. Prevents a manual `devbrain cognify` from running
+    concurrently with the scheduled one and double-spending LLM calls.
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (_pass_lock_key(pass_name, project_id),))
+        return bool(cur.fetchone()[0])
+
+
+def _release_pass_lock(conn: Any, pass_name: str, project_id: Any) -> None:
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT pg_advisory_unlock(%s)", (_pass_lock_key(pass_name, project_id),)
+            )
+    except Exception:  # noqa: BLE001 — connection close releases it anyway
+        pass
 
 
 def _start_run_log(conn: Any, pass_name: str, project_id: Any) -> int:
