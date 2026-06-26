@@ -19,11 +19,73 @@ from cognify.extract import (
     ExtractPass,
     ExtractResult,
     _archive_prior_extracts,
+    _last_successful_run,
     _sessions_since,
     _upsert_memory,
     extract_from_session,
     run_extract_pass,
 )
+
+
+def _insert_run_log(conn, project_id, *, started, completed, error=None):
+    """Insert a cognify_run_log row for the extract pass with explicit
+    started/completed timestamps (strings or None)."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO devbrain.cognify_run_log "
+            "(pass_name, project_id, started_at, completed_at, error) "
+            "VALUES ('extract', %s, %s, %s, %s) RETURNING id",
+            (project_id, started, completed, error),
+        )
+        rid = cur.fetchone()[0]
+    conn.commit()
+    return rid
+
+
+@pytest.mark.db
+def test_last_successful_run_ignores_in_progress_and_crashed(conn, project_factory):
+    """The watermark must come only from COMPLETED, error-free runs.
+
+    Regression for the silent no-op bug: the orchestrator commits the
+    run-log row at pass START (completed_at + error both NULL), so an
+    `error IS NULL` filter alone made extract read its own in-progress row
+    (since=now → zero sessions every run). A crashed run (no completed_at,
+    no error) must likewise not advance the watermark."""
+    from datetime import timedelta
+
+    project = project_factory("extract_watermark")
+    pid = project["id"]
+    now = datetime.now(timezone.utc)
+
+    # A genuinely completed, successful run two hours ago.
+    _insert_run_log(
+        conn, pid,
+        started=now - timedelta(hours=2),
+        completed=now - timedelta(hours=2),
+    )
+    # A LATER in-progress run (mimics the orchestrator's start-of-pass insert).
+    _insert_run_log(conn, pid, started=now, completed=None)
+    # A LATER crashed run (completed_at NULL, error NULL).
+    _insert_run_log(conn, pid, started=now - timedelta(minutes=1), completed=None)
+
+    since = _last_successful_run(conn, "extract", pid)
+    assert since is not None, "should fall back to the completed run"
+    # It must be the 2-hours-ago completed run, not the ~now in-progress one.
+    assert since < now - timedelta(minutes=30)
+
+    # And a session created 1 hour ago (AFTER the completed run, BEFORE the
+    # poisoning now() rows) must still be a candidate — proving the later
+    # in-progress/crashed rows didn't advance the watermark.
+    sid = str(uuid.uuid4())
+    _insert_chunk(conn, pid, sid, "content from 1 hour ago")
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE devbrain.memory SET created_at = now() - interval '1 hour' "
+            "WHERE provenance_id = %s",
+            (sid,),
+        )
+    conn.commit()
+    assert sid in _sessions_since(conn, pid, since)
 
 
 def _count_lessons(conn, project_id, session_id):
