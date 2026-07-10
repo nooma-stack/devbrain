@@ -31,6 +31,39 @@ The direct MCP tools (`store`, `start_session`, `breadcrumb`, `end_session`) byp
 ingest and write `memory` straight from the TS server (`mcp-server/src/index.ts`),
 its own `pg.Pool`, its own Ollama embed call.
 
+#### ChatGPT desktop / Codex rollouts (2026-07-10)
+
+OpenAI's unified ChatGPT desktop app (launched 2026-07-09, bundle
+`com.openai.codex`) is the Codex app rebranded — desktop **Work/Codex
+threads** are written as plaintext rollout JSONL to
+`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` (`originator: "Codex
+Desktop"`), which the `codex` adapter parses. Notes:
+
+- `~/.codex` is already in the codex adapter's `watch_paths`; desktop
+  threads ingest with zero config. Cloud "Chat" tab conversations do NOT
+  land locally (and ChatGPT Business has no Compliance/export API — that
+  is Enterprise-only), so local capture is the only automatable path.
+- Archived rollouts may be `*.jsonl.zst` (needs `zstandard`, in
+  requirements). `event_msg` user/agent messages are parsed as a
+  FALLBACK only — they duplicate `response_item` content in current
+  builds.
+- **Remote devs**: ship lighthouse-related rollouts to the Studio drop
+  zone under `ingest-incoming/<dev>/codex/…` (the codex adapter claims
+  that subtree; it is registered before claude_code so the greedy
+  ".jsonl under ingest-incoming" match can't steal these). Because
+  project attribution comes from `session_meta.cwd` (not the path),
+  sync scripts MUST content-filter to work sessions, e.g.:
+
+  ```bash
+  # sync only rollouts whose cwd is under ~/lighthouse (privacy boundary)
+  for f in $(grep -l '"cwd":"'"$HOME"'/lighthouse'       $HOME/.codex/sessions/*/*/*/rollout-*.jsonl 2>/dev/null); do
+    rsync -az "$f" brightbrain-studio:ingest-incoming/$USER/codex/
+  done
+  ```
+
+  The rollout format is undocumented and version-churny — parse
+  failures should be watched after Codex app updates.
+
 ### B. Cognify (knowledge maintenance)
 Seven scheduled launchd passes, orchestrated by `factory/cognify/orchestrator.py`
 (`PASS_ORDER`), each logged to `cognify_run_log` / `cognify_spend_log`:

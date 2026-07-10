@@ -87,6 +87,7 @@ def scan_all():
         print(f"\nScanning {watch_dir}...")
         for path in sorted(
             list(watch_dir.rglob("*.jsonl"))
+            + list(watch_dir.rglob("*.jsonl.zst"))
             + list(watch_dir.rglob("session-*.json"))
             + list(watch_dir.rglob("*.md"))
         ):
@@ -99,7 +100,7 @@ def scan_all():
                 size = path.stat().st_size
             except OSError:
                 continue
-            if size < 1024:
+            if size < (256 if path.name.endswith(".jsonl.zst") else 1024):
                 continue
 
             total += 1
@@ -136,7 +137,7 @@ class SessionFileHandler(FileSystemEventHandler):
         # silently stops all ingestion (KeepAlive won't fire — the process is
         # still alive, just deaf). So the entire body is exception-safe.
         try:
-            if path.suffix not in (".jsonl", ".json", ".md"):
+            if path.suffix not in (".jsonl", ".json", ".md") and not path.name.endswith(".jsonl.zst"):
                 return
             if path.suffix == ".json" and not path.name.startswith("session-"):
                 return
@@ -149,7 +150,7 @@ class SessionFileHandler(FileSystemEventHandler):
                 size = path.stat().st_size
             except OSError:
                 return  # file vanished before we could stat it (transient temp)
-            if size < 1024:
+            if size < (256 if path.name.endswith(".jsonl.zst") else 1024):
                 return
 
             print(f"\n[watch] Detected: {path.name}")
