@@ -87,6 +87,7 @@ def scan_all():
         print(f"\nScanning {watch_dir}...")
         for path in sorted(
             list(watch_dir.rglob("*.jsonl"))
+            + list(watch_dir.rglob("*.jsonl.zst"))
             + list(watch_dir.rglob("session-*.json"))
             + list(watch_dir.rglob("*.md"))
         ):
@@ -136,7 +137,7 @@ class SessionFileHandler(FileSystemEventHandler):
         # silently stops all ingestion (KeepAlive won't fire — the process is
         # still alive, just deaf). So the entire body is exception-safe.
         try:
-            if path.suffix not in (".jsonl", ".json", ".md"):
+            if path.suffix not in (".jsonl", ".json", ".md") and not path.name.endswith(".jsonl.zst"):
                 return
             if path.suffix == ".json" and not path.name.startswith("session-"):
                 return

@@ -18,7 +18,10 @@ from chunker import chunk_text
 from db import delete_chunks_for_session, get_connection, get_or_create_project_id, get_existing_session_id, insert_chunk, insert_raw_session, session_exists, update_session_summary
 from embeddings import embed, embed_batch
 
-ADAPTERS = [ClaudeCodeAdapter(), OpenClawAdapter(), CodexAdapter(), GeminiAdapter(), MarkdownMemoryAdapter()]
+# CodexAdapter MUST precede ClaudeCodeAdapter: both match .jsonl, and
+# claude_code's detect() greedily claims anything under ingest-incoming —
+# codex drop-zone files (ingest-incoming/<dev>/codex/…) would be stolen.
+ADAPTERS = [CodexAdapter(), ClaudeCodeAdapter(), OpenClawAdapter(), GeminiAdapter(), MarkdownMemoryAdapter()]
 
 
 def file_hash(path: Path) -> str:
