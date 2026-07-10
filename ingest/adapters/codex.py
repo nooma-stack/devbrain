@@ -89,7 +89,19 @@ class CodexAdapter:
         # Remote-dev drop zone: ingest-incoming/<dev>/codex/… (must be
         # claimed here because ClaudeCodeAdapter matches ANY .jsonl under
         # ingest-incoming; pipeline ADAPTERS order puts codex first).
-        return "ingest-incoming" in s and "/codex/" in s
+        # Positional check — the "codex" segment must be the SECOND path
+        # segment after ingest-incoming (i.e. the per-dev source dir), so a
+        # dev whose drop-zone username happens to be "codex"
+        # (ingest-incoming/codex/projects/…) can't have their Claude Code
+        # transcripts captured-and-dropped here.
+        if "ingest-incoming" not in s:
+            return False
+        parts = file_path.parts
+        try:
+            idx = parts.index("ingest-incoming")
+        except ValueError:
+            return False
+        return len(parts) > idx + 2 and parts[idx + 2] == "codex"
 
     def detect_project(self, file_path: Path) -> str | None:
         """Infer project from session_meta cwd field.

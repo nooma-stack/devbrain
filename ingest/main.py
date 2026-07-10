@@ -100,7 +100,7 @@ def scan_all():
                 size = path.stat().st_size
             except OSError:
                 continue
-            if size < 1024:
+            if size < (256 if path.name.endswith(".jsonl.zst") else 1024):
                 continue
 
             total += 1
@@ -150,7 +150,7 @@ class SessionFileHandler(FileSystemEventHandler):
                 size = path.stat().st_size
             except OSError:
                 return  # file vanished before we could stat it (transient temp)
-            if size < 1024:
+            if size < (256 if path.name.endswith(".jsonl.zst") else 1024):
                 return
 
             print(f"\n[watch] Detected: {path.name}")

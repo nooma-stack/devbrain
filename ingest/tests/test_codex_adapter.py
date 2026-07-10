@@ -74,6 +74,15 @@ def test_detects_drop_zone_codex_subdir_only():
         Path("/Users/lhtdev/ingest-incoming/mark/projects/-Users-mark-lighthouse-brightbot/x.jsonl")
     )
     assert not a.detect(Path("/Users/x/somewhere/random.jsonl"))
+    # A dev whose drop-zone username is "codex" must NOT be claimed — their
+    # files are Claude Code transcripts (positional segment check).
+    assert not a.detect(
+        Path("/Users/lhtdev/ingest-incoming/codex/projects/-Users-c-lighthouse-x/y.jsonl")
+    )
+    # Deeper nesting under the codex source dir still matches.
+    assert a.detect(
+        Path("/Users/lhtdev/ingest-incoming/mark/codex/2026/07/rollout-b.jsonl.zst")
+    )
 
 
 def test_pipeline_order_codex_wins_drop_zone():
