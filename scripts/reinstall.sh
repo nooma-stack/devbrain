@@ -8,11 +8,12 @@
 # without a fresh machine.
 #
 # Default: removes DevBrain repo + shims + Postgres data.
-# With --full: also removes Ollama models, Homebrew, and CLT (full reset).
+# With --full: also removes Docker Desktop, Ollama models, Homebrew, and CLT.
+# Colima/OrbStack VM and application data are not removed wholesale.
 #
 # Usage (sync to target machine and run):
 #   bash reinstall.sh             # quick reset (preserves Homebrew/Ollama/CLT)
-#   bash reinstall.sh --full      # nuclear reset
+#   bash reinstall.sh --full      # extended toolchain reset
 #   bash reinstall.sh --yes       # skip confirmation prompt
 #
 # Or directly from GitHub:
@@ -23,6 +24,12 @@ set -euo pipefail
 
 DEVBRAIN_HOME="${DEVBRAIN_HOME:-$HOME/devbrain}"
 PKRELAY_HOME="${PKRELAY_HOME:-$HOME/pkrelay}"
+RESILIENCE_MANIFEST="$HOME/.devbrain/resilience/install-manifest.json"
+INSTALL_TARGET_PATH="$HOME/.devbrain/install-target.json"
+TARGET_CONTAINER_RUNTIME=""
+TARGET_DOCKER_CONTEXT=""
+EXPLICIT_CONTAINER_RUNTIME=""
+EXPLICIT_DOCKER_CONTEXT=""
 
 # Anchor CWD to $HOME so that when DEVBRAIN_HOME gets deleted mid-script,
 # subshells (e.g., spawned by the Homebrew uninstaller) don't spam
@@ -34,12 +41,77 @@ cd "$HOME"
 FULL_RESET=false
 AUTO_YES=false
 
-for arg in "$@"; do
-    case "$arg" in
-        --full) FULL_RESET=true ;;
-        --yes|-y) AUTO_YES=true ;;
+print_usage() {
+    cat <<'EOF'
+Usage: bash scripts/reinstall.sh [options]
+
+  --full                           Also reset the documented toolchain items
+  --yes, -y                        Skip the confirmation prompt
+  --container-runtime=RUNTIME      Required with --docker-context when an
+                                   older install has no target metadata
+  --docker-context=CONTEXT         Exact Docker context containing DevBrain
+  --help, -h                       Show this help
+EOF
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --full) FULL_RESET=true ;;
+            --yes|-y) AUTO_YES=true ;;
+            --container-runtime=*)
+                EXPLICIT_CONTAINER_RUNTIME="${1#*=}"
+                ;;
+            --container-runtime)
+                shift
+                [[ $# -gt 0 ]] || {
+                    echo "Error: --container-runtime requires a value" >&2
+                    exit 2
+                }
+                EXPLICIT_CONTAINER_RUNTIME="$1"
+                ;;
+            --docker-context=*)
+                EXPLICIT_DOCKER_CONTEXT="${1#*=}"
+                ;;
+            --docker-context)
+                shift
+                [[ $# -gt 0 ]] || {
+                    echo "Error: --docker-context requires a value" >&2
+                    exit 2
+                }
+                EXPLICIT_DOCKER_CONTEXT="$1"
+                ;;
+            --help|-h)
+                print_usage
+                exit 0
+                ;;
+            *)
+                echo "Error: unknown reinstall option: $1" >&2
+                exit 2
+                ;;
+        esac
+        shift
+    done
+}
+parse_args "$@"
+
+if [[ -n "$EXPLICIT_CONTAINER_RUNTIME" || -n "$EXPLICIT_DOCKER_CONTEXT" ]]; then
+    if [[ -z "$EXPLICIT_CONTAINER_RUNTIME" || -z "$EXPLICIT_DOCKER_CONTEXT" ]]; then
+        echo "Error: --container-runtime and --docker-context must be used together" >&2
+        exit 2
+    fi
+    case "$EXPLICIT_CONTAINER_RUNTIME" in
+        colima|docker-desktop|docker-engine|orbstack) ;;
+        *)
+            echo "Error: unsupported --container-runtime" >&2
+            exit 2
+            ;;
     esac
-done
+    if [[ ! "$EXPLICIT_DOCKER_CONTEXT" =~ ^[A-Za-z0-9][-A-Za-z0-9._+]*$ ]]; then
+        echo "Error: --docker-context contains unsupported characters" >&2
+        exit 2
+    fi
+fi
 
 # ─── Colors ─────────────────────────────────────────────────────────────────
 
@@ -68,6 +140,190 @@ ask_yn() {
     [[ "$answer" =~ ^[Yy] ]]
 }
 
+_capture_container_target() {
+    if [[ -L "$INSTALL_TARGET_PATH" ]] || {
+        [[ -e "$INSTALL_TARGET_PATH" ]] && [[ ! -f "$INSTALL_TARGET_PATH" ]]
+    }; then
+        warn "Install target metadata is not a regular file:"
+        warn "  $INSTALL_TARGET_PATH"
+        return 1
+    fi
+    if [[ ! -f "$RESILIENCE_MANIFEST" && ! -f "$INSTALL_TARGET_PATH" ]]; then
+        if [[ -n "$EXPLICIT_CONTAINER_RUNTIME" ]]; then
+            TARGET_CONTAINER_RUNTIME="$EXPLICIT_CONTAINER_RUNTIME"
+            TARGET_DOCKER_CONTEXT="$EXPLICIT_DOCKER_CONTEXT"
+            return 0
+        fi
+        warn "No recorded DevBrain Docker target was found."
+        warn "For an older install, retry with both:"
+        warn "  --container-runtime=RUNTIME --docker-context=CONTEXT"
+        return 1
+    fi
+
+    local manifest_python="$DEVBRAIN_HOME/.venv/bin/python"
+    if [[ ! -x "$manifest_python" ]]; then
+        manifest_python="$(command -v python3 2>/dev/null || true)"
+    fi
+    if [[ -z "$manifest_python" ]]; then
+        warn "Python is required to validate DevBrain container metadata."
+        return 1
+    fi
+
+    local manifest_target
+    if ! manifest_target="$(
+        PYTHONPATH="$DEVBRAIN_HOME${PYTHONPATH:+:$PYTHONPATH}" \
+            "$manifest_python" - "$RESILIENCE_MANIFEST" \
+            "$INSTALL_TARGET_PATH" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+manifest_path = Path(sys.argv[1]).expanduser().resolve()
+target_path = Path(sys.argv[2]).expanduser().resolve()
+
+resilience_metadata = None
+if manifest_path.is_file():
+    from ops.resilience.install import _load_manifest
+
+    resilience_metadata = _load_manifest(manifest_path)
+    if resilience_metadata is None:
+        raise SystemExit(
+            "resilience manifest disappeared while it was being read"
+        )
+
+install_metadata = None
+if target_path.is_file():
+    try:
+        install_metadata = json.loads(target_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"install target metadata is unreadable: {exc}") from exc
+    expected = {
+        "schema_version",
+        "generated_by",
+        "profile",
+        "container_runtime",
+        "docker_context",
+    }
+    if not isinstance(install_metadata, dict) or set(install_metadata) != expected:
+        raise SystemExit("install target metadata fields are invalid")
+    if (
+        install_metadata.get("schema_version") != 2
+        or install_metadata.get("generated_by") != "devbrain-installer"
+    ):
+        raise SystemExit("install target metadata identity is invalid")
+    if install_metadata.get("profile") not in {"workstation", "studio"}:
+        raise SystemExit("install target metadata profile is invalid")
+if resilience_metadata is None and install_metadata is None:
+    raise SystemExit(
+        "container target metadata disappeared while it was being read"
+    )
+
+if resilience_metadata is not None and install_metadata is not None:
+    resilience_target = (
+        resilience_metadata.get("container_runtime"),
+        resilience_metadata.get("docker_context"),
+    )
+    install_target = (
+        install_metadata.get("container_runtime"),
+        install_metadata.get("docker_context"),
+    )
+    if resilience_target != install_target:
+        raise SystemExit(
+            "resilience and install target metadata disagree; "
+            "refusing destructive cleanup"
+        )
+
+metadata = install_metadata or resilience_metadata
+runtime = metadata.get("container_runtime")
+context = metadata.get("docker_context")
+if runtime not in {"colima", "docker-desktop", "docker-engine", "orbstack"}:
+    raise SystemExit("container metadata has an invalid runtime")
+if not isinstance(context, str) or not re.fullmatch(
+    r"[A-Za-z0-9][-A-Za-z0-9._+]*", context
+):
+    raise SystemExit("container metadata has an invalid Docker context")
+
+sys.stdout.write(f"{runtime}\t{context}")
+PY
+    )"; then
+        warn "Could not validate the recorded container target."
+        return 1
+    fi
+
+    IFS=$'\t' read -r TARGET_CONTAINER_RUNTIME \
+        TARGET_DOCKER_CONTEXT <<< "$manifest_target"
+    if [[ -z "$TARGET_CONTAINER_RUNTIME" || -z "$TARGET_DOCKER_CONTEXT" ]]; then
+        warn "Validated metadata did not identify its container target."
+        return 1
+    fi
+    if [[ -n "$EXPLICIT_CONTAINER_RUNTIME" ]] && {
+        [[ "$EXPLICIT_CONTAINER_RUNTIME" != "$TARGET_CONTAINER_RUNTIME" ]] ||
+        [[ "$EXPLICIT_DOCKER_CONTEXT" != "$TARGET_DOCKER_CONTEXT" ]]
+    }; then
+        warn "Explicit container target disagrees with recorded metadata."
+        warn "Refusing destructive cleanup; repair the metadata first."
+        return 1
+    fi
+}
+
+docker_for_devbrain() {
+    if [[ -n "$TARGET_DOCKER_CONTEXT" ]]; then
+        command docker --context "$TARGET_DOCKER_CONTEXT" "$@"
+    else
+        command docker "$@"
+    fi
+}
+
+_prepare_selected_container_runtime() {
+    [[ -n "$TARGET_DOCKER_CONTEXT" ]] || return 0
+    if ! command -v docker >/dev/null 2>&1; then
+        warn "Docker CLI is unavailable; cannot clean context '$TARGET_DOCKER_CONTEXT'."
+        return 1
+    fi
+    if docker_for_devbrain info >/dev/null 2>&1; then
+        return 0
+    fi
+
+    case "$TARGET_CONTAINER_RUNTIME" in
+        colima)
+            if ! command -v colima >/dev/null 2>&1; then
+                warn "Colima is unavailable; cannot start the selected Docker context."
+                return 1
+            fi
+            info "Starting Colima so its DevBrain data can be removed..."
+            colima start
+            ;;
+        docker-desktop)
+            info "Launching Docker Desktop so its DevBrain data can be removed..."
+            open -a Docker >/dev/null 2>&1 || true
+            ;;
+        orbstack)
+            info "Launching OrbStack so its DevBrain data can be removed..."
+            open -a OrbStack >/dev/null 2>&1 || true
+            ;;
+        docker-engine)
+            info "Starting Docker Engine so its DevBrain data can be removed..."
+            if command -v systemctl >/dev/null 2>&1; then
+                sudo systemctl start docker
+            elif command -v service >/dev/null 2>&1; then
+                sudo service docker start
+            fi
+            ;;
+    esac
+
+    local attempt=0
+    while (( attempt < 30 )); do
+        attempt=$((attempt + 1))
+        if docker_for_devbrain info >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+    done
+    warn "Docker context '$TARGET_DOCKER_CONTEXT' did not become ready."
+    return 1
+}
+
 # ─── Banner & confirmation ──────────────────────────────────────────────────
 
 echo ""
@@ -82,13 +338,19 @@ echo -e "  ${RED}✗${RESET} /opt/homebrew/bin/devbrain  /opt/homebrew/bin/insta
 echo -e "  ${RED}✗${RESET} /usr/local/bin/devbrain  /usr/local/bin/install-devbrain (if present)"
 echo -e "  ${RED}✗${RESET} devbrain-db Docker container + volume (loses all DevBrain DB data)"
 echo -e "  ${RED}✗${RESET} ~/Library/LaunchAgents/com.devbrain.ingest.plist (launchd service)"
+echo -e "  ${RED}✗${RESET} $INSTALL_TARGET_PATH (recorded Docker target)"
+if [[ -f "$RESILIENCE_MANIFEST" ]]; then
+    echo -e "  ${RED}✗${RESET} Resilience service + files recorded in $RESILIENCE_MANIFEST"
+fi
 
 if $FULL_RESET; then
     echo ""
     echo -e "${YELLOW}--full flag set — also removing:${RESET}"
+    echo -e "  ${RED}✗${RESET} Docker Desktop application and data (if installed)"
     echo -e "  ${RED}✗${RESET} Ollama models (snowflake-arctic-embed2, qwen2.5:7b — ~10GB to redownload)"
     echo -e "  ${RED}✗${RESET} Homebrew itself (will be reinstalled fresh)"
     echo -e "  ${RED}✗${RESET} Xcode Command Line Tools (will be reinstalled fresh, slow)"
+    echo -e "  ${GREEN}✓${RESET} Colima/OrbStack VM disks are not wiped"
 fi
 
 echo ""
@@ -109,6 +371,37 @@ fi
 echo ""
 echo -e "${BOLD}[1] Stopping running services${RESET}"
 
+if [[ -d "$DEVBRAIN_HOME" || -f "$RESILIENCE_MANIFEST" \
+      || -f "$INSTALL_TARGET_PATH" || -n "$EXPLICIT_CONTAINER_RUNTIME" ]]; then
+    if ! _capture_container_target; then
+        warn "Refusing to delete DevBrain without its exact Docker target."
+        exit 1
+    fi
+    info "Using Docker context '$TARGET_DOCKER_CONTEXT' ($TARGET_CONTAINER_RUNTIME)."
+    if ! _prepare_selected_container_runtime; then
+        warn "Refusing to continue while DevBrain database cleanup is unavailable."
+        exit 1
+    fi
+fi
+
+if [[ -f "$RESILIENCE_MANIFEST" ]]; then
+    if [[ ! -f "$DEVBRAIN_HOME/scripts/install-resilience.sh" ]]; then
+        warn "Resilience is installed, but its manifest-aware uninstaller is missing:"
+        warn "  $DEVBRAIN_HOME/scripts/install-resilience.sh"
+        warn "Refusing to delete the repo and leave an unmanaged background service."
+        exit 1
+    fi
+    info "Uninstalling manifest-owned resilience service and files..."
+    if bash "$DEVBRAIN_HOME/scripts/install-resilience.sh" --uninstall --yes; then
+        ok "Resilience service uninstalled"
+    else
+        warn "Resilience uninstall failed. Resolve it before deleting DevBrain."
+        exit 1
+    fi
+else
+    skip "No resilience install manifest found"
+fi
+
 if launchctl list 2>/dev/null | grep -q com.devbrain.ingest; then
     info "Unloading launchd ingest service..."
     launchctl unload ~/Library/LaunchAgents/com.devbrain.ingest.plist 2>/dev/null || true
@@ -117,18 +410,195 @@ else
     skip "No launchd ingest service running"
 fi
 
-if docker ps 2>/dev/null | grep -q devbrain-db; then
-    info "Stopping devbrain-db container..."
-    if [[ -f "$DEVBRAIN_HOME/docker-compose.yml" ]]; then
-        (cd "$DEVBRAIN_HOME" && docker compose down -v 2>/dev/null) || docker stop devbrain-db
-    else
-        docker stop devbrain-db 2>/dev/null || true
+if [[ -n "$TARGET_DOCKER_CONTEXT" ]]; then
+    if ! command -v docker >/dev/null 2>&1; then
+        warn "Docker CLI disappeared before DevBrain data cleanup."
+        exit 1
     fi
-    docker rm devbrain-db 2>/dev/null || true
-    docker volume rm devbrain_devbrain-pgdata 2>/dev/null || true
-    ok "Container + volume removed"
+    if ! docker_for_devbrain info >/dev/null 2>&1; then
+        warn "Selected Docker context '$TARGET_DOCKER_CONTEXT' became unavailable."
+        exit 1
+    fi
+    devbrain_volumes=(
+        devbrain_devbrain-pgdata
+        devbrain_devbrain-wal-archive
+        devbrain-pgdata
+        devbrain-wal-archive
+    )
+
+    _inventory_contains() {
+        local needle="$1"
+        local inventory="$2"
+        local item
+        while IFS= read -r item; do
+            [[ "$item" == "$needle" ]] && return 0
+        done <<< "$inventory"
+        return 1
+    }
+
+    _append_devbrain_volume() {
+        local candidate="$1"
+        local existing
+        for existing in "${devbrain_volumes[@]}"; do
+            [[ "$existing" == "$candidate" ]] && return 0
+        done
+        devbrain_volumes+=("$candidate")
+    }
+
+    container_present=false
+    volume_present=false
+    container_inventory=""
+    volume_inventory=""
+    if ! container_inventory="$(
+        docker_for_devbrain container ls -a --format '{{.Names}}'
+    )"; then
+        warn "Could not inventory containers in the selected Docker context."
+        exit 1
+    fi
+    if ! volume_inventory="$(docker_for_devbrain volume ls -q)"; then
+        warn "Could not inventory volumes in the selected Docker context."
+        exit 1
+    fi
+
+    mounted_volumes=""
+    if _inventory_contains "devbrain-db" "$container_inventory"; then
+        container_present=true
+        if ! mounted_volumes="$(
+            docker_for_devbrain container inspect \
+            --format '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}' \
+            devbrain-db 2>/dev/null
+        )"; then
+            warn "Could not inspect the confirmed devbrain-db container."
+            exit 1
+        fi
+        while IFS= read -r volume; do
+            [[ -n "$volume" ]] || continue
+            if [[ ! "$volume" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
+                warn "Container reported an unsafe volume name; refusing cleanup."
+                exit 1
+            fi
+            _append_devbrain_volume "$volume"
+        done <<< "$mounted_volumes"
+    fi
+    for volume in "${devbrain_volumes[@]}"; do
+        if _inventory_contains "$volume" "$volume_inventory"; then
+            volume_present=true
+        fi
+    done
+    labeled_candidates=""
+    for logical_volume in devbrain-pgdata devbrain-wal-archive; do
+        labeled=""
+        if ! labeled="$(
+            docker_for_devbrain volume ls -q \
+                --filter "label=com.docker.compose.volume=$logical_volume"
+        )"; then
+            warn "Could not inspect labeled Compose volumes."
+            exit 1
+        fi
+        if [[ -n "$labeled" ]]; then
+            labeled_candidates+="${labeled_candidates:+$'\n'}$labeled"
+            volume_present=true
+        fi
+    done
+    labeled_services=""
+    if ! labeled_services="$(
+        docker_for_devbrain container ls -a -q \
+            --filter label=com.docker.compose.service=devbrain-db
+    )"; then
+        warn "Could not inspect labeled Compose services."
+        exit 1
+    fi
+
+    if $container_present || $volume_present || \
+       [[ -n "$labeled_candidates" || -n "$labeled_services" ]]; then
+        info "Removing devbrain-db container and volume..."
+        if $container_present; then
+            if ! docker_for_devbrain container rm -f -v \
+                devbrain-db >/dev/null 2>&1; then
+                warn "Could not remove the confirmed devbrain-db container."
+                exit 1
+            fi
+        fi
+
+        if ! volume_inventory="$(docker_for_devbrain volume ls -q)"; then
+            warn "Could not refresh the Docker volume inventory."
+            exit 1
+        fi
+        for volume in "${devbrain_volumes[@]}"; do
+            if _inventory_contains "$volume" "$volume_inventory"; then
+                if ! docker_for_devbrain volume rm "$volume" >/dev/null 2>&1; then
+                    warn "Could not remove confirmed DevBrain volume '$volume'."
+                    exit 1
+                fi
+            fi
+        done
+
+        if ! container_inventory="$(
+            docker_for_devbrain container ls -a --format '{{.Names}}'
+        )"; then
+            warn "Could not verify the post-cleanup container inventory."
+            exit 1
+        fi
+        if ! volume_inventory="$(docker_for_devbrain volume ls -q)"; then
+            warn "Could not verify the post-cleanup volume inventory."
+            exit 1
+        fi
+
+        cleanup_incomplete=false
+        if _inventory_contains "devbrain-db" "$container_inventory"; then
+            cleanup_incomplete=true
+        fi
+        for volume in "${devbrain_volumes[@]}"; do
+            if _inventory_contains "$volume" "$volume_inventory"; then
+                cleanup_incomplete=true
+            fi
+        done
+        leftover_services=""
+        if ! leftover_services="$(
+            docker_for_devbrain container ls -a -q \
+                --filter label=com.docker.compose.service=devbrain-db
+        )"; then
+            warn "Could not verify Compose service cleanup."
+            exit 1
+        fi
+        leftover_volumes=""
+        for logical_volume in devbrain-pgdata devbrain-wal-archive; do
+            labeled=""
+            if ! labeled="$(
+                docker_for_devbrain volume ls -q \
+                    --filter "label=com.docker.compose.volume=$logical_volume"
+            )"; then
+                warn "Could not verify Compose volume cleanup."
+                exit 1
+            fi
+            if [[ -n "$labeled" ]]; then
+                leftover_volumes+="${leftover_volumes:+$'\n'}$labeled"
+            fi
+        done
+        if [[ -n "$leftover_services" || -n "$leftover_volumes" ]]; then
+            cleanup_incomplete=true
+        fi
+        if $cleanup_incomplete; then
+            warn "DevBrain container data remains in Docker context '$TARGET_DOCKER_CONTEXT'."
+            if [[ -n "$leftover_volumes" ]]; then
+                warn "Labeled volumes still present:"
+                while IFS= read -r volume; do
+                    [[ -n "$volume" ]] && warn "  $volume"
+                done <<< "$leftover_volumes"
+            fi
+            exit 1
+        fi
+        ok "Container + volume removed"
+    else
+        skip "No devbrain-db container or volume found"
+    fi
 else
-    skip "No devbrain-db container running"
+    skip "Docker daemon unavailable; no recorded DevBrain context to clean"
+fi
+
+if [[ -f "$INSTALL_TARGET_PATH" ]]; then
+    rm -f "$INSTALL_TARGET_PATH"
+    ok "Removed recorded container target"
 fi
 
 # ─── Step 2: Remove shims ──────────────────────────────────────────────────
@@ -376,6 +846,7 @@ verify_failures=0
 
 _check_removed "DevBrain repo" "$DEVBRAIN_HOME" || ((verify_failures++))
 _check_removed "launchd plist" "$HOME/Library/LaunchAgents/com.devbrain.ingest.plist" || ((verify_failures++))
+_check_removed "container target metadata" "$INSTALL_TARGET_PATH" || ((verify_failures++))
 
 if $FULL_RESET; then
     _check_removed "Docker.app" "/Applications/Docker.app" || ((verify_failures++))

@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.request
@@ -948,6 +949,7 @@ def setup_cmd(section):
       devbrain setup channels     — notification channels (tmux, Slack, Telegram, ...)
       devbrain setup mcp          — auto-configure MCP for installed AI CLIs
       devbrain setup factory-permissions  — set factory CLI permissions tier
+      devbrain setup resilience   — local self-healing (VPS checks are optional)
       devbrain setup pkrelay      — install optional PKRelay browser bridge
       devbrain setup devdoctor    — run devbrain devdoctor (health check)
       devbrain setup updates      — check for and pull DevBrain updates
@@ -960,6 +962,269 @@ def setup_cmd(section):
     """
     from setup import run_setup
     run_setup(section=section)
+
+
+def _ensure_resilience_import_path() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    repo_root_text = str(repo_root)
+    if repo_root_text not in sys.path:
+        sys.path.insert(0, repo_root_text)
+
+
+def _load_resilience_cli():
+    _ensure_resilience_import_path()
+    from ops.resilience.__main__ import main as resilience_main
+
+    return resilience_main
+
+
+def _resolve_devbrain_docker_context() -> str:
+    """Resolve the one Docker context that owns the live DevBrain container."""
+
+    safe_context = re.compile(r"^[A-Za-z0-9][-A-Za-z0-9._+]*$")
+    safe_container_id = re.compile(r"^[a-f0-9]{12,64}$")
+
+    def run_docker(args: list[str]) -> subprocess.CompletedProcess:
+        try:
+            return subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise click.ClickException(f"Docker probe failed: {exc}") from exc
+
+    target_path = Path.home() / ".devbrain" / "install-target.json"
+    recorded_context = None
+    if target_path.is_symlink() or (
+        target_path.exists() and not target_path.is_file()
+    ):
+        raise click.ClickException(
+            f"container target metadata is not a regular file: {target_path}"
+        )
+    if target_path.is_file():
+        try:
+            metadata = json.loads(target_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise click.ClickException(
+                f"container target metadata is unreadable: {exc}"
+            ) from exc
+        expected = {
+            "schema_version",
+            "generated_by",
+            "profile",
+            "container_runtime",
+            "docker_context",
+        }
+        if (
+            not isinstance(metadata, dict)
+            or set(metadata) != expected
+            or metadata.get("schema_version") != 2
+            or metadata.get("generated_by") != "devbrain-installer"
+            or metadata.get("profile") not in {"workstation", "studio"}
+            or metadata.get("container_runtime")
+            not in {"colima", "docker-desktop", "docker-engine", "orbstack"}
+            or not isinstance(metadata.get("docker_context"), str)
+            or not safe_context.fullmatch(metadata["docker_context"])
+        ):
+            raise click.ClickException(
+                f"container target metadata is invalid: {target_path}"
+            )
+        recorded_context = metadata["docker_context"]
+
+    def devbrain_container_id(context: str) -> str | None:
+        probe = run_docker(
+            [
+                "docker",
+                "--context",
+                context,
+                "container",
+                "ls",
+                "--all",
+                "--no-trunc",
+                "--filter",
+                "name=^/devbrain-db$",
+                "--format",
+                "{{.ID}}",
+            ]
+        )
+        if probe.returncode != 0:
+            raise click.ClickException(
+                f"Docker context {context!r} is unavailable; refusing container "
+                "recreation"
+            )
+        container_ids = {
+            container_id.strip()
+            for container_id in probe.stdout.splitlines()
+            if container_id.strip()
+        }
+        if not container_ids:
+            return None
+        if len(container_ids) != 1 or not all(
+            safe_container_id.fullmatch(container_id)
+            for container_id in container_ids
+        ):
+            raise click.ClickException(
+                f"Docker context {context!r} returned an invalid devbrain-db "
+                "identity; refusing container recreation"
+            )
+        return next(iter(container_ids))
+
+    if recorded_context is not None:
+        if devbrain_container_id(recorded_context) is None:
+            raise click.ClickException(
+                f"recorded Docker context {recorded_context!r} does not contain "
+                "devbrain-db"
+            )
+        return recorded_context
+
+    contexts = run_docker(["docker", "context", "ls", "--format", "{{.Name}}"])
+    if contexts.returncode != 0:
+        raise click.ClickException(
+            "cannot list Docker contexts and no install target is recorded"
+        )
+    matches: dict[str, list[str]] = {}
+    for context in contexts.stdout.splitlines():
+        context = context.strip()
+        if not context:
+            continue
+        if not safe_context.fullmatch(context):
+            raise click.ClickException(
+                f"Docker returned an unsupported context name {context!r}; "
+                "refusing legacy target discovery"
+            )
+        container_id = devbrain_container_id(context)
+        if container_id is not None:
+            matches.setdefault(container_id, []).append(context)
+    if len(matches) != 1:
+        raise click.ClickException(
+            "no install target is recorded and DevBrain was found in "
+            f"{len(matches)} distinct Docker backends; refusing "
+            "ambient-context recreation"
+        )
+    aliases = next(iter(matches.values()))
+    preference = {"desktop-linux": 0, "colima": 1, "orbstack": 2, "default": 3}
+    return min(aliases, key=lambda item: (preference.get(item, 4), item))
+
+
+@cli.group(name="ops")
+def ops_cmd():
+    """Inspect and operate the optional host resilience service."""
+
+
+@ops_cmd.command(name="status")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=lambda: Path.home() / ".devbrain" / "resilience" / "config.json",
+    show_default=True,
+)
+def ops_status(config_path: Path) -> None:
+    """Show the last local watchdog heartbeat."""
+
+    code = _load_resilience_cli()(
+        ["--config", str(config_path.expanduser().resolve()), "status"]
+    )
+    if code:
+        raise click.exceptions.Exit(code)
+
+
+@ops_cmd.command(name="run-once")
+@click.option(
+    "--config",
+    "config_path",
+    type=click.Path(path_type=Path),
+    default=lambda: Path.home() / ".devbrain" / "resilience" / "config.json",
+    show_default=True,
+)
+def ops_run_once(config_path: Path) -> None:
+    """Run one typed check/recovery cycle in the foreground."""
+
+    code = _load_resilience_cli()(
+        ["--config", str(config_path.expanduser().resolve()), "run-once"]
+    )
+    if code:
+        raise click.exceptions.Exit(code)
+
+
+@ops_cmd.group(name="medic")
+def ops_medic_cmd():
+    """Create off-host medic keys and signed task envelopes."""
+
+
+@ops_medic_cmd.command(name="keygen")
+@click.option("--private", "private_path", type=click.Path(path_type=Path), required=True)
+@click.option("--public", "public_path", type=click.Path(path_type=Path), required=True)
+def ops_medic_keygen(private_path: Path, public_path: Path) -> None:
+    """Generate one Ed25519 keypair; keep the private file off the Studio."""
+
+    _ensure_resilience_import_path()
+    from ops.resilience.medic_tools import main as medic_tools_main
+
+    code = medic_tools_main(
+        [
+            "keygen",
+            "--private",
+            str(private_path),
+            "--public",
+            str(public_path),
+        ]
+    )
+    if code:
+        raise click.exceptions.Exit(code)
+
+
+@ops_medic_cmd.command(name="task")
+@click.option("--instance-id", required=True)
+@click.option(
+    "--action",
+    type=click.Choice(["status", "diagnose", "heal"]),
+    required=True,
+)
+@click.option("--check", default=None)
+@click.option(
+    "--sign",
+    "signers",
+    multiple=True,
+    required=True,
+    metavar="KEY_ID=PRIVATE_KEY_PATH",
+)
+@click.option("--output", type=click.Path(path_type=Path), required=True)
+@click.option("--ttl-seconds", type=click.IntRange(1, 900), default=300)
+def ops_medic_task(
+    instance_id: str,
+    action: str,
+    check: str | None,
+    signers: tuple[str, ...],
+    output: Path,
+    ttl_seconds: int,
+) -> None:
+    """Create a short-lived signed task for a configured medic inbox."""
+
+    _ensure_resilience_import_path()
+    from ops.resilience.medic_tools import main as medic_tools_main
+
+    argv = [
+        "task",
+        "--instance-id",
+        instance_id,
+        "--action",
+        action,
+        "--ttl-seconds",
+        str(ttl_seconds),
+        "--output",
+        str(output),
+    ]
+    if check:
+        argv.extend(["--check", check])
+    for signer in signers:
+        argv.extend(["--sign", signer])
+    code = medic_tools_main(argv)
+    if code:
+        raise click.exceptions.Exit(code)
 
 
 @cli.command(name="dashboard")
@@ -1482,7 +1747,91 @@ def _run_devdoctor_checks() -> list[dict]:
             add(f"ai_cli_logged_in:{_ai_cli}", True,
                 "probe timed out (treating as authed)", warn=True)
 
-    # 10. Env vars (informational — never fails, just reports overrides)
+    # 10. Optional host resilience service. Absence is not a warning because
+    # workstation installs intentionally keep this opt-in.
+    resilience_manifest = (
+        Path.home() / ".devbrain" / "resilience" / "install-manifest.json"
+    )
+    if resilience_manifest.exists():
+        try:
+            manifest = json.loads(resilience_manifest.read_text(encoding="utf-8"))
+            service = manifest["service"]
+            manager = service["manager"]
+            if manager == "launchd":
+                label = service["label"]
+                domain = (
+                    "system"
+                    if service["scope"] == "system"
+                    else f"gui/{service['uid']}"
+                )
+                probe = _subprocess.run(
+                    ["launchctl", "print", f"{domain}/{label}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+            elif manager == "systemd-user":
+                probe = _subprocess.run(
+                    [
+                        "systemctl",
+                        "--user",
+                        "is-active",
+                        "--quiet",
+                        "--",
+                        service["unit"],
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+            else:
+                raise ValueError(f"unsupported service manager: {manager}")
+            add(
+                "resilience_service",
+                probe.returncode == 0,
+                f"{manager} service active"
+                if probe.returncode == 0
+                else f"{manager} service is not active",
+            )
+
+            repo_root_text = str(DEVBRAIN_HOME)
+            if repo_root_text not in sys.path:
+                sys.path.insert(0, repo_root_text)
+            from ops.resilience.core import load_config, read_heartbeat
+
+            resilience_config = load_config(manifest["config_path"])
+            heartbeat = read_heartbeat(resilience_config)
+            generated = float(heartbeat["generated_at_epoch"])
+            age = max(0.0, time.time() - generated)
+            maximum_age = max(180.0, resilience_config.interval_seconds * 3)
+            heartbeat_ok = age <= maximum_age and heartbeat.get("healthy") is True
+            add(
+                "resilience_heartbeat",
+                heartbeat_ok,
+                (
+                    f"healthy, {age:.0f}s old"
+                    if heartbeat_ok
+                    else f"stale/unhealthy, {age:.0f}s old"
+                ),
+            )
+            if resilience_config.medic_config_path is not None:
+                from ops.resilience.medic_service import load_medic_config
+
+                medic = load_medic_config(
+                    resilience_config.medic_config_path,
+                    runtime_config=resilience_config,
+                )
+                add(
+                    "resilience_medic",
+                    True,
+                    f"{medic.mode} mode; {len(medic.authorized_keys)} public key(s)",
+                )
+        except Exception as exc:
+            add("resilience_config", False, f"{exc}")
+
+    # 11. Env vars (informational — never fails, just reports overrides)
     overrides = sorted(k for k in os.environ if k.startswith("DEVBRAIN_"))
     add(
         "env_overrides",
@@ -1962,6 +2311,10 @@ def rotate_db_password(
         click.echo("Aborted.")
         return
 
+    docker_context = (
+        _resolve_devbrain_docker_context() if recreate else None
+    )
+
     # Verify the current password actually works before generating a new one.
     # Use keyword form (host=, port=, ...) so the password never appears in
     # the connection string libpq echoes back in OperationalError messages.
@@ -2077,52 +2430,48 @@ def rotate_db_password(
     # loopback-only port binding) take effect. Password rotation alone
     # doesn't require this — ALTER USER already applied it.
     if recreate:
-        if subprocess.run(
-            ["docker", "--version"], capture_output=True
-        ).returncode != 0:
+        assert docker_context is not None
+        docker = ["docker", "--context", docker_context]
+        click.echo(
+            f"→ Recreating devbrain-db in Docker context {docker_context!r}..."
+        )
+        compose_dir = str(DEVBRAIN_HOME)
+        down_rc = subprocess.call(
+            [*docker, "compose", "down"], cwd=compose_dir
+        )
+        if down_rc != 0:
             click.echo(
-                "⚠️  docker not available — skipping container recreate.",
+                "⚠️  'docker compose down' returned non-zero. Continuing.",
                 err=True,
             )
-        else:
-            click.echo("→ Recreating devbrain-db container...")
-            compose_dir = str(DEVBRAIN_HOME)
-            down_rc = subprocess.call(
-                ["docker", "compose", "down"], cwd=compose_dir
+        up_rc = subprocess.call(
+            [*docker, "compose", "up", "-d", "devbrain-db"],
+            cwd=compose_dir,
+        )
+        if up_rc != 0:
+            raise click.ClickException(
+                "'docker compose up -d devbrain-db' failed. The new "
+                "password is already in .env/yaml and stored in Postgres "
+                "— fix docker-compose errors and bring the container up "
+                "manually."
             )
-            if down_rc != 0:
-                click.echo(
-                    "⚠️  'docker compose down' returned non-zero. Continuing.",
-                    err=True,
-                )
-            up_rc = subprocess.call(
-                ["docker", "compose", "up", "-d", "devbrain-db"],
-                cwd=compose_dir,
-            )
-            if up_rc != 0:
-                raise click.ClickException(
-                    "'docker compose up -d devbrain-db' failed. The new "
-                    "password is already in .env/yaml and stored in Postgres "
-                    "— fix docker-compose errors and bring the container up "
-                    "manually."
-                )
 
-            # Poll until Postgres accepts connections again
-            click.echo("→ Waiting for Postgres to accept connections...", nl=False)
-            for _ in range(30):
-                try:
-                    psycopg2.connect(**new_conn_kwargs, connect_timeout=1).close()
-                    click.echo(" ✅")
-                    break
-                except psycopg2.Error:
-                    time.sleep(1)
-            else:
-                click.echo(" ⚠️")
-                click.echo(
-                    "Container is up but Postgres didn't accept connections "
-                    "within 30s. Check 'docker logs devbrain-db'.",
-                    err=True,
-                )
+        # Poll until Postgres accepts connections again
+        click.echo("→ Waiting for Postgres to accept connections...", nl=False)
+        for _ in range(30):
+            try:
+                psycopg2.connect(**new_conn_kwargs, connect_timeout=1).close()
+                click.echo(" ✅")
+                break
+            except psycopg2.Error:
+                time.sleep(1)
+        else:
+            click.echo(" ⚠️")
+            click.echo(
+                "Container is up but Postgres didn't accept connections "
+                "within 30s. Check the recorded Docker context logs.",
+                err=True,
+            )
 
     click.echo()
     click.echo("✅ Rotation complete.")
@@ -2147,14 +2496,16 @@ def upgrade(
 ) -> None:
     """Migrate an existing install to the latest defaults.
 
-    Chains five steps:
+    Chains seven steps:
 
     \b
       1. git pull --ff-only           (skip with --no-pull)
-      2. Rebuild the MCP server       (skip with --no-rebuild)
-      3. Rotate DB password if weak   (skip with --no-rotate)
-      4. Set factory tier if unsafe   (skip with --no-tier)
-      5. Run devdoctor for verification
+      2. Refresh Python requirements
+      3. Rebuild the MCP server       (skip with --no-rebuild)
+      4. Rotate DB password if weak   (skip with --no-rotate)
+      5. Set factory tier if unsafe   (skip with --no-tier)
+      6. Restart installed resilience
+      7. Run devdoctor for verification
 
     Intended for existing DevBrain installs that pre-date newer defaults
     (random DB password, loopback-only Postgres binding, factory
@@ -2176,10 +2527,12 @@ def upgrade(
     click.echo()
     click.echo("Steps:")
     click.echo("  1. git pull --ff-only")
-    click.echo("  2. Rebuild MCP server (npm install + build)")
-    click.echo("  3. Rotate DB password if still on the old devbrain-local default")
-    click.echo("  4. Prompt for factory permissions tier if set to 3 / unset")
-    click.echo("  5. Run devdoctor")
+    click.echo("  2. Refresh Python requirements")
+    click.echo("  3. Rebuild MCP server (npm install + build)")
+    click.echo("  4. Rotate DB password if still on the old devbrain-local default")
+    click.echo("  5. Prompt for factory permissions tier if set to 3 / unset")
+    click.echo("  6. Restart the resilience service if it is installed")
+    click.echo("  7. Run devdoctor")
     click.echo()
     click.secho(
         "⚠️  Restart any running Claude Code sessions after this finishes —",
@@ -2197,7 +2550,7 @@ def upgrade(
 
     # ─── Step 1: git pull ────────────────────────────────────────────────
     click.echo()
-    click.secho("[1/5] git pull --ff-only", bold=True)
+    click.secho("[1/7] git pull --ff-only", bold=True)
     if no_pull:
         click.echo("   (skipped via --no-pull)")
     else:
@@ -2209,9 +2562,40 @@ def upgrade(
                 "git pull failed — resolve manually, then re-run 'devbrain upgrade'."
             )
 
-    # ─── Step 2: rebuild MCP ─────────────────────────────────────────────
+    # ─── Step 2: Python requirements ─────────────────────────────────────
     click.echo()
-    click.secho("[2/5] Rebuild MCP server", bold=True)
+    click.secho("[2/7] Refresh Python requirements", bold=True)
+    requirements_path = DEVBRAIN_HOME / "requirements.txt"
+    venv_python = DEVBRAIN_HOME / ".venv" / "bin" / "python"
+    if not requirements_path.is_file():
+        raise click.ClickException(
+            f"requirements file is missing: {requirements_path}"
+        )
+    if not venv_python.is_file():
+        raise click.ClickException(
+            f"DevBrain virtualenv is missing: {venv_python}. "
+            "Re-run the installer to repair it."
+        )
+    rc = subprocess.call(
+        [
+            str(venv_python),
+            "-m",
+            "pip",
+            "install",
+            "--disable-pip-version-check",
+            "-q",
+            "-r",
+            str(requirements_path),
+        ],
+        cwd=str(DEVBRAIN_HOME),
+    )
+    if rc != 0:
+        raise click.ClickException("Python requirements update failed")
+    click.echo("   ✓ requirements current")
+
+    # ─── Step 3: rebuild MCP ─────────────────────────────────────────────
+    click.echo()
+    click.secho("[3/7] Rebuild MCP server", bold=True)
     if no_rebuild:
         click.echo("   (skipped via --no-rebuild)")
     else:
@@ -2232,9 +2616,9 @@ def upgrade(
                 raise click.ClickException("MCP rebuild failed")
             click.echo("   ✓ rebuilt")
 
-    # ─── Step 3: DB password ────────────────────────────────────────────
+    # ─── Step 4: DB password ────────────────────────────────────────────
     click.echo()
-    click.secho("[3/5] Check DB password", bold=True)
+    click.secho("[4/7] Check DB password", bold=True)
     if no_rotate:
         click.echo("   (skipped via --no-rotate)")
     else:
@@ -2264,9 +2648,9 @@ def upgrade(
         else:
             click.echo("   ✓ custom password in use")
 
-    # ─── Step 4: factory tier ───────────────────────────────────────────
+    # ─── Step 5: factory tier ───────────────────────────────────────────
     click.echo()
-    click.secho("[4/5] Check factory permissions tier", bold=True)
+    click.secho("[5/7] Check factory permissions tier", bold=True)
     if no_tier:
         click.echo("   (skipped via --no-tier)")
     else:
@@ -2283,9 +2667,35 @@ def upgrade(
             from setup import run_setup
             run_setup(section="factory-permissions")
 
-    # ─── Step 5: devdoctor ──────────────────────────────────────────────
+    # ─── Step 6: resilience service ─────────────────────────────────────
     click.echo()
-    click.secho("[5/5] Final health check", bold=True)
+    click.secho("[6/7] Restart resilience service", bold=True)
+    resilience_manifest = (
+        Path.home() / ".devbrain" / "resilience" / "install-manifest.json"
+    )
+    if not resilience_manifest.is_file():
+        click.echo("   (not installed — skipped)")
+    else:
+        resilience_installer = DEVBRAIN_HOME / "scripts" / "install-resilience.sh"
+        if not resilience_installer.is_file():
+            raise click.ClickException(
+                "resilience is installed, but its manifest-aware installer is "
+                f"missing: {resilience_installer}"
+            )
+        rc = subprocess.call(
+            ["bash", str(resilience_installer), "--restart"],
+            cwd=str(DEVBRAIN_HOME),
+        )
+        if rc != 0:
+            raise click.ClickException(
+                "resilience restart failed; the existing manifest and service "
+                "files were preserved for repair"
+            )
+        click.echo("   ✓ restarted")
+
+    # ─── Step 7: devdoctor ──────────────────────────────────────────────
+    click.echo()
+    click.secho("[7/7] Final health check", bold=True)
     try:
         ctx.invoke(devdoctor, as_json=False, fix=False)
     except SystemExit as exc:

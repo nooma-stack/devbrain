@@ -1,0 +1,20 @@
+[Unit]
+Description=DevBrain resilience watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@DEVBRAIN_HOME@
+ExecStart=@PYTHON@ -m ops.resilience --config @CONFIG_PATH@ watch
+Environment=@DEVBRAIN_ENV@
+Environment=@HOME_ENV@
+Environment=@PATH_ENV@
+UMask=0077
+Restart=always
+RestartSec=30
+StandardOutput=@STDOUT_TARGET@
+StandardError=@STDERR_TARGET@
+
+[Install]
+WantedBy=default.target
