@@ -5,6 +5,7 @@ pyyaml>=6.0
 textual>=0.80
 google-auth>=2.0
 google-api-python-client>=2.0
+cryptography>=42.0
 # Anthropic SDK used by cognify_extract + cognify_edges (LLM-cost passes).
 # Cognify's code path degrades gracefully on ImportError (logs a warning and
 # skips the LLM call), so the package is technically optional for non-LLM

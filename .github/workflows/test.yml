@@ -12,6 +12,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  resilience-macos:
+    name: resilience installer (macOS)
+    runs-on: macos-14
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Validate macOS installer and resilience tests
+        run: |
+          /bin/bash -n scripts/install.sh scripts/install-resilience.sh scripts/reinstall.sh
+          cd factory
+          python -m pytest \
+            tests/test_resilience_core.py \
+            tests/test_resilience_install.py \
+            tests/test_resilience_medic.py \
+            tests/test_resilience_medic_install.py \
+            tests/test_resilience_surfaces.py \
+            -p no:cacheprovider --tb=short -q
+
   pytest:
     name: pytest (no-DB subset)
     runs-on: ubuntu-latest
@@ -73,6 +104,11 @@ jobs:
             tests/test_port_registry.py \
             tests/test_seed_ports.py \
             tests/test_compose_env.py \
+            tests/test_resilience_core.py \
+            tests/test_resilience_install.py \
+            tests/test_resilience_medic.py \
+            tests/test_resilience_medic_install.py \
+            tests/test_resilience_surfaces.py \
             -p no:cacheprovider --tb=short -q
 
   pytest-db:
