@@ -95,6 +95,43 @@ _CODEX_BIN = os.environ.get("DEVBRAIN_CODEX_BIN") or shutil.which("codex") \
     or "/opt/homebrew/bin/codex"
 _CODEX_TIMEOUT_S = int(os.environ.get("DEVBRAIN_CODEX_TIMEOUT_S", "240"))
 
+
+def _salvage_last_json(*streams: str) -> dict | None:
+    """Recover the final JSON object codex printed but never wrote to -o.
+
+    codex-cli 0.144.x intermittently completed the model call, echoed the
+    schema-valid JSON to its progress streams, then exited 1 WITHOUT writing
+    the --output-schema file — 44,730 fanout items (through 2026-08-24) paid
+    twice for work that was already sitting in stderr: once on the ChatGPT
+    sub for the "failed" codex run, once on Anthropic for the fallback.
+    Scan the streams (stdout first — codex prints the final message there)
+    for the last parseable JSON object and hand the work back instead of
+    discarding it. raw_decode ignores the trailing "tokens used" chatter.
+    """
+    decoder = json.JSONDecoder()
+    for text in streams:
+        if not text:
+            continue
+        # Walk "{" starts in order, skipping any that fall inside an object
+        # already parsed — otherwise the winner would be the final NESTED
+        # object (e.g. the last list element) instead of the top-level one.
+        last: dict | None = None
+        skip_until = -1
+        for idx in [i for i, ch in enumerate(text) if ch == "{"][:400]:
+            if idx < skip_until:
+                continue
+            try:
+                obj, consumed = decoder.raw_decode(text[idx:])
+            except json.JSONDecodeError:
+                continue
+            skip_until = idx + consumed
+            if isinstance(obj, dict):
+                last = obj
+        if last is not None:
+            return last
+    return None
+
+
 # Model passed to `codex exec` when the extract model is the "codex" sentinel.
 # We must pass an EXPLICIT -m: as of 2026-06-02 OpenAI retired the
 # `-codex`-suffixed models (gpt-5.x-codex) for ChatGPT-account auth, and the
@@ -598,17 +635,24 @@ def _codex_extract(content: str, *, model: str | None = None) -> dict:
             return {"lessons": [], "decisions": [], "_usage": empty_usage,
                     "_failure": "api", "_failure_detail": "codex exec timeout"}
 
+        result = None
         if not os.path.exists(out_path):
-            tail = (proc.stderr or "")[-400:]
-            return {"lessons": [], "decisions": [], "_usage": empty_usage,
-                    "_failure": "api",
-                    "_failure_detail": f"codex produced no output (rc={proc.returncode}): {tail}"}
-        try:
-            with open(out_path) as fh:
-                result = json.load(fh)
-        except (json.JSONDecodeError, OSError) as exc:
-            return {"lessons": [], "decisions": [], "_usage": empty_usage,
-                    "_failure": "json_parse", "_failure_detail": str(exc)[:300]}
+            # The -o file is missing but the run may still have succeeded —
+            # see _salvage_last_json. Only give up if there is no JSON to
+            # recover from the streams either.
+            result = _salvage_last_json(proc.stdout or "", proc.stderr or "")
+            if result is None:
+                tail = (proc.stderr or "")[-400:]
+                return {"lessons": [], "decisions": [], "_usage": empty_usage,
+                        "_failure": "api",
+                        "_failure_detail": f"codex produced no output (rc={proc.returncode}): {tail}"}
+        if result is None:
+            try:
+                with open(out_path) as fh:
+                    result = json.load(fh)
+            except (json.JSONDecodeError, OSError) as exc:
+                return {"lessons": [], "decisions": [], "_usage": empty_usage,
+                        "_failure": "json_parse", "_failure_detail": str(exc)[:300]}
 
     if not isinstance(result, dict):
         return {"lessons": [], "decisions": [], "_usage": empty_usage,
