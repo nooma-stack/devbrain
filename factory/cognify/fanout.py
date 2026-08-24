@@ -90,7 +90,12 @@ def _codex_classify(
     Mirrors cognify_extract._codex_extract; codex bills the ChatGPT-sub login
     so there's no token spend to record.
     """
-    from cognify.extract import _CODEX_BIN, _CODEX_TIMEOUT_S  # noqa: PLC0415
+    from cognify.extract import (  # noqa: PLC0415
+        _CODEX_BIN,
+        _CODEX_DEFAULT_MODEL,
+        _CODEX_TIMEOUT_S,
+        _salvage_last_json,
+    )
 
     if not _CODEX_BIN or not os.path.exists(_CODEX_BIN):
         return None, "api", f"codex binary not found at {_CODEX_BIN}"
@@ -106,8 +111,14 @@ def _codex_classify(
             "--skip-git-repo-check", "--ephemeral", "-C", wd,
             "--output-schema", schema_path, "-o", out_path,
         ]
-        if model and model.lower() != "codex":
-            cmd += ["-m", model]
+        # Always pass an explicit -m, exactly like _codex_extract. Without
+        # it the "codex" sentinel fell through to ~/.codex/config.toml's
+        # default — a heavyweight coding-agent reasoning model that burned
+        # >13k tokens on trivial classifications and blew the exec timeout
+        # on real ones, which is why fanout failed codex ~10x more often
+        # than extract ever did.
+        codex_model = model if (model and model.lower() != "codex") else _CODEX_DEFAULT_MODEL
+        cmd += ["-m", codex_model]
         cmd.append(prompt)
         try:
             proc = subprocess.run(
@@ -117,6 +128,10 @@ def _codex_classify(
         except subprocess.TimeoutExpired:
             return None, "api", "codex exec timeout"
         if not os.path.exists(out_path):
+            # Salvage before failing over — see _salvage_last_json.
+            salvaged = _salvage_last_json(proc.stdout or "", proc.stderr or "")
+            if salvaged is not None:
+                return salvaged, None, None
             return None, "api", (
                 f"codex no output (rc={proc.returncode}): "
                 f"{(proc.stderr or '')[-300:]}"
