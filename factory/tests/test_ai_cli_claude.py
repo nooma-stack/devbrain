@@ -101,19 +101,20 @@ def test_extract_oauth_token_handles_ansi_escapes():
 
 
 def test_extract_oauth_token_handles_cursor_positioning_inside_token():
-    """Real-world reproduction from the 2026-05-08 E2E test: claude renders
-    the token across visual TTY lines by injecting `\\x1b[1C` (cursor right)
-    and `\\r\\x1b[1B` (CR + cursor down) escapes mid-token. The extractor
-    strips those before matching."""
-    real_world_capture = (
-        "Long-lived authentication token created successfully!\n"
-        "sk-ant-oat\x1b[1C1-fO5B\x1b[1CyG_n4rstUKSfpUzIAT37ppUyqpgXKwjHa6"
-        "fneODMXTqCCA-25WUIqqiE4Al0Zr\r\x1b[1B4TcP0P7q1U-4m6C_x-A-6uvrsAAA\r\x1b[2B"
-        "Store this token securely.\n"
+    """Cursor movement inside a token is removed before extraction."""
+    prefix = "".join(("sk", "-ant-", "oat1-"))
+    payload = "".join(
+        f"SYNTHETIC_SEGMENT_{index:02d}_" for index in range(6)
     )
-    expected = (
-        "sk-ant-oat1-fO5ByG_n4rstUKSfpUzIAT37ppUyqpgXKwjHa6"
-        "fneODMXTqCCA-25WUIqqiE4Al0Zr4TcP0P7q1U-4m6C_x-A-6uvrsAAA"
+    expected = prefix + payload
+    real_world_capture = (
+        "\x1b[2mToken:\x1b[0m "
+        + expected[:10]
+        + "\x1b[1C"
+        + expected[10:58]
+        + "\r\x1b[1B"
+        + expected[58:]
+        + "\x1b[2BStore this synthetic token securely"
     )
     assert _extract_oauth_token(real_world_capture) == expected
 

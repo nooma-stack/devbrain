@@ -51,15 +51,14 @@ def _fake_runner_success():
 
 
 def test_safe_preview_long_token():
-    token = "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"
+    token = "synthetic-" + "".join(
+        f"preview-segment-{index:02d}-" for index in range(6)
+    )
     preview = _safe_preview(token)
-    # 25-char prefix
     assert preview.startswith(token[:25])
-    # Last 4 chars present
     assert preview.endswith(token[-4:])
     assert "…" in preview
-    # Critically, the middle of the token must NOT be in the preview.
-    assert "9JdHIfY9qf6i" not in preview
+    assert token[25:-4] not in preview
 
 
 def test_safe_preview_short_token():
