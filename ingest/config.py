@@ -10,6 +10,10 @@ Environment variables (all optional):
     DEVBRAIN_OLLAMA_URL      — Ollama server URL (overrides yaml.embedding.url and summarization.url)
     DEVBRAIN_EMBEDDING_MODEL — Embedding model name (overrides yaml.embedding.model)
     DEVBRAIN_SUMMARY_MODEL   — Summarization model name (overrides yaml.summarization.model)
+    DEVBRAIN_SUMMARY_MAX_CHARS — Max transcript chars sent to the summarizer
+                               (overrides yaml.summarization.max_input_chars)
+    DEVBRAIN_SUMMARY_TIMEOUT_S — Summarizer HTTP timeout in seconds
+                               (overrides yaml.summarization.timeout_seconds)
 """
 
 from __future__ import annotations
@@ -46,6 +50,14 @@ _DEFAULTS: dict = {
         "provider": "ollama",
         "url": "http://localhost:11434",
         "model": "qwen2.5:7b",
+        # 48K chars ≈ 13-16K tokens: inside qwen2.5:7b's 32K window, a
+        # fraction of qwen3.8's 256K. The old hardcoded 12K-char cut meant
+        # the summarizer saw only the first ~3K tokens of a session — long
+        # sessions were summarized off their opening moves alone.
+        "max_input_chars": 48000,
+        # Scales with the window: 48K chars of prefill on a 27B-class local
+        # model runs minutes, not the old 120s.
+        "timeout_seconds": 480,
     },
     "chunking": {
         "max_tokens": 400,
@@ -89,6 +101,10 @@ def load_config() -> dict:
         cfg["embedding"]["model"] = v
     if v := os.environ.get("DEVBRAIN_SUMMARY_MODEL"):
         cfg["summarization"]["model"] = v
+    if v := os.environ.get("DEVBRAIN_SUMMARY_MAX_CHARS"):
+        cfg["summarization"]["max_input_chars"] = int(v)
+    if v := os.environ.get("DEVBRAIN_SUMMARY_TIMEOUT_S"):
+        cfg["summarization"]["timeout_seconds"] = int(v)
 
     return cfg
 
@@ -115,6 +131,8 @@ EMBED_DIMS = _config["embedding"]["dims"]
 CHUNK_MAX_TOKENS = _config["chunking"]["max_tokens"]
 CHUNK_OVERLAP_TOKENS = _config["chunking"]["overlap_tokens"]
 SUMMARIZE_MODEL = _config["summarization"]["model"]
+SUMMARIZE_MAX_INPUT_CHARS = int(_config["summarization"]["max_input_chars"])
+SUMMARIZE_TIMEOUT_S = int(_config["summarization"]["timeout_seconds"])
 SUMMARIZE_URL = _config["summarization"]["url"]
 ADAPTER_CONFIG = _config["ingest"].get("adapters", {})
 PROJECT_MAPPINGS = _config["ingest"].get("project_mappings", {})
