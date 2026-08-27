@@ -81,7 +81,7 @@ _EXTRACT_MODEL = os.environ.get("DEVBRAIN_EXTRACT_MODEL", "codex")
 # (ChatGPT usage-limit / timeout / codex error), fall back to this Anthropic
 # model so extraction never stalls on a quota wall. Set DEVBRAIN_EXTRACT_FALLBACK
 # to "" / "none" to disable the fallback.
-_FALLBACK_MODEL = os.environ.get("DEVBRAIN_EXTRACT_FALLBACK", "claude-sonnet-4-6")
+_FALLBACK_MODEL = os.environ.get("DEVBRAIN_EXTRACT_FALLBACK", "claude-sonnet-5")
 
 # ── Codex (OpenAI CLI) extraction backend ──────────────────────────────────
 # When the requested model routes here (model == "codex" or an OpenAI model id

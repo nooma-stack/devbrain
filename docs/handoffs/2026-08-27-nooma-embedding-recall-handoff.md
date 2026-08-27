@@ -12,7 +12,7 @@
 3. Re-embed the corpus: `python ingest/reembed_memory.py` (full corpus), then `python ingest/reembed.py` (legacy chunks).
 4. Rebuild the HNSW index **serially** (SQL in §4). **Never `REINDEX CONCURRENTLY` a pgvector HNSW index.**
 5. Run the recall verification procedure (§5) with a pinned query vector.
-6. Before reloading the cognify launchd jobs: wire metered billing (§7). They are currently **unloaded on purpose**.
+6. Reload the cognify launchd jobs in **codex + ollama mode** — strip the OAuth tokens first (§7). No Claude key is required; Claude is an optional fallback.
 
 ---
 
@@ -109,30 +109,60 @@ goes through HNSW.** A row present in one but missing from the other = index pro
 Embed-text conventions (what `reembed_memory.py` implements — needed for any manual spot-check):
 `chunk`, `session_summary` → content only; every other kind → `title\ncontent` when titled, else content.
 
-## 6. Related but separate: summarizer model (optional, recommended)
+## 6. Model roster: who does what (the codex + ollama + optional-Claude posture)
 
-LHT upgraded ingest summaries qwen2.5:7b → **qwen3.8:27b** with measured wins: qwen2.5:7b *hallucinated
-completion* of unfinished sessions (memory poison); qwen3.8 reported true partial state. 70s vs 10s per
-summary — irrelevant for async ingest. If you adopt it on nooma:
-- ollama ≥ 0.32.15 (see §2 — triggers the re-embed rule if you upgrade),
+How summaries actually flow, so you know what each model owns:
+- **In-session agents author the best summaries themselves**: `end_session` takes the agent's own
+  summary text and stores it — no extra model call, and it supersedes the ollama summary in ranking.
+- **qwen3.8 (ollama) summarizes every ingested transcript** at ingest time (new or changed content),
+  regardless of whether end_session later arrives. It is canonical only for orphan sessions.
+- Input is the **first `max_input_chars` (48K default ≈ 12–16K tokens), single pass** — no map-reduce;
+  content past the window is unseen *by the summary* (the chunking/embedding pipeline still covers the
+  full transcript for deep_search, so tail content remains findable — only the summary is head-biased).
+  Multi-pass/head+tail summarization is an open roadmap item if long-session summaries matter more.
+- **cognify resummarize** (Claude) upgrades settled orphan summaries — OPTIONAL; with no Claude
+  credential it skips gracefully and qwen3.8 summaries stand. With qwen3.8 + the 48K window this is a
+  defensible steady state (the pass existed to paper over qwen2.5:7b's weakness).
+
+qwen3.8 adoption (recommended):
+- ollama ≥ 0.32.15 (see §2 — upgrading ollama triggers the re-embed rule),
 - `config/devbrain.yaml` → `summarization.model: qwen3.8:27b`, restart `com.devbrain.ingest`,
 - the wider 48K-char window + `num_ctx` fix apply automatically from #184,
 - **`format=json` structured calls to qwen3.8 return EMPTY under default thinking — pass `"think": false`.**
 
-## 7. Before reloading cognify: billing (the jobs are unloaded on purpose)
+Codex model guidance (measured 2026-08-27, codex-cli 0.149.1, ChatGPT auth):
+- `gpt-5.4-mini` (the pinned default) remains the right and effectively only mini-tier id —
+  `gpt-5.6-mini`, `gpt-5.5-mini`, `gpt-5.6-codex`, `gpt-5.x-codex-mini` all 400 with
+  "not supported when using Codex with a ChatGPT account".
+- `gpt-5.6-sol` works but must NEVER be used for the schema tasks: its reasoning burns >13k tokens on
+  trivial classifications and blows the exec timeout (this exact misconfiguration caused fanout's
+  62,503-fallback storm). Re-probe newer mini ids occasionally.
+
+## 7. Reloading cognify: codex + ollama mode, Claude as optional fallback (DECIDED posture for nooma)
 
 The four cognify LaunchAgents (`extract`, `edges`, `resummarize`, `fanout`) were unloaded on BOTH studios
 on 2026-08-24 because their plists embedded **subscription OAuth tokens** (`CLAUDE_CODE_OAUTH_TOKEN`) that
 drained personal Claude Max plans (537× 429 rate-limit errors during the saturation week).
-- `factory/cognify/_anthropic_auth.py` gives `ANTHROPIC_API_KEY` **first precedence** — zero code changes
-  needed. LHT pattern: write the key to `~/.config/devbrain/cognify-billing.env` (chmod 600), strip the
-  token from the plists, wrap `ProgramArguments` with
-  `/bin/bash -lc 'set -a; . $HOME/.config/devbrain/cognify-billing.env; set +a; exec <original cmd>'`.
-- Nooma has **no API key configured anywhere** (checked) — Patrick must supply the billing choice for
-  nooma (personal Console key, or route more of cognify to local ollama).
-- The codex-first path is fine to keep: nooma's codex auth is already `patrick@nooma.solutions` (Pro),
-  and #182 fixed the failure loop (fanout was 62,503× falling back to Claude, double-paying every item).
-- The old embedded tokens should be **revoked** (they also live in `.plist.pre-installer` copies).
+
+**Nooma runs WITHOUT a Claude credential.** This works because `factory/cognify/_anthropic_auth.py` is
+fail-open: with no credential, Claude-dependent work **skips gracefully** instead of erroring —
+- extract/fanout: codex (ChatGPT sub, `patrick@nooma.solutions` Pro — verified) handles everything;
+  a codex-failed item is skipped and retried on a later pass (#182 made codex failures rare);
+- resummarize: skips entirely; qwen3.8 summaries stand as canonical for orphan sessions (see §6).
+
+**To reload:**
+1. Strip `CLAUDE_CODE_OAUTH_TOKEN` from all four plists (plistlib, keep `.bak` copies) — do NOT add any
+   replacement credential.
+2. `launchctl load` the four plists; kickstart extract once and confirm `[ok]` lines in
+   `~/.devbrain/logs/cognify-extract.log` with no auth errors.
+3. **Revoke the old tokens** (they also live in `.plist.pre-installer` copies).
+
+**To enable the Claude fallback later** (optional): put `ANTHROPIC_API_KEY=<console key>` in
+`~/.config/devbrain/cognify-billing.env` (chmod 600) and wrap each plist's `ProgramArguments` with
+`/bin/bash -lc 'set -a; . $HOME/.config/devbrain/cognify-billing.env; set +a; exec <original cmd>'`
+(the LHT pattern). `ANTHROPIC_API_KEY` has first precedence — no code changes. Model defaults are now
+**claude-sonnet-5** (env-overridable: `DEVBRAIN_EXTRACT_FALLBACK`, `DEVBRAIN_FANOUT_FALLBACK`,
+`DEVBRAIN_RESUMMARIZE_MODEL`).
 
 ## 8. Standing rules this encodes
 
@@ -143,3 +173,17 @@ drained personal Claude Max plans (537× 429 rate-limit errors during the satura
 5. **No subscription OAuth tokens in scheduled jobs.** Metered credentials only.
 6. Backlog idea worth building: persist `(ollama_version, model_digest)` alongside embeddings so
    generation drift is mechanically detectable instead of a forensic hunt.
+
+## 9. Roadmap: embedding-model upgrade (evaluate, don't rush)
+
+snowflake-arctic-embed2 (1024d) is solid but no longer the frontier: the **Qwen3-Embedding family**
+(0.6B/4B/8B, ollama-native, MTEB-eng-v2 70.7 even at 0.6B) is the current local standout, and it supports
+**user-defined output dimensions (32–1024, MRL)** — meaning it can run at 1024 dims and drop into the
+existing `vector(1024)` schema with NO column migration. A swap is a full migration by definition
+(different model = different space): run the §4 runbook end-to-end — re-embed everything, serial index
+rebuild, pinned-vector recall verification. Budget: re-embed is model-bound (a 4B embedder is several×
+slower than arctic's 568M; LHT took ~5h at 23 rows/s on arctic — plan for most of a day at 4B).
+Note Qwen3-Embedding is instruction-aware: bare symmetric embedding (what devbrain does) works, but
+query-side instruction prefixes are where its last few retrieval points live — a later enhancement.
+Do this AFTER the current stabilization has soaked; coordinate LHT + nooma so the two DBs don't sit on
+different embedding models long-term.
