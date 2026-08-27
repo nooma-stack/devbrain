@@ -28,6 +28,16 @@ function getPool(): pg.Pool {
       connectionTimeoutMillis: 5000,
       idleTimeoutMillis: 30000,
     })
+    // HNSW search depth for every vector ORDER BY ... LIMIT in this
+    // process (deep_search, recency neighbors, supersedes walks). The
+    // pgvector default (40) measurably drops true top-10 members on this
+    // corpus — a rank-#3 breadcrumb was reproducibly absent from top-10
+    // until ef_search 200 (2026-08-27; 19ms vs 992ms for an exact scan,
+    // so the recall headroom is nearly free). Applied per-connection:
+    // SET is session-scoped and pool connections are long-lived.
+    _pool.on('connect', (client) => {
+      client.query("SET hnsw.ef_search = 200").catch(() => {})
+    })
   }
   return _pool
 }
