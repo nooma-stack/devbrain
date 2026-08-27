@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -35,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 # Sonnet is the right tradeoff for summarization — strong reasoning, much
 # cheaper than Opus. Caller can override via --model.
-DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_MODEL = os.environ.get("DEVBRAIN_RESUMMARIZE_MODEL", "claude-sonnet-5")
 
 # How long after the last raw_sessions write before we consider the
 # session "settled" and safe to upgrade. Avoids running on a still-

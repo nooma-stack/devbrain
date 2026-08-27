@@ -45,7 +45,7 @@ logger = logging.getLogger(__name__)
 # we fall back to DEVBRAIN_FANOUT_FALLBACK (default Sonnet) so cross-project
 # fan-out never silently drops sessions. Mirrors cognify_extract.
 DEFAULT_MODEL = os.environ.get("DEVBRAIN_FANOUT_MODEL", "codex")
-_FANOUT_FALLBACK = os.environ.get("DEVBRAIN_FANOUT_FALLBACK", "claude-sonnet-4-6")
+_FANOUT_FALLBACK = os.environ.get("DEVBRAIN_FANOUT_FALLBACK", "claude-sonnet-5")
 
 # JSON Schema for the classifier's final response. OpenAI strict structured
 # output (codex --output-schema) requires every object to set
