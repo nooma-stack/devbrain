@@ -97,3 +97,44 @@ def test_extract_text_from_line_skips_checkpointed_prefix(tmp_path):
     tail = extract_text(p, from_line=facts.last_breadcrumb_line or 0)
     assert "LATE-MARKER" in tail
     assert "EARLY-MARKER" not in tail
+
+
+# ── USF (DB raw_content) parity tests ───────────────────────────────────────
+
+def _usf(messages):
+    import json as _json
+    return _json.dumps({"usf_version": "1.0", "messages": messages})
+
+
+def test_usf_closed_session_with_chain():
+    from session_closure import parse_usf
+    raw = _usf([
+        {"role": "user", "content": "go", "tool_calls": []},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"tool": "mcp__devbrain__breadcrumb",
+                         "args": {"conversation_uuid": "cu-1", "title": "cp",
+                                  "content": "mid"}}]},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"tool": "mcp__devbrain__end_session",
+                         "args": {"session_id": "cu-1", "summary": "done"}}]},
+    ])
+    facts = parse_usf(raw)
+    assert facts.closed
+    assert facts.conversation_uuid == "cu-1"
+    assert facts.last_breadcrumb_line == 2      # message INDEX, not line
+
+
+def test_usf_unclosed_and_text_extraction():
+    from session_closure import extract_usf_text, parse_usf
+    raw = _usf([
+        {"role": "assistant", "content": "EARLY work", "tool_calls": []},
+        {"role": "assistant", "content": "",
+         "tool_calls": [{"tool": "mcp__devbrain__breadcrumb",
+                         "args": {"conversation_uuid": "u2", "title": "cp",
+                                  "content": "c"}}]},
+        {"role": "assistant", "content": "LATE work", "tool_calls": []},
+    ])
+    facts = parse_usf(raw)
+    assert not facts.closed
+    tail = extract_usf_text(raw, from_index=facts.last_breadcrumb_line or 0)
+    assert "LATE" in tail and "EARLY" not in tail
