@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/devbrain-checkpoint.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
