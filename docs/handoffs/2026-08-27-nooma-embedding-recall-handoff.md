@@ -187,3 +187,39 @@ Note Qwen3-Embedding is instruction-aware: bare symmetric embedding (what devbra
 query-side instruction prefixes are where its last few retrieval points live — a later enhancement.
 Do this AFTER the current stabilization has soaked; coordinate LHT + nooma so the two DBs don't sit on
 different embedding models long-term.
+
+
+## 10. Session-closure system (added 2026-08-29) — deploy on nooma too
+
+Most sessions never call `end_session` (6,500+ unclosed historical claude_code sessions on the LHT
+DB alone), leaving qwen summaries of only the transcript HEAD as their memory. The closure system
+fixes this with an author-quality ladder. Components (all in-repo):
+
+- **`hooks/session-checkpoint/`** — a `SessionStart(matcher: compact)` hook: right after every
+  compaction the model is instructed to persist a `CHECKPOINT pre-compact:` breadcrumb of the arc it
+  just compacted, while it still holds the summary. Install per machine (script + settings snippet in
+  the folder). Long sessions thus self-document as a chain of in-context checkpoints — the rolling
+  ledger, authored by the model that lived it, at near-zero marginal cost.
+- **`ingest/session_closure.py`** — mechanical closure detection: a closed session carries an
+  `mcp__*__end_session` tool_use in its own transcript (no sentinel convention needed — the tool call
+  IS the sentinel, and it works retroactively on every old transcript). The same scan extracts the
+  `conversation_uuid` chain linkage and the last-breadcrumb position.
+- **`ingest/close_orphan_sessions.py`** — scanner + backfill worker. `--report` scans; backfill
+  summarizes only the tail from the last checkpoint (head+tail capped), then calls the REAL MCP
+  `end_session` via `ingest/mcp_stdio_client.py`, so logging (`end_session_log.cli =
+  'closure-backfill'`), enrichment, embedding, and fanout all happen exactly as for a live agent.
+  Backends, best first: `resume` (cold-`claude --resume`; the original model closes its own session),
+  `codex` (gpt-5.6-luna/terra via stdin — verified reachable on the ChatGPT sub; use for BOUNDED
+  backfills, it is an interactive subscription), `openrouter` (ZDR + data_collection=deny enforced in
+  the request; pennies; steady-state default for non-PHI), `ollama` (local, $0, the floor).
+- **PHI guard**: remote backends refuse without `DEVBRAIN_CLOSURE_REMOTE_OK=1`. On machines whose
+  transcripts may contain clinical content, leave it unset (ollama/resume only). Nooma personal
+  content: setting it is fine.
+
+Nooma rollout: install the hook, run `--report`, then work the backlog —
+`--backend codex --model gpt-5.6-luna --limit 20` for a bounded historical pass (watch your ChatGPT
+sub limits), then schedule the scanner (launchd, hourly) with `--backend ollama --limit 5` as the
+steady state. Compliance summary for backend choices: HIPAA PHI requires a **BAA** — ZDR alone is not
+sufficient (Vertex under a GCP BAA, or local, for PHI). Non-PHI: OpenRouter one-click ZDR +
+data_collection=deny, or Ollama Cloud (states transient processing, no logging/training/retention),
+or HF Inference Endpoints (no payload storage; 30-day logs; BAA available on Enterprise).
