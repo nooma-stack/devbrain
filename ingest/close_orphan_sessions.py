@@ -13,6 +13,10 @@ Backfill quality ladder (pick with --backend):
                  and let the model that lived it write its own
                  end_session. Highest quality; needs the claude CLI and
                  the session belonging to this machine/user.
+    openai     — OpenAI API (gpt-5.6-luna default; auto-escalates to
+                 terra when luna's output fails validation). 1.05M-token
+                 window on both, so whole transcripts fit. This is the
+                 BAA-covered rail for LHT content.
     codex      — big-context model via codex CLI on the ChatGPT sub
                  (gpt-5.6-luna/terra verified reachable). Prompt goes via
                  stdin, so million-char inputs are fine. SUBSCRIPTION
@@ -22,10 +26,10 @@ Backfill quality ladder (pick with --backend):
     ollama     — local qwen fold over breadcrumbs + head/tail. $0,
                  always available, the floor.
 
-PHI guard: remote backends (codex/openrouter) refuse to run unless
-DEVBRAIN_CLOSURE_REMOTE_OK=1 is set — transcripts on a machine that
-handles clinical work may contain PHI and must stay local (ollama /
-resume) or on BAA-covered rails.
+PHI guard: remote backends (openai/codex/openrouter) refuse to run
+unless DEVBRAIN_CLOSURE_REMOTE_OK=1 is set. Setting it asserts the
+content/backend pairing is compliant — e.g. the OpenAI API under the
+org's BAA for LHT content, or personal non-PHI content anywhere.
 
 The end_session write goes through the REAL MCP server (stdio client),
 so logging, enrichment, embedding, and fanout all happen exactly as for
@@ -37,6 +41,7 @@ Usage:
     close_orphan_sessions.py --backend ollama --limit 5
     close_orphan_sessions.py --backend resume --limit 3
     close_orphan_sessions.py --backend codex --model gpt-5.6-luna --limit 10
+    close_orphan_sessions.py --backend openai --limit 600   # luna, terra escalation
 """
 
 from __future__ import annotations
@@ -84,8 +89,10 @@ describe unfinished steps as done. Respond ONLY with JSON matching this schema:
 {tail}
 """
 
-# Input budgets per backend (chars).
-BUDGETS = {"ollama": 90_000, "codex": 2_000_000, "openrouter": 1_200_000}
+# Input budgets per backend (chars). ~3.5M chars ≈ 1M tokens: the
+# gpt-5.6 window, so the head+tail cap almost never fires on "openai".
+BUDGETS = {"ollama": 90_000, "codex": 2_000_000, "openrouter": 1_200_000,
+           "openai": 3_500_000}
 
 
 def _salvage_json(text: str) -> dict | None:
@@ -146,6 +153,28 @@ def run_codex(prompt: str, model: str) -> dict | None:
         return _salvage_json((proc.stdout or "") + (proc.stderr or ""))
 
 
+def run_openai(prompt: str, model: str) -> dict | None:
+    key = os.environ.get("OPENAI_API_KEY")
+    if not key:
+        raise SystemExit("OPENAI_API_KEY not set")
+    body = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "response_format": {"type": "json_schema", "json_schema": {
+            "name": "end_session_payload", "strict": True,
+            "schema": PAYLOAD_SCHEMA}},
+    }
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/chat/completions",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {key}"})
+    with urllib.request.urlopen(req, timeout=1800) as r:
+        data = json.loads(r.read())
+    text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
+    return _salvage_json(text)
+
+
 def run_openrouter(prompt: str, model: str) -> dict | None:
     key = os.environ.get("OPENROUTER_API_KEY")
     if not key:
@@ -187,7 +216,8 @@ def run_resume(session_uuid: str, limit_note: str) -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--report", action="store_true", help="scan + report only")
-    ap.add_argument("--backend", choices=["resume", "codex", "openrouter", "ollama"],
+    ap.add_argument("--backend",
+                    choices=["resume", "openai", "codex", "openrouter", "ollama"],
                     default="ollama")
     ap.add_argument("--model", default=None,
                     help="model id (default: qwen3.8:27b / gpt-5.6-luna / "
@@ -198,7 +228,7 @@ def main() -> int:
     ap.add_argument("--project", default=None, help="restrict to one project slug")
     args = ap.parse_args()
 
-    if args.backend in ("codex", "openrouter") and \
+    if args.backend in ("openai", "codex", "openrouter") and \
             os.environ.get("DEVBRAIN_CLOSURE_REMOTE_OK") != "1":
         raise SystemExit(
             "Remote backend refused: transcripts may contain sensitive/PHI "
@@ -206,6 +236,7 @@ def main() -> int:
             "transcripts are cleared for remote processing.")
 
     model = args.model or {"ollama": "qwen3.8:27b", "codex": "gpt-5.6-luna",
+                           "openai": "gpt-5.6-luna",
                            "openrouter": "qwen/qwen3-235b-a22b",
                            "resume": ""}[args.backend]
 
@@ -225,8 +256,16 @@ def main() -> int:
             ORDER BY rs.created_at DESC""", params)
     rows = cur.fetchall()
 
+    # A backfilled session's transcript never gains the end_session
+    # tool_use, so transcript-scanning alone would re-backfill it forever.
+    # end_session_log is the second half of the truth: anything already
+    # logged (by chain uuid OR by the backfill-<transcript-uuid> id) is
+    # closed.
+    cur.execute("SELECT session_id FROM devbrain.end_session_log")
+    logged_ids = {r[0] for r in cur.fetchall()}
+
     stats = {"scanned": 0, "closed": 0, "unclosed": 0, "missing_file": 0,
-             "backfilled": 0, "failed": 0}
+             "already_logged": 0, "backfilled": 0, "failed": 0}
     todo: list[tuple[str, str, str, object]] = []
     for session_uuid, source_path, slug in rows:
         stats["scanned"] += 1
@@ -237,11 +276,17 @@ def main() -> int:
         if facts.closed:
             stats["closed"] += 1
             continue
+        if (f"backfill-{session_uuid}" in logged_ids
+                or (facts.conversation_uuid
+                    and facts.conversation_uuid in logged_ids)):
+            stats["already_logged"] += 1
+            continue
         stats["unclosed"] += 1
         if len(todo) < args.limit:
             todo.append((session_uuid, source_path, slug, facts))
 
     print(f"scan: {stats['scanned']} sessions — {stats['closed']} closed, "
+          f"{stats['already_logged']} already-backfilled, "
           f"{stats['unclosed']} unclosed, {stats['missing_file']} file-gone",
           flush=True)
     if args.report:
@@ -269,8 +314,13 @@ def main() -> int:
             prompt = PROMPT_HEADER.format(
                 schema=json.dumps(PAYLOAD_SCHEMA), breadcrumbs=crumbs, tail=tail)
             runner = {"ollama": run_ollama, "codex": run_codex,
+                      "openai": run_openai,
                       "openrouter": run_openrouter}[args.backend]
             payload = _validate(runner(prompt, model) or {})
+            if not payload and args.backend == "openai" and model == "gpt-5.6-luna":
+                # Quality ladder: luna is the cheap default; a validation
+                # failure escalates that ONE session to terra before giving up.
+                payload = _validate(run_openai(prompt, "gpt-5.6-terra") or {})
             if not payload:
                 stats["failed"] += 1
                 print(f"  {session_uuid[:8]}: model produced no valid payload",
