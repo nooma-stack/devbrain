@@ -59,7 +59,8 @@ from pathlib import Path
 import psycopg2
 
 from config import DATABASE_URL, OLLAMA_URL
-from session_closure import extract_text, parse_transcript
+from session_closure import (extract_text, extract_usf_text, parse_transcript,
+                             parse_usf)
 
 PAYLOAD_SCHEMA = {
     "type": "object",
@@ -249,7 +250,7 @@ def main() -> int:
         where.append("p.slug = %s")
         params.append(args.project)
     cur.execute(
-        f"""SELECT rs.session_id, rs.source_path, p.slug
+        f"""SELECT rs.id, rs.session_id, rs.source_path, p.slug
             FROM devbrain.raw_sessions rs
             JOIN devbrain.projects p ON rs.project_id = p.id
             WHERE {' AND '.join(where)}
@@ -264,15 +265,26 @@ def main() -> int:
     cur.execute("SELECT session_id FROM devbrain.end_session_log")
     logged_ids = {r[0] for r in cur.fetchall()}
 
-    stats = {"scanned": 0, "closed": 0, "unclosed": 0, "missing_file": 0,
+    stats = {"scanned": 0, "closed": 0, "unclosed": 0, "from_db_copy": 0,
              "already_logged": 0, "backfilled": 0, "failed": 0}
     todo: list[tuple[str, str, str, object]] = []
-    for session_uuid, source_path, slug in rows:
+    for row_id, session_uuid, source_path, slug in rows:
         stats["scanned"] += 1
-        if not source_path or not Path(source_path).exists():
-            stats["missing_file"] += 1
-            continue
-        facts = parse_transcript(source_path)
+        if source_path and Path(source_path).exists():
+            facts = parse_transcript(source_path)
+        else:
+            # Transcript pruned from disk (Claude Code retention) — fall
+            # back to the USF copy in raw_sessions.raw_content, which
+            # preserves tool calls and therefore has full closure parity.
+            # Fetched lazily per row: raw_content is large.
+            cur.execute("SELECT raw_content FROM devbrain.raw_sessions "
+                        "WHERE id = %s", (row_id,))
+            raw = (cur.fetchone() or [None])[0]
+            if not raw:
+                continue
+            stats["from_db_copy"] += 1
+            facts = parse_usf(raw)
+            source_path = None  # signals the USF extraction path below
         if facts.closed:
             stats["closed"] += 1
             continue
@@ -284,10 +296,12 @@ def main() -> int:
         stats["unclosed"] += 1
         if len(todo) < args.limit:
             todo.append((session_uuid, source_path, slug, facts))
+            continue
 
     print(f"scan: {stats['scanned']} sessions — {stats['closed']} closed, "
           f"{stats['already_logged']} already-backfilled, "
-          f"{stats['unclosed']} unclosed, {stats['missing_file']} file-gone",
+          f"{stats['unclosed']} unclosed "
+          f"(of which {stats['from_db_copy']} via DB copy, file gone)",
           flush=True)
     if args.report:
         return 0
@@ -298,6 +312,12 @@ def main() -> int:
         t0 = time.time()
         try:
             if args.backend == "resume":
+                if not source_path:
+                    stats["failed"] += 1
+                    print(f"  {session_uuid[:8]}: resume needs the transcript "
+                          "file; use a model backend for DB-copy rows",
+                          flush=True)
+                    continue
                 ok = run_resume(session_uuid, "")
                 print(f"  resume {session_uuid[:8]}: "
                       f"{'ok' if ok else 'FAILED'} ({time.time()-t0:.0f}s)",
@@ -308,9 +328,17 @@ def main() -> int:
             crumbs = "\n\n".join(
                 f"[checkpoint] {c.get('title', '')}\n{c.get('content', '')}"
                 for c in facts.breadcrumbs) or "(none recorded)"
-            tail = extract_text(source_path,
-                                from_line=facts.last_breadcrumb_line or 0,
-                                head_tail_chars=BUDGETS[args.backend])
+            if source_path:
+                tail = extract_text(source_path,
+                                    from_line=facts.last_breadcrumb_line or 0,
+                                    head_tail_chars=BUDGETS[args.backend])
+            else:
+                cur.execute("SELECT raw_content FROM devbrain.raw_sessions "
+                            "WHERE session_id = %s LIMIT 1", (session_uuid,))
+                raw = (cur.fetchone() or [""])[0] or ""
+                tail = extract_usf_text(raw,
+                                        from_index=facts.last_breadcrumb_line or 0,
+                                        head_tail_chars=BUDGETS[args.backend])
             prompt = PROMPT_HEADER.format(
                 schema=json.dumps(PAYLOAD_SCHEMA), breadcrumbs=crumbs, tail=tail)
             runner = {"ollama": run_ollama, "codex": run_codex,
