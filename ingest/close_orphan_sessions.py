@@ -267,9 +267,15 @@ def main() -> int:
 
     stats = {"scanned": 0, "closed": 0, "unclosed": 0, "from_db_copy": 0,
              "already_logged": 0, "backfilled": 0, "failed": 0}
-    todo: list[tuple[str, str, str, object]] = []
+    todo: list[tuple[str, str, str | None, str, object]] = []
     for row_id, session_uuid, source_path, slug in rows:
         stats["scanned"] += 1
+        # Older ingests carry NULL session_id (843 rows on the LHT DB);
+        # raw_sessions.id is the always-present identity. Without this
+        # fallback every NULL row would share the dedup id
+        # "backfill-None" and the first closure would mark them ALL as
+        # already-backfilled.
+        ident = session_uuid or f"row-{row_id}"
         if source_path and Path(source_path).exists():
             facts = parse_transcript(source_path)
         else:
@@ -295,7 +301,7 @@ def main() -> int:
             continue
         stats["unclosed"] += 1
         if len(todo) < args.limit:
-            todo.append((session_uuid, source_path, slug, facts))
+            todo.append((ident, str(row_id), source_path, slug, facts))
             continue
 
     print(f"scan: {stats['scanned']} sessions — {stats['closed']} closed, "
@@ -308,18 +314,18 @@ def main() -> int:
 
     from mcp_stdio_client import call_tool  # noqa: PLC0415
 
-    for session_uuid, source_path, slug, facts in todo:
+    for ident, row_id, source_path, slug, facts in todo:
         t0 = time.time()
         try:
             if args.backend == "resume":
                 if not source_path:
                     stats["failed"] += 1
-                    print(f"  {session_uuid[:8]}: resume needs the transcript "
+                    print(f"  {ident[:16]}: resume needs the transcript "
                           "file; use a model backend for DB-copy rows",
                           flush=True)
                     continue
-                ok = run_resume(session_uuid, "")
-                print(f"  resume {session_uuid[:8]}: "
+                ok = run_resume(ident, "")
+                print(f"  resume {ident[:16]}: "
                       f"{'ok' if ok else 'FAILED'} ({time.time()-t0:.0f}s)",
                       flush=True)
                 stats["backfilled" if ok else "failed"] += 1
@@ -334,7 +340,7 @@ def main() -> int:
                                     head_tail_chars=BUDGETS[args.backend])
             else:
                 cur.execute("SELECT raw_content FROM devbrain.raw_sessions "
-                            "WHERE session_id = %s LIMIT 1", (session_uuid,))
+                            "WHERE id = %s", (row_id,))
                 raw = (cur.fetchone() or [""])[0] or ""
                 tail = extract_usf_text(raw,
                                         from_index=facts.last_breadcrumb_line or 0,
