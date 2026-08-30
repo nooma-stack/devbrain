@@ -276,7 +276,7 @@ def main() -> int:
         if facts.closed:
             stats["closed"] += 1
             continue
-        if (f"backfill-{session_uuid}" in logged_ids
+        if (f"backfill-{ident}" in logged_ids
                 or (facts.conversation_uuid
                     and facts.conversation_uuid in logged_ids)):
             stats["already_logged"] += 1
@@ -323,22 +323,22 @@ def main() -> int:
                 payload = _validate(run_openai(prompt, "gpt-5.6-terra") or {})
             if not payload:
                 stats["failed"] += 1
-                print(f"  {session_uuid[:8]}: model produced no valid payload",
+                print(f"  {ident[:16]}: model produced no valid payload",
                       flush=True)
                 continue
             call_tool("end_session", {
                 "project": slug,
-                "session_id": facts.conversation_uuid or f"backfill-{session_uuid}",
+                "session_id": facts.conversation_uuid or f"backfill-{ident}",
                 **payload,
             }, env_extra={"DEVBRAIN_MCP_CLI": "closure-backfill",
                           "DEVBRAIN_PROJECT": slug})
             stats["backfilled"] += 1
-            print(f"  {session_uuid[:8]} [{slug}] backfilled via {args.backend} "
+            print(f"  {ident[:16]} [{slug}] backfilled via {args.backend} "
                   f"({time.time()-t0:.0f}s, tail from line "
                   f"{facts.last_breadcrumb_line or 0})", flush=True)
         except Exception as exc:  # keep the batch going
             stats["failed"] += 1
-            print(f"  {session_uuid[:8]}: ERROR {str(exc)[:200]}", flush=True)
+            print(f"  {ident[:16]}: ERROR {str(exc)[:200]}", flush=True)
 
     print(f"done: {stats['backfilled']} backfilled, {stats['failed']} failed",
           flush=True)
