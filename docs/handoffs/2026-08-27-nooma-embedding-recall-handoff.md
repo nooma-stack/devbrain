@@ -223,3 +223,53 @@ steady state. Compliance summary for backend choices: HIPAA PHI requires a **BAA
 sufficient (Vertex under a GCP BAA, or local, for PHI). Non-PHI: OpenRouter one-click ZDR +
 data_collection=deny, or Ollama Cloud (states transient processing, no logging/training/retention),
 or HF Inference Endpoints (no payload storage; 30-day logs; BAA available on Enterprise).
+
+
+## 11. Closure-backfill operations: measured facts + audit playbook (2026-08-31)
+
+Everything below was learned the hard way on the LHT deployment so nooma doesn't have to.
+
+### Measured facts (gpt-5.6-luna via API, `--backend openai`)
+- **Cost**: 495 full-transcript sessions = **$1.15** (~5K tokens avg/request, most input billed as
+  discounted cache-writes). The ENTIRE 1,783-session LHT history closed for roughly **$5**. The
+  luna→terra validation-failure escalation never fired once.
+- **Speed**: 33–50s per session, sequential; ~500 sessions ≈ 5–6h unattended.
+- The `openai` backend exists since #190/#194; for nooma either `openai` (metered key) or
+  `codex` (ChatGPT sub, bounded) is fine — the BAA constraint is LHT-specific.
+
+### Data hazards the worker now handles (but know they exist)
+1. **Pre-USF plain-text era** (#194): older `raw_content` is extracted TEXT, not USF JSON — 998 rows
+   on LHT. The USF extractor returned "" for them and a whole run paid to summarize blank pages
+   (741 junk "the transcript was empty" summaries). The worker now feeds plain text directly AND has
+   a hard guard: **no source text → skip and report, never bill**. Nooma almost certainly has its own
+   pre-USF stratum — expect it.
+2. **NULL session_id rows** (#193): 843 on LHT. Identity falls back to `row-<raw_sessions.id>`;
+   without it every NULL row shares one dedup id and the first closure marks them all done.
+3. **Backfilled transcripts never gain the end_session tool_use** (#190): the scanner must consult
+   `end_session_log` or it re-backfills forever. Already wired; do not "simplify" it away.
+
+### Audit playbook — run this after EVERY bulk backfill
+- **A suspiciously cheap run means blank inputs, not efficiency.** The 741-junk run was flagged
+  because it cost LESS than a smaller run. Cheap bills deserve the same suspicion as big ones.
+- **Output side**: count junk-pattern summaries in the run window
+  (`content ILIKE '%cannot be determined%' / '%transcript%empty%' / '%no actionable work%'` etc.)
+  and check avg summary length per time bucket. Healthy cohorts on LHT: ~3,600–3,900 chars avg,
+  ≤5% junk-pattern (those few = honest reports on genuinely tiny sessions).
+- **Input side (deterministic, no model calls)**: recompute `extract_text`/`extract_usf_text` for the
+  cohort and bucket lengths — `<100ch` should be ZERO now that the guard exists.
+- **Never audit by time-window sampling** — cohorts overlap and it convicts the wrong run. Since #195
+  every summary chunk carries `metadata.session_id` + `metadata.cli`, so summary→session→author is
+  one join. Use it.
+- **Junk cleanup recipe** (if a bad batch ever lands): soft-archive the junk memory rows
+  (`SET archived_at = now()` — search excludes archived; never hard-delete), then delete the
+  matching `end_session_log` rows (`cli='closure-backfill'`, `session_id = 'backfill-' ||
+  coalesce(session_id, 'row-'||id)`) so the dedup guard lets those sessions redo.
+
+### Process lessons (for any agent editing this repo)
+- **Assert every mechanical string-replace** (`assert src.count(old) == 1`). PR #192 shipped from a
+  stale base with unasserted replaces: half no-op'd, half applied, and main briefly used an undefined
+  variable. #193 is the repair; the pattern is the lesson.
+- **Re-fetch and verify the branch base immediately before branching**, and treat an unexpected TEST
+  COUNT as a stale-base alarm (5 tests where 7 exist = wrong base).
+- After any bulk data operation, verify the scanner's own counters
+  (`closed / already-backfilled / unclosed / from_db_copy`) tell the story you expect.
