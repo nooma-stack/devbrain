@@ -53,12 +53,21 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 import psycopg2
 
 from config import DATABASE_URL, OLLAMA_URL
+
+
+class RateLimited(RuntimeError):
+    """Provider 429 — carries the server-suggested wait when given."""
+
+    def __init__(self, retry_after_s: int):
+        super().__init__(f"rate limited (retry after ~{retry_after_s}s)")
+        self.retry_after_s = retry_after_s
 from session_closure import (extract_text, extract_usf_text, parse_transcript,
                              parse_usf)
 
@@ -170,8 +179,17 @@ def run_openai(prompt: str, model: str) -> dict | None:
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json",
                  "Authorization": f"Bearer {key}"})
-    with urllib.request.urlopen(req, timeout=1800) as r:
-        data = json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=1800) as r:
+            data = json.loads(r.read())
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            try:
+                retry_after = int(exc.headers.get("Retry-After", "120"))
+            except (TypeError, ValueError):
+                retry_after = 120
+            raise RateLimited(min(retry_after, 900)) from exc
+        raise
     text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "")
     return _salvage_json(text)
 
@@ -321,6 +339,11 @@ def main() -> int:
 
     from mcp_stdio_client import call_tool  # noqa: PLC0415
 
+    # 2026-08-31: a daily-tier 429 window burned through 448 queued
+    # sessions as instant failures. Rate limits now retry with backoff
+    # and, when persistent, ABORT the run — the dedup guard makes the
+    # remainder free to pick up on the next invocation.
+    consecutive_429 = 0
     for ident, row_id, source_path, slug, facts in todo:
         t0 = time.time()
         try:
@@ -374,7 +397,29 @@ def main() -> int:
             runner = {"ollama": run_ollama, "codex": run_codex,
                       "openai": run_openai,
                       "openrouter": run_openrouter}[args.backend]
-            payload = _validate(runner(prompt, model) or {})
+            payload = None
+            for attempt in range(3):
+                try:
+                    payload = _validate(runner(prompt, model) or {})
+                    consecutive_429 = 0
+                    break
+                except RateLimited as rl:
+                    wait = max(rl.retry_after_s, 60 * (attempt + 1))
+                    print(f"  {ident[:16]}: 429 — waiting {wait}s "
+                          f"(attempt {attempt + 1}/3)", flush=True)
+                    time.sleep(wait)
+            else:
+                consecutive_429 += 1
+                stats["failed"] += 1
+                print(f"  {ident[:16]}: still rate-limited after retries",
+                      flush=True)
+                if consecutive_429 >= 2:
+                    print("ABORTING RUN: provider quota appears exhausted "
+                          "(persistent 429). Re-run after the quota window "
+                          "resets — completed sessions are dedup-guarded.",
+                          flush=True)
+                    break
+                continue
             if not payload and args.backend == "openai" and model == "gpt-5.6-luna":
                 # Quality ladder: luna is the cheap default; a validation
                 # failure escalates that ONE session to terra before giving up.
