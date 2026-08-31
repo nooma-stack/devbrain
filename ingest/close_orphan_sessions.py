@@ -289,8 +289,15 @@ def main() -> int:
             if not raw:
                 continue
             stats["from_db_copy"] += 1
+            # 998 pre-USF rows on the LHT DB store raw_content as PLAIN
+            # TEXT, not USF JSON. parse_usf returns empty facts for those
+            # — which is fine (closure falls back to the end_session_log
+            # guard) — but the TEXT ITSELF is the extracted transcript
+            # and must be fed to the model as-is, not run through the
+            # JSON extractor (which returns "" and produced 741 paid
+            # 'the transcript was empty' summaries on 2026-08-30).
             facts = parse_usf(raw)
-            source_path = None  # signals the USF extraction path below
+            source_path = None  # signals the DB-copy extraction path below
         if facts.closed:
             stats["closed"] += 1
             continue
@@ -342,9 +349,26 @@ def main() -> int:
                 cur.execute("SELECT raw_content FROM devbrain.raw_sessions "
                             "WHERE id = %s", (row_id,))
                 raw = (cur.fetchone() or [""])[0] or ""
-                tail = extract_usf_text(raw,
-                                        from_index=facts.last_breadcrumb_line or 0,
-                                        head_tail_chars=BUDGETS[args.backend])
+                if raw.lstrip().startswith("{"):
+                    tail = extract_usf_text(
+                        raw, from_index=facts.last_breadcrumb_line or 0,
+                        head_tail_chars=BUDGETS[args.backend])
+                else:
+                    # Pre-USF era: raw_content IS the extracted text.
+                    text = raw
+                    budget = BUDGETS[args.backend]
+                    if len(text) > budget:
+                        half = budget // 2
+                        text = (text[:half]
+                                + "\n\n[... middle elided for length ...]\n\n"
+                                + text[-half:])
+                    tail = text
+            if not tail.strip():
+                stats["failed"] += 1
+                print(f"  {ident[:16]}: no source text available — skipping "
+                      "instead of paying for an empty-transcript summary",
+                      flush=True)
+                continue
             prompt = PROMPT_HEADER.format(
                 schema=json.dumps(PAYLOAD_SCHEMA), breadcrumbs=crumbs, tail=tail)
             runner = {"ollama": run_ollama, "codex": run_codex,
