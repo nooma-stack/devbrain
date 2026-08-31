@@ -1064,6 +1064,14 @@ server.tool(
         issues_found: issues_found ?? [],
         next_steps: next_steps ?? [],
         timestamp: new Date().toISOString(),
+        // Provenance back-links (2026-08-31): without these, auditing
+        // "which session does this summary belong to / who wrote it"
+        // is time-window forensics. session_id is the caller-supplied
+        // chain id (always present for closure backfills and for agents
+        // following the start_session convention; null for bare calls,
+        // which matches the auto-generated-id behavior downstream).
+        session_id: session_id ?? null,
+        cli: process.env.DEVBRAIN_MCP_CLI || null,
       })],
     )
 
