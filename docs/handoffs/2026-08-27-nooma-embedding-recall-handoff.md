@@ -331,3 +331,15 @@ LHT repair (mirror on nooma if human alerting is wanted there):
 - Division of labor with the courier/devplane layer: courier reaches AGENT SESSIONS
   (SendMessage/bridge); gmail_dwd reaches HUMANS. They complement, not supersede, each other —
   the brain doctor uses notify_cli→gmail_dwd for humans and the get_project_context banner for agents.
+
+
+### §12 addendum 2: devplane_msg channel — desk delivery, verified (2026-09-02)
+
+`notifications/channels/devplane_msg.py` (PR #203) posts person-addressed messages to devplane's
+messaging centre; the per-machine courier daemons deliver them as visible cards in the recipient's
+LIVE Claude sessions. Verified end-to-end: a Studio-fired doctor test traversed
+notify_cli → devplane thread → laptop courier → arrived as a message card inside an active session
+within ~30s. Config: yaml `notifications.channels.devplane_msg` {enabled, url, token, agent_code}
+with DEVPLANE_* env fallbacks; register per dev as `devplane_msg:<handle>`. OPERATIONAL TEXT ONLY —
+devplane is pointer/metadata territory (courier spec §2), never PHI bodies. The full doctor alert
+fan-out is now: log → agent banner (get_project_context) → gmail_dwd email → devplane_msg desk card.
