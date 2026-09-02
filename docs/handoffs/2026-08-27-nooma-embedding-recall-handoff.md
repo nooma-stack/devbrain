@@ -343,3 +343,19 @@ within ~30s. Config: yaml `notifications.channels.devplane_msg` {enabled, url, t
 with DEVPLANE_* env fallbacks; register per dev as `devplane_msg:<handle>`. OPERATIONAL TEXT ONLY —
 devplane is pointer/metadata territory (courier spec §2), never PHI bodies. The full doctor alert
 fan-out is now: log → agent banner (get_project_context) → gmail_dwd email → devplane_msg desk card.
+
+
+### §12 addendum 3: team-wide desk channels + handle validation (2026-09-02)
+
+All four humans now carry `gmail_dwd` (email) + `devplane_msg` (desk) channels:
+patrickkelly→patrick, mark_wallenwine→mark, mike_courtney→mike, jonathan→jonathan.
+
+- **Handle validation for free**: devplane refuses unknown recipients loudly (404 `unknown_handle`)
+  and the refusal body lists every registered human/agent handle — so one send to a deliberately
+  invalid handle validates the whole roster with zero messages delivered. Use this before wiring
+  any new `devplane_msg` address.
+- **Receiver-confirmation status**: patrick's desk leg is receiver-verified. mark/mike/jonathan are
+  configured-and-addressed but unconfirmed until a real message lands; Mike and Jonathan are on
+  Windows where the courier build is still planned (spec §3.3), so their desk messages rest in the
+  devplane inbox/board and the EMAIL leg carries their alerts meanwhile. Router records loud
+  failures now, so a broken leg shows up in `channels_attempted/delivered` rather than silence.
