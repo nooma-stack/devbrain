@@ -308,3 +308,26 @@ Nooma install (mirrors the LHT Studio):
 3. Run `brain_doctor.py` once by hand and expect 9/9 PASS as the baseline; investigate any FAIL
    before trusting the cadence. LHT baseline on install day: drift 1.00000, self-recall 20/20,
    junk 2%, all passes on cadence.
+
+
+### §12 addendum: the notification channels were doubly dead — repair steps (2026-09-02)
+
+Patrick suspected the notify channels didn't work; he was right, twice over:
+1. **Nothing was enabled**: `notifications.channels.<type>.enabled` in `config/devbrain.yaml` is
+   required per channel, and the stanza didn't exist — the router silently skipped everything.
+2. **The registered type `"email"` doesn't exist**: registry names are `gmail_dwd`, `smtp`, `tmux`,
+   `telegram_bot`, `webhook_*`. Devs registered with `type: email` (Patrick, Mark, Mike, Jonathan)
+   were "Unknown channel type" — skipped without error for months.
+
+LHT repair (mirror on nooma if human alerting is wanted there):
+- yaml: `notifications.channels.gmail_dwd: {enabled: true, service_account_path: <SA json>,
+  sender_email: brightbot@..., sender_display_name: BrightBrain}` (+ `tmux: {enabled: true}`).
+- DB: `UPDATE devbrain.devs SET channels = replace(channels::text, '"type": "email"',
+  '"type": "gmail_dwd"')::jsonb WHERE ...` (4 devs fixed).
+- Verified END-TO-END: notify_cli → `attempted=gmail_dwd delivered=gmail_dwd` → real email
+  confirmed in the sender's Sent folder. **A notification path is not "configured" until a test
+  message has been received** — router skips are silent by design, so absence of errors proves
+  nothing.
+- Division of labor with the courier/devplane layer: courier reaches AGENT SESSIONS
+  (SendMessage/bridge); gmail_dwd reaches HUMANS. They complement, not supersede, each other —
+  the brain doctor uses notify_cli→gmail_dwd for humans and the get_project_context banner for agents.
