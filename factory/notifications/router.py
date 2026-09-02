@@ -25,6 +25,7 @@ import notifications.channels.telegram_bot  # noqa: F401
 import notifications.channels.webhook_slack  # noqa: F401
 import notifications.channels.webhook_discord  # noqa: F401
 import notifications.channels.webhook_generic  # noqa: F401
+import notifications.channels.devplane_msg  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
