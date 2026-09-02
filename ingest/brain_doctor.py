@@ -29,6 +29,7 @@ Exit code = number of FAILs. Run daily via launchd (template alongside).
 from __future__ import annotations
 
 import json
+import os
 import random
 import subprocess
 import sys
@@ -238,6 +239,27 @@ def main() -> int:
                VALUES (NULL, 'health_check_failed', %s, %s, '{log}', '{log}', now())""",
             (f"brain doctor: {len(fails)} check(s) FAILING",
              "\n".join(fails)))
+        # Real human delivery: route through the same channel machinery the
+        # factory uses (tmux/email/chat/telegram per each dev's registration).
+        # Recipients via DEVBRAIN_DOCTOR_NOTIFY (comma-separated dev_ids).
+        import tempfile  # noqa: PLC0415
+        recipients = [r.strip() for r in
+                      os.environ.get("DEVBRAIN_DOCTOR_NOTIFY", "").split(",")
+                      if r.strip()]
+        notify_cli = Path(DEVBRAIN_HOME) / "factory" / "notify_cli.py"
+        for dev in recipients:
+            try:
+                with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as tf:
+                    tf.write(f"brain doctor: {len(fails)} check(s) FAILING")
+                    title_f = tf.name
+                with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as bf:
+                    bf.write("\n".join(fails))
+                    body_f = bf.name
+                subprocess.run([sys.executable, str(notify_cli), dev,
+                                "needs_human", title_f, body_f],
+                               capture_output=True, timeout=120)
+            except Exception as exc:
+                print(f"notify {dev} failed: {str(exc)[:100]}", flush=True)
     return len(fails)
 
 

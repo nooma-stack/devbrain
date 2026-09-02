@@ -220,6 +220,33 @@ server.tool(
       return { content: [{ type: 'text', text: `Project "${slug}" not found in DevBrain.` }] }
     }
 
+    // System-health banner: surface the brain doctor's latest verdict to
+    // EVERY session automatically. Agents should not need to know a
+    // monitoring system exists to benefit from it — a failing memory
+    // system announces itself at the moment an agent starts using it.
+    let healthBanner = ''
+    try {
+      const docLog = resolve(import.meta.dirname, '../../logs/brain-doctor.log')
+      const raw = readFileSync(docLog, 'utf-8')
+      const blocks = raw.split('=== brain doctor ')
+      const last = blocks[blocks.length - 1] ?? ''
+      const stampLine = last.split('\n')[0] ?? ''
+      const fails = last.split('\n').filter((l) => l.startsWith('FAIL'))
+      const warns = last.split('\n').filter((l) => l.startsWith('WARN'))
+      const ageMs = Date.now() - new Date(stampLine.replace(' ===', '').replace(' ', 'T').replace('Z', ':00Z')).getTime()
+      if (fails.length > 0) {
+        healthBanner = `\n\n## ⚠ SYSTEM HEALTH — BRAIN DOCTOR FAILING (${stampLine.replace(' ===', '')})\n`
+          + fails.join('\n')
+          + '\nMemory quality may be degraded. See logs/brain-doctor.log and the handoff doc §12 before trusting recall-sensitive work.'
+      } else if (Number.isFinite(ageMs) && ageMs > 48 * 3600 * 1000) {
+        healthBanner = `\n\n## ⚠ SYSTEM HEALTH — brain doctor has not run since ${stampLine.replace(' ===', '')} (stale >48h); the launchd job may be dead.`
+      } else if (warns.length > 0) {
+        healthBanner = `\n\n## System health: PASS with warnings (${stampLine.replace(' ===', '')})\n` + warns.join('\n')
+      }
+    } catch {
+      // No doctor log yet (fresh install) — stay silent rather than noisy.
+    }
+
     // P2.d.i: decisions/issues/patterns now read from devbrain.memory.
     // The legacy tables (decisions/issues/patterns) carry richer
     // schemas (status, rationale, category, fix_applied, name) that
@@ -270,7 +297,7 @@ server.tool(
     return {
       content: [{
         type: 'text',
-        text: JSON.stringify(ctx, null, 2),
+        text: JSON.stringify(ctx, null, 2) + healthBanner,
       }],
     }
   },
