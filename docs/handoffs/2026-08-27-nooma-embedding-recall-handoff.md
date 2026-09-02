@@ -273,3 +273,21 @@ Everything below was learned the hard way on the LHT deployment so nooma doesn't
   COUNT as a stale-base alarm (5 tests where 7 exist = wrong base).
 - After any bulk data operation, verify the scanner's own counters
   (`closed / already-backfilled / unclosed / from_db_copy`) tell the story you expect.
+
+
+### Final LHT completion stats + two late lessons (2026-09-02)
+
+- **History fully closed**: 1,935 sessions — 138 agent-closed, 1,796 backfilled, ~0 unclosed
+  (only whatever arrived inside the settle window). Total API spend ≈ **$3.50** for ~1,800
+  full-transcript closures. Luna handled everything; the terra escalation never fired across the
+  entire project.
+- **429 has two species — read the error body before scheduling retries.** Rate limits
+  (`rate_limit_error`) want backoff/waiting; `insufficient_quota` / `credit_balance_exhausted`
+  means the org's PREPAID CREDIT BALANCE is empty and no amount of waiting helps — a human must
+  add credits. The monthly budget cap shown on the usage dashboard is NOT the credit balance.
+  The worker's abort-on-persistent-429 handles both safely (#197), but diagnosis differs.
+- **Junk-pattern audits produce false positives.** An honest summary may legitimately contain
+  "could not be verified" or "insufficient information" in its issues list. Before archiving on a
+  pattern match, bucket by time cohort and SAMPLE — only archive matches inside a known-sick
+  window. On LHT: 741 + 81 junk archived across two sweeps; 60+ pattern matches outside the sick
+  windows were genuine summaries and were left alone.
