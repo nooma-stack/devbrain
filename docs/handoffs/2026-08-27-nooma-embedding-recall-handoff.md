@@ -291,3 +291,20 @@ Everything below was learned the hard way on the LHT deployment so nooma doesn't
   pattern match, bucket by time cohort and SAMPLE — only archive matches inside a known-sick
   window. On LHT: 741 + 81 junk archived across two sweeps; 60+ pattern matches outside the sick
   windows were genuine summaries and were left alone.
+
+
+## 12. Routine health checks — install on nooma too (2026-09-02)
+
+Every §1–§11 failure was originally caught by ACCIDENT. `ingest/brain_doctor.py` mechanizes them:
+nine daily checks (embedding drift, ANN self-recall, index validity, junk-summary rate,
+ingest/cognify liveness, orphan backlog, summary coverage, worker quota). FAILs insert a
+`devbrain.notifications` row and everything appends to `logs/brain-doctor.log`.
+
+Nooma install (mirrors the LHT Studio):
+1. `cp ingest/launchd/com.devbrain.{closure-scanner,brain-doctor}.plist ~/Library/LaunchAgents/ && launchctl load` both.
+2. Write `~/.config/devbrain/closure.env` (chmod 600) with `DEVBRAIN_CLOSURE_REMOTE_OK=1` and either
+   `OPENAI_API_KEY=...` directly or `GOOGLE_APPLICATION_CREDENTIALS` for Secret-Manager fetch; or set
+   `CLOSURE_BACKEND=codex` to ride the ChatGPT sub.
+3. Run `brain_doctor.py` once by hand and expect 9/9 PASS as the baseline; investigate any FAIL
+   before trusting the cadence. LHT baseline on install day: drift 1.00000, self-recall 20/20,
+   junk 2%, all passes on cadence.
