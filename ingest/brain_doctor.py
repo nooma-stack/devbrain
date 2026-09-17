@@ -236,7 +236,7 @@ def main() -> int:
             """INSERT INTO devbrain.notifications
                (recipient_dev_id, event_type, title, body, channels_attempted,
                 channels_delivered, sent_at)
-               VALUES (NULL, 'health_check_failed', %s, %s, '{log}', '{log}', now())""",
+               VALUES (NULL, 'health_check_failed', %s, %s, '["log"]'::jsonb, '["log"]'::jsonb, now())""",
             (f"brain doctor: {len(fails)} check(s) FAILING",
              "\n".join(fails)))
         # Real human delivery: route through the same channel machinery the
