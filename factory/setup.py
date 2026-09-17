@@ -2210,8 +2210,13 @@ def setup_add_dev(
     from config import (
         DATABASE_URL,
         DEVBRAIN_HOME as _DEVBRAIN_HOME,
+        ONBOARDING_ADMIN_CONTACT,
+        ONBOARDING_ORGANIZATION_NAME,
+        ONBOARDING_SENDER_DESCRIPTION,
         ONBOARDING_SSH_HOST,
         ONBOARDING_SSH_PORT,
+        ONBOARDING_SSH_USER,
+        ONBOARDING_WORKSPACE_NAME,
     )
 
     _header("Onboard a new dev")
@@ -2459,8 +2464,13 @@ def finalize_invitation_and_kit(
     from config import (
         DATABASE_URL,
         DEVBRAIN_HOME as _DEVBRAIN_HOME,
+        ONBOARDING_ADMIN_CONTACT,
+        ONBOARDING_ORGANIZATION_NAME,
+        ONBOARDING_SENDER_DESCRIPTION,
         ONBOARDING_SSH_HOST,
         ONBOARDING_SSH_PORT,
+        ONBOARDING_SSH_USER,
+        ONBOARDING_WORKSPACE_NAME,
     )
 
     _echo = echo or (lambda *_a, **_k: None)
@@ -2573,7 +2583,12 @@ def finalize_invitation_and_kit(
         bootstrap_expiry=bootstrap_expires,
         ssh_host=ONBOARDING_SSH_HOST,
         ssh_port=ONBOARDING_SSH_PORT,
+        ssh_user=ONBOARDING_SSH_USER,
         ssh_host_fingerprint=ssh_host_fingerprint,
+        organization_name=ONBOARDING_ORGANIZATION_NAME,
+        workspace_name=ONBOARDING_WORKSPACE_NAME,
+        sender_description=ONBOARDING_SENDER_DESCRIPTION,
+        admin_contact=ONBOARDING_ADMIN_CONTACT,
         cli=cli,
         platform=platform,
         agent_app=agent_app,

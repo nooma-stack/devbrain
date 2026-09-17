@@ -22,6 +22,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+from config import ONBOARDING_ORGANIZATION_NAME, ONBOARDING_WORKSPACE_NAME
+
 logger = logging.getLogger(__name__)
 
 _CLI_DISPLAY_NAMES: dict[str, str] = {
@@ -89,10 +91,10 @@ work the same way — just paste the kit's contents at the prompt.
 """
 
 
-_EMAIL_TEMPLATE = """Welcome to BrightBot, {first_name}!
+_EMAIL_TEMPLATE = """Welcome to {workspace_name}, {first_name}!
 
-You've been invited to join the BrightBot dev factory — Lighthouse
-Therapy's multi-AI-agent automation pipeline that drafts, implements,
+You've been invited to join the {workspace_name} dev factory —
+{organization_name}'s multi-AI-agent automation pipeline that drafts, implements,
 reviews, and QAs feature work using YOUR {cli_display_name} subscription,
 attributed to YOUR git identity.
 
@@ -213,9 +215,14 @@ def send_onboarding_email(
         drop_instruction=drop_instruction,
         admin_name=admin_name,
         admin_contact=admin_contact,
+        organization_name=ONBOARDING_ORGANIZATION_NAME,
+        workspace_name=ONBOARDING_WORKSPACE_NAME,
     )
 
-    title = f"Welcome to BrightBot — your DevBrain onboarding kit ({cli_display_name})"
+    title = (
+        f"Welcome to {ONBOARDING_WORKSPACE_NAME} — "
+        f"your DevBrain onboarding kit ({cli_display_name})"
+    )
 
     # Rename the kit file to the canonical attachment name if it differs.
     if kit_path.name != kit_filename:

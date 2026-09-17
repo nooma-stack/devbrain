@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.devbrain.tunnel-soho-vps</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/autossh</string>
+    <string>-M</string>
+    <string>0</string>
+    <string>-N</string>
+    <string>-R</string>
+    <string>0.0.0.0:2223:localhost:22</string>
+    <string>-i</string>
+    <string>/Users/patrickkelly/.ssh/devbrain-soho-vps-tunnel</string>
+    <string>-o</string>
+    <string>ServerAliveInterval=30</string>
+    <string>-o</string>
+    <string>ServerAliveCountMax=3</string>
+    <string>-o</string>
+    <string>ExitOnForwardFailure=yes</string>
+    <string>-o</string>
+    <string>StrictHostKeyChecking=accept-new</string>
+    <string>-o</string>
+    <string>UserKnownHostsFile=/Users/patrickkelly/.ssh/known_hosts</string>
+    <string>devbrain-tunnel@2.24.99.121</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AUTOSSH_GATETIME</key>
+    <string>0</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/patrickkelly/.devbrain/logs/tunnel-soho-vps.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/patrickkelly/.devbrain/logs/tunnel-soho-vps.err</string>
+</dict>
+</plist>

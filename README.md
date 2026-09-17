@@ -39,6 +39,14 @@ DevBrain solves this as shared infrastructure:
 
 ## Quick start
 
+For off-LAN teammate onboarding, set `onboarding.ssh_user`,
+`onboarding.ssh_host`, and `onboarding.ssh_port` in
+`config/devbrain.yaml` (or the matching `DEVBRAIN_ONBOARD_*` environment
+variables). Production Mac Studio deployments typically use a restricted,
+outbound-only reverse SSH tunnel to a fixed-IP VPS; generated onboarding kits
+then use that public endpoint without exposing PostgreSQL or Ollama. The
+onboarding webhook remains loopback-only on `127.0.0.1:8000` by default.
+
 **One-liner install** (macOS or Linux):
 
 ```bash

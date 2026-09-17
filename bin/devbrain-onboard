@@ -58,6 +58,7 @@ export PGDATABASE="${PGDATABASE:-${DEVBRAIN_DB_NAME:-devbrain}}"
 export BIND_HOST="${DEVBRAIN_ONBOARD_HOST:-127.0.0.1}"
 export BIND_PORT="${DEVBRAIN_ONBOARD_PORT:-8000}"
 export LOG_LEVEL="${DEVBRAIN_ONBOARD_LOG_LEVEL:-INFO}"
+ONBOARD_PYTHON="${DEVBRAIN_ONBOARD_PYTHON:-$DEVBRAIN_DIR/.venv/bin/python}"
 
 if [[ -z "$PGPASSWORD" ]]; then
     echo "Error: DEVBRAIN_DB_PASSWORD not set in $DEVBRAIN_DIR/.env" >&2
@@ -65,4 +66,4 @@ if [[ -z "$PGPASSWORD" ]]; then
 fi
 
 cd "$DEVBRAIN_DIR/factory"
-exec "$DEVBRAIN_DIR/.venv/bin/python" onboard_webhook.py
+exec "$ONBOARD_PYTHON" onboard_webhook.py
