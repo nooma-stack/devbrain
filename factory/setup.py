@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -1882,6 +1883,222 @@ def setup_pkrelay() -> None:
         _info("Install manually from github.com/nooma-stack/pkrelay")
 
 
+def setup_resilience() -> None:
+    """Interactively install or reconfigure the local resilience service."""
+    _header("Resilience / self-healing (optional)")
+    _desc(
+        "The local service checks the container runtime, PostgreSQL, Ollama,",
+        "ingest, and disk space, then performs bounded recovery actions.",
+        "It works without a VPS and does not expose DevBrain to the internet.",
+    )
+    click.echo()
+    _desc("Optional integrations (all disabled unless you select them):")
+    _desc("  • Heartbeat — sends signed health reports to an HTTPS endpoint")
+    _desc("  • Tunnel check — watches an existing launchd/systemd tunnel")
+    _desc("  • Agent-bus check — probes an existing local or remote agent-bus")
+    _desc("  • Backup freshness — watches output from an existing backup job")
+    _desc("  • Signed medic — accepts expiring status/diagnose tasks; healing")
+    _desc("    additionally requires two distinct signatures and named checks")
+    _desc("You can use local self-healing without configuring any of these.")
+    click.echo()
+
+    script = DEVBRAIN_HOME / "scripts" / "install-resilience.sh"
+    if not script.exists():
+        _warn(f"Cannot find {script}")
+        _info("Update DevBrain, then re-run 'devbrain setup resilience'.")
+        return
+
+    manifest = Path.home() / ".devbrain" / "resilience" / "install-manifest.json"
+    verb = "Reconfigure" if manifest.exists() else "Install"
+    if not _confirm(f"{verb} the resilience service?", default=True):
+        _info("Skipped. No resilience settings were changed.")
+        return
+
+    profile_default = "workstation"
+    runtime_default = ""
+    if manifest.exists():
+        try:
+            existing = json.loads(manifest.read_text())
+            if existing.get("profile") in {"workstation", "studio"}:
+                profile_default = existing["profile"]
+            if existing.get("container_runtime") in {
+                "colima", "docker-desktop", "docker-engine", "orbstack"
+            }:
+                runtime_default = existing["container_runtime"]
+        except (OSError, json.JSONDecodeError):
+            _warn("Existing manifest is unreadable; using safe defaults.")
+
+    profile = _prompt(
+        "Deployment profile",
+        default=profile_default,
+        type=click.Choice(["workstation", "studio"], case_sensitive=False),
+    )
+    if not runtime_default:
+        if platform.system() != "Darwin":
+            runtime_default = "docker-engine"
+        elif profile == "studio":
+            runtime_default = "colima"
+        elif Path("/Applications/OrbStack.app").exists():
+            runtime_default = "orbstack"
+        elif shutil.which("colima"):
+            runtime_default = "colima"
+        else:
+            runtime_default = "docker-desktop"
+    runtime = _prompt(
+        "Container runtime",
+        default=runtime_default,
+        type=click.Choice(
+            ["docker-desktop", "docker-engine", "colima", "orbstack"],
+            case_sensitive=False,
+        ),
+    )
+
+    args = [
+        "bash",
+        str(script),
+        "--profile", profile,
+        "--container-runtime", runtime,
+    ]
+
+    if _confirm("Enable an external heartbeat?", default=False):
+        heartbeat_url = _prompt(
+            "Heartbeat HTTPS URL",
+            default=os.environ.get("DEVBRAIN_HEARTBEAT_URL", ""),
+        ).strip()
+        if not heartbeat_url:
+            raise click.ClickException(
+                "A heartbeat URL is required when heartbeat is enabled."
+            )
+        heartbeat_secret_env = _prompt(
+            "Heartbeat HMAC token environment-variable name",
+            default="DEVBRAIN_HEARTBEAT_TOKEN",
+        ).strip()
+        args.extend([
+            "--with-heartbeat",
+            "--heartbeat-url", heartbeat_url,
+            "--heartbeat-secret-env", heartbeat_secret_env,
+        ])
+
+    if _confirm("Monitor an existing VPS/reverse-tunnel service?", default=False):
+        tunnel_label = _prompt(
+            "Tunnel launchd label or systemd user unit",
+            default=os.environ.get("DEVBRAIN_TUNNEL_LABEL", ""),
+        ).strip()
+        if not tunnel_label:
+            raise click.ClickException(
+                "A tunnel label is required when tunnel monitoring is enabled."
+            )
+        args.extend(["--with-tunnel-check", "--tunnel-label", tunnel_label])
+
+    if _confirm("Monitor an existing agent-bus health endpoint?", default=False):
+        agent_bus_url = _prompt(
+            "Agent-bus health URL",
+            default=os.environ.get(
+                "DEVBRAIN_AGENT_BUS_HEALTH_URL",
+                "http://localhost:18900/healthz",
+            ),
+        ).strip()
+        if not agent_bus_url:
+            raise click.ClickException(
+                "An agent-bus health URL is required when its check is enabled."
+            )
+        args.extend([
+            "--with-agent-bus-check",
+            "--agent-bus-url", agent_bus_url,
+        ])
+
+    if _confirm("Monitor output from an existing backup job?", default=False):
+        backup_path = _prompt(
+            "Backup file or directory",
+            default=os.environ.get("DEVBRAIN_BACKUP_PATH", ""),
+        ).strip()
+        if not backup_path:
+            raise click.ClickException(
+                "A backup path is required when freshness monitoring is enabled."
+            )
+        args.extend([
+            "--with-backup-check",
+            "--backup-path", backup_path,
+        ])
+
+    if _confirm("Enable the signed medic queue?", default=False):
+        _desc(
+            "Generate keys on an operator machine with:",
+            "  python -m ops.resilience.medic_tools keygen ...",
+            "Copy only the .pub files here. Private keys must remain off-host.",
+        )
+        medic_mode = _prompt(
+            "Medic mode",
+            default="diagnose",
+            type=click.Choice(["diagnose", "heal"], case_sensitive=False),
+        )
+        primary_key = _prompt(
+            "Primary public-key file",
+            default=os.environ.get(
+                "DEVBRAIN_MEDIC_PRIMARY_PUBLIC_KEY_FILE", ""
+            ),
+        ).strip()
+        if not primary_key:
+            raise click.ClickException(
+                "The medic requires a primary public-key file."
+            )
+        args.extend([
+            "--with-medic", medic_mode,
+            "--medic-primary-public-key", primary_key,
+        ])
+        instance_id = _prompt(
+            "Stable medic instance ID",
+            default=os.environ.get("DEVBRAIN_INSTANCE_ID", platform.node()),
+        ).strip()
+        if instance_id:
+            args.extend(["--medic-instance-id", instance_id])
+        if medic_mode == "heal":
+            confirm_key = _prompt(
+                "Confirm public-key file (must be a different key)",
+                default=os.environ.get(
+                    "DEVBRAIN_MEDIC_CONFIRM_PUBLIC_KEY_FILE", ""
+                ),
+            ).strip()
+            if not confirm_key:
+                raise click.ClickException(
+                    "Medic heal mode requires a confirm public-key file."
+                )
+            allowed_raw = _prompt(
+                "Allowed recovery checks (comma-separated)",
+                default=(
+                    "postgres"
+                    if runtime == "docker-engine"
+                    else "container_runtime,postgres,ollama,ingest"
+                ),
+            )
+            allowed = [
+                check.strip() for check in allowed_raw.split(",") if check.strip()
+            ]
+            if not allowed:
+                raise click.ClickException(
+                    "Medic heal mode requires at least one allowed check."
+                )
+            args.extend(["--medic-confirm-public-key", confirm_key])
+            for check in allowed:
+                args.extend(["--medic-allow-check", check])
+
+    click.echo()
+    _info("Installing resilience service with explicit, secret-free arguments...")
+    try:
+        completed = subprocess.run(args, check=False)
+    except OSError as exc:
+        raise click.ClickException(
+            f"Could not start the resilience installer: {exc}"
+        ) from exc
+    if completed.returncode != 0:
+        raise click.ClickException(
+            f"Resilience installer exited with status {completed.returncode}."
+        )
+
+    _ok(f"Resilience service configured ({profile}, {runtime})")
+    _info("Re-run 'devbrain setup resilience' anytime to change optional checks.")
+
+
 def print_post_actions() -> None:
     if not POST_ACTIONS:
         return
@@ -2416,6 +2633,8 @@ MENU_SECTIONS: list[tuple[str, str, callable]] = [
     ("MCP client config (Claude Code, Codex, Gemini)", "mcp", setup_mcp_client),
     ("Factory CLI permissions tier (read-only / guarded / unrestricted)",
      "factory-permissions", setup_factory_permissions),
+    ("Resilience / self-healing (local; remote checks optional)",
+     "resilience", setup_resilience),
     ("PKRelay browser extension (optional)",   "pkrelay",  setup_pkrelay),
     ("Run DevDoctor (health check + offered fixes)", "devdoctor", run_verification),
     ("Check for DevBrain updates",             "updates",  check_for_updates),
@@ -2437,6 +2656,7 @@ def _run_full_setup() -> None:
     setup_projects()
     setup_notifications(dev_id)
     setup_mcp_client()
+    setup_resilience()
     setup_pkrelay()
     run_verification()
     print_post_actions()
@@ -2498,7 +2718,7 @@ def run_setup(section: str | None = None) -> None:
       - section='full'    → run all sections linearly (first-time-user flow)
 
     Valid section keys: github, ai-clis, identity, multi-dev, projects,
-    channels, mcp, pkrelay, verify, actions, full.
+    channels, mcp, resilience, pkrelay, verify, actions, full.
     """
     _ensure_tty_stdin()
 

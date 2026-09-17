@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>@LABEL@</string>
+
+    <key>UserName</key>
+    <string>@RUN_AS_USER@</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@PYTHON@</string>
+        <string>-m</string>
+        <string>ops.resilience</string>
+        <string>--config</string>
+        <string>@CONFIG_PATH@</string>
+        <string>watch</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@DEVBRAIN_HOME@</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DEVBRAIN_HOME</key>
+        <string>@DEVBRAIN_HOME@</string>
+        <key>HOME</key>
+        <string>@HOME@</string>
+        <key>PATH</key>
+        <string>@PATH@</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>Umask</key>
+    <integer>63</integer>
+
+    <key>StandardOutPath</key>
+    <string>@STDOUT_PATH@</string>
+    <key>StandardErrorPath</key>
+    <string>@STDERR_PATH@</string>
+</dict>
+</plist>
