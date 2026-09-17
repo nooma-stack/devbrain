@@ -502,7 +502,7 @@ Smoke-test the server by hand:
 # Exits immediately on EOF; confirms the binary is runnable.
 ```
 
-### 5.1 Optional: Agent Bus
+### 5.1 Optional: PKRelay browser bridge
 
 DevBrain integrates with **PKRelay**, a companion browser bus that lets
 agents see and interact with web pages over MCP. Skip if you only need
@@ -519,6 +519,10 @@ native-messaging host, and exposes browser tools (page snapshots,
 clicks, form fills) to any MCP client. The DevBrain installer offers
 the same flow under "PKRelay (optional)" — opt out with
 `--no-pkrelay` if scripting an unattended install.
+
+Agent-bus is a separate remote-orchestration companion. DevBrain contains its
+MCP client, but does not vendor or silently install the daemon. An existing
+agent-bus endpoint can be monitored by the optional host-resilience profile.
 
 ### 5.2 Multi-dev setup
 
@@ -578,6 +582,24 @@ re-run, locally-customized channels preserved on the destination.
 See [docs/MIGRATING.md](docs/MIGRATING.md) for the full operator
 playbook including pre-flight schema checks, scoped exports
 (`--project SLUG`), and troubleshooting.
+
+### 5.4 Optional host resilience and signed medic
+
+An always-on host can install a bounded watchdog that checks the container
+runtime, database container, Ollama, ingest, disk space, and configured
+companions. Local recovery requires no VPS:
+
+```bash
+devbrain setup resilience
+# or:
+./scripts/install-resilience.sh --profile studio --container-runtime colima
+```
+
+Workstation/studio profiles, heartbeat configuration, tunnel and agent-bus
+checks, opt-in monitoring for an existing backup producer, signed medic key
+setup, recovery policy, fire drills, and exact manifest-based uninstall are
+documented in
+[docs/HOST_OPERATIONS.md](docs/HOST_OPERATIONS.md).
 
 ---
 

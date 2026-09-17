@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.devbrain.onboard</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/login</string>
+    <string>-fpq</string>
+    <string>patrickkelly</string>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>exec /Users/patrickkelly/devbrain/bin/devbrain-onboard</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/patrickkelly/devbrain</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>SessionCreate</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/patrickkelly/Library/Logs/devbrain-onboard.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/patrickkelly/Library/Logs/devbrain-onboard.log</string>
+</dict>
+</plist>

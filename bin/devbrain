@@ -12,11 +12,12 @@ while [[ -L "$_target" ]]; do
 done
 DEVBRAIN_DIR="$(cd "$(dirname "$_target")/.." && pwd)"
 
-# ─── Auto-update on `devbrain setup` ───────────────────────────────────────
+# ─── Auto-update before setup/upgrade Python starts ─────────────────────────
 # Pull the latest main before the wizard runs, so users always get the newest
-# setup code (fixes, new prompts, etc.) without having to cd and git pull.
+# setup/upgrade code (fixes, migrations, dependency steps, etc.) without
+# running stale Python after an in-process pull.
 # Skipped if:
-#   - first arg isn't "setup"
+#   - first arg isn't "setup" or "upgrade"
 #   - DEVBRAIN_NO_UPDATE=1 is set
 #   - not on the 'main' branch (user is testing a feature branch)
 #   - working tree has uncommitted changes
@@ -54,7 +55,15 @@ _auto_update() {
     echo ""
 }
 
-if [[ "${1:-}" == "setup" ]] && [[ "${DEVBRAIN_NO_UPDATE:-}" != "1" ]]; then
+_skip_auto_update=false
+for _arg in "$@"; do
+    if [[ "$_arg" == "--no-pull" ]]; then
+        _skip_auto_update=true
+    fi
+done
+if [[ "${1:-}" =~ ^(setup|upgrade)$ ]] \
+   && [[ "${DEVBRAIN_NO_UPDATE:-}" != "1" ]] \
+   && ! $_skip_auto_update; then
     _auto_update
 fi
 

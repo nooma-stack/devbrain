@@ -176,8 +176,53 @@ FACTORY_CRED_DEPENDENTS = list(FACTORY_CONFIG.get("cred_dependents", []))
 #     ssh_host: 72.60.64.155        # VPS jump host (or DNS name)
 #     ssh_port: 2222                # reverse-tunnel port forwarding to Mac Studio
 _ONBOARDING_CONFIG = _config.get("onboarding", {})
-ONBOARDING_SSH_HOST = str(_ONBOARDING_CONFIG.get("ssh_host", "lhts-mac-studio.local"))
-ONBOARDING_SSH_PORT = int(_ONBOARDING_CONFIG.get("ssh_port", 22))
+ONBOARDING_SSH_HOST = str(
+    os.environ.get(
+        "DEVBRAIN_ONBOARD_SSH_HOST",
+        _ONBOARDING_CONFIG.get("ssh_host", "lhts-mac-studio.local"),
+    )
+)
+ONBOARDING_SSH_PORT = int(
+    os.environ.get(
+        "DEVBRAIN_ONBOARD_SSH_PORT",
+        _ONBOARDING_CONFIG.get("ssh_port", 22),
+    )
+)
+ONBOARDING_SSH_USER = str(
+    os.environ.get(
+        "DEVBRAIN_ONBOARD_SSH_USER",
+        _ONBOARDING_CONFIG.get("ssh_user", "lhtdev"),
+    )
+)
+ONBOARDING_ORGANIZATION_NAME = str(
+    os.environ.get(
+        "DEVBRAIN_ONBOARD_ORGANIZATION_NAME",
+        _ONBOARDING_CONFIG.get("organization_name", "Lighthouse Therapy"),
+    )
+)
+ONBOARDING_WORKSPACE_NAME = str(
+    os.environ.get(
+        "DEVBRAIN_ONBOARD_WORKSPACE_NAME",
+        _ONBOARDING_CONFIG.get("workspace_name", "BrightBot"),
+    )
+)
+ONBOARDING_SENDER_DESCRIPTION = str(
+    os.environ.get(
+        "DEVBRAIN_ONBOARD_SENDER_DESCRIPTION",
+        _ONBOARDING_CONFIG.get(
+            "sender_description",
+            "lighthouse-therapy.com (delivered via Google Workspace DWD)",
+        ),
+    )
+)
+ONBOARDING_ADMIN_CONTACT = str(
+    os.environ.get(
+        "DEVBRAIN_ONBOARD_ADMIN_CONTACT",
+        _ONBOARDING_CONFIG.get(
+            "admin_contact", "patrick@lighthouse-therapy.com"
+        ),
+    )
+)
 
 # Fix-loop trigger tier. When True (default as of 2026-04-23), reviewer
 # WARNING findings also route a job through FIX_LOOP; when False the

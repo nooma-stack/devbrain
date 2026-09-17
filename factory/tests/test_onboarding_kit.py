@@ -308,6 +308,26 @@ def test_phase6_verify_command_present_all_clis(tmp_path):
         assert "whoami" in content
 
 
+def test_custom_deployment_identity_replaces_lht_defaults(tmp_path):
+    content = _write(
+        tmp_path,
+        ssh_user="patrickkelly",
+        ssh_host="2.24.99.121",
+        ssh_port=2223,
+        organization_name="Nooma Stack",
+        workspace_name="Nooma DevBrain",
+        sender_description="Verify with the Nooma administrator",
+        admin_contact="Patrick Kelly",
+    )
+    assert "patrickkelly@2.24.99.121" in content
+    assert "/Users/patrickkelly/devbrain/mcp-server/run.sh" in content
+    assert "mac_studio_ssh_port: 2223" in content
+    assert "Nooma Stack / DevBrain" in content
+    assert "Verify with the Nooma administrator" in content
+    assert "lhtdev@" not in content
+    assert "/Users/lhtdev/" not in content
+
+
 def test_phase6_mcp_entry_injects_dev_id_env(tmp_path):
     """Kit's Phase 6 MCP config must include `env DEVBRAIN_DEV_ID=<dev_id>` so
     the MCP server on Mac Studio knows which dev is calling — used by the

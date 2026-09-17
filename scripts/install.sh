@@ -12,6 +12,8 @@
 #   ./scripts/install.sh              # Interactive (prompts for optional steps)
 #   ./scripts/install.sh --yes        # Accept all defaults (non-interactive)
 #   ./scripts/install.sh --no-pkrelay # Skip PKRelay prompt
+#   ./scripts/install.sh --profile=studio
+#   ./scripts/install.sh --with-resilience
 #
 # Requirements: macOS (Apple Silicon or Intel) or Linux (Debian/Ubuntu).
 # Other Linux distros may need manual dep installation — see INSTALL.md.
@@ -59,15 +61,305 @@ AUTO_YES=false
 SKIP_PKRELAY=false
 SKIP_SETUP=false
 SKIP_SHIMS=false
+DEPLOYMENT_PROFILE="workstation"
+DEPLOYMENT_PROFILE_EXPLICIT=false
+CONTAINER_RUNTIME=""
+CONTAINER_RUNTIME_EXPLICIT=false
+DOCKER_CONTEXT_NAME=""
+INSTALL_TARGET_PATH="$HOME/.devbrain/install-target.json"
+RECORDED_DEPLOYMENT_PROFILE=""
+RECORDED_CONTAINER_RUNTIME=""
+RECORDED_DOCKER_CONTEXT=""
+WITH_RESILIENCE=false
+NO_RESILIENCE=false
+WITH_HEARTBEAT=false
+WITH_TUNNEL_CHECK=false
+WITH_AGENT_BUS_CHECK=false
+WITH_BACKUP_CHECK=false
+BACKUP_PATH=""
+WITH_MEDIC=""
+MEDIC_INSTANCE_ID=""
+MEDIC_PRIMARY_PUBLIC_KEY=""
+MEDIC_CONFIRM_PUBLIC_KEY=""
+MEDIC_ALLOW_CHECKS=()
 
-for arg in "$@"; do
-    case "$arg" in
-        --yes|-y) AUTO_YES=true ;;
-        --no-pkrelay) SKIP_PKRELAY=true ;;
-        --no-setup) SKIP_SETUP=true ;;
-        --no-shims) SKIP_SHIMS=true ;;
+print_usage() {
+    cat <<'EOF'
+Usage: ./scripts/install.sh [options]
+
+Core options:
+  --yes, -y                         Accept existing installer defaults
+  --no-pkrelay                      Skip the PKRelay prompt
+  --no-setup                        Skip the interactive setup wizard
+  --no-shims                        Skip global command shims
+
+Deployment options:
+  --profile=workstation|studio      Workstation is the default; studio enables
+                                    the local resilience service by default
+  --container-runtime=RUNTIME       docker-desktop, docker-engine, colima,
+                                    or orbstack
+  --with-resilience                 Install the local self-healing service
+  --no-resilience                   Do not install it (overrides profile default)
+  --with-heartbeat                  Add an external heartbeat check; reads
+                                    DEVBRAIN_HEARTBEAT_URL from env or .env
+  --with-tunnel-check               Monitor a tunnel service; reads
+                                    DEVBRAIN_TUNNEL_LABEL from env or .env
+  --with-agent-bus-check            Monitor agent-bus; reads its health URL
+                                    from env or .env
+  --with-backup-check               Monitor output from an existing backup job
+  --backup-path=PATH                Backup file/directory to monitor; may also
+                                    be set as DEVBRAIN_BACKUP_PATH
+  --with-medic=diagnose|heal        Enable the signed local medic queue
+  --medic-primary-public-key=PATH   Off-host primary public key file
+  --medic-confirm-public-key=PATH   Distinct confirm public key (heal only)
+  --medic-allow-check=CHECK         Named recovery a heal task may request;
+                                    repeat for additional checks
+  --medic-instance-id=ID            Stable target name (defaults to hostname)
+
+Remote checks are optional. Resilience works locally without a VPS.
+Medic private signing keys must remain off the DevBrain host.
+EOF
+}
+
+# Parse inside a function so `shift` consumes only the function's positional
+# arguments. The script-level "$@" remains intact for bootstrap_clone, which
+# must forward every flag to the newly cloned installer.
+parse_install_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --yes|-y) AUTO_YES=true ;;
+            --no-pkrelay) SKIP_PKRELAY=true ;;
+            --no-setup) SKIP_SETUP=true ;;
+            --no-shims) SKIP_SHIMS=true ;;
+            --profile=*)
+                DEPLOYMENT_PROFILE="${1#*=}"
+                DEPLOYMENT_PROFILE_EXPLICIT=true
+                ;;
+            --profile)
+                shift
+                [[ $# -gt 0 ]] || { echo "Error: --profile requires a value" >&2; exit 2; }
+                DEPLOYMENT_PROFILE="$1"
+                DEPLOYMENT_PROFILE_EXPLICIT=true
+                ;;
+            --container-runtime=*)
+                CONTAINER_RUNTIME="${1#*=}"
+                CONTAINER_RUNTIME_EXPLICIT=true
+                ;;
+            --container-runtime)
+                shift
+                [[ $# -gt 0 ]] || { echo "Error: --container-runtime requires a value" >&2; exit 2; }
+                CONTAINER_RUNTIME="$1"
+                CONTAINER_RUNTIME_EXPLICIT=true
+                ;;
+            --with-resilience) WITH_RESILIENCE=true ;;
+            --no-resilience) NO_RESILIENCE=true ;;
+            --with-heartbeat) WITH_HEARTBEAT=true ;;
+            --with-tunnel-check) WITH_TUNNEL_CHECK=true ;;
+            --with-agent-bus-check) WITH_AGENT_BUS_CHECK=true ;;
+            --with-backup-check) WITH_BACKUP_CHECK=true ;;
+            --backup-path=*) BACKUP_PATH="${1#*=}" ;;
+            --backup-path)
+                shift
+                [[ $# -gt 0 ]] || { echo "Error: --backup-path requires a path" >&2; exit 2; }
+                BACKUP_PATH="$1"
+                ;;
+            --with-medic=*) WITH_MEDIC="${1#*=}" ;;
+            --with-medic)
+                shift
+                [[ $# -gt 0 ]] || { echo "Error: --with-medic requires diagnose or heal" >&2; exit 2; }
+                WITH_MEDIC="$1"
+                ;;
+            --medic-instance-id=*) MEDIC_INSTANCE_ID="${1#*=}" ;;
+            --medic-instance-id)
+                shift
+                [[ $# -gt 0 ]] || { echo "Error: --medic-instance-id requires a value" >&2; exit 2; }
+                MEDIC_INSTANCE_ID="$1"
+                ;;
+            --medic-primary-public-key=*) MEDIC_PRIMARY_PUBLIC_KEY="${1#*=}" ;;
+            --medic-primary-public-key)
+                shift
+                [[ $# -gt 0 ]] || { echo "Error: --medic-primary-public-key requires a path" >&2; exit 2; }
+                MEDIC_PRIMARY_PUBLIC_KEY="$1"
+                ;;
+            --medic-confirm-public-key=*) MEDIC_CONFIRM_PUBLIC_KEY="${1#*=}" ;;
+            --medic-confirm-public-key)
+                shift
+                [[ $# -gt 0 ]] || { echo "Error: --medic-confirm-public-key requires a path" >&2; exit 2; }
+                MEDIC_CONFIRM_PUBLIC_KEY="$1"
+                ;;
+            --medic-allow-check=*) MEDIC_ALLOW_CHECKS+=("${1#*=}") ;;
+            --medic-allow-check)
+                shift
+                [[ $# -gt 0 ]] || { echo "Error: --medic-allow-check requires a check ID" >&2; exit 2; }
+                MEDIC_ALLOW_CHECKS+=("$1")
+                ;;
+            --help|-h)
+                print_usage
+                exit 0
+                ;;
+            *)
+                echo "Error: unknown installer option: $1" >&2
+                echo "Run ./scripts/install.sh --help for supported options." >&2
+                exit 2
+                ;;
+        esac
+        shift
+    done
+}
+parse_install_args "$@"
+
+load_existing_install_target() {
+    if [[ -L "$INSTALL_TARGET_PATH" ]] || {
+        [[ -e "$INSTALL_TARGET_PATH" ]] && [[ ! -f "$INSTALL_TARGET_PATH" ]]
+    }; then
+        echo "Error: install target metadata is not a regular file: $INSTALL_TARGET_PATH" >&2
+        exit 1
+    fi
+    [[ -f "$INSTALL_TARGET_PATH" ]] || return 0
+
+    local metadata_python="$DEVBRAIN_HOME/.venv/bin/python"
+    if [[ ! -x "$metadata_python" ]]; then
+        metadata_python="$(command -v python3 2>/dev/null || true)"
+    fi
+    if [[ -z "$metadata_python" ]]; then
+        echo "Error: Python is required to validate $INSTALL_TARGET_PATH" >&2
+        exit 1
+    fi
+
+    local recorded
+    if ! recorded="$("$metadata_python" - "$INSTALL_TARGET_PATH" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1]).expanduser().resolve()
+try:
+    metadata = json.loads(path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"install target metadata is unreadable: {exc}") from exc
+expected = {
+    "schema_version",
+    "generated_by",
+    "profile",
+    "container_runtime",
+    "docker_context",
+}
+if not isinstance(metadata, dict) or set(metadata) != expected:
+    raise SystemExit("install target metadata fields are invalid")
+if (
+    metadata.get("schema_version") != 2
+    or metadata.get("generated_by") != "devbrain-installer"
+):
+    raise SystemExit("install target metadata identity is invalid")
+profile = metadata.get("profile")
+runtime = metadata.get("container_runtime")
+context = metadata.get("docker_context")
+if profile not in {"workstation", "studio"}:
+    raise SystemExit("install target metadata has an invalid profile")
+if runtime not in {"colima", "docker-desktop", "docker-engine", "orbstack"}:
+    raise SystemExit("install target metadata has an invalid runtime")
+if not isinstance(context, str) or not re.fullmatch(
+    r"[A-Za-z0-9][-A-Za-z0-9._+]*", context
+):
+    raise SystemExit("install target metadata has an invalid Docker context")
+sys.stdout.write(f"{profile}\t{runtime}\t{context}")
+PY
+    )"; then
+        echo "Error: refusing to overwrite invalid install target metadata" >&2
+        exit 1
+    fi
+    IFS=$'\t' read -r RECORDED_DEPLOYMENT_PROFILE \
+        RECORDED_CONTAINER_RUNTIME RECORDED_DOCKER_CONTEXT <<< "$recorded"
+}
+load_existing_install_target
+
+if [[ -n "$RECORDED_DEPLOYMENT_PROFILE" ]] \
+   && ! $DEPLOYMENT_PROFILE_EXPLICIT; then
+    DEPLOYMENT_PROFILE="$RECORDED_DEPLOYMENT_PROFILE"
+fi
+
+case "$DEPLOYMENT_PROFILE" in
+    workstation|studio) ;;
+    *)
+        echo "Error: --profile must be workstation or studio" >&2
+        exit 2
+        ;;
+esac
+
+if [[ -n "$RECORDED_CONTAINER_RUNTIME" ]]; then
+    if $CONTAINER_RUNTIME_EXPLICIT \
+       && [[ "$CONTAINER_RUNTIME" != "$RECORDED_CONTAINER_RUNTIME" ]]; then
+        echo "Error: this install is recorded on runtime '$RECORDED_CONTAINER_RUNTIME'." >&2
+        echo "Refusing to switch to '$CONTAINER_RUNTIME' without an explicit database migration." >&2
+        exit 2
+    fi
+    CONTAINER_RUNTIME="$RECORDED_CONTAINER_RUNTIME"
+    DOCKER_CONTEXT_NAME="$RECORDED_DOCKER_CONTEXT"
+elif [[ -z "$CONTAINER_RUNTIME" ]]; then
+    if [[ "$(uname -s)" != "Darwin" ]]; then
+        CONTAINER_RUNTIME="docker-engine"
+    elif [[ "$DEPLOYMENT_PROFILE" == "studio" ]]; then
+        CONTAINER_RUNTIME="colima"
+    else
+        CONTAINER_RUNTIME="docker-desktop"
+    fi
+fi
+case "$CONTAINER_RUNTIME" in
+    colima|docker-desktop|docker-engine|orbstack) ;;
+    *)
+        echo "Error: --container-runtime must be docker-desktop, docker-engine, colima, or orbstack" >&2
+        exit 2
+        ;;
+esac
+if [[ -z "$DOCKER_CONTEXT_NAME" ]]; then
+    case "$CONTAINER_RUNTIME" in
+        colima) DOCKER_CONTEXT_NAME="colima" ;;
+        docker-desktop) DOCKER_CONTEXT_NAME="desktop-linux" ;;
+        docker-engine) DOCKER_CONTEXT_NAME="default" ;;
+        orbstack) DOCKER_CONTEXT_NAME="orbstack" ;;
     esac
-done
+fi
+
+if $WITH_RESILIENCE && $NO_RESILIENCE; then
+    echo "Error: --with-resilience and --no-resilience cannot be used together" >&2
+    exit 2
+fi
+case "$WITH_MEDIC" in
+    ""|diagnose|heal) ;;
+    *)
+        echo "Error: --with-medic must be diagnose or heal" >&2
+        exit 2
+        ;;
+esac
+if [[ -z "$WITH_MEDIC" ]] && {
+    [[ -n "$MEDIC_INSTANCE_ID" ]] ||
+    [[ -n "$MEDIC_PRIMARY_PUBLIC_KEY" ]] ||
+    [[ -n "$MEDIC_CONFIRM_PUBLIC_KEY" ]] ||
+    [[ ${#MEDIC_ALLOW_CHECKS[@]} -gt 0 ]]
+}; then
+    echo "Error: medic options require --with-medic=diagnose|heal" >&2
+    exit 2
+fi
+if ! $WITH_BACKUP_CHECK && [[ -n "$BACKUP_PATH" ]]; then
+    echo "Error: --backup-path requires --with-backup-check" >&2
+    exit 2
+fi
+if $NO_RESILIENCE && {
+    $WITH_HEARTBEAT ||
+    $WITH_TUNNEL_CHECK ||
+    $WITH_AGENT_BUS_CHECK ||
+    $WITH_BACKUP_CHECK ||
+    [[ -n "$WITH_MEDIC" ]]
+}; then
+    echo "Error: resilience options cannot be combined with --no-resilience" >&2
+    exit 2
+fi
+# Selecting any optional check is also an explicit request for the resilience
+# service. This makes `--with-heartbeat` useful on a workstation under --yes.
+if $WITH_HEARTBEAT || $WITH_TUNNEL_CHECK || $WITH_AGENT_BUS_CHECK || $WITH_BACKUP_CHECK || [[ -n "$WITH_MEDIC" ]]; then
+    WITH_RESILIENCE=true
+fi
 
 # ─── Formatting ─────────────────────────────────────────────────────────────
 
@@ -697,33 +989,42 @@ install_docker() {
     desc "Runs PostgreSQL + pgvector in a container. DevBrain stores all"
     desc "memory, sessions, and factory state in this database."
 
-    if command -v docker &>/dev/null; then
-        skip "Docker $(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')"
-        # Even if Docker is already installed, kick the daemon if it's
-        # not running so it's ready by the Postgres step.
-        if [[ "$OS" == "macos" ]] && ! docker info &>/dev/null 2>&1; then
-            _launch_docker_in_background
-        fi
-    elif [[ "$OS" == "macos" ]]; then
-        desc "(Alternatives: Colima or OrbStack — see INSTALL.md)"
-        if _run "Installing Docker Desktop via Homebrew" brew install --cask docker-desktop; then
-            ok "Docker Desktop installed"
+    if [[ "$OS" == "macos" ]]; then
+        # A Docker CLI installed for Colima is not evidence that Docker
+        # Desktop exists. The chosen backend must be installed independently
+        # so another running context cannot make this selection look healthy.
+        if [[ -d /Applications/Docker.app ]]; then
+            skip "Docker Desktop"
         else
-            warn "Homebrew cask install failed."
-            warn "Most common cause on Sequoia/Tahoe: the terminal lacks"
-            warn "App Management permission, so brew can't set xattrs on"
-            warn "files inside /Applications/Docker.app."
-            info "Falling back to Docker's own DMG installer..."
-            if _install_docker_desktop_from_dmg; then
-                ok "Docker Desktop installed via DMG"
+            desc "(Alternatives: Colima or OrbStack — see INSTALL.md)"
+            if _run "Installing Docker Desktop via Homebrew" brew install --cask docker-desktop; then
+                ok "Docker Desktop installed"
             else
-                fail "Docker Desktop install failed both ways."
-                fail "Manual install: https://www.docker.com/products/docker-desktop"
-                fail "Then re-run this installer — it will detect Docker and continue."
-                return 1
+                warn "Homebrew cask install failed."
+                warn "Most common cause on Sequoia/Tahoe: the terminal lacks"
+                warn "App Management permission, so brew can't set xattrs on"
+                warn "files inside /Applications/Docker.app."
+                info "Falling back to Docker's own DMG installer..."
+                if _install_docker_desktop_from_dmg; then
+                    ok "Docker Desktop installed via DMG"
+                else
+                    fail "Docker Desktop install failed both ways."
+                    fail "Manual install: https://www.docker.com/products/docker-desktop"
+                    fail "Then re-run this installer — it will detect Docker and continue."
+                    return 1
+                fi
             fi
         fi
-        _launch_docker_in_background
+        if ! command -v docker &>/dev/null; then
+            fail "Docker Desktop is installed, but the Docker CLI is not in PATH."
+            fail "Open Docker Desktop once, then re-run the installer."
+            return 1
+        fi
+        if ! docker --context "$DOCKER_CONTEXT_NAME" info &>/dev/null 2>&1; then
+            _launch_docker_in_background
+        fi
+    elif command -v docker &>/dev/null; then
+        skip "Docker $(docker --version 2>/dev/null | awk '{print $3}' | tr -d ',')"
     else
         info "Installing Docker Engine..."
         curl -fsSL https://get.docker.com | sh
@@ -734,6 +1035,96 @@ install_docker() {
             sudo systemctl start docker 2>/dev/null || true
         fi
     fi
+}
+
+ensure_docker_compose_plugin() {
+    if docker compose version &>/dev/null 2>&1; then
+        return 0
+    fi
+
+    local plugin_source
+    plugin_source="$(command -v docker-compose 2>/dev/null || true)"
+    if [[ -z "$plugin_source" ]]; then
+        fail "Docker Compose plugin is unavailable after installation."
+        return 1
+    fi
+
+    local plugin_dir="$HOME/.docker/cli-plugins"
+    local plugin_target="$plugin_dir/docker-compose"
+    mkdir -p "$plugin_dir"
+    chmod 700 "$plugin_dir"
+    if [[ ! -e "$plugin_target" && ! -L "$plugin_target" ]]; then
+        ln -s "$plugin_source" "$plugin_target"
+    fi
+    if ! docker compose version &>/dev/null 2>&1; then
+        fail "Docker Compose plugin is not discoverable at $plugin_target."
+        fail "Resolve the existing plugin path, then re-run the installer."
+        return 1
+    fi
+}
+
+install_colima() {
+    step "Container runtime (Colima)"
+    desc "Colima provides a lightweight Docker-compatible VM without"
+    desc "requiring Docker Desktop. It is the default for studio installs."
+
+    if [[ "$OS" != "macos" ]]; then
+        fail "Colima installation is supported by this installer only on macOS."
+        fail "Use --container-runtime=docker-engine on Linux."
+        return 1
+    fi
+
+    local packages=""
+    command -v colima &>/dev/null || packages+=" colima"
+    command -v docker &>/dev/null || packages+=" docker"
+    if ! docker compose version &>/dev/null 2>&1; then
+        packages+=" docker-compose"
+    fi
+    if [[ -n "$packages" ]]; then
+        # shellcheck disable=SC2086
+        _run "Installing Colima and Docker CLI via Homebrew" brew install $packages
+        ok "Colima container runtime installed"
+    else
+        skip "Colima and Docker CLI"
+    fi
+    ensure_docker_compose_plugin
+
+    if ! colima status &>/dev/null 2>&1; then
+        info "Starting Colima..."
+        _run "Starting Colima VM" colima start
+    fi
+}
+
+install_orbstack() {
+    step "Container runtime (OrbStack)"
+    desc "OrbStack provides a Docker-compatible macOS runtime. A VPS is"
+    desc "not required; it runs the DevBrain database entirely on this Mac."
+
+    if [[ "$OS" != "macos" ]]; then
+        fail "OrbStack is available only on macOS."
+        fail "Use --container-runtime=docker-engine on Linux."
+        return 1
+    fi
+
+    if [[ -d /Applications/OrbStack.app ]] || command -v orb &>/dev/null; then
+        skip "OrbStack"
+    else
+        _run "Installing OrbStack via Homebrew" brew install --cask orbstack
+        ok "OrbStack installed"
+    fi
+
+    if ! docker --context "$DOCKER_CONTEXT_NAME" info &>/dev/null 2>&1; then
+        info "Launching OrbStack..."
+        open -a OrbStack 2>/dev/null || true
+    fi
+}
+
+install_container_runtime() {
+    case "$CONTAINER_RUNTIME" in
+        docker-desktop|docker-engine) install_docker ;;
+        colima) install_colima ;;
+        orbstack) install_orbstack ;;
+    esac
 }
 
 install_ollama() {
@@ -1135,6 +1526,7 @@ setup_config() {
     else
         skip ".env already exists"
     fi
+    chmod 600 "$DEVBRAIN_HOME/.env"
 
     if [[ ! -f "$DEVBRAIN_HOME/config/devbrain.yaml" ]]; then
         cp "$DEVBRAIN_HOME/config/devbrain.yaml.example" "$DEVBRAIN_HOME/config/devbrain.yaml"
@@ -1194,12 +1586,13 @@ setup_venvs() {
 }
 
 _wait_for_docker_daemon() {
-    # Poll `docker info` until the daemon responds, or timeout. Prints
+    # Poll the selected Docker context until its daemon responds. Prints
     # a progress dot per second so the user knows we're still alive.
     local max_wait="${1:-60}"
+    local context="${2:-$DOCKER_CONTEXT_NAME}"
     local waited=0
     echo -n "  Waiting for Docker daemon"
-    while ! docker info &>/dev/null 2>&1; do
+    while ! docker --context "$context" info &>/dev/null 2>&1; do
         sleep 1
         waited=$((waited + 1))
         echo -n "."
@@ -1222,8 +1615,8 @@ ensure_docker_ready() {
     desc "DevBrain's database runs in a Docker container. Before we can"
     desc "start it, the Docker daemon needs to be fully running."
 
-    if docker info &>/dev/null 2>&1; then
-        ok "Docker daemon is already running"
+    if docker --context "$DOCKER_CONTEXT_NAME" info &>/dev/null 2>&1; then
+        ok "Docker context '$DOCKER_CONTEXT_NAME' is already running"
         return 0
     fi
 
@@ -1255,8 +1648,8 @@ ensure_docker_ready() {
         fi
 
         info "Verifying Docker daemon..."
-        if _wait_for_docker_daemon 20; then
-            ok "Docker daemon responding"
+        if _wait_for_docker_daemon 20 "$DOCKER_CONTEXT_NAME"; then
+            ok "Docker context '$DOCKER_CONTEXT_NAME' is responding"
             return 0
         fi
 
@@ -1267,6 +1660,67 @@ ensure_docker_ready() {
         fi
         warn "Daemon still not responding. Check Docker Desktop."
     done
+}
+
+ensure_container_runtime_ready() {
+    if [[ "$CONTAINER_RUNTIME" == "docker-desktop" || "$CONTAINER_RUNTIME" == "docker-engine" ]]; then
+        ensure_docker_ready
+        export DOCKER_CONTEXT="$DOCKER_CONTEXT_NAME"
+        return
+    fi
+
+    step "Container runtime check"
+    desc "DevBrain's database uses the Docker-compatible API exposed by"
+    desc "$CONTAINER_RUNTIME. The runtime must be ready before DB startup."
+
+    if docker --context "$DOCKER_CONTEXT_NAME" info &>/dev/null 2>&1; then
+        ok "$CONTAINER_RUNTIME context '$DOCKER_CONTEXT_NAME' is already responding"
+        export DOCKER_CONTEXT="$DOCKER_CONTEXT_NAME"
+        return 0
+    fi
+
+    case "$CONTAINER_RUNTIME" in
+        colima)
+            info "Starting Colima..."
+            colima start
+            ;;
+        orbstack)
+            info "Launching OrbStack..."
+            open -a OrbStack 2>/dev/null || true
+            ;;
+    esac
+
+    info "Waiting for the Docker-compatible daemon..."
+    if _wait_for_docker_daemon 120 "$DOCKER_CONTEXT_NAME"; then
+        export DOCKER_CONTEXT="$DOCKER_CONTEXT_NAME"
+        ok "$CONTAINER_RUNTIME context '$DOCKER_CONTEXT_NAME' is responding"
+        return 0
+    fi
+
+    fail "$CONTAINER_RUNTIME did not become ready."
+    fail "Start it manually, verify 'docker --context $DOCKER_CONTEXT_NAME info', then re-run install-devbrain."
+    return 1
+}
+
+record_install_target() {
+    local target_dir
+    local temporary
+    target_dir="$(dirname "$INSTALL_TARGET_PATH")"
+    mkdir -p "$target_dir"
+    chmod 700 "$target_dir"
+    temporary="$(mktemp "$target_dir/.install-target.XXXXXX")"
+    chmod 600 "$temporary"
+    printf '%s\n' \
+        '{' \
+        '  "schema_version": 2,' \
+        '  "generated_by": "devbrain-installer",' \
+        "  \"profile\": \"$DEPLOYMENT_PROFILE\"," \
+        "  \"container_runtime\": \"$CONTAINER_RUNTIME\"," \
+        "  \"docker_context\": \"$DOCKER_CONTEXT_NAME\"" \
+        '}' >"$temporary"
+    mv "$temporary" "$INSTALL_TARGET_PATH"
+    chmod 600 "$INSTALL_TARGET_PATH"
+    ok "Recorded container target at $INSTALL_TARGET_PATH"
 }
 
 start_postgres() {
@@ -1469,6 +1923,104 @@ install_launchd() {
     else
         info "Skipped — run scripts/install-ingest-service.sh later if you want it."
     fi
+}
+
+# ─── Optional: local resilience / self-healing ─────────────────────────────
+
+install_resilience() {
+    step "Resilience service (optional self-healing)"
+    desc "Monitors the local container runtime, PostgreSQL, Ollama, ingest,"
+    desc "and disk space, then applies bounded recovery actions."
+    desc "It works entirely on this machine; a VPS is not required."
+
+    local enable=false
+    if $NO_RESILIENCE; then
+        enable=false
+    elif $WITH_RESILIENCE; then
+        enable=true
+    elif [[ "$DEPLOYMENT_PROFILE" == "studio" ]]; then
+        enable=true
+    elif $AUTO_YES; then
+        # Preserve workstation --yes behavior: optional resilience is not
+        # silently installed unless the user selected --with-resilience or
+        # one of its optional checks.
+        enable=false
+    elif ask_no "Install the local resilience service?"; then
+        enable=true
+    fi
+
+    if ! $enable; then
+        if $NO_RESILIENCE; then
+            info "Skipped (--no-resilience)"
+        else
+            info "Skipped. Add later with 'devbrain setup resilience'."
+        fi
+        return 0
+    fi
+
+    if [[ -n "$WITH_MEDIC" ]]; then
+        MEDIC_PRIMARY_PUBLIC_KEY="${MEDIC_PRIMARY_PUBLIC_KEY:-${DEVBRAIN_MEDIC_PRIMARY_PUBLIC_KEY_FILE:-}}"
+        if [[ "$WITH_MEDIC" == "heal" ]]; then
+            MEDIC_CONFIRM_PUBLIC_KEY="${MEDIC_CONFIRM_PUBLIC_KEY:-${DEVBRAIN_MEDIC_CONFIRM_PUBLIC_KEY_FILE:-}}"
+            if [[ ${#MEDIC_ALLOW_CHECKS[@]} -eq 0 ]]; then
+                fail "Medic heal mode requires at least one --medic-allow-check."
+                return 1
+            fi
+        fi
+    fi
+
+    local resilience_args=(
+        --profile "$DEPLOYMENT_PROFILE"
+        --container-runtime "$CONTAINER_RUNTIME"
+        --docker-context "$DOCKER_CONTEXT_NAME"
+    )
+    if $WITH_HEARTBEAT; then
+        resilience_args+=(--with-heartbeat)
+        if [[ -n "${DEVBRAIN_HEARTBEAT_URL:-}" ]]; then
+            resilience_args+=(--heartbeat-url "$DEVBRAIN_HEARTBEAT_URL")
+        fi
+    fi
+    if $WITH_TUNNEL_CHECK; then
+        resilience_args+=(--with-tunnel-check)
+        if [[ -n "${DEVBRAIN_TUNNEL_LABEL:-}" ]]; then
+            resilience_args+=(--tunnel-label "$DEVBRAIN_TUNNEL_LABEL")
+        fi
+    fi
+    if $WITH_AGENT_BUS_CHECK; then
+        resilience_args+=(--with-agent-bus-check)
+        if [[ -n "${DEVBRAIN_AGENT_BUS_HEALTH_URL:-}" ]]; then
+            resilience_args+=(--agent-bus-url "$DEVBRAIN_AGENT_BUS_HEALTH_URL")
+        fi
+    fi
+    if $WITH_BACKUP_CHECK; then
+        resilience_args+=(--with-backup-check)
+        if [[ -n "$BACKUP_PATH" ]]; then
+            resilience_args+=(--backup-path "$BACKUP_PATH")
+        fi
+    fi
+    if [[ -n "$WITH_MEDIC" ]]; then
+        resilience_args+=(--with-medic "$WITH_MEDIC")
+        if [[ -n "$MEDIC_PRIMARY_PUBLIC_KEY" ]]; then
+            resilience_args+=(--medic-primary-public-key "$MEDIC_PRIMARY_PUBLIC_KEY")
+        fi
+        if [[ -n "$MEDIC_INSTANCE_ID" ]]; then
+            resilience_args+=(--medic-instance-id "$MEDIC_INSTANCE_ID")
+        fi
+        if [[ "$WITH_MEDIC" == "heal" ]]; then
+            if [[ -n "$MEDIC_CONFIRM_PUBLIC_KEY" ]]; then
+                resilience_args+=(--medic-confirm-public-key "$MEDIC_CONFIRM_PUBLIC_KEY")
+            fi
+            local medic_check
+            for medic_check in "${MEDIC_ALLOW_CHECKS[@]}"; do
+                resilience_args+=(--medic-allow-check "$medic_check")
+            done
+        fi
+    fi
+
+    info "Installing $DEPLOYMENT_PROFILE resilience with $CONTAINER_RUNTIME recovery..."
+    DEVBRAIN_PYTHON="$DEVBRAIN_HOME/.venv/bin/python" \
+        bash "$DEVBRAIN_HOME/scripts/install-resilience.sh" "${resilience_args[@]}"
+    ok "Resilience service installed"
 }
 
 # ─── Optional: PKRelay ──────────────────────────────────────────────────────
@@ -1759,13 +2311,15 @@ main() {
     detect_os
     info "Detected: $OS ($ARCH)"
     info "DevBrain home: $DEVBRAIN_HOME"
+    info "Deployment profile: $DEPLOYMENT_PROFILE"
+    info "Container runtime: $CONTAINER_RUNTIME"
     echo ""
 
     # Prime sudo once up front so every downstream step (Homebrew bootstrap,
     # `brew install --cask docker` moving Docker.app into /Applications,
     # Linux apt-get, etc.) finds a cached credential. Prevents the sudo
     # Password: prompt from colliding with the quiet-mode spinner later.
-    _prime_sudo "DevBrain install needs sudo for a few system-level steps (Homebrew, Docker Desktop)."
+    _prime_sudo "DevBrain install needs sudo for a few system-level steps (Homebrew and system services)."
 
     # Phase 1: Foundation dependencies
     if [[ "$OS" == "macos" ]]; then
@@ -1781,11 +2335,11 @@ main() {
     install_gh
     install_psql
 
-    # Phase 3: Docker — install, then explicitly wait for user to complete
-    # Docker Desktop setup (license agreement). This is the main interactive
-    # checkpoint; everything after this phase runs unattended.
-    install_docker
-    ensure_docker_ready
+    # Phase 3: chosen Docker-compatible runtime. Workstations retain the
+    # Docker Desktop default; studio installs default to lightweight Colima.
+    install_container_runtime
+    ensure_container_runtime_ready
+    record_install_target
 
     # Phase 4: DB startup — now that Docker is confirmed running
     setup_config
@@ -1799,6 +2353,7 @@ main() {
     pull_models
     build_mcp
     install_launchd
+    install_resilience
 
     # Phase 6: AI CLIs (interactive prompts) + optional companions + finalization
     install_ai_clis

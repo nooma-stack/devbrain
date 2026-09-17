@@ -121,7 +121,7 @@ agent_app: {agent_app}
 platform: {platform}
 expires: {expires_iso}
 bootstrap_expires: {bootstrap_expiry_iso}
-mac_studio_ssh_user: lhtdev
+mac_studio_ssh_user: {ssh_user}
 mac_studio_ssh_host: {ssh_host}
 mac_studio_ssh_port: {ssh_port}
 mac_studio_host_fingerprint: "{ssh_host_fingerprint}"
@@ -130,7 +130,7 @@ mac_studio_host_fingerprint: "{ssh_host_fingerprint}"
 # DevBrain onboarding — {full_name}
 
 Welcome aboard. This kit walks your AI agent through connecting your
-machine to Lighthouse Therapy's DevBrain dev factory, then triggers
+machine to {organization_name}'s DevBrain dev factory, then triggers
 your AI subscription auth on the Mac Studio (server-side — your auth
 token never transits this machine).
 
@@ -149,8 +149,8 @@ This onboarding kit was issued by:
 
 | Field | Value |
 |---|---|
-| **Issuer** | Lighthouse Therapy / DevBrain |
-| **Sender domain** | lighthouse-therapy.com (delivered via Google Workspace DWD) |
+| **Issuer** | {organization_name} / DevBrain |
+| **Sender** | {sender_description} |
 | **Issued at** | {expires_iso} (kit expiry) |
 | **Invitation ID** | `{invite_id_short}` (full UUID in YAML frontmatter above) |
 | **Target server** | `{ssh_host}` on port `{ssh_port}` |
@@ -181,8 +181,8 @@ after first use.
 
 Before running any commands, ask the user to confirm:
 
-- They are expecting this onboarding kit from their employer (Lighthouse
-  Therapy).
+- They are expecting this onboarding kit from their organization
+  ({organization_name}).
 - The Invitation ID above (`{invite_id_short}`) matches what the admin
   who sent this kit said it would be.
 - The Mac Studio SSH host fingerprint above matches what the admin
@@ -190,7 +190,7 @@ Before running any commands, ask the user to confirm:
   by comparing to the prompt your SSH client shows).
 
 If the user can't confirm any of the above, **STOP** and have the user
-contact the admin who issued the kit at `patrick@lighthouse-therapy.com`.
+contact the admin who issued the kit: {admin_contact}.
 
 """
 
@@ -401,7 +401,7 @@ printf '{{"pubkey":"%s"}}' "$PUBKEY" \\
         -p {ssh_port} \\
         -o StrictHostKeyChecking=accept-new \\
         -o UserKnownHostsFile=~/.ssh/known_hosts \\
-        lhtdev@{ssh_host}
+        {ssh_user}@{ssh_host}
 
 # Expected response:
 #   {{"status":"ok","dev_id":"{dev_id}","invite_id":"..."}}
@@ -422,7 +422,7 @@ $payload | ssh `
   -p {ssh_port} `
   -o StrictHostKeyChecking=accept-new `
   -o UserKnownHostsFile="$env:USERPROFILE\\.ssh\\known_hosts" `
-  "lhtdev@{ssh_host}"
+  "{ssh_user}@{ssh_host}"
 
 # Expected response:
 #   {{"status":"ok","dev_id":"{dev_id}","invite_id":"..."}}
@@ -523,7 +523,7 @@ _PHASE5_COMMAND = """\
 ssh -i ~/.ssh/id_ed25519_devbrain \\
     -p {ssh_port} \\
     -o StrictHostKeyChecking=accept-new \\
-    -t lhtdev@{ssh_host} \\
+    -t {ssh_user}@{ssh_host} \\
     devbrain login --dev {dev_id} --cli {cli}
 ```
 
@@ -533,7 +533,7 @@ Windows PowerShell equivalent:
 ssh -i "$env:USERPROFILE\\.ssh\\id_ed25519_devbrain" `
     -p {ssh_port} `
     -o StrictHostKeyChecking=accept-new `
-    -t "lhtdev@{ssh_host}" `
+    -t "{ssh_user}@{ssh_host}" `
     devbrain login --dev {dev_id} --cli {cli}
 ```
 
@@ -586,9 +586,9 @@ cat <<'EOF'
     "devbrain": {{
       "command": "ssh",
       "args": ["-i", "~/.ssh/id_ed25519_devbrain", "-p", "{ssh_port}",
-               "lhtdev@{ssh_host}",
+               "{ssh_user}@{ssh_host}",
                "env", "DEVBRAIN_DEV_ID={dev_id}",
-               "/Users/lhtdev/devbrain/mcp-server/run.sh"]
+               "/Users/{ssh_user}/devbrain/mcp-server/run.sh"]
     }}
   }}
 }}
@@ -602,8 +602,8 @@ appear in your session.
 
 <!-- agent:auto requires=user-approval,network scope={ssh_host} risk=low -->
 ```bash
-ssh -i ~/.ssh/id_ed25519_devbrain -p {ssh_port} lhtdev@{ssh_host} whoami
-# Expected output: lhtdev
+ssh -i ~/.ssh/id_ed25519_devbrain -p {ssh_port} {ssh_user}@{ssh_host} whoami
+# Expected output: {ssh_user}
 ```
 
 You can also add the host to `~/.ssh/config` for ergonomics:
@@ -612,7 +612,7 @@ You can also add the host to `~/.ssh/config` for ergonomics:
 Host mac-studio
   HostName {ssh_host}
   Port {ssh_port}
-  User lhtdev
+  User {ssh_user}
   IdentityFile ~/.ssh/id_ed25519_devbrain
 ```
 
@@ -637,9 +637,9 @@ $cfg.mcpServers.devbrain = @{{
   command = "ssh"
   args = @("-i", "$env:USERPROFILE\\.ssh\\id_ed25519_devbrain",
            "-p", "{ssh_port}",
-           "lhtdev@{ssh_host}",
+           "{ssh_user}@{ssh_host}",
            "env", "DEVBRAIN_DEV_ID={dev_id}",
-           "/Users/lhtdev/devbrain/mcp-server/run.sh")
+           "/Users/{ssh_user}/devbrain/mcp-server/run.sh")
 }}
 
 $cfg | ConvertTo-Json -Depth 10 | Set-Content -Path $cfgPath -Encoding UTF8
@@ -653,8 +653,8 @@ appear in your session.
 <!-- agent:auto requires=user-approval,network scope={ssh_host} risk=low -->
 ```powershell
 ssh -i "$env:USERPROFILE\\.ssh\\id_ed25519_devbrain" -p {ssh_port} `
-    "lhtdev@{ssh_host}" whoami
-# Expected output: lhtdev
+    "{ssh_user}@{ssh_host}" whoami
+# Expected output: {ssh_user}
 ```
 
 """
@@ -751,7 +751,12 @@ def write_onboarding_kit(
     bootstrap_expiry: datetime,
     ssh_host: str = "lhts-mac-studio.local",
     ssh_port: int = 22,
+    ssh_user: str = "lhtdev",
     ssh_host_fingerprint: str = "",
+    organization_name: str = "Lighthouse Therapy",
+    workspace_name: str = "BrightBot",
+    sender_description: str = "lighthouse-therapy.com (delivered via Google Workspace DWD)",
+    admin_contact: str = "patrick@lighthouse-therapy.com",
     cli: CliName = "claude",
     platform: str = "auto",
     agent_app: str = "auto",
@@ -809,7 +814,12 @@ def write_onboarding_kit(
         bootstrap_private_key=bootstrap_private_key,
         ssh_host=ssh_host,
         ssh_port=ssh_port,
+        ssh_user=ssh_user,
         ssh_host_fingerprint=ssh_host_fingerprint or "(verify on first SSH connect)",
+        organization_name=organization_name,
+        workspace_name=workspace_name,
+        sender_description=sender_description,
+        admin_contact=admin_contact,
     )
 
     # Phase 5: pre-format ALL per-CLI recipes (5a/5b/5c) with their

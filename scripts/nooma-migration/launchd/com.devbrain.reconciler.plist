@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.devbrain.reconciler</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/login</string>
+    <string>-fpq</string>
+    <string>patrickkelly</string>
+    <string>/bin/zsh</string>
+    <string>-lc</string>
+    <string>cd /Users/patrickkelly/devbrain &amp;&amp; PYTHONPATH=factory exec /Users/patrickkelly/devbrain/.venv/bin/python factory/onboard_reconciler.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/patrickkelly/devbrain</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>SessionCreate</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/patrickkelly/Library/Logs/devbrain-reconciler.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/patrickkelly/Library/Logs/devbrain-reconciler.log</string>
+</dict>
+</plist>

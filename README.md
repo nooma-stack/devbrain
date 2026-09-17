@@ -39,6 +39,14 @@ DevBrain solves this as shared infrastructure:
 
 ## Quick start
 
+For off-LAN teammate onboarding, set `onboarding.ssh_user`,
+`onboarding.ssh_host`, and `onboarding.ssh_port` in
+`config/devbrain.yaml` (or the matching `DEVBRAIN_ONBOARD_*` environment
+variables). Production Mac Studio deployments typically use a restricted,
+outbound-only reverse SSH tunnel to a fixed-IP VPS; generated onboarding kits
+then use that public endpoint without exposing PostgreSQL or Ollama. The
+onboarding webhook remains loopback-only on `127.0.0.1:8000` by default.
+
 **One-liner install** (macOS or Linux):
 
 ```bash
@@ -51,8 +59,8 @@ This single command:
 2. Installs every dependency (Homebrew/apt, Docker, Ollama, Node,
    Python, gh, psql)
 3. Starts PostgreSQL, pulls Ollama models (~10 GB, one-time)
-4. Builds the MCP server, optionally installs the launchd ingest
-   service and PKRelay
+4. Builds the MCP server; optionally installs ingest, host resilience,
+   and PKRelay
 5. Runs `devbrain doctor` to verify
 6. Installs `devbrain` and `install-devbrain` as global commands
 7. Auto-launches the interactive setup wizard for projects,
@@ -79,6 +87,23 @@ curl -fsSL https://raw.githubusercontent.com/nooma-stack/devbrain/main/scripts/i
 
 **Manual install** — if you'd rather follow each step yourself, see
 [**INSTALL.md**](INSTALL.md).
+
+### Optional host resilience
+
+Always-on hosts can add bounded local self-healing without a VPS:
+
+```bash
+./scripts/install.sh --profile=studio
+# or on an existing install:
+devbrain setup resilience
+```
+
+The `workstation` profile remains the default and does not silently install
+the service under `--yes`. The `studio` profile enables it and defaults to
+Colima. Outbound heartbeat, an existing tunnel check, agent-bus health, and
+the signed medic are separate opt-ins. Backup freshness is also opt-in and
+requires an existing backup producer plus an explicit output path. See
+[Host resilience and medic operations](docs/HOST_OPERATIONS.md).
 
 ---
 

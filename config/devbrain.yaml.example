@@ -11,8 +11,13 @@
 # Defaults (not set here): ssh_host=lhts-mac-studio.local, ssh_port=22 —
 # only works for devs on the same Bonjour-resolvable LAN as Mac Studio.
 onboarding:
+  ssh_user: lhtdev                # Shared macOS account on the DevBrain host
   ssh_host: 72.60.64.155        # Public IP / DNS name (e.g., your VPS)
   ssh_port: 2222                # Reverse-tunnel port forwarding to Mac Studio's sshd
+  organization_name: Lighthouse Therapy
+  workspace_name: BrightBot
+  sender_description: lighthouse-therapy.com (delivered via Google Workspace DWD)
+  admin_contact: patrick@lighthouse-therapy.com
 
 database:
   host: localhost
