@@ -27,11 +27,17 @@ jobs:
     container:
       image: python:3.12-bookworm
     steps:
-      - name: Install git
-        # python:3.12-bookworm has no git; checkout and the secret scan need it.
+      - name: Install git and Node.js
+        # checkout and cache are Node actions; the runner execs `node` inside
+        # this container. python:3.12-bookworm does not ship Node. Git is
+        # required by the credential scan (`git ls-files`).
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends git ca-certificates
+          apt-get install -y --no-install-recommends git ca-certificates curl xz-utils
+          curl -fsSL https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-x64.tar.xz \
+            | tar -xJ -C /usr/local --strip-components=1
+          node --version
+          git --version
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -116,11 +122,16 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - name: Install git and PostgreSQL client
-        # psql is not in the Python image. GitHub-hosted ubuntu has it.
+      - name: Install git, Node.js, and PostgreSQL client
+        # psql is not in the Python image. Node is required so
+        # actions/checkout and actions/cache can run inside this container.
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends git ca-certificates postgresql-client
+          apt-get install -y --no-install-recommends git ca-certificates curl xz-utils postgresql-client
+          curl -fsSL https://nodejs.org/dist/v22.23.2/node-v22.23.2-linux-x64.tar.xz \
+            | tar -xJ -C /usr/local --strip-components=1
+          node --version
+          psql --version
 
       - name: Checkout
         uses: actions/checkout@v4
