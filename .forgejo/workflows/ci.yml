@@ -1,0 +1,240 @@
+name: ci
+
+# Forgejo port of .github/workflows/test.yml and llm-smoke-test.yml.
+# Test, lint, and security-scan gates only. .github/workflows is unchanged.
+#
+# resilience-macos is omitted: the only runner is nooma-build (x86_64 Linux).
+# That job runs scripts/install.sh, scripts/install-resilience.sh, and
+# scripts/reinstall.sh under macOS bash, plus the resilience pytest files.
+# The same pytest files still run in the pytest job below.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    name: pytest (no-DB subset)
+    runs-on: nooma-build
+    timeout-minutes: 10
+    container:
+      image: python:3.12-bookworm
+    steps:
+      - name: Install git
+        # python:3.12-bookworm has no git; checkout and the secret scan need it.
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Scan current tree for credential-shaped literals
+        run: python -m factory.repository_secret_scan --root .
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run ingest adapter tests (no-DB)
+        run: |
+          cd ingest
+          python -m pytest tests/ -v --tb=short -p no:cacheprovider
+
+      - name: Run pytest (no-DB unit subset)
+        # Explicit allow-list of test files that genuinely don't touch
+        # Postgres in setup OR teardown. Many "logic-only" tests (e.g.,
+        # test_findings_parser, test_oscillation_guardrail) have shared
+        # fixtures with DB-touching teardowns even when the test body is
+        # pure — those run locally fine but break CI without a service
+        # container.
+        #
+        # The DB-available counterpart lives in the `pytest-db` job below,
+        # which spins up a pgvector service container, applies all
+        # migrations in order, and runs the postulates + curator
+        # integration tests (Atlas Step 5f).
+        run: |
+          cd factory
+          python -m pytest \
+            tests/test_ai_clis_base.py \
+            tests/test_ai_clis_auth_helpers.py \
+            tests/test_ai_cli_codex.py \
+            tests/test_ai_cli_claude.py \
+            tests/test_ai_cli_gemini.py \
+            tests/test_profiles.py \
+            tests/test_dev_login.py \
+            tests/test_cli_login_commands.py \
+            tests/test_cli_executor_routing.py \
+            tests/test_channel_smtp.py \
+            tests/test_channel_telegram.py \
+            tests/test_port_registry.py \
+            tests/test_seed_ports.py \
+            tests/test_compose_env.py \
+            tests/test_repository_secret_scan.py \
+            tests/test_rotate_token.py \
+            tests/test_resilience_core.py \
+            tests/test_resilience_install.py \
+            tests/test_resilience_medic.py \
+            tests/test_resilience_medic_install.py \
+            tests/test_resilience_surfaces.py \
+            -p no:cacheprovider --tb=short -q
+
+  pytest-db:
+    name: pytest (DB-available — postulates + curator integration)
+    runs-on: nooma-build
+    timeout-minutes: 15
+    container:
+      image: python:3.12-bookworm
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: devbrain
+          POSTGRES_PASSWORD: devbrain-ci
+          POSTGRES_DB: devbrain
+        # No host port publish. The job container reaches this service as
+        # hostname `postgres` on the runner network (port 5432).
+        options: >-
+          --health-cmd "pg_isready -U devbrain"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Install git and PostgreSQL client
+        # psql is not in the Python image. GitHub-hosted ubuntu has it.
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates postgresql-client
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Bootstrap schema (apply all migrations in order)
+        # Migration 001 creates the `vector` extension and the devbrain
+        # schema; subsequent migrations build on it. Apply every
+        # migrations/0NN_*.sql in numerical order.
+        # Host is the service name, not localhost: this job runs in a
+        # container on the same network as the postgres service.
+        env:
+          PGPASSWORD: devbrain-ci
+        run: |
+          for i in $(seq 1 30); do
+            pg_isready -h postgres -p 5432 -U devbrain && break
+            sleep 2
+          done
+          pg_isready -h postgres -p 5432 -U devbrain
+          for f in $(ls migrations/0*.sql | sort); do
+            echo "Applying $f..."
+            psql -h postgres -p 5432 -U devbrain -d devbrain -v ON_ERROR_STOP=1 -f "$f"
+          done
+
+      - name: Lint compliance rules (devbrain rules lint)
+        # Atlas Step 7b: every profile-tagged rule must ship with a
+        # matching postulate test. The lint runs against the empty CI
+        # database (no rules seeded yet) and exits 0 — once Phase 7c
+        # seeds rules, missing postulates will fail this step before
+        # pytest runs, surfacing the gap quickly.
+        # config.py reads DEVBRAIN_DATABASE_URL when set (short-circuits
+        # the yaml lookup), so that single env var is all the lint needs.
+        env:
+          DEVBRAIN_DATABASE_URL: postgresql://devbrain:devbrain-ci@postgres:5432/devbrain
+        run: |
+          cd factory && python -m curator.rules_lint
+
+      - name: Run postulates (rootdir = repo root)
+        # Conftest gates on DEVBRAIN_DB_PASSWORD and reads
+        # DEVBRAIN_DB_HOST_PORT (not DEVBRAIN_DB_PORT) — see
+        # tests/postulates/conftest.py.
+        env:
+          DEVBRAIN_DB_HOST: postgres
+          DEVBRAIN_DB_HOST_PORT: "5432"
+          DEVBRAIN_DB_USER: devbrain
+          DEVBRAIN_DB_PASSWORD: devbrain-ci
+          DEVBRAIN_DB_NAME: devbrain
+        run: |
+          python -m pytest tests/postulates/ -v --tb=short
+
+      - name: Run curator + migration + cascade integration tests (rootdir = factory/)
+        # factory/tests/conftest.py uses the same env-var contract; rootdir
+        # differs because pytest discovers factory/pytest.ini.
+        env:
+          DEVBRAIN_DB_HOST: postgres
+          DEVBRAIN_DB_HOST_PORT: "5432"
+          DEVBRAIN_DB_USER: devbrain
+          DEVBRAIN_DB_PASSWORD: devbrain-ci
+          DEVBRAIN_DB_NAME: devbrain
+        run: |
+          cd factory && python -m pytest \
+            tests/test_curator_brief.py \
+            tests/test_curator_end_session.py \
+            tests/test_curator_eval_runner.py \
+            tests/test_curator_eval_types.py \
+            tests/test_curator_graduation.py \
+            tests/test_curator_refinement.py \
+            tests/test_curator_strength.py \
+            tests/test_curator_types.py \
+            tests/test_curator_worker.py \
+            tests/test_eval_security.py \
+            tests/test_eval_test.py \
+            tests/test_migration_017.py \
+            tests/test_migration_018.py \
+            tests/test_migration_019.py \
+            tests/test_migration_020.py \
+            tests/test_migration_021.py \
+            tests/test_migration_023.py \
+            tests/test_step6_e2e.py \
+            tests/test_store_cascade_enqueue.py \
+            tests/test_cognify_edges.py \
+            tests/test_cognify_edges_cites.py \
+            tests/test_cognify_edges_contradicts.py \
+            -v --tb=short
+
+  llm-smoke:
+    name: llm-smoke (real API call)
+    # Skipped: GitHub's llm-smoke-test workflow makes one live Anthropic
+    # call (factory/tests/llm_smoke/) using the CI_ANTHROPIC_OAUTH_TOKEN
+    # secret. Forgejo has no GitHub secrets, and the token must not be
+    # faked. Remove `if: false` only after a maintainer adds an equivalent
+    # Forgejo secret and exports it as CLAUDE_CODE_OAUTH_TOKEN.
+    if: false
+    runs-on: nooma-build
+    timeout-minutes: 5
+    container:
+      image: python:3.12-bookworm
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run LLM smoke test
+        env:
+          PYTHONPATH: factory
+        run: |
+          python -m pytest factory/tests/llm_smoke/ -v --tb=short -p no:cacheprovider
