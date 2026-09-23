@@ -1,0 +1,40 @@
+name: security
+
+# Security gates on the Nooma Forgejo (image nooma/ci-security; the logic is its nooma-scan script,
+# maintained in nooma-stack/forge-ops). On push and pull request they fail only on what the change
+# introduces: a secret in the new commits (gitleaks) or a new finding from the semgrep p/ci rules.
+# Known-vulnerable dependencies (osv-scanner) are reported on every run and fixed through Renovate
+# pull requests; they don't block. The daily run scans the whole default branch and reports only.
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '23 6 * * *'
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    runs-on: nooma-build
+    timeout-minutes: 30
+    container:
+      image: nooma/ci-security:latest
+    env:
+      EVENT: ${{ github.event_name }}
+      BEFORE: ${{ github.event.before }}
+      PR_BASE: ${{ github.event.pull_request.base.sha }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: New secrets (gitleaks)
+        run: nooma-scan secrets
+      - name: New code findings (semgrep p/ci)
+        if: ${{ !cancelled() }}
+        run: nooma-scan code
+      - name: Known-vulnerable dependencies (osv-scanner, report only)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: nooma-scan deps
