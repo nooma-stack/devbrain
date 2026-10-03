@@ -52,6 +52,13 @@ ingest:
     # "/Users/youruser/code/myproject": myproject
     # "/Users/youruser/code/another":   another
 
+  # Path components that keep a transcript out of the brain entirely.
+  # Default: ["subagents"] (Claude Code subagent transcripts). Add the
+  # project dir of any headless agent whose sessions should not be
+  # ingested, e.g. "-Users-youruser-support-runner". [] ingests everything.
+  exclude_path_parts:
+    - subagents
+
   adapters:
     claude_code:
       enabled: true

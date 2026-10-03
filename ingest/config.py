@@ -139,3 +139,10 @@ PROJECT_MAPPINGS = _config["ingest"].get("project_mappings", {})
 # Workspace roots (glob patterns, e.g. "/Users/*/lighthouse") under which the
 # next path segment names the project — auto-created on first sight.
 AUTO_PROJECT_ROOTS = _config["ingest"].get("auto_project_roots", [])
+# Path components whose presence keeps a transcript out of the brain entirely.
+# Subagent transcripts (<session>/subagents/agent-*.jsonl) are excluded by
+# default; add a headless agent's project dir (e.g.
+# "-Users-lhtdev-brightbot-triage") so its sessions are never ingested.
+INGEST_EXCLUDE_PATH_PARTS = list(
+    _config["ingest"].get("exclude_path_parts", ["subagents"])
+)
