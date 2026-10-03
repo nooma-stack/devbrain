@@ -15,6 +15,7 @@ from adapters.gemini import GeminiAdapter
 from adapters.markdown_memory import MarkdownMemoryAdapter
 from adapters.openclaw import OpenClawAdapter
 from chunker import chunk_text
+from config import INGEST_EXCLUDE_PATH_PARTS
 from db import delete_chunks_for_session, get_connection, get_or_create_project_id, get_existing_session_id, insert_chunk, insert_raw_session, session_exists, update_session_summary
 from embeddings import embed, embed_batch
 
@@ -39,8 +40,18 @@ def detect_adapter(path: Path):
     return None
 
 
+def is_excluded_path(path: Path, parts: list[str] | None = None) -> bool:
+    """True when any whole path component is in the exclude list
+    (ingest.exclude_path_parts)."""
+    excluded = INGEST_EXCLUDE_PATH_PARTS if parts is None else parts
+    return bool(set(excluded) & set(Path(path).parts))
+
+
 def ingest_file(path: Path, *, force: bool = False) -> bool:
     """Ingest a single session file. Returns True if processed."""
+    if is_excluded_path(path):
+        return False
+
     adapter = detect_adapter(path)
     if adapter is None:
         return False
