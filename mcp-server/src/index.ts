@@ -26,7 +26,10 @@ import {
   type MatchStrength,
 } from './hybrid.js'
 import { rerankScores } from './rerank.js'
-import { screeningLabel, untrustedText } from './untrusted.js'
+import { REMOTE_REPLY_NOTICE, screeningLabel, untrustedText } from './untrusted.js'
+
+/** A stored title (factory job, memory) made inert for echoing in tool text. */
+const safeTitle = (t: string): string => untrustedText(getSearchConfig().untrustedWrap).title(t)
 import { enqueueCascades, hasScreenFlagsColumn, recordMemory, recordMemoryDependency, resolveMemoryId } from './memory.js'
 import { screenFlags } from './screening.js'
 import { relationCheckMode, relationStoreNote, triggerRelationCheckInBackground } from './relation.js'
@@ -1444,7 +1447,7 @@ server.tool(
             (parsed.drain_error ? ` (drain warning: ${parsed.drain_error})` : '')
           )
         } catch {
-          enrichmentReport = `\n\nEnrichment applied; raw output: ${(result.stdout ?? '').toString().slice(0, 200)}`
+          enrichmentReport = `\n\nEnrichment applied; raw output: ${untrustedText(getSearchConfig().untrustedWrap).body((result.stdout ?? '').toString().slice(0, 200))}`
         }
       }
       // Lesson candidates are written without a relation check (the
@@ -1621,10 +1624,38 @@ server.tool(
       return { content: [{ type: 'text', text: `graph_walk error: ${out.error}` }] }
     }
 
+    // Recorded data, not instructions (untrusted.ts): notice first, bodies
+    // wrapped, titles neutralized, screening-flagged rows labelled.
+    const u = untrustedText(getSearchConfig().untrustedWrap)
+    const memories = (Array.isArray(out.memories) ? out.memories : []) as Array<Record<string, unknown>>
+    const flagsById = new Map<string, string[]>()
+    const ids = memories.map((m) => String(m.id ?? '')).filter((id) => id.length > 10)
+    if (ids.length > 0 && (await hasScreenFlagsColumn())) {
+      const flagged = await query<{ id: string; screen_flags: string[] }>(
+        `SELECT id::text AS id, screen_flags FROM devbrain.memory
+          WHERE id = ANY($1::uuid[]) AND screen_flags IS NOT NULL AND cardinality(screen_flags) > 0`,
+        [ids],
+      )
+      for (const row of flagged.rows) flagsById.set(row.id, row.screen_flags)
+    }
+    const body: Record<string, unknown> = {
+      ...(u.notice ? { notice: u.notice } : {}),
+      ...out,
+      memories: memories.map((m) => {
+        const label = screeningLabel(flagsById.get(String(m.id ?? '')))
+        return {
+          ...m,
+          title: typeof m.title === 'string' ? u.title(m.title) : m.title,
+          content: typeof m.content === 'string' ? u.body(m.content) : m.content,
+          ...(label ? { screening: label } : {}),
+        }
+      }),
+    }
+
     return {
       content: [{
         type: 'text',
-        text: JSON.stringify(out, null, 2),
+        text: JSON.stringify(body, null, 2),
       }],
     }
   },
@@ -1781,10 +1812,13 @@ server.tool(
       artifacts = artResult.rows
     }
 
+    // Job titles are stored text written by agents: neutralize them under the notice.
+    const u = untrustedText(getSearchConfig().untrustedWrap)
+    const jobs = result.rows.map((j) => ({ ...j, title: typeof j.title === 'string' ? u.title(j.title) : j.title }))
     return {
       content: [{
         type: 'text',
-        text: JSON.stringify({ jobs: result.rows, artifacts }, null, 2),
+        text: JSON.stringify({ ...(u.notice ? { notice: u.notice } : {}), jobs, artifacts }, null, 2),
       }],
     }
   },
@@ -1837,10 +1871,10 @@ server.tool(
       )
 
       if (!branch_name) {
-        return { content: [{ type: 'text', text: `Job "${title}" APPROVED, but the job has no branch_name on record — nothing to push. Push any commits manually.` }] }
+        return { content: [{ type: 'text', text: `Job "${safeTitle(title)}" APPROVED, but the job has no branch_name on record — nothing to push. Push any commits manually.` }] }
       }
       if (!root_path) {
-        return { content: [{ type: 'text', text: `Job "${title}" APPROVED, but the project has no root_path on record — can't locate the git worktree. Push branch '${branch_name}' manually.` }] }
+        return { content: [{ type: 'text', text: `Job "${safeTitle(title)}" APPROVED, but the project has no root_path on record — can't locate the git worktree. Push branch '${branch_name}' manually.` }] }
       }
 
       // Worktree-aware cwd: factory jobs run in per-job worktrees at
@@ -1889,7 +1923,7 @@ server.tool(
           return {
             content: [{
               type: 'text',
-              text: `Job "${title}" approval SYNC FAILED (worktree diverged from origin/${branch_name}). Status reverted to ready_for_approval.\n\ngit output tail:\n${detail}\n\nResolve the divergence in the worktree (rebase or reset to origin) then re-run factory_approve.`,
+              text: `Job "${safeTitle(title)}" approval SYNC FAILED (worktree diverged from origin/${branch_name}). Status reverted to ready_for_approval.\n\ngit output tail:\n${detail}\n\nResolve the divergence in the worktree (rebase or reset to origin) then re-run factory_approve.`,
             }],
           }
         }
@@ -1910,14 +1944,14 @@ server.tool(
           "UPDATE devbrain.factory_jobs SET status = 'ready_for_approval', current_phase = 'ready_for_approval', updated_at = now() WHERE id = $1",
           [job_id],
         )
-        return { content: [{ type: 'text', text: `Job "${title}" approval PUSH FAILED: ${push.error.message}. Status reverted to ready_for_approval.` }] }
+        return { content: [{ type: 'text', text: `Job "${safeTitle(title)}" approval PUSH FAILED: ${push.error.message}. Status reverted to ready_for_approval.` }] }
       }
 
       if (push.status === 0) {
         // Post-push success — trim any warnings from stdout/stderr for the caller.
         const trimmedStderr = (push.stderr ?? '').trim()
         const hint = trimmedStderr ? `\n\n(git output:\n${trimmedStderr.slice(-512)})` : ''
-        return { content: [{ type: 'text', text: `Job "${title}" APPROVED and PUSHED to origin/${branch_name}.\n\nNext: create a PR with \`gh pr create --base main --head ${branch_name}\`.${hint}` }] }
+        return { content: [{ type: 'text', text: `Job "${safeTitle(title)}" APPROVED and PUSHED to origin/${branch_name}.\n\nNext: create a PR with \`gh pr create --base main --head ${branch_name}\`.${hint}` }] }
       }
 
       // Non-zero exit — auth failure, diverged ref, network, etc.
@@ -1933,7 +1967,7 @@ server.tool(
       return {
         content: [{
           type: 'text',
-          text: `Job "${title}" approval PUSH FAILED (exit ${push.status}). Status reverted to ready_for_approval so you can retry after fixing the underlying issue.\n\ngit output tail:\n${tail || '(empty)'}\n\nOnce fixed, re-run factory_approve to retry.`,
+          text: `Job "${safeTitle(title)}" approval PUSH FAILED (exit ${push.status}). Status reverted to ready_for_approval so you can retry after fixing the underlying issue.\n\ngit output tail:\n${tail || '(empty)'}\n\nOnce fixed, re-run factory_approve to retry.`,
         }],
       }
     } else if (action === 'reject') {
@@ -1941,14 +1975,14 @@ server.tool(
         "UPDATE devbrain.factory_jobs SET status = 'rejected', current_phase = 'rejected', updated_at = now() WHERE id = $1",
         [job_id],
       )
-      return { content: [{ type: 'text', text: `Job "${title}" REJECTED.${notes ? ' Reason: ' + notes : ''}` }] }
+      return { content: [{ type: 'text', text: `Job "${safeTitle(title)}" REJECTED.${notes ? ' Reason: ' + notes : ''}` }] }
     } else {
       // request_changes — back to fix loop
       await query(
         "UPDATE devbrain.factory_jobs SET status = 'fix_loop', current_phase = 'fix_loop', error_count = error_count + 1, updated_at = now() WHERE id = $1",
         [job_id],
       )
-      return { content: [{ type: 'text', text: `Job "${title}" sent back for changes.${notes ? ' Notes: ' + notes : ''}` }] }
+      return { content: [{ type: 'text', text: `Job "${safeTitle(title)}" sent back for changes.${notes ? ' Notes: ' + notes : ''}` }] }
     }
   },
 )
@@ -1976,12 +2010,12 @@ server.tool(
     const title = job.title as string
 
     if (job.archived_at) {
-      return { content: [{ type: 'text', text: `Job "${title}" is already archived (archived at ${job.archived_at}).` }] }
+      return { content: [{ type: 'text', text: `Job "${safeTitle(title)}" is already archived (archived at ${job.archived_at}).` }] }
     }
 
     const terminalStatuses = ['approved', 'rejected', 'deployed', 'failed']
     if (!terminalStatuses.includes(status)) {
-      return { content: [{ type: 'text', text: `Cannot clean up active jobs. Job "${title}" is currently in status: ${status}.` }] }
+      return { content: [{ type: 'text', text: `Cannot clean up active jobs. Job "${safeTitle(title)}" is currently in status: ${status}.` }] }
     }
 
     await query(
@@ -1995,16 +2029,19 @@ server.tool(
       [job_id],
     )
 
+    // Title and report summary are stored text written by agents.
+    const u = untrustedText(getSearchConfig().untrustedWrap)
     let reportInfo = ''
     if (reportResult.rows.length > 0) {
       const report = reportResult.rows[0]
-      reportInfo = `\nCleanup report: ${report.outcome} — ${report.summary}`
+      reportInfo = `\nCleanup report: ${report.outcome} — ${u.body(String(report.summary ?? ''))}`
+      if (u.notice) reportInfo += `\n(${u.notice})`
     }
 
     return {
       content: [{
         type: 'text',
-        text: `Job "${title}" archived successfully (status: ${status}).${reportInfo}`,
+        text: `Job "${u.title(title)}" archived successfully (status: ${status}).${reportInfo}`,
       }],
     }
   },
@@ -2088,13 +2125,18 @@ server.tool(
       return { content: [{ type: 'text', text: `No file locks active for project "${slug}".` }] }
     }
 
+    const untrusted = untrustedText(getSearchConfig().untrustedWrap)
     return {
       content: [{
         type: 'text',
         text: JSON.stringify({
+          ...(untrusted.notice ? { notice: untrusted.notice } : {}),
           project: slug,
           active_locks: result.rows.length,
-          locks: result.rows,
+          locks: result.rows.map((l) => ({
+            ...l,
+            job_title: typeof l.job_title === 'string' ? untrusted.title(l.job_title) : l.job_title,
+          })),
         }, null, 2),
       }],
     }
@@ -2154,7 +2196,7 @@ server.tool(
       return {
         content: [{
           type: 'text',
-          text: `Job "${title}" is not blocked (status: ${status}). Cannot apply resolution.`,
+          text: `Job "${safeTitle(title)}" is not blocked (status: ${status}). Cannot apply resolution.`,
         }],
       }
     }
@@ -2191,7 +2233,7 @@ server.tool(
     return {
       content: [{
         type: 'text',
-        text: `✅ Resolution "${action}" applied to job "${title}" (${fullJobId.slice(0, 8)}). Factory process spawned to execute.`,
+        text: `✅ Resolution "${action}" applied to job "${safeTitle(title)}" (${fullJobId.slice(0, 8)}). Factory process spawned to execute.`,
       }],
     }
   },
@@ -2293,11 +2335,14 @@ server.tool(
       return { content: [{ type: 'text', text: 'Daemon returned unparseable response.' }] }
     }
 
+    // The reply is another agent's output: untrusted, like retrieved memory.
+    const u = untrustedText(getSearchConfig().untrustedWrap)
+    const head = u.notice ? `${REMOTE_REPLY_NOTICE}\n` : ''
     if (payload.exit_code !== 0) {
       return {
         content: [{
           type: 'text',
-          text: `Remote claude exited ${payload.exit_code}\nstderr: ${payload.stderr ?? '(empty)'}\nsession_id: ${payload.session_id ?? '(none)'}`,
+          text: `${head}Remote claude exited ${payload.exit_code}\nstderr: ${u.body(payload.stderr ?? '(empty)')}\nsession_id: ${payload.session_id ?? '(none)'}`,
         }],
       }
     }
@@ -2305,7 +2350,7 @@ server.tool(
     return {
       content: [{
         type: 'text',
-        text: `[session: ${payload.session_id ?? 'unknown'}]\n\n${payload.result ?? '(empty response)'}`,
+        text: `${head}[session: ${payload.session_id ?? 'unknown'}]\n\n${u.body(payload.result ?? '(empty response)')}`,
       }],
     }
   },

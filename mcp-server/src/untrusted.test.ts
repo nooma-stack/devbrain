@@ -126,3 +126,49 @@ describe('untrusted_wrap flag', () => {
     assert.equal(on.body('x'), `${MEMORY_OPEN}x${MEMORY_CLOSE}`)
   })
 })
+
+describe('every read tool that returns stored text is covered', () => {
+  const src = readFileSync(resolve(import.meta.dirname, 'index.ts'), 'utf-8')
+  const tool = (name: string) => {
+    const start = src.indexOf(`'${name}',`)
+    assert.ok(start > 0, name)
+    return src.slice(start, src.indexOf('server.tool(', start + 1))
+  }
+
+  test('graph_walk: notice, wrapped content, neutralized titles, screening label', () => {
+    const body = tool('graph_walk')
+    assert.match(body, /\.\.\.\(u\.notice \? \{ notice: u\.notice \} : \{\}\),\s*\.\.\.out,/)
+    assert.match(body, /content: typeof m\.content === 'string' \? u\.body\(m\.content\)/)
+    assert.match(body, /title: typeof m\.title === 'string' \? u\.title\(m\.title\)/)
+    assert.match(body, /screeningLabel\(flagsById\.get/)
+  })
+
+  test('factory_status and factory_file_locks neutralize job titles under the notice', () => {
+    assert.match(tool('factory_status'), /title: typeof j\.title === 'string' \? u\.title\(j\.title\)/)
+    assert.match(tool('factory_file_locks'), /job_title: typeof l\.job_title === 'string' \? untrusted\.title\(l\.job_title\)/)
+  })
+
+  test('tools that echo a stored job title neutralize it', () => {
+    for (const name of ['factory_approve', 'factory_cleanup', 'devbrain_resolve_blocked']) {
+      const body = tool(name)
+      assert.ok(!/Job "\$\{title\}"|job "\$\{title\}"/.test(body), name)
+    }
+    assert.match(tool('factory_cleanup'), /u\.body\(String\(report\.summary/)
+  })
+
+  test('end_session wraps the enrichment output it echoes', () => {
+    assert.match(tool('end_session'), /Enrichment applied; raw output: \$\{untrustedText\(getSearchConfig\(\)\.untrustedWrap\)\.body\(/)
+  })
+})
+
+describe('agent_remote_prompt reply is untrusted', () => {
+  const src = readFileSync(resolve(import.meta.dirname, 'index.ts'), 'utf-8')
+  const start = src.indexOf("'agent_remote_prompt',")
+  const body = src.slice(start, src.indexOf('server.tool(', start + 1))
+  test('notice line first, reply and stderr wrapped, behind the flag', () => {
+    assert.match(body, /const u = untrustedText\(getSearchConfig\(\)\.untrustedWrap\)/)
+    assert.match(body, /const head = u\.notice \? `\$\{REMOTE_REPLY_NOTICE\}\\n` : ''/)
+    assert.match(body, /u\.body\(payload\.result \?\? '\(empty response\)'\)/)
+    assert.match(body, /u\.body\(payload\.stderr \?\? '\(empty\)'\)/)
+  })
+})
