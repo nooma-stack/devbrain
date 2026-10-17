@@ -225,3 +225,34 @@ def test_rerank_defaults_match_the_mcp():
     assert re.search(r"rerankUrl:\s*'([^']+)'", block).group(1) == rp.url
     assert int(re.search(r"rerankCandidates:\s*(\d+)", block).group(1)) == rp.candidates
     assert re.search(r"rerankBlend:\s*'(\w+)'", block).group(1) == rp.blend
+
+
+def test_weak_flag_stats_and_pick():
+    from recall_audit.weak import Observation, flag_stats, pick_threshold
+
+    obs = [
+        Observation("p1", "project", True, 0.97, 0.7, 1),
+        Observation("p2", "project", True, 0.86, 0.5, 3),  # answerable but weak-looking
+        Observation("p3", "project", True, 0.50, 0.3, None),  # answer missed
+        Observation("n1", "project", False, 0.80, 0.45, None),
+        Observation("n2", "project", False, 0.60, 0.35, None),
+    ]
+    st = flag_stats(obs, "rerank", 0.88)
+    assert st["flagged"] == 4 and st["false_flags_found"] == 1 and st["false_flags_missed"] == 1
+    assert st["recall"] == 1.0 and abs(st["precision"] - 0.5) < 1e-9
+    pick = pick_threshold(obs, "rerank", [0.7, 0.85, 0.9], min_precision=0.6)
+    assert pick["threshold"] == 0.85  # P 2/3, R 1.0
+
+
+def test_weak_thresholds_match_the_mcp():
+    from recall_audit.weak import DEFAULT_NEGATIVES, WEAK_COSINE_THRESHOLD, WEAK_RERANK_THRESHOLD, load_negatives
+
+    ts = HYBRID_TS.read_text()
+    block = ts[ts.index("export const SEARCH_DEFAULTS") :]
+    block = block[: block.index("\n}")]
+    assert float(re.search(r"weakMatchRerankThreshold:\s*([\d.]+)", block).group(1)) == WEAK_RERANK_THRESHOLD
+    assert float(re.search(r"weakMatchCosineThreshold:\s*([\d.]+)", block).group(1)) == WEAK_COSINE_THRESHOLD
+    negs = load_negatives(DEFAULT_NEGATIVES)
+    assert len(negs) >= 50
+    gold_projects = {g.project for g in load_gold(DEFAULT_GOLD)}
+    assert {n.project for n in negs} <= gold_projects

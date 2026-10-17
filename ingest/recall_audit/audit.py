@@ -228,8 +228,11 @@ def run_rerank(
     pool: list[str],
     rp: RerankParams,
     timings: dict[str, list[float]] | None = None,
+    scores_out: dict[str, float] | None = None,
 ) -> list[str]:
-    """deep_search's rerank stage: score the pool head with the local service."""
+    """deep_search's rerank stage: score the pool head with the local service.
+
+    ``scores_out`` (optional) receives the per-key reranker scores."""
     import urllib.request  # noqa: PLC0415
 
     head = [k for k in pool[: rp.candidates] if not k.startswith("codebase:")]
@@ -247,7 +250,10 @@ def run_rerank(
         scores = json.loads(resp.read())["scores"]
     if timings is not None:
         timings.setdefault("rerank", []).append((time.monotonic() - t0) * 1000)
-    return apply_rerank(pool, dict(zip(keys, scores)), rp.candidates, rp.blend)
+    by_key = dict(zip(keys, scores))
+    if scores_out is not None:
+        scores_out.update(by_key)
+    return apply_rerank(pool, by_key, rp.candidates, rp.blend)
 
 
 def first_hit_rank_groups(groups: list[Group], expected: Iterable[str], rep_only: bool = False) -> int | None:

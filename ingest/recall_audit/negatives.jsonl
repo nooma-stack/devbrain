@@ -1,0 +1,50 @@
+{"id": "n01", "query": "how did we shard the agentbeacon event store across three cassandra clusters", "project": "agentbeacon"}
+{"id": "n02", "query": "what refund policy did we set for agentbeacon annual enterprise contracts paid by wire", "project": "agentbeacon"}
+{"id": "n03", "query": "which apple watch complication did amios ship for shift reminders", "project": "amios"}
+{"id": "n04", "query": "how does amios reconcile payroll against the quickbooks desktop 2019 export", "project": "amios"}
+{"id": "n05", "query": "what helm chart values do we use for brightbot blue-green deployments on aks", "project": "brightbot"}
+{"id": "n06", "query": "why did brightbot switch its speech synthesis to a self-hosted festival server", "project": "brightbot"}
+{"id": "n07", "query": "how does cvportal render 3d molecule previews in the candidate profile", "project": "cvportal"}
+{"id": "n08", "query": "what was the outcome of the cvportal soc 1 type ii audit with deloitte", "project": "cvportal"}
+{"id": "n09", "query": "how did we port the devbrain ingest daemon to windows services with nssm", "project": "devbrain"}
+{"id": "n10", "query": "which graphql federation gateway does devbrain expose to mobile clients", "project": "devbrain"}
+{"id": "n11", "query": "what is the devbrain policy for storing memories on ipfs for decentralised backup", "project": "devbrain"}
+{"id": "n12", "query": "how does devplane bill customers per seat through paddle", "project": "devplane"}
+{"id": "n13", "query": "why did devplane drop its erlang otp supervisor tree for the scheduler", "project": "devplane"}
+{"id": "n14", "query": "how many alpacas does granlee ranch keep and what do they eat in winter", "project": "granlee-ranch"}
+{"id": "n15", "query": "what tractor financing did granlee ranch take from john deere credit", "project": "granlee-ranch"}
+{"id": "n16", "query": "how does pkrelay tunnel traffic over bluetooth low energy to the phone", "project": "pkrelay"}
+{"id": "n17", "query": "what firefox android build of pkrelay did we publish on f-droid", "project": "pkrelay"}
+{"id": "n18", "query": "which wordpress multisite plugins does soho-reboot use for donor portals", "project": "soho-reboot"}
+{"id": "n19", "query": "how did soho-reboot migrate its sms campaigns from twilio to plivo", "project": "soho-reboot"}
+{"id": "n20", "query": "what valuation did trifekta ai raise its seed round at and who led it", "project": "trifekta-ai"}
+{"id": "n21", "query": "how does trifekta ai train its own foundation model on tpu pods", "project": "trifekta-ai"}
+{"id": "n22", "query": "which iso 13485 medical device controls does trifekta ai map for hospitals", "project": "trifekta-ai"}
+{"id": "n23", "query": "how do eic dogfood tenants pay invoices in bitcoin through btcpay", "project": "trifekta-eic-dogfood"}
+{"id": "n24", "query": "why does the eic dogfood stack run on oracle exadata instead of postgres", "project": "trifekta-eic-dogfood"}
+{"id": "n25", "query": "what did the penetration test by mandiant find in the agentbeacon mobile app", "project": "agentbeacon"}
+{"id": "n26", "query": "how do we version the brightbot unity game assets for the vr therapy room", "project": "brightbot"}
+{"id": "n27", "query": "what is the devplane sla credit schedule for the gold support tier", "project": "devplane"}
+{"id": "n28", "query": "how did we tune the jvm garbage collector for the devbrain search service", "project": "devbrain"}
+{"id": "n29", "query": "which salesforce flows sync granlee ranch sponsors into marketing cloud", "project": "granlee-ranch"}
+{"id": "n30", "query": "what dns provider hosts the pkrelay update server and why did we pick ns1", "project": "pkrelay"}
+{"id": "n31", "query": "how do we calibrate the mass spectrometer before each lab run", "project": "devbrain"}
+{"id": "n32", "query": "what did we decide about migrating the cobol batch jobs from the mainframe to aws lambda", "project": "devbrain"}
+{"id": "n33", "query": "who won the internal hackathon trophy in march and what did they build", "project": "trifekta-ai"}
+{"id": "n34", "query": "what is the recipe for the sourdough starter we keep in the office fridge", "project": "devbrain"}
+{"id": "n35", "query": "how is the solar inverter on the warehouse roof wired to the battery bank", "project": "granlee-ranch"}
+{"id": "n36", "query": "which fpga board did we pick for the satellite telemetry decoder", "project": "devbrain"}
+{"id": "n37", "query": "how do we handle gdpr data subject requests from customers in brazil under lgpd", "project": "trifekta-ai"}
+{"id": "n38", "query": "what was the root cause of the kafka consumer lag spike in the payments ledger", "project": "devplane"}
+{"id": "n39", "query": "how do we rotate the snowflake warehouse service account keys every quarter", "project": "devbrain"}
+{"id": "n40", "query": "what did the board decide about opening an office in singapore", "project": "trifekta-ai"}
+{"id": "n41", "query": "how do we sign android release builds with the play app signing key", "project": "amios"}
+{"id": "n42", "query": "what unreal engine version does the training simulator use", "project": "brightbot"}
+{"id": "n43", "query": "how is the cnc router zeroed before cutting walnut slabs", "project": "granlee-ranch"}
+{"id": "n44", "query": "why did we choose cockroachdb multi-region for the trading engine order book", "project": "devplane"}
+{"id": "n45", "query": "what latex template do we use for the quarterly investor letter", "project": "trifekta-ai"}
+{"id": "n46", "query": "how does the elevator control firmware handle a stuck door sensor", "project": "soho-reboot"}
+{"id": "n47", "query": "which vet clinic does the ranch use for llama vaccinations", "project": "granlee-ranch"}
+{"id": "n48", "query": "how do we load test the websocket chat server with gatling at a million connections", "project": "pkrelay"}
+{"id": "n49", "query": "what is the escalation path when the hvac chiller alarm goes off at night", "project": "soho-reboot"}
+{"id": "n50", "query": "how did we localise the cvportal ui into japanese and korean", "project": "cvportal"}

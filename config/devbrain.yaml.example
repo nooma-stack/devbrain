@@ -74,6 +74,12 @@ embedding:
 #   rerank_candidates: 30      # top candidates rescored
 #   rerank_blend: rrf          # rrf (fuse with incoming order) | rerank (reranker order alone)
 #   rerank_timeout_ms: 1200
+#   # Weak-match flag (env DEVBRAIN_WEAK_MATCH on/off): responses whose best
+#   # result scores below the threshold get weak_match: true and a note.
+#   # Calibrated with ingest/recall_audit/weak.py.
+#   weak_match: true
+#   weak_match_rerank_threshold: 0.88   # reranker score (0..1)
+#   weak_match_cosine_threshold: 0.41   # fallback when the reranker did not score
 
 summarization:
   provider: ollama
