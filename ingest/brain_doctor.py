@@ -69,7 +69,11 @@ def check_embedding_drift(cur):
         ORDER BY created_at DESC LIMIT 4)""")
     worst = 1.0
     for mid, title, content, kind in cur.fetchall():
-        text = f"{title}\n{content}" if title else content
+        # The MCP store tool embeds "title\ncontent" but saves content as
+        # "title\n\ncontent", so prefixing the title again double-counts it
+        # and reports drift that is not there (0.98 on 2026-10-16).
+        text = (content if not title or content.startswith(title)
+                else f"{title}\n{content}")
         vs = "[" + ",".join(f"{x:.6f}" for x in _embed(text)) + "]"
         cur.execute("SELECT 1-(embedding <=> %s::vector) FROM devbrain.memory WHERE id=%s",
                     (vs, mid))
@@ -232,13 +236,21 @@ def main() -> int:
     with open(LOG_PATH, "a") as fh:
         fh.write(report + "\n")
     if fails:
-        cur.execute(
-            """INSERT INTO devbrain.notifications
-               (recipient_dev_id, event_type, title, body, channels_attempted,
-                channels_delivered, sent_at)
-               VALUES (NULL, 'health_check_failed', %s, %s, '["log"]'::jsonb, '["log"]'::jsonb, now())""",
-            (f"brain doctor: {len(fails)} check(s) FAILING",
-             "\n".join(fails)))
+        # recipient_dev_id is NOT NULL: a NULL here raised and skipped the
+        # human delivery below on every FAIL (2026-09-02 → 2026-10-16).
+        # The log row is addressed to the doctor itself; humans get their
+        # own rows from notify_cli. Never let this row block delivery.
+        try:
+            cur.execute(
+                """INSERT INTO devbrain.notifications
+                   (recipient_dev_id, event_type, title, body, channels_attempted,
+                    channels_delivered, sent_at)
+                   VALUES ('brain-doctor', 'health_check_failed', %s, %s,
+                           '["log"]'::jsonb, '["log"]'::jsonb, now())""",
+                (f"brain doctor: {len(fails)} check(s) FAILING",
+                 "\n".join(fails)))
+        except Exception as exc:
+            print(f"log notification insert failed: {str(exc)[:150]}", flush=True)
         # Real human delivery: route through the same channel machinery the
         # factory uses (tmux/email/chat/telegram per each dev's registration).
         # Recipients via DEVBRAIN_DOCTOR_NOTIFY (comma-separated dev_ids).
@@ -255,9 +267,12 @@ def main() -> int:
                 with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as bf:
                     bf.write("\n".join(fails))
                     body_f = bf.name
-                subprocess.run([sys.executable, str(notify_cli), dev,
-                                "needs_human", title_f, body_f],
-                               capture_output=True, timeout=120)
+                proc = subprocess.run([sys.executable, str(notify_cli), dev,
+                                       "needs_human", title_f, body_f],
+                                      capture_output=True, text=True, timeout=120)
+                out = (proc.stdout or proc.stderr or "").strip().splitlines()
+                print(f"notify {dev}: exit {proc.returncode} "
+                      f"{out[-1][:150] if out else ''}", flush=True)
             except Exception as exc:
                 print(f"notify {dev} failed: {str(exc)[:100]}", flush=True)
     return len(fails)
