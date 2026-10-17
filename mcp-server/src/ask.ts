@@ -459,16 +459,16 @@ export async function ask(args: AskArgs, deps: AskDeps = {}): Promise<AskResult>
     strengths.push(strength)
     const a: AskAnswer = {
       memory_id: id,
-      kind: row.kind,
+      kind: wrap.title(String(row.kind)),
       title: row.title === null ? null : wrap.title(row.title),
-      project: row.project,
+      project: wrap.title(String(row.project)),
       date: isoDate(row.created_at),
       content: wrap.body(clipAnswer(row.content)),
     }
     if (rerankByKey?.has(g.rep)) a.relevance = Number(rerankByKey.get(g.rep)!.toFixed(4))
     if (cosine.has(g.rep)) a.cosine = Number(cosine.get(g.rep)!.toFixed(4))
     if (row.screen_flags?.length) {
-      a.screen_flags = row.screen_flags
+      a.screen_flags = wrap.deep(row.screen_flags)
       a.screening = screeningLabel(row.screen_flags)
     }
     if (g.similar.length) a.similar_ids = g.similar
@@ -489,13 +489,14 @@ export async function ask(args: AskArgs, deps: AskDeps = {}): Promise<AskResult>
   }
 
   const weak = cfg.weakMatch && isWeak(responseStrength(strengths), cfg)
+  // notice first so a reader sees it before any memory text.
   const out: AskResult = {
+    ...(wrap.notice ? { notice: wrap.notice } : {}),
     question: args.question,
     kind: args.kind,
     answers,
     weak_match: weak,
-    edge_notes: edgeNotes,
-    notice: wrap.notice,
+    edge_notes: wrap.deep(edgeNotes),
     retrieval: { candidates: pool.length, reranked: rerankByKey !== null, ms: Math.round(performance.now() - t0) },
   }
   if (weak) out.note = WEAK_MATCH_NOTE

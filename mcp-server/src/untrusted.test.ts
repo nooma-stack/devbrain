@@ -285,6 +285,16 @@ describe('untrusted output paths', () => {
     assert.match(tool('get_compose_env'), /\[ue\.title\(k\), ue\.title\(v\)\]/)
   })
 
+  test('ask: notice first; kind, project, screen_flags and edge notes neutralized (relation is a typed literal)', () => {
+    const ask = readFileSync(resolve(import.meta.dirname, 'ask.ts'), 'utf-8')
+    assert.match(ask, /const out: AskResult = \{\s*\.\.\.\(wrap\.notice \? \{ notice: wrap\.notice \} : \{\}\),\s*question:/)
+    assert.match(ask, /kind: wrap\.title\(String\(row\.kind\)\)/)
+    assert.match(ask, /project: wrap\.title\(String\(row\.project\)\)/)
+    assert.match(ask, /a\.screen_flags = wrap\.deep\(row\.screen_flags\)/)
+    assert.match(ask, /edge_notes: wrap\.deep\(edgeNotes\)/)
+    assert.match(ask, /content: wrap\.body\(clipAnswer\(row\.content\)\)/)
+  })
+
   test('REMOTE_REPLY_NOTICE is one short line', () => {
     assert.ok(REMOTE_REPLY_NOTICE.length < 200 && !REMOTE_REPLY_NOTICE.includes('\n'))
   })
