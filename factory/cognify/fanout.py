@@ -161,6 +161,29 @@ def _codex_classify(
             return None, "json_parse", str(exc)[:200]
 
 
+def _openai_classify(
+    system_text: str, user_text: str, *, model: str | None = None,
+) -> tuple[dict | None, str | None, str | None, dict, str]:
+    """Classify via the OpenAI platform API (cognify.backend=openai).
+
+    Returns (parsed, failure, detail, usage, model_used). Strict
+    json_schema output with the codex schema, so parsing matches codex.
+    """
+    from cognify import openai_api  # noqa: PLC0415
+
+    res = openai_api.complete(
+        system_text, user_text,
+        pass_name="fanout",
+        model=model,
+        json_schema=_FANOUT_OUTPUT_SCHEMA,
+        schema_name="fanout_classification",
+        max_output_tokens=16_000,
+    )
+    if res.failure:
+        return None, res.failure, res.detail, res.usage, res.model
+    return res.parsed, None, None, res.usage, res.model
+
+
 def _anthropic_classify(
     system_text: str, user_text: str, *, model: str, max_retries: int = 3,
 ) -> tuple[dict | None, str | None, str | None, dict | None]:
@@ -283,6 +306,9 @@ class ClassificationResult:
     })
     failure: str | None = None
     failure_detail: str | None = None
+    # Model actually called, when it differs from the one requested
+    # (backend=openai); run_fanout bills spend to it.
+    model: str | None = None
 
 
 def _load_active_taxonomy(conn: Any) -> list[dict[str, Any]]:
@@ -397,14 +423,41 @@ def classify_session(
     system_text = build_system_prompt(render_taxonomy(taxonomy))
     user_text = build_user_message(session_text)
 
-    # 3. Classify. Prefer codex (schema-constrained JSON → no json_parse
+    # 3. Classify. An explicit cognify.backend wins, with no fallback.
+    #    Otherwise prefer codex (schema-constrained JSON → no json_parse
     #    drops); fall back to Anthropic on a codex `api` failure
     #    (quota/timeout/error) so fan-out never silently drops a session.
-    from cognify.extract import _routes_to_codex  # noqa: PLC0415
+    from cognify import backends  # noqa: PLC0415
+    from cognify.extract import _ANTHROPIC_DEFAULT_MODEL, _routes_to_codex  # noqa: PLC0415
 
     parsed: dict | None = None
     effective_model = model
-    if _routes_to_codex(effective_model):
+    selected = backends.selected()
+    if selected == "openai":
+        parsed, o_fail, o_detail, o_usage, used = _openai_classify(
+            system_text, user_text, model=effective_model,
+        )
+        result.usage = o_usage
+        result.model = used
+        if parsed is None:
+            result.failure = o_fail
+            result.failure_detail = o_detail
+            return result
+    elif selected == "anthropic":
+        if _routes_to_codex(effective_model):
+            effective_model = _ANTHROPIC_DEFAULT_MODEL
+            result.model = effective_model
+    elif selected is not None and selected != "codex":
+        backends.check(selected, "fanout")  # INVALID: logs the refusal
+        result.failure = "refused"
+        result.failure_detail = f"cognify.backend {selected!r} not usable"
+        return result
+    elif selected == "codex" and not _routes_to_codex(effective_model):
+        effective_model = "codex"
+
+    if parsed is None and (selected == "codex" or (
+        selected is None and _routes_to_codex(effective_model)
+    )):
         parsed, c_fail, c_detail = _codex_classify(
             system_text, user_text, model=effective_model,
         )
@@ -416,6 +469,7 @@ def classify_session(
         if parsed is None:
             if (
                 c_fail in ("api", "refused")
+                and backends.fallback_enabled()
                 and _FANOUT_FALLBACK
                 and _FANOUT_FALLBACK.lower() not in ("none", "")
                 and not _routes_to_codex(_FANOUT_FALLBACK)
@@ -731,8 +785,13 @@ def run_fanout(
         # before the API call (no_taxonomy/no_session/no_content/no_auth).
         usage = classification.usage
         if any(usage.get(k, 0) for k in ("input_tokens", "output_tokens")):
+            spend_model = classification.model or model
+            spend_pricing = (
+                (get_pricing(spend_model) or SONNET_4_6)
+                if classification.model else pricing
+            )
             cost = compute_cost_usd(
-                pricing,
+                spend_pricing,
                 input_tokens=usage.get("input_tokens", 0),
                 output_tokens=usage.get("output_tokens", 0),
                 cache_read_tokens=usage.get("cache_read_tokens", 0),
@@ -743,7 +802,7 @@ def run_fanout(
                     conn,
                     project_id=project_id,
                     pass_name="fanout",
-                    model=model,
+                    model=spend_model,
                     input_tokens=usage.get("input_tokens", 0),
                     output_tokens=usage.get("output_tokens", 0),
                     cache_read_tokens=usage.get("cache_read_tokens", 0),

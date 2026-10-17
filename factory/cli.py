@@ -518,7 +518,10 @@ def setup_cognify_launchd_cmd(project_slug, reload):
 
     The Anthropic credential is resolved from the current env:
     ANTHROPIC_API_KEY wins; CLAUDE_CODE_OAUTH_TOKEN (or
-    ANTHROPIC_AUTH_TOKEN) is the fallback. Errors if neither is set.
+    ANTHROPIC_AUTH_TOKEN) is the fallback. With cognify.backend: openai,
+    the OpenAI key source in the env (GOOGLE_APPLICATION_CREDENTIALS +
+    DEVBRAIN_OPENAI_SECRET_PROJECT for Secret Manager, or OPENAI_API_KEY)
+    is written instead/as well. Errors if no credential is set.
 
     Idempotent — safe to re-run with the same args.
 
@@ -3886,6 +3889,7 @@ def cognify_codex_home_command(do_init, force):
             )
     allowed = sorted(backends.allowed())
     click.echo(f"cognify.allowed_backends: {allowed or 'none'}")
+    click.echo(f"cognify.backend: {backends.selected() or 'unset (route by model)'}")
     ok, reason = codex_home.check(home)
     click.echo(f"codex home {home}: {'OK' if ok else 'NOT USABLE - ' + reason}")
     if "codex" in allowed and not ok:
