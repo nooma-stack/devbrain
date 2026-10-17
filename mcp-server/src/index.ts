@@ -41,6 +41,7 @@ import {
   findSupersedingMemories,
 } from './recency.js'
 import { summarizeSession } from './summarize.js'
+import { registerAskTool } from './ask.js'
 
 // Factory orchestrator runner path
 const FACTORY_RUNNER = resolve(import.meta.dirname, '../../factory/run.py')
@@ -2807,6 +2808,9 @@ server.tool(
 
 
 // ─── Start server ────────────────────────────────────────────────────────────
+
+// ─── Tool: ask (typed question, retrieval only; mcp-server/src/ask.ts) ───────
+registerAskTool(server, { resolveProjectId, defaultProject: DEFAULT_PROJECT })
 
 async function main() {
   // Probe the DB before we tell the MCP client we're ready. If the DB
