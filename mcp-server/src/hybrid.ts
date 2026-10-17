@@ -62,6 +62,8 @@ export interface SearchConfig {
   weakMatchRerankThreshold: number
   /** Weak below this cosine similarity when no reranker score is available. */
   weakMatchCosineThreshold: number
+  /** Wrap retrieved memory text in <memory>…</memory> with a notice (untrusted.ts). */
+  untrustedWrap: boolean
 }
 
 // Measured 2026-10-17 with ingest/recall_audit on the Nooma corpus (see the
@@ -95,6 +97,7 @@ export const SEARCH_DEFAULTS: SearchConfig = {
   weakMatch: true,
   weakMatchRerankThreshold: 0.88,
   weakMatchCosineThreshold: 0.41,
+  untrustedWrap: true,
 }
 
 type Env = Record<string, string | undefined>
@@ -130,13 +133,13 @@ function parseTerms(v: unknown): boolean | undefined {
  * DEVBRAIN_KEYWORD_WEIGHT, DEVBRAIN_KEYWORD_TERMS (identifiers|all),
  * DEVBRAIN_DEDUP_SEARCH (on/off), DEVBRAIN_DEDUP_THRESHOLD,
  * DEVBRAIN_RECENCY_STRATEGY (hnsw|exact), DEVBRAIN_RERANK (on/off),
- * DEVBRAIN_RERANK_URL, DEVBRAIN_WEAK_MATCH (on/off).
+ * DEVBRAIN_RERANK_URL, DEVBRAIN_WEAK_MATCH (on/off), DEVBRAIN_UNTRUSTED_WRAP (on/off).
  * yaml: search.{hybrid, rrf_k, keyword_weight, candidates, keyword_max_df,
  * keyword_row_budget, keyword_max_terms, keyword_terms, keyword_timeout_ms,
  * dedup, dedup_threshold, dedup_representative, dedup_timeout_ms,
  * recency_strategy, recency_max_scan_tuples, recency_timeout_ms, rerank,
  * rerank_url, rerank_candidates, rerank_blend, rerank_timeout_ms, weak_match,
- * weak_match_rerank_threshold, weak_match_cosine_threshold}.
+ * weak_match_rerank_threshold, weak_match_cosine_threshold, untrusted_wrap}.
  */
 export function resolveSearchConfig(yaml: unknown, env: Env = process.env): SearchConfig {
   const y = (yaml && typeof yaml === 'object' ? yaml : {}) as Record<string, unknown>
@@ -192,6 +195,7 @@ export function resolveSearchConfig(yaml: unknown, env: Env = process.env): Sear
       parseNum(y.weak_match_cosine_threshold, (n) => n >= -1 && n <= 1),
       d.weakMatchCosineThreshold,
     ),
+    untrustedWrap: pick(parseBool(env.DEVBRAIN_UNTRUSTED_WRAP), parseBool(y.untrusted_wrap), d.untrustedWrap),
   }
 }
 

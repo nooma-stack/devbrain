@@ -80,6 +80,10 @@ embedding:
 #   weak_match: true
 #   weak_match_rerank_threshold: 0.88   # reranker score (0..1)
 #   weak_match_cosine_threshold: 0.41   # fallback when the reranker did not score
+#   # Retrieved memory is untrusted (env DEVBRAIN_UNTRUSTED_WRAP on/off):
+#   # deep_search, get_project_context and get_source_context wrap memory
+#   # text in <memory>…</memory> under a one-line notice.
+#   untrusted_wrap: true
 
 summarization:
   provider: ollama
