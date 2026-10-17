@@ -164,6 +164,7 @@ def _call_sonnet(
     failure_label values:
       None        — success
       'no_auth'   — credential not configured
+      'refused'   — anthropic not in cognify.allowed_backends
       'api'       — API call errored
       'empty'     — empty response
     """
@@ -171,6 +172,10 @@ def _call_sonnet(
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_tokens": 0, "cache_write_tokens": 0,
     }
+    from cognify import backends  # noqa: PLC0415
+
+    if not backends.check("anthropic", "resummarize"):
+        return None, empty_usage, "refused"
     try:
         import anthropic  # noqa: PLC0415
     except ImportError:

@@ -31,6 +31,27 @@ import pytest
 # Add factory dir to path so imports work
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+@pytest.fixture(autouse=True)
+def _cognify_backend_defaults(tmp_path, monkeypatch):
+    """Give every test a valid, isolated cognify CODEX_HOME and the default
+    backend allow-list, so codex-path tests don't depend on the host's
+    ~/.devbrain or config/devbrain.yaml. Tests of the refusal paths override
+    DEVBRAIN_CODEX_HOME / backends.reset() themselves."""
+    home = tmp_path / "codex-cognify-home"
+    try:
+        from cognify import backends, codex_home
+    except ImportError:  # pragma: no cover — module not importable here
+        yield
+        return
+    codex_home.init(home)
+    (home / "auth.json").write_text("{}")
+    monkeypatch.setenv("DEVBRAIN_CODEX_HOME", str(home))
+    monkeypatch.delenv("DEVBRAIN_COGNIFY_ALLOWED_BACKENDS", raising=False)
+    backends.reset()
+    yield
+    backends.reset()
+
+
 # Every row inserted by a factory fixture is tagged with this prefix so
 # the cleanup is easy to spot and won't touch real data even if the
 # delete query is buggy.

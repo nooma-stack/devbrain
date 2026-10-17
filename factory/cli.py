@@ -3852,6 +3852,46 @@ def cognify_gate_command(project_slug, last_n, as_json):
     click.echo("  reasons: " + ", ".join(f"{k}={v}" for k, v in reasons.most_common()))
 
 
+@cli.command("cognify-codex-home")
+@click.option("--init", "do_init", is_flag=True, default=False,
+              help="Create the directory and write its tool-less config.toml.")
+@click.option("--force", is_flag=True, default=False,
+              help="With --init: overwrite an existing config.toml.")
+def cognify_codex_home_command(do_init, force):
+    """Set up / check the isolated CODEX_HOME cognify runs codex with.
+
+    Cognify sends transcript text to `codex exec`; it refuses to run codex
+    unless this directory exists, has its own login, and its config.toml
+    has no MCP servers, plugins, apps or browser/computer-use tools.
+    Also prints cognify.allowed_backends for this deployment.
+    """
+    import sys
+
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
+    from cognify import backends, codex_home
+
+    home = codex_home.resolve_home()
+    if do_init:
+        try:
+            path = codex_home.init(home, force=force)
+            click.echo(f"wrote {path}")
+        except FileExistsError as exc:
+            raise click.ClickException(
+                f"{exc} exists; pass --force to overwrite it"
+            ) from exc
+        if not (home / "auth.json").exists():
+            click.echo(
+                "next: log this home in (its own session, separate from ~/.codex):\n"
+                f"  CODEX_HOME={home} codex login --device-auth"
+            )
+    allowed = sorted(backends.allowed())
+    click.echo(f"cognify.allowed_backends: {allowed or 'none'}")
+    ok, reason = codex_home.check(home)
+    click.echo(f"codex home {home}: {'OK' if ok else 'NOT USABLE - ' + reason}")
+    if "codex" in allowed and not ok:
+        sys.exit(1)
+
+
 @cli.command("cognify-bulk")
 @click.option("--project", "project_slug", required=True,
               help="Project slug.")
