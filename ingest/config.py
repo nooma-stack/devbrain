@@ -9,6 +9,10 @@ Environment variables (all optional):
     DEVBRAIN_DATABASE_URL    — Full Postgres URL (overrides yaml.database.*)
     DEVBRAIN_OLLAMA_URL      — Ollama server URL (overrides yaml.embedding.url and summarization.url)
     DEVBRAIN_EMBEDDING_MODEL — Embedding model name (overrides yaml.embedding.model)
+    DEVBRAIN_QUERY_PREFIX    — Prefix prepended to search QUERIES before embedding
+                               (overrides yaml.embedding.query_prefix). Empty string
+                               disables it. Default: "query: " for snowflake-arctic-embed*
+                               models, "" otherwise. Never applied to stored documents.
     DEVBRAIN_SUMMARY_MODEL   — Summarization model name (overrides yaml.summarization.model)
     DEVBRAIN_SUMMARY_MAX_CHARS — Max transcript chars sent to the summarizer
                                (overrides yaml.summarization.max_input_chars)
@@ -109,6 +113,32 @@ def load_config() -> dict:
     return cfg
 
 
+# snowflake-arctic-embed(2) is an asymmetric retrieval model: it was trained
+# with queries prefixed "query: " and documents embedded bare. Other models
+# get no default prefix — set embedding.query_prefix for e.g. e5/nomic.
+_ARCTIC_QUERY_PREFIX = "query: "
+
+
+def default_query_prefix(model: str) -> str:
+    """Query-side instruction prefix the embedding model was trained with."""
+    return _ARCTIC_QUERY_PREFIX if model.startswith("snowflake-arctic-embed") else ""
+
+
+def resolve_query_prefix(cfg: dict) -> str:
+    """Query prefix with precedence env > yaml > model default.
+
+    DEVBRAIN_QUERY_PREFIX="" (set but empty) disables the prefix, so the
+    env check is ``is not None`` rather than truthiness.
+    """
+    env = os.environ.get("DEVBRAIN_QUERY_PREFIX")
+    if env is not None:
+        return env
+    yaml_prefix = cfg["embedding"].get("query_prefix")
+    if yaml_prefix is not None:
+        return str(yaml_prefix)
+    return default_query_prefix(cfg["embedding"]["model"])
+
+
 def build_database_url(cfg: dict | None = None) -> str:
     """Construct a Postgres URL. Env var DEVBRAIN_DATABASE_URL wins if set."""
     if env_url := os.environ.get("DEVBRAIN_DATABASE_URL"):
@@ -128,6 +158,7 @@ DATABASE_URL = build_database_url(_config)
 OLLAMA_URL = _config["embedding"]["url"]
 EMBED_MODEL = _config["embedding"]["model"]
 EMBED_DIMS = _config["embedding"]["dims"]
+EMBED_QUERY_PREFIX = resolve_query_prefix(_config)
 CHUNK_MAX_TOKENS = _config["chunking"]["max_tokens"]
 CHUNK_OVERLAP_TOKENS = _config["chunking"]["overlap_tokens"]
 SUMMARIZE_MODEL = _config["summarization"]["model"]

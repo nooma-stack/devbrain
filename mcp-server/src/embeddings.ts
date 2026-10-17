@@ -1,4 +1,4 @@
-import { getEmbeddingConfig } from './db.js'
+import { getEmbeddingConfig, getQueryPrefix } from './db.js'
 
 const { url: OLLAMA_URL, model: EMBED_MODEL } = getEmbeddingConfig()
 
@@ -7,6 +7,28 @@ const { url: OLLAMA_URL, model: EMBED_MODEL } = getEmbeddingConfig()
 // fetch rejects with an AbortError, which propagates as a normal failure.
 const EMBED_TIMEOUT_MS = Number(process.env.DEVBRAIN_EMBED_TIMEOUT_MS ?? 30000)
 
+// ─── Documents vs queries ────────────────────────────────────────────────────
+//
+// snowflake-arctic-embed2 is an asymmetric retrieval model: search QUERIES
+// are embedded with a "query: " prefix, stored DOCUMENTS are embedded bare.
+//
+//   embed() / embedBatch()  — DOCUMENTS. Every write path (store, breadcrumb,
+//                             end_session, ingest, reembed) uses these. They
+//                             must never carry the prefix: the corpus was
+//                             embedded bare, and prefixing writes would
+//                             silently shift stored vectors away from it.
+//   embedQuery()            — QUERIES (deep_search). Prepends getQueryPrefix()
+//                             (DEVBRAIN_QUERY_PREFIX > yaml
+//                             embedding.query_prefix > model default; "" off).
+//
+// ingest/embeddings.py keeps the same split for Python callers.
+
+/** The exact text sent to the model for a search query. */
+export function queryEmbedText(text: string): string {
+  return `${getQueryPrefix()}${text}`
+}
+
+/** Embed a DOCUMENT (no query prefix). */
 export async function embed(text: string): Promise<number[]> {
   const response = await fetch(`${OLLAMA_URL}/api/embed`, {
     method: 'POST',
@@ -23,6 +45,12 @@ export async function embed(text: string): Promise<number[]> {
   return data.embeddings[0]
 }
 
+/** Embed a search QUERY (with the model's query prefix). */
+export async function embedQuery(text: string): Promise<number[]> {
+  return embed(queryEmbedText(text))
+}
+
+/** Embed DOCUMENTS in one request (no query prefix). */
 export async function embedBatch(texts: string[]): Promise<number[][]> {
   const response = await fetch(`${OLLAMA_URL}/api/embed`, {
     method: 'POST',

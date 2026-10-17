@@ -33,6 +33,10 @@ embedding:
   url: http://localhost:11434
   model: snowflake-arctic-embed2
   dims: 1024
+  # Prefix added to search QUERIES only (deep_search), never to stored
+  # documents. Default: "query: " for snowflake-arctic-embed* models, ""
+  # otherwise. "" disables. Env DEVBRAIN_QUERY_PREFIX overrides.
+  # query_prefix: "query: "
 
 summarization:
   provider: ollama
