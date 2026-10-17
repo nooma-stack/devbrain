@@ -11,7 +11,13 @@ from pathlib import Path
 from recall_audit.audit import (
     DEFAULT_GOLD,
     KEYWORD_SQL_PATH,
+    DedupParams,
+    Group,
     HybridParams,
+    collapse_near_duplicates,
+    first_hit_rank_groups,
+    freed_slots,
+    load_near_dup_sql,
     first_hit_rank,
     index_loss,
     load_gold,
@@ -127,3 +133,43 @@ def test_keyword_gold_items_are_tagged():
     ident = re.compile(r"[A-Za-z0-9][_./:-][A-Za-z0-9]|^[A-Z0-9_]{4,}$")
     for it in kw:
         assert any(ident.search(tok.strip("?,.")) for tok in it.query.split()), it.id
+
+
+def test_collapse_matches_mcp():
+    # Same case as 'matches the Python audit mirror' under collapseNearDuplicates
+    # in mcp-server/src/hybrid.test.ts.
+    groups = collapse_near_duplicates(
+        ["m1", "m2", "m3", "m4", "m5", "m6"],
+        [("m1", "m3"), ("m2", "m3"), ("m4", "m6"), ("m5", "m1")],
+        3,
+        {"m1": 10, "m3": 30, "m5": 20, "m4": 5, "m6": 5},
+    )
+    assert [(g.rep, g.similar) for g in groups] == [("m3", ["m1", "m5"]), ("m2", []), ("m4", ["m6"])]
+
+
+def test_collapse_best_representative_and_no_chaining():
+    groups = collapse_near_duplicates(["a", "c", "d", "b"], [("a", "c"), ("c", "d")], 10)
+    assert [(g.rep, g.similar) for g in groups] == [("a", ["c"]), ("d", []), ("b", [])]
+
+
+def test_group_hit_rank_counts_any_member_or_rep_only():
+    groups = [Group("x", ["y"]), Group("z")]
+    assert first_hit_rank_groups(groups, ["y"]) == 1
+    assert first_hit_rank_groups(groups, ["y"], rep_only=True) is None
+    assert first_hit_rank_groups(groups, ["z"], rep_only=True) == 2
+    assert freed_slots(groups) == 1
+
+
+def test_near_dup_sql_placeholders():
+    sql = load_near_dup_sql()
+    assert sorted(set(re.findall(r"%\(p(\d+)\)s", sql))) == ["1", "2"]
+
+
+def test_dedup_defaults_match_the_mcp():
+    ts = HYBRID_TS.read_text()
+    block = ts[ts.index("export const SEARCH_DEFAULTS") :]
+    block = block[: block.index("}")]
+    dp = DedupParams()
+    assert re.search(r"\bdedup:\s*(true|false)", block).group(1) == ("true" if dp.enabled else "false")
+    assert float(re.search(r"dedupThreshold:\s*([\d.]+)", block).group(1)) == dp.threshold
+    assert re.search(r"dedupRepresentative:\s*'(\w+)'", block).group(1) == dp.representative

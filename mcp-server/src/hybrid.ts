@@ -28,6 +28,14 @@ export interface SearchConfig {
   keywordIdentifiersOnly: boolean
   /** statement_timeout for the keyword query; on timeout deep_search falls back to vector-only. */
   keywordTimeoutMs: number
+  /** Collapse near-duplicate results (cosine >= dedupThreshold) into one slot. */
+  dedup: boolean
+  /** Cosine similarity at or above which two results count as the same memory. */
+  dedupThreshold: number
+  /** Which copy represents a group: the best-ranked one or the newest one. */
+  dedupRepresentative: 'best' | 'newest'
+  /** statement_timeout for the pair query; on timeout results are returned un-collapsed. */
+  dedupTimeoutMs: number
 }
 
 // Measured 2026-10-17 with ingest/recall_audit on the Nooma corpus (see the
@@ -43,6 +51,10 @@ export const SEARCH_DEFAULTS: SearchConfig = {
   keywordMaxTerms: 12,
   keywordIdentifiersOnly: true,
   keywordTimeoutMs: 1000,
+  dedup: true,
+  dedupThreshold: 0.93,
+  dedupRepresentative: 'newest',
+  dedupTimeoutMs: 500,
 }
 
 type Env = Record<string, string | undefined>
@@ -75,9 +87,11 @@ function parseTerms(v: unknown): boolean | undefined {
  * Invalid values fall back to the next source rather than failing a search.
  *
  * Env: DEVBRAIN_HYBRID_SEARCH (on/off), DEVBRAIN_RRF_K,
- * DEVBRAIN_KEYWORD_WEIGHT, DEVBRAIN_KEYWORD_TERMS (identifiers|all).
+ * DEVBRAIN_KEYWORD_WEIGHT, DEVBRAIN_KEYWORD_TERMS (identifiers|all),
+ * DEVBRAIN_DEDUP_SEARCH (on/off), DEVBRAIN_DEDUP_THRESHOLD.
  * yaml: search.{hybrid, rrf_k, keyword_weight, candidates, keyword_max_df,
- * keyword_row_budget, keyword_max_terms, keyword_terms, keyword_timeout_ms}.
+ * keyword_row_budget, keyword_max_terms, keyword_terms, keyword_timeout_ms,
+ * dedup, dedup_threshold, dedup_representative, dedup_timeout_ms}.
  */
 export function resolveSearchConfig(yaml: unknown, env: Env = process.env): SearchConfig {
   const y = (yaml && typeof yaml === 'object' ? yaml : {}) as Record<string, unknown>
@@ -102,7 +116,20 @@ export function resolveSearchConfig(yaml: unknown, env: Env = process.env): Sear
       d.keywordIdentifiersOnly,
     ),
     keywordTimeoutMs: Math.round(pick(parseNum(y.keyword_timeout_ms, (n) => n >= 10), d.keywordTimeoutMs)),
+    dedup: pick(parseBool(env.DEVBRAIN_DEDUP_SEARCH), parseBool(y.dedup), d.dedup),
+    dedupThreshold: pick(
+      parseNum(env.DEVBRAIN_DEDUP_THRESHOLD, (n) => n > 0 && n <= 1),
+      parseNum(y.dedup_threshold, (n) => n > 0 && n <= 1),
+      d.dedupThreshold,
+    ),
+    dedupRepresentative: pick(parseRepresentative(y.dedup_representative), d.dedupRepresentative),
+    dedupTimeoutMs: Math.round(pick(parseNum(y.dedup_timeout_ms, (n) => n >= 10), d.dedupTimeoutMs)),
   }
+}
+
+function parseRepresentative(v: unknown): 'best' | 'newest' | undefined {
+  const s = v === undefined || v === null ? '' : String(v).trim().toLowerCase()
+  return s === 'best' || s === 'newest' ? s : undefined
 }
 
 /**
@@ -181,4 +208,74 @@ export function keywordParams(
     cfg.keywordMaxTerms,
     cfg.keywordIdentifiersOnly,
   ]
+}
+
+// ─── Near-duplicate collapse ────────────────────────────────────────────────
+
+/** Path of the near-duplicate pair SQL ($1 ids, $2 threshold). */
+export const NEAR_DUP_SQL_PATH = resolve(import.meta.dirname, '../sql/near_duplicates.sql')
+
+let _nearDupSql: string | null = null
+
+export function nearDupSql(): string {
+  if (_nearDupSql === null) _nearDupSql = readFileSync(NEAR_DUP_SQL_PATH, 'utf-8')
+  return _nearDupSql
+}
+
+export interface DupGroup {
+  /** Representative key shown in the result slot. */
+  rep: string
+  /** Other copies (cosine >= threshold to the best-ranked member), in rank order. */
+  similar: string[]
+}
+
+/**
+ * Greedy near-duplicate collapse in rank order. Mirror of
+ * collapse_near_duplicates in ingest/recall_audit/audit.py.
+ *
+ * Walk the ranked pool; a key listed in `pairs` with an existing group's
+ * (best-ranked) representative joins the first such group, otherwise it
+ * opens a new group while fewer than `limit` exist. The walk continues past
+ * `limit` so every copy in the pool is attached. No chaining: similarity is
+ * always to the group's best-ranked member.
+ *
+ * With `created` (key -> created_at epoch seconds), each group's shown
+ * representative is then swapped for its newest member; the group keeps
+ * the slot its best-ranked member earned.
+ */
+export function collapseNearDuplicates(
+  ranked: string[],
+  pairs: Array<[string, string]>,
+  limit: number,
+  created?: Map<string, number>,
+): DupGroup[] {
+  const adj = new Map<string, Set<string>>()
+  for (const [a, b] of pairs) {
+    if (!adj.has(a)) adj.set(a, new Set())
+    if (!adj.has(b)) adj.set(b, new Set())
+    adj.get(a)!.add(b)
+    adj.get(b)!.add(a)
+  }
+  const groups: DupGroup[] = []
+  const seen = new Set<string>()
+  for (const key of ranked) {
+    if (seen.has(key)) continue
+    seen.add(key)
+    const near = adj.get(key)
+    const home = near ? groups.find((g) => near.has(g.rep)) : undefined
+    if (home) home.similar.push(key)
+    else if (groups.length < limit) groups.push({ rep: key, similar: [] })
+  }
+  if (created) {
+    const at = (k: string) => created.get(k) ?? Number.NEGATIVE_INFINITY
+    for (const g of groups) {
+      let newest = g.rep
+      for (const m of g.similar) if (at(m) > at(newest)) newest = m
+      if (newest !== g.rep) {
+        g.similar = [g.rep, ...g.similar.filter((m) => m !== newest)]
+        g.rep = newest
+      }
+    }
+  }
+  return groups
 }

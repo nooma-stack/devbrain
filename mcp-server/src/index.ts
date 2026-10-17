@@ -10,7 +10,7 @@ import { join, resolve } from 'path'
 import { z } from 'zod'
 import { getSearchConfig, query, queryWithTimeout, waitForDb } from './db.js'
 import { embed, embedQuery, toSqlVector } from './embeddings.js'
-import { keywordParams, keywordSql, matchedBy, rrfFuse } from './hybrid.js'
+import { collapseNearDuplicates, keywordParams, keywordSql, matchedBy, nearDupSql, rrfFuse } from './hybrid.js'
 import { enqueueCascades, recordMemory, recordMemoryDependency, resolveMemoryId } from './memory.js'
 import { relationCheckMode, relationStoreNote, triggerRelationCheckInBackground } from './relation.js'
 import {
@@ -466,7 +466,9 @@ server.tool(
     // DEVBRAIN_HYBRID_SEARCH=off disables it.
     const searchCfg = getSearchConfig()
     const useHybrid = searchCfg.hybrid && runMemoryQuery
-    const fetchDepth = useHybrid ? Math.max(limit, searchCfg.candidates) : limit
+    // Near-duplicate collapse walks a candidate pool deeper than `limit`.
+    const useDedup = searchCfg.dedup && runMemoryQuery
+    const fetchDepth = useHybrid || useDedup ? Math.max(limit, searchCfg.candidates) : limit
     const keywordPromise: Promise<Candidate[] | null> = useHybrid
       ? queryWithTimeout(
           keywordSql(),
@@ -614,31 +616,64 @@ server.tool(
     // keyword hits, RRF-fuse the vector order with the keyword order.
     candidates.sort((a, b) => b.score - a.score)
     const keywordHits = await keywordPromise
-    let top = candidates.slice(0, limit)
+    const keyOf = (c: Candidate) => c.memory_id || `codebase:${c.chunk_id}`
+    const byKey = new Map<string, Candidate>()
+    for (const c of [...candidates, ...(keywordHits ?? [])]) {
+      if (!byKey.has(keyOf(c))) byKey.set(keyOf(c), c)
+    }
+    // The ranked candidate pool: vector order, or the RRF fusion of vector
+    // and keyword order when the keyword channel returned anything.
+    let pool = candidates.map(keyOf)
     let matchedByKey: Map<string, string> | null = null
     if (keywordHits && keywordHits.length > 0) {
-      const keyOf = (c: Candidate) => c.memory_id || `codebase:${c.chunk_id}`
-      const byKey = new Map<string, Candidate>()
-      const cosine = new Map<string, number>()
-      for (const c of [...candidates, ...keywordHits]) {
-        const key = keyOf(c)
-        if (!byKey.has(key)) byKey.set(key, c)
-        cosine.set(key, c.score)
-      }
-      const vectorKeys = candidates.map(keyOf)
       const keywordKeys = keywordHits.map(keyOf)
-      const fused = rrfFuse(
-        [vectorKeys, keywordKeys],
-        [1, searchCfg.keywordWeight],
-        searchCfg.rrfK,
-        limit,
-        cosine,
-      )
-      top = fused.map((key) => byKey.get(key)!)
-      const vSet = new Set(vectorKeys)
+      const cosine = new Map([...byKey].map(([k, c]) => [k, c.score]))
+      const vSet = new Set(pool)
       const kSet = new Set(keywordKeys)
-      matchedByKey = new Map(fused.map((key) => [key, matchedBy(key, vSet, kSet)]))
+      pool = rrfFuse([pool, keywordKeys], [1, searchCfg.keywordWeight], searchCfg.rrfK, byKey.size, cosine)
+      matchedByKey = new Map(pool.map((key) => [key, matchedBy(key, vSet, kSet)]))
     }
+
+    // Near-duplicate collapse: cognify re-extracts the same fact many times,
+    // so copies at cosine >= dedupThreshold share one slot. The shown copy
+    // is the newest (or best-ranked) one; the others are listed by id under
+    // `similar_ids`, so nothing is dropped. Any failure returns the pool
+    // un-collapsed. DEVBRAIN_DEDUP_SEARCH=off disables it.
+    let similarByKey: Map<string, string[]> | null = null
+    let topKeys = pool.slice(0, limit)
+    if (useDedup && pool.length > 1) {
+      const memoryKeys = pool.filter((k) => !k.startsWith('codebase:'))
+      try {
+        const pairRes = await queryWithTimeout<{
+          a_id: string; b_id: string; a_created: number; b_created: number
+        }>(nearDupSql(), [memoryKeys, searchCfg.dedupThreshold], searchCfg.dedupTimeoutMs)
+        const created = new Map<string, number>()
+        for (const r of pairRes.rows) {
+          created.set(r.a_id, Number(r.a_created))
+          created.set(r.b_id, Number(r.b_created))
+        }
+        const groups = collapseNearDuplicates(
+          pool,
+          pairRes.rows.map((r) => [r.a_id, r.b_id] as [string, string]),
+          limit,
+          searchCfg.dedupRepresentative === 'newest' ? created : undefined,
+        )
+        topKeys = groups.map((g) => g.rep)
+        similarByKey = new Map(groups.filter((g) => g.similar.length > 0).map((g) => [g.rep, g.similar]))
+        if (matchedByKey) {
+          // A group was surfaced by whichever channels found any member.
+          for (const g of groups) {
+            const labels = new Set([g.rep, ...g.similar].map((k) => matchedByKey!.get(k) ?? 'vector'))
+            const label = labels.has('both') || (labels.has('vector') && labels.has('keyword'))
+              ? 'both' : labels.has('keyword') ? 'keyword' : 'vector'
+            matchedByKey.set(g.rep, label)
+          }
+        }
+      } catch (err) {
+        console.error(`[deep_search] near-duplicate collapse skipped: ${err instanceof Error ? err.message : String(err)}`)
+      }
+    }
+    const top = topKeys.map((key) => byKey.get(key)!)
 
     const results = await Promise.all(
       top.map(async (cand) => {
@@ -660,7 +695,13 @@ server.tool(
         }
         if (matchedByKey) {
           // Which retrieval channel(s) surfaced this result: vector, keyword or both.
-          r.matched_by = matchedByKey.get(cand.memory_id || `codebase:${cand.chunk_id}`) ?? 'vector'
+          r.matched_by = matchedByKey.get(keyOf(cand)) ?? 'vector'
+        }
+        const similar = similarByKey?.get(keyOf(cand))
+        if (similar) {
+          // Near-duplicates collapsed into this slot (same fact, other copies).
+          r.similar_count = similar.length
+          r.similar_ids = similar
         }
 
         // Auto drill-down: fetch raw context for top results if depth is
