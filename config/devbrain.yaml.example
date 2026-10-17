@@ -154,10 +154,11 @@ ingest:
   # checked for hidden unicode. Env DEVBRAIN_SCREENING / _MODEL_CHECK.
   screening:
     mode: "on"              # on | off
-    # Optional second pass: the LOCAL summarization model must confirm a
-    # rule hit before a chunk is marked (a failed call keeps the rule
-    # verdict). A non-loopback model URL disables it unless
-    # allow_remote_model is true (transcripts may contain PHI).
+    # Optional second pass over rule hits by the LOCAL summarization model.
+    # It reads the attacker's text, so it can only ADD (model_confirmed);
+    # its "benign" verdict clears nothing except a plain agent_directive
+    # hit, and that veto is logged. A non-loopback model URL disables it
+    # unless allow_remote_model is true (transcripts may contain PHI).
     model_check: false
     # model: qwen2.5:7b     # default: summarization.model
     allow_remote_model: false

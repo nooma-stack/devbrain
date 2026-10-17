@@ -98,12 +98,18 @@ characters, bidi overrides, zero-width characters inside words).
   wording rules, on a squashed form (separators collapsed, spelled-out
   letters rejoined). A hit only the normalized/squashed form produces also
   gets `obfuscated`.
-- Trust comes only from structure. In a structured message (ingest's
-  parsed session, raw_content JSON) the person's own typed user turn is
-  the principal and only gets the hidden-unicode check; a `[tool_result]`
-  line inside it starts an untrusted part. FLAT text (chunks, assembled
-  prompts, summaries, notes) is never trusted: a role prefix there is just
-  text a tool result could forge.
+- Trust comes only from structure and is opt-in. An adapter marks a
+  message `principal` only when the person typed it (Claude Code: a user
+  entry that is not `isMeta` and has no tool result; Codex: a user text
+  item or desktop `user_message`); every other message, other adapters and
+  raw_content JSON stored before the flag are untrusted. Even a principal
+  message is trusted only up to the FIRST harness marker anywhere in it
+  (`<system-reminder>`, `<task-notification>`, `<command-…>`, hook
+  context, skill / CLAUDE.md / MCP-instruction blocks, pasted or mailed
+  documents, `[tool_result]`, or any line starting with an XML-ish tag).
+  The principal part only gets the hidden-unicode check. FLAT text
+  (chunks, assembled prompts, summaries, notes) is never trusted: a role
+  prefix there is just text a tool result could forge.
 - Ingest screens each message and stores on each chunk the union of the
   flags of the messages it overlaps (`memory.screen_flags`, NULL = no
   flag), so a payload split across chunks flags them all; the summary is
@@ -117,8 +123,10 @@ characters, bidi overrides, zero-width characters inside words).
 - `devbrain screen-memory [--project] [--kind] [--since] [--apply]` reports
   (default, read-only) or sets flags on existing rows; it writes flagged rows
   only, never clean ones.
-- `ingest.screening.model_check: true` adds a local-model confirmation of
-  rule hits at ingest (loopback only unless `allow_remote_model`).
+- `ingest.screening.model_check: true` adds a local-model pass over rule
+  hits at ingest (loopback only unless `allow_remote_model`). It can only
+  add (`model_confirmed`); a "benign" verdict clears nothing but a plain
+  `agent_directive` hit, and each such veto is logged.
 
 ### Hosted backends: allow-list and codex isolation
 - `cognify.allowed_backends` (`factory/cognify/backends.py`) lists the hosted

@@ -164,6 +164,23 @@ class ClaudeCodeAdapter:
                                         content_parts.append(f"[tool_result] {result_text[:500]}")
 
                     content = "\n".join(content_parts).strip()
+                    # Typed by the person: a user entry that is not harness
+                    # text (isMeta: skills, caveats, injected reminders) and
+                    # carries no tool result. Injection screening trusts
+                    # nothing else (and still cuts at the first harness
+                    # marker inside the text).
+                    has_tool_result = isinstance(raw_content, list) and any(
+                        isinstance(b, dict) and b.get("type") == "tool_result"
+                        for b in raw_content
+                    )
+                    principal = (
+                        role == "user"
+                        and entry_type == "user"
+                        and not entry.get("isMeta")
+                        and not entry.get("isCompactSummary")
+                        and not has_tool_result
+                        and bool(content)
+                    )
                     if content or tool_calls:
                         messages.append(UniversalMessage(
                             role=role,
@@ -171,6 +188,7 @@ class ClaudeCodeAdapter:
                             content=content,
                             tool_calls=tool_calls,
                             files_touched=msg_files,
+                            principal=principal,
                         ))
         except Exception as e:
             print(f"  Error parsing {file_path}: {e}")
