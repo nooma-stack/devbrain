@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
+from cognify import relate
 from cognify.embedding import embed_text, to_vector_literal
 from cognify.orchestrator import CognifyPass, PassResult, register_pass
 from observability.pricing import (
@@ -1018,10 +1019,24 @@ def _upsert_memory(
     # the row is still written and a reembed pass backfills the vector.
     placeholders_list = ["%s"] * len(cols)
     emb = embed_text(f"{title}\n{content}" if title else content)
-    if emb is not None:
+    emb_literal = to_vector_literal(emb) if emb is not None else None
+    if emb_literal is not None:
         cols.append("embedding")
-        vals.append(to_vector_literal(emb))
+        vals.append(emb_literal)
         placeholders_list.append("%s::vector")
+
+    # Write-time relation check (write_path.relation_check; off by default).
+    # A "same" verdict means this fact is already known in the project: the
+    # existing atom is reinforced and nothing is written. Any failure in
+    # the check falls through to the plain write below.
+    rel_cfg = relate.get_config()
+    pre = relate.precheck(
+        conn, rel_cfg,
+        project_id=project_id, kind=db_kind, title=title, content=content,
+        embedding_literal=emb_literal, source="extract", source_ref=str(session_id),
+    )
+    if pre.skip_insert:
+        return pre.existing_id, False
 
     placeholders = ", ".join(placeholders_list)
     with conn.cursor() as cur:
@@ -1032,6 +1047,10 @@ def _upsert_memory(
             vals,
         )
         mid = cur.fetchone()[0]
+    pre.finish(
+        conn, project_id=project_id, new_id=mid, cfg=rel_cfg,
+        source="extract", source_ref=str(session_id),
+    )
     conn.commit()
     return mid, True
 

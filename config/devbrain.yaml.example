@@ -43,6 +43,32 @@ summarization:
   url: http://localhost:11434
   model: qwen2.5:7b
 
+# Write-path quality checks.
+write_path:
+  # Write-time relation check: compare each new decision/pattern/issue atom
+  # with its nearest atoms in the same project and label it same / refines /
+  # contradicts / new with the LOCAL model. "same" is not stored again (the
+  # existing atom is reinforced); refines/contradicts add graph edges.
+  # See docs/MEMORY_PIPELINE.md. Env overrides in brackets.
+  relation_check:
+    # off | shadow (classify + log only) | on      [DEVBRAIN_RELATION_CHECK]
+    # Quote the value: a bare off/on is read as a boolean (also accepted).
+    mode: "off"
+    # Cosine floor for a candidate to reach the model. [DEVBRAIN_RELATION_THRESHOLD]
+    threshold: 0.80
+    # refines/contradicts below this similarity are written as plain rows.
+    edge_min_similarity: 0.85
+    # "same" below this confidence is kept as "refines" (row written + edge).
+    min_same_confidence: 0.8
+    top_k: 3
+    timeout_seconds: 30                           # [DEVBRAIN_RELATION_TIMEOUT_S]
+    # Model + URL default to summarization.* above, i.e. this host's Ollama.
+    # model: qwen2.5:7b                           # [DEVBRAIN_RELATION_MODEL]
+    # url: http://localhost:11434                 # [DEVBRAIN_RELATION_URL]
+    # Memory text can contain PHI. A non-loopback model URL disables the
+    # check unless this is true.                  [DEVBRAIN_RELATION_ALLOW_REMOTE]
+    allow_remote_model: false
+
 chunking:
   max_tokens: 400
   overlap_tokens: 80

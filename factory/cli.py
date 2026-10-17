@@ -3692,6 +3692,98 @@ def cognify_reextract_command(
             )
 
 
+@cli.command("cognify-relate")
+@click.option("--memory-id", "memory_ids", multiple=True,
+              help="Check this already-written atom (repeatable).")
+@click.option("--project", "project_slug", default=None,
+              help="Limit the sweep to one project.")
+@click.option("--sweep/--no-sweep", default=False,
+              help="Also check recent atoms that have no relation-log row yet.")
+@click.option("--lookback-hours", type=float, default=48.0, show_default=True,
+              help="Sweep window.")
+@click.option("--max-checks", type=int, default=25, show_default=True,
+              help="Sweep cap (model calls per run).")
+@click.option("--source", default="cli", show_default=True,
+              help="Recorded in memory_relation_log.source (e.g. mcp:store).")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Classify and print verdicts; write nothing.")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Emit result as JSON.")
+def cognify_relate_command(memory_ids, project_slug, sweep, lookback_hours,
+                           max_checks, source, dry_run, as_json):
+    """Write-time relation check for atoms already written (async path).
+
+    Classifies each atom against older atoms in its project as same /
+    refines / contradicts / new with the local model and applies the
+    verdict (write_path.relation_check.mode=on) or only logs it (shadow).
+    The MCP store tool spawns this detached after it answers.
+
+    Examples:\n
+      devbrain cognify-relate --memory-id=<uuid> --source=mcp:store\n
+      devbrain cognify-relate --sweep --project=myproject\n
+      devbrain cognify-relate --sweep --dry-run --max-checks=10
+    """
+    import sys
+    import json as _json
+
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
+    from cognify import relate
+
+    import uuid as _uuid
+    for mid in memory_ids:
+        try:
+            _uuid.UUID(mid)
+        except ValueError:
+            raise click.BadParameter(f"not a UUID: {mid!r}", param_hint="--memory-id")
+
+    cfg = relate.get_config()
+    if not cfg.enabled:
+        click.echo("relation check is off (write_path.relation_check.mode); nothing to do.")
+        return
+
+    db = get_db()
+    project_id = None
+    if project_slug:
+        with db._conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM devbrain.projects WHERE slug = %s", (project_slug,))
+            row = cur.fetchone()
+        if not row:
+            raise click.ClickException(f"Project {project_slug!r} not found.")
+        project_id = row[0]
+
+    out: dict = {"mode": cfg.mode, "dry_run": dry_run, "checked": [], "sweep": None}
+    conn = db._conn()
+    try:
+        for mid in memory_ids:
+            v = relate.relate_existing(conn, cfg, mid, source=source, dry_run=dry_run)
+            out["checked"].append({
+                "memory_id": mid,
+                "relation": None if v is None else ("error" if v.error else v.relation),
+                "model_relation": None if v is None else v.model_relation,
+                "matched_memory_id": str(v.match.id) if v and v.match else None,
+                "similarity": round(v.match.similarity, 4) if v and v.match else None,
+                "latency_ms": None if v is None else v.latency_ms,
+            })
+        if sweep:
+            out["sweep"] = relate.sweep(
+                conn, cfg, project_id=project_id, lookback_hours=lookback_hours,
+                max_checks=max_checks, source=source, dry_run=dry_run,
+            )
+    finally:
+        conn.close()
+
+    if as_json:
+        click.echo(_json.dumps(out, indent=2, default=str))
+    else:
+        for c in out["checked"]:
+            click.echo(
+                f"{c['memory_id']}: {c['relation'] or 'skipped'}"
+                + (f" -> {c['matched_memory_id']} ({c['similarity']})" if c["matched_memory_id"] else "")
+            )
+        if out["sweep"] is not None:
+            click.echo(f"sweep: {out['sweep']}")
+
+
 @cli.command("cognify-bulk")
 @click.option("--project", "project_slug", required=True,
               help="Project slug.")
