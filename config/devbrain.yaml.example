@@ -53,6 +53,13 @@ embedding:
 #   keyword_row_budget: 3000   # max summed row count of the kept terms
 #   keyword_max_terms: 12
 #   keyword_timeout_ms: 1000   # over this, the search falls back to vector-only
+#   # Near-duplicate collapse (env DEVBRAIN_DEDUP_SEARCH on/off,
+#   # DEVBRAIN_DEDUP_THRESHOLD): results at cosine >= dedup_threshold share
+#   # one slot; the other copies are listed in the result's similar_ids.
+#   dedup: true
+#   dedup_threshold: 0.93
+#   dedup_representative: newest # newest | best (best-ranked copy)
+#   dedup_timeout_ms: 500        # over this, results come back un-collapsed
 
 summarization:
   provider: ollama

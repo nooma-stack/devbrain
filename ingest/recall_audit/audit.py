@@ -16,8 +16,12 @@ call shape: no source_types filter): the devbrain.memory query (same JOINs,
 pipeline. The ``hybrid`` pipeline adds deep_search's keyword channel — the
 exact SQL file the MCP runs (mcp-server/sql/keyword_search.sql) — and fuses
 the two ranked lists with weighted Reciprocal Rank Fusion (``rrf_fuse``,
-mirror of ``rrfFuse`` in mcp-server/src/hybrid.ts). Each configuration is
-run twice:
+mirror of ``rrfFuse`` in mcp-server/src/hybrid.ts). ``--dedup on`` adds deep_search's near-duplicate
+collapse (mcp-server/sql/near_duplicates.sql + ``collapse_near_duplicates``,
+mirror of collapseNearDuplicates): a hit counts when the expected id is the
+group's representative or one of its ``similar_ids``; the table also gives
+rep-only metrics and the duplicate slots freed in the un-collapsed top 10.
+Each configuration is run twice:
 
 * ``index`` — through the HNSW index at ``hnsw.ef_search`` (default 400 +
   ``hnsw.iterative_scan=relaxed_order``, what the MCP pool sets per
@@ -41,6 +45,7 @@ Usage (from ingest/)::
     python -m recall_audit --modes index --iterative-scan off
     python -m recall_audit --prefix-modes on --modes index --pipelines vector,hybrid
     python -m recall_audit --pipelines hybrid --rrf-k 30 --keyword-weight 0.5
+    python -m recall_audit --pipelines hybrid --dedup off,on --dedup-thresholds 0.92,0.94,0.96
 
 Connection: ``--dsn`` > ``DEVBRAIN_DATABASE_URL`` > config/devbrain.yaml;
 Ollama: ``DEVBRAIN_OLLAMA_URL`` > yaml. libpq env vars (PGPASSWORD, ...) work
@@ -108,6 +113,84 @@ def load_keyword_sql(path: Path = KEYWORD_SQL_PATH) -> str:
     return re.sub(r"\$(\d+)", r"%(p\1)s", text)
 
 
+# deep_search's near-duplicate pair query (same loader rules as above).
+NEAR_DUP_SQL_PATH = KEYWORD_SQL_PATH.with_name("near_duplicates.sql")
+
+
+def load_near_dup_sql(path: Path = NEAR_DUP_SQL_PATH) -> str:
+    return load_keyword_sql(path)
+
+
+@dataclass
+class Group:
+    """One collapsed result: the representative plus its near-duplicates."""
+
+    rep: str
+    similar: list[str] = field(default_factory=list)
+
+    @property
+    def members(self) -> list[str]:
+        return [self.rep, *self.similar]
+
+
+def collapse_near_duplicates(
+    ranked: list[str],
+    pairs: Iterable[tuple[str, str]],
+    limit: int,
+    created: dict[str, float] | None = None,
+) -> list[Group]:
+    """Greedy collapse in rank order. Mirror of collapseNearDuplicates in
+    mcp-server/src/hybrid.ts.
+
+    Walk the ranked pool; a key similar (>= threshold, i.e. listed in
+    ``pairs``) to an already-kept representative joins the best-ranked such
+    representative, otherwise it becomes a new representative while fewer
+    than ``limit`` exist. The walk continues past ``limit`` so every copy in
+    the pool is attached. No chaining: similarity is to the representative.
+
+    With ``created`` (id -> created_at epoch), each group's representative is
+    then swapped for its newest member; the group keeps its rank.
+    """
+    adj: dict[str, set[str]] = {}
+    for a, b in pairs:
+        adj.setdefault(a, set()).add(b)
+        adj.setdefault(b, set()).add(a)
+    groups: list[Group] = []
+    seen: set[str] = set()
+    for key in ranked:
+        if key in seen:
+            continue
+        seen.add(key)
+        near = adj.get(key, set())
+        home = next((g for g in groups if g.rep in near), None)
+        if home is not None:
+            home.similar.append(key)
+        elif len(groups) < limit:
+            groups.append(Group(key))
+    if created:
+        for g in groups:
+            newest = max(g.members, key=lambda k: (created.get(k, float("-inf")), k == g.rep))
+            if newest != g.rep:
+                g.similar = [g.rep, *(m for m in g.similar if m != newest)]
+                g.rep = newest
+    return groups
+
+
+def first_hit_rank_groups(groups: list[Group], expected: Iterable[str], rep_only: bool = False) -> int | None:
+    """1-based rank of the first group holding an expected id (any member,
+    or only the representative when ``rep_only``)."""
+    want = set(expected)
+    for i, g in enumerate(groups, 1):
+        if (g.rep in want) if rep_only else any(m in want for m in g.members):
+            return i
+    return None
+
+
+def freed_slots(groups_of_top: list[Group]) -> int:
+    """Duplicate entries absorbed when collapsing a top-k list."""
+    return sum(len(g.similar) for g in groups_of_top)
+
+
 @dataclass(frozen=True)
 class HybridParams:
     """Defaults mirror SEARCH_DEFAULTS in mcp-server/src/hybrid.ts."""
@@ -119,6 +202,15 @@ class HybridParams:
     keyword_row_budget: float = 3000.0
     keyword_max_terms: int = 12
     keyword_identifiers_only: bool = True
+
+
+@dataclass(frozen=True)
+class DedupParams:
+    """Defaults mirror SEARCH_DEFAULTS.dedup* in mcp-server/src/hybrid.ts."""
+
+    enabled: bool = True
+    threshold: float = 0.93
+    representative: str = "newest"  # newest | best
 
 
 @dataclass
@@ -150,8 +242,13 @@ class RunResult:
     pipeline: str = "vector"
     ranks: dict[str, int | None] = field(default_factory=dict)
     seconds: float = 0.0
-    # per-query SQL wall time (ms) per channel: "vector", "keyword"
+    # per-query SQL wall time (ms) per channel: "vector", "keyword", "dedup"
     timings: dict[str, list[float]] = field(default_factory=dict)
+    dedup: str = "off"
+    # with dedup: rank of the first group whose representative is expected
+    rep_ranks: dict[str, int | None] = field(default_factory=dict)
+    # with dedup: duplicate entries in the un-collapsed top 10 (slots freed)
+    freed: dict[str, int] = field(default_factory=dict)
 
 
 def load_gold(path: Path) -> list[GoldItem]:
@@ -265,11 +362,14 @@ def run_search(
     hybrid: HybridParams | None = None,
     keyword_sql: str | None = None,
     timings: dict[str, list[float]] | None = None,
+    return_pool: bool = False,
 ) -> list[str]:
     """One deep_search-equivalent query in its own read-only transaction.
 
     ``pipeline="hybrid"`` widens the vector fetch to max(depth, candidates)
     (as deep_search does), runs the keyword SQL, and RRF-fuses both lists.
+    ``return_pool`` returns the whole fused candidate pool instead of the
+    top ``depth`` (the near-duplicate collapse walks the pool).
     """
     if mode == "exact":
         cur.execute("SET LOCAL enable_indexscan = off")
@@ -281,7 +381,7 @@ def run_search(
             # ef_search-sized candidate list (deep_search sets relaxed_order).
             cur.execute("SELECT set_config('hnsw.iterative_scan', %s, true)", (iterative_scan,))
     hp = hybrid or HybridParams()
-    fetch = max(depth, hp.candidates) if pipeline == "hybrid" else depth
+    fetch = max(depth, hp.candidates) if (pipeline == "hybrid" or return_pool) else depth
     params = {"vec": vec, "limit": fetch, "pid": project_id}
     mem_filter = "AND m.project_id = %(pid)s" if project_id else ""
     t0 = time.monotonic()
@@ -297,7 +397,7 @@ def run_search(
     vector_ranked = merge_candidates(mem_rows, cb_rows, fetch)
     if pipeline != "hybrid":
         cur.connection.rollback()  # end the read-only txn; nothing to keep
-        return vector_ranked[:depth]
+        return vector_ranked if return_pool else vector_ranked[:depth]
 
     t1 = time.monotonic()
     cur.execute(
@@ -322,13 +422,38 @@ def run_search(
     cosine = dict(mem_rows + cb_rows)
     for mid, sc in kw_rows:
         cosine.setdefault(mid, sc)
+    pool = vector_ranked + [mid for mid, _ in kw_rows]
     return rrf_fuse(
         [vector_ranked, [mid for mid, _ in kw_rows]],
         [1.0, hp.keyword_weight],
         hp.rrf_k,
-        depth,
+        len(pool) if return_pool else depth,
         cosine,
     )
+
+
+def run_dedup(
+    cur: Any,
+    pool: list[str],
+    threshold: float,
+    depth: int,
+    sql: str | None = None,
+    timings: dict[str, list[float]] | None = None,
+    representative: str = "best",
+) -> tuple[list[Group], int]:
+    """deep_search's collapse over a fused pool: (groups[:depth], freed slots in top 10)."""
+    ids = [k for k in pool if not k.startswith("codebase:")]
+    t0 = time.monotonic()
+    cur.execute(sql or load_near_dup_sql(), {"p1": ids, "p2": threshold})
+    rows = cur.fetchall()
+    pairs = [(r[0], r[1]) for r in rows]
+    created = {r[0]: r[3] for r in rows} | {r[1]: r[4] for r in rows}
+    cur.connection.rollback()
+    if timings is not None:
+        timings.setdefault("dedup", []).append((time.monotonic() - t0) * 1000)
+    groups = collapse_near_duplicates(pool, pairs, depth, created if representative == "newest" else None)
+    top10 = collapse_near_duplicates(pool[:10], pairs, 10)
+    return groups, freed_slots(top10)
 
 
 def _fmt(m: Metrics) -> str:
@@ -348,27 +473,50 @@ def render_table(results: list[RunResult], items: list[GoldItem]) -> str:
     lines = [
         f"Gold items: {len(items)}",
         "",
-        "| query prefix | scope | search | pipeline | items | recall@5 | recall@10 | MRR |",
-        "|---|---|---|---|---|---|---|---|",
+        "| query prefix | scope | search | pipeline | dedup | items | recall@5 | recall@10 | MRR |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
         for name, subset in _subsets(items):
             m = summarize(r.ranks[i.id] for i in subset)
-            lines.append(f"| {r.prefix_mode} | {r.scope} | {r.mode} | {r.pipeline} | {name} ({m.n}) | {_fmt(m)} |")
-    lines += ["", "| scope | search | pipeline | channel | p50 ms | p95 ms | max ms |", "|---|---|---|---|---|---|---|"]
+            lines.append(
+                f"| {r.prefix_mode} | {r.scope} | {r.mode} | {r.pipeline} | {r.dedup} | {name} ({m.n}) | {_fmt(m)} |"
+            )
+    dd = [r for r in results if r.rep_ranks]
+    if dd:
+        lines += [
+            "",
+            "Near-duplicate collapse: rep-only = hit only when the representative itself is expected;",
+            "freed = duplicate entries absorbed from the un-collapsed top 10 (mean per query, and queries with any).",
+            "",
+            "| scope | search | pipeline | dedup | rep-only R@5 | rep-only R@10 | rep-only MRR | freed / query | queries with freed slots |",
+            "|---|---|---|---|---|---|---|---|---|",
+        ]
+        for r in dd:
+            m = summarize(r.rep_ranks[i.id] for i in items)
+            fr = [r.freed[i.id] for i in items]
+            lines.append(
+                f"| {r.scope} | {r.mode} | {r.pipeline} | {r.dedup} | {_fmt(m).replace(' | ', ' | ')} | "
+                f"{sum(fr) / len(fr):.2f} | {sum(1 for f in fr if f)} |"
+            )
+    lines += [
+        "",
+        "| scope | search | pipeline | dedup | channel | p50 ms | p95 ms | max ms |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
     for r in results:
         for ch, ts in sorted(r.timings.items()):
             lines.append(
-                f"| {r.scope} | {r.mode} | {r.pipeline} | {ch} | {percentile(ts, 50):.1f} | "
+                f"| {r.scope} | {r.mode} | {r.pipeline} | {r.dedup} | {ch} | {percentile(ts, 50):.1f} | "
                 f"{percentile(ts, 95):.1f} | {max(ts):.1f} |"
             )
-    by_key = {(r.prefix_mode, r.scope, r.mode, r.pipeline): r for r in results}
+    by_key = {(r.prefix_mode, r.scope, r.mode, r.pipeline, r.dedup): r for r in results}
     loss_lines = []
-    for (p, s, mode, pl), r in by_key.items():
-        if not mode.startswith("index") or (p, s, "exact", pl) not in by_key:
+    for (p, s, mode, pl, dd_), r in by_key.items():
+        if not mode.startswith("index") or (p, s, "exact", pl, dd_) not in by_key:
             continue
-        lost = index_loss(by_key[(p, s, "exact", pl)].ranks, r.ranks)
-        loss_lines.append(f"- prefix {p}, scope {s}, {mode}, {pl}: lost {len(lost)} exact top-10 hit(s) {lost}")
+        lost = index_loss(by_key[(p, s, "exact", pl, dd_)].ranks, r.ranks)
+        loss_lines.append(f"- prefix {p}, scope {s}, {mode}, {pl}, dedup {dd_}: lost {len(lost)} exact top-10 hit(s) {lost}")
     if loss_lines:
         lines += ["", "Index loss (exact top-10 hits missing from index top-10):", *loss_lines]
     return "\n".join(lines)
@@ -398,6 +546,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--keyword-max-df", type=float, default=hd.keyword_max_df)
     ap.add_argument("--keyword-row-budget", type=float, default=hd.keyword_row_budget)
     ap.add_argument("--keyword-max-terms", type=int, default=hd.keyword_max_terms)
+    ddp = DedupParams()
+    ap.add_argument(
+        "--dedup",
+        default="off,on" if ddp.enabled else "off",
+        help="comma list of off,on: near-duplicate collapse after ranking",
+    )
+    ap.add_argument(
+        "--dedup-thresholds",
+        default=str(ddp.threshold),
+        help="comma list of cosine thresholds for dedup=on (e.g. 0.92,0.94,0.96)",
+    )
+    ap.add_argument("--dedup-representative", choices=["best", "newest"], default=ddp.representative)
     ap.add_argument(
         "--keyword-sql",
         type=Path,
@@ -438,6 +598,14 @@ def main(argv: list[str] | None = None) -> int:
         keyword_identifiers_only=args.keyword_terms == "identifiers",
     )
     keyword_sql = load_keyword_sql(args.keyword_sql) if "hybrid" in pipelines else None
+    dedup_modes: list[tuple[str, float | None]] = []
+    for d in (x.strip() for x in args.dedup.split(",") if x.strip()):
+        if d == "off":
+            dedup_modes.append(("off", None))
+        else:
+            for t in (float(x) for x in args.dedup_thresholds.split(",") if x.strip()):
+                dedup_modes.append((f"{t:g}", t))
+    near_dup_sql = load_near_dup_sql() if any(t is not None for _, t in dedup_modes) else None
 
     conn = psycopg2.connect(args.dsn or config.DATABASE_URL)
     conn.set_session(readonly=True, autocommit=False)
@@ -460,11 +628,16 @@ def main(argv: list[str] | None = None) -> int:
                 if mode == "index" and iterative:
                     label = f"index+{iterative}"
                 for pipeline in pipelines:
-                    rr = RunResult(prefix_mode=f"{pm} ({prefix!r})", scope=scope, mode=label, pipeline=pipeline)
+                    runs = [
+                        RunResult(
+                            prefix_mode=f"{pm} ({prefix!r})", scope=scope, mode=label, pipeline=pipeline, dedup=dname
+                        )
+                        for dname, _ in dedup_modes
+                    ]
                     t0 = time.monotonic()
                     for it in items:
                         pid = slug_to_id[it.project] if scope == "project" else None
-                        ranked = run_search(
+                        pool = run_search(
                             cur,
                             vecs[it.id],
                             pid,
@@ -477,22 +650,34 @@ def main(argv: list[str] | None = None) -> int:
                             query_text=it.query,
                             hybrid=hybrid,
                             keyword_sql=keyword_sql,
-                            timings=rr.timings,
+                            timings=runs[0].timings,
+                            return_pool=True,
                         )
-                        rr.ranks[it.id] = first_hit_rank(ranked, it.expected_ids)
-                    rr.seconds = time.monotonic() - t0
-                    results.append(rr)
-                    m = summarize(rr.ranks.values())
-                    print(
-                        f"[{rr.prefix_mode} {scope} {mode} {pipeline}] R@5={m.recall_at_5:.3f} "
-                        f"R@10={m.recall_at_10:.3f} MRR={m.mrr:.3f} ({rr.seconds:.1f}s)",
-                        file=sys.stderr,
-                    )
+                        for rr, (_, thr) in zip(runs, dedup_modes):
+                            if thr is None:
+                                rr.ranks[it.id] = first_hit_rank(pool[: args.depth], it.expected_ids)
+                                continue
+                            groups, freed = run_dedup(
+                                cur, pool, thr, args.depth, near_dup_sql, rr.timings, args.dedup_representative
+                            )
+                            rr.ranks[it.id] = first_hit_rank_groups(groups, it.expected_ids)
+                            rr.rep_ranks[it.id] = first_hit_rank_groups(groups, it.expected_ids, rep_only=True)
+                            rr.freed[it.id] = freed
+                    secs = time.monotonic() - t0
+                    for rr in runs:
+                        rr.seconds = secs
+                        results.append(rr)
+                        m = summarize(rr.ranks.values())
+                        print(
+                            f"[{rr.prefix_mode} {scope} {mode} {pipeline} dedup={rr.dedup}] R@5={m.recall_at_5:.3f} "
+                            f"R@10={m.recall_at_10:.3f} MRR={m.mrr:.3f} ({rr.seconds:.1f}s)",
+                            file=sys.stderr,
+                        )
     conn.close()
 
     print(render_table(results, items))
     if args.per_item:
-        header = "item | " + " | ".join(f"{r.prefix_mode}/{r.scope}/{r.mode}/{r.pipeline}" for r in results)
+        header = "item | " + " | ".join(f"{r.prefix_mode}/{r.scope}/{r.mode}/{r.pipeline}/{r.dedup}" for r in results)
         print("\n" + header)
         for it in items:
             cells = " | ".join(str(r.ranks[it.id] or f">{args.depth}") for r in results)
@@ -506,6 +691,9 @@ def main(argv: list[str] | None = None) -> int:
                         "scope": r.scope,
                         "mode": r.mode,
                         "pipeline": r.pipeline,
+                        "dedup": r.dedup,
+                        "rep_ranks": r.rep_ranks,
+                        "freed": r.freed,
                         "seconds": r.seconds,
                         "ranks": r.ranks,
                         "timings_ms": r.timings,

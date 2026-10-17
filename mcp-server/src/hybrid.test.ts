@@ -8,9 +8,11 @@ import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import {
   SEARCH_DEFAULTS,
+  collapseNearDuplicates,
   keywordParams,
   keywordSql,
   matchedBy,
+  nearDupSql,
   resolveSearchConfig,
   rrfFuse,
 } from './hybrid.js'
@@ -158,5 +160,94 @@ describe('deep_search wiring', () => {
 
   test('fuses with the configured RRF weight and k', () => {
     assert.match(body, /rrfFuse\([\s\S]*searchCfg\.keywordWeight[\s\S]*searchCfg\.rrfK/)
+  })
+})
+
+describe('collapseNearDuplicates', () => {
+  const pairs: Array<[string, string]> = [['a', 'c'], ['a', 'e'], ['b', 'd']]
+
+  test('copies join the best-ranked representative they match', () => {
+    const groups = collapseNearDuplicates(['a', 'b', 'c', 'd', 'e', 'f'], pairs, 10)
+    assert.deepEqual(groups, [
+      { rep: 'a', similar: ['c', 'e'] },
+      { rep: 'b', similar: ['d'] },
+      { rep: 'f', similar: [] },
+    ])
+  })
+
+  test('limit counts groups, and copies beyond it are still attached', () => {
+    const groups = collapseNearDuplicates(['a', 'b', 'c', 'd', 'e', 'f'], pairs, 2)
+    assert.deepEqual(groups.map((g) => g.rep), ['a', 'b'])
+    assert.deepEqual(groups[0].similar, ['c', 'e'])
+  })
+
+  test('no chaining: similarity is to the representative only', () => {
+    // c ~ a, d ~ c, but d is not similar to a → d opens its own group.
+    const groups = collapseNearDuplicates(['a', 'c', 'd'], [['a', 'c'], ['c', 'd']], 10)
+    assert.deepEqual(groups, [{ rep: 'a', similar: ['c'] }, { rep: 'd', similar: [] }])
+  })
+
+  test('newest representative keeps the slot and lists the others', () => {
+    const created = new Map([['a', 1], ['c', 3], ['e', 2], ['b', 5], ['d', 4]])
+    const groups = collapseNearDuplicates(['a', 'b', 'c', 'd', 'e'], pairs, 10, created)
+    assert.deepEqual(groups, [
+      { rep: 'c', similar: ['a', 'e'] },
+      { rep: 'b', similar: ['d'] },
+    ])
+  })
+
+  test('matches the Python audit mirror on a fixed case', () => {
+    // Same inputs as test_collapse_matches_mcp in ingest/tests/test_recall_audit.py.
+    const groups = collapseNearDuplicates(
+      ['m1', 'm2', 'm3', 'm4', 'm5', 'm6'],
+      [['m1', 'm3'], ['m2', 'm3'], ['m4', 'm6'], ['m5', 'm1']],
+      3,
+      new Map([['m1', 10], ['m3', 30], ['m5', 20], ['m4', 5], ['m6', 5]]),
+    )
+    assert.deepEqual(groups, [
+      { rep: 'm3', similar: ['m1', 'm5'] },
+      { rep: 'm2', similar: [] },
+      { rep: 'm4', similar: ['m6'] },
+    ])
+  })
+})
+
+describe('dedup config', () => {
+  test('defaults', () => {
+    const cfg = resolveSearchConfig({}, {})
+    assert.equal(cfg.dedup, true)
+    assert.equal(cfg.dedupThreshold, 0.93)
+    assert.equal(cfg.dedupRepresentative, 'newest')
+  })
+
+  test('env > yaml, invalid falls back', () => {
+    const cfg = resolveSearchConfig(
+      { dedup: true, dedup_threshold: 0.95, dedup_representative: 'best', dedup_timeout_ms: 200 },
+      { DEVBRAIN_DEDUP_SEARCH: 'off', DEVBRAIN_DEDUP_THRESHOLD: '0.92' },
+    )
+    assert.equal(cfg.dedup, false)
+    assert.equal(cfg.dedupThreshold, 0.92)
+    assert.equal(cfg.dedupRepresentative, 'best')
+    assert.equal(cfg.dedupTimeoutMs, 200)
+    const bad = resolveSearchConfig({ dedup_threshold: 3, dedup_representative: 'oldest' }, {})
+    assert.equal(bad.dedupThreshold, SEARCH_DEFAULTS.dedupThreshold)
+    assert.equal(bad.dedupRepresentative, SEARCH_DEFAULTS.dedupRepresentative)
+  })
+})
+
+describe('near-duplicate SQL', () => {
+  const sql = nearDupSql()
+  test('takes ids and threshold only, no percent sign', () => {
+    const used = new Set([...sql.matchAll(/\$(\d+)/g)].map((m) => Number(m[1])))
+    assert.deepEqual([...used].sort(), [1, 2])
+    assert.ok(!sql.includes('%'))
+  })
+  test('returns the columns deep_search reads', () => {
+    for (const col of ['a_id', 'b_id', 'a_created', 'b_created']) assert.match(sql, new RegExp(`AS ${col}\\b`))
+  })
+  test('deep_search runs it under a timeout and falls back', () => {
+    const src = readFileSync(resolve(import.meta.dirname, 'index.ts'), 'utf-8')
+    assert.match(src, /queryWithTimeout<[\s\S]*?>\(nearDupSql\(\)/)
+    assert.match(src, /near-duplicate collapse skipped/)
   })
 })
