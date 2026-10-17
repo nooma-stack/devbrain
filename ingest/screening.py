@@ -27,8 +27,10 @@ summaries, notes) is never trusted, because a role prefix there is just
 text a tool result could forge. Callers screen the exact string a model
 will receive.
 
-Pure stdlib, no I/O: imported by the ingest pipeline and (via
-factory/cognify/screen.py) by the cognify passes.
+Pure stdlib; reads screening_rules.json (shared with the MCP server's
+write-time screening, mcp-server/src/screening.ts) at import. Imported by
+the ingest pipeline and (via factory/cognify/screen.py) by the cognify
+passes.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ import unicodedata
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 RULES = (
     "override",
@@ -50,110 +53,52 @@ RULES = (
     "obfuscated",
 )
 
-# ── patterns ─────────────────────────────────────────────────────────────────
+# ── patterns (shared with mcp-server/src/screening.ts) ──────────────────────
+#
+# The rule patterns, the invisible-character class and the look-alike map
+# live in screening_rules.json so the MCP server's write-time screening
+# (store / breadcrumb / end_session) uses exactly the same rules. Both
+# test suites run the shared cases in screening_cases.json.
 
-_I = re.IGNORECASE
+_SPEC = json.loads(
+    (Path(__file__).with_name("screening_rules.json")).read_text("utf-8")
+)
 
-_OVERRIDE = [
-    re.compile(
-        r"\b(ignore|disregard|forget|override|bypass)\s+(all\s+|any\s+|the\s+|your\s+|my\s+)?"
-        r"(previous|prior|preceding|above|earlier|former|existing|original|system)\s+"
-        r"(instructions?|prompts?|directives?|rules|guidelines|messages|context)",
-        _I,
-    ),
-    re.compile(
-        r"\b(ignore|disregard|forget)\s+(everything|all)\s+(you\s+(were|have\s+been)\s+told|"
-        r"(above|before|previously))",
-        _I,
-    ),
-    re.compile(
-        r"\byou\s+are\s+now\s+(in\s+)?(an?\s+)?(DAN|developer\s+mode|jailbr[eo]ken|"
-        r"unrestricted|unfiltered|god\s+mode|no\s+longer\s+bound)",
-        _I,
-    ),
-    re.compile(r"\b(new|updated|revised)\s+system\s+(prompt|instructions?)\s*[:=]", _I),
-    re.compile(
-        r"\bfrom\s+now\s+on,?\s+you\s+(will|must|are\s+to)\s+(ignore|disregard)\b", _I
-    ),
-]
 
-_AGENT_DIRECTIVE = [
-    re.compile(
-        r"\bif\s+you\s+are\s+an?\s+(AI|LLM|language\s+model|assistant|agent|chatbot|"
-        r"AI\s+(assistant|agent|model))\b[^.\n]{0,80}\b(reading|processing|summari[sz]ing|"
-        r"seeing|parsing)\b",
-        _I,
-    ),
-    re.compile(
-        r"\b(note|message|instructions?|attention)\s+(to|for)\s+(any\s+|all\s+|the\s+)?"
-        r"(AI\s+|LLM\s+)?(AI|LLM|assistant|agent|language\s+model|model)s?"
-        r"(\s+(reading|processing|parsing)\s+this[^:\n]{0,30})?\s*(:|—|,)",
-        _I,
-    ),
-    re.compile(
-        r"\b(AI|LLM)\s+(agents?|assistants?|models?)\s+(reading|processing|summari[sz]ing)\s+"
-        r"this\b",
-        _I,
-    ),
-]
+def _compile(entry: dict) -> re.Pattern:
+    flags = 0
+    if "i" in entry.get("flags", ""):
+        flags |= re.IGNORECASE
+    if "m" in entry.get("flags", ""):
+        flags |= re.MULTILINE
+    return re.compile(entry["pattern"], flags)
 
-_FAKE_TAG = [
-    re.compile(
-        r"<\|(im_start|im_end|system|user|assistant|endoftext|eot_id|start_header_id)\|>",
-        _I,
-    ),
-    re.compile(r"\[/?INST\]|<<\/?SYS>>"),
-    # A bare role tag on its own, not a placeholder inside code/docs such as
-    # `raw.<system>.source`.
-    re.compile(
-        r"(?:^|(?<=\s))</?\s*(system|system_prompt|system-prompt|developer)\s*>(?=\s|$)",
-        _I | re.MULTILINE,
-    ),
-    re.compile(r"</\s*(tool_result|function_results|tool_response)\s*>", _I),
-    re.compile(r"<\s*/?\s*antml:"),
-    # Legacy "\n\nHuman:" / "\n\nAssistant:" turn markers.
-    re.compile(r"\n\s*\n(Human|Assistant):\s*\S"),
-]
 
-_EXFIL = [
-    re.compile(
-        r"\b(send|post|upload|forward|email|e-mail|exfiltrate|leak|transmit|paste)\s+"
-        r"(me\s+)?(the\s+|your\s+|all\s+|any\s+|these\s+|those\s+)?"
-        r"(api[\s_-]?keys?|access\s+tokens?|tokens?|passwords?|secrets?|credentials?|"
-        r"ssh\s+keys?|private\s+keys?|\.env(\s+file)?|cookies?|session\s+tokens?)\b"
-        r"[^\n]{0,60}\b(to|at|into)\s+(https?://|www\.|[\w.+-]+@[\w-]+\.|[\w-]+\.(com|net|org|io|"
-        r"xyz|ru|cn|top|site|app|dev)\b)",
-        _I,
-    ),
-    re.compile(
-        r"\b(reveal|print|output|repeat|show|dump|leak)\s+(me\s+)?(your|the)\s+"
-        r"(system\s+prompt|hidden\s+instructions|initial\s+instructions|developer\s+message)",
-        _I,
-    ),
-]
+_TEXT_RULES = {
+    rule: [_compile(e) for e in entries]
+    for rule, entries in _SPEC["text_rules"].items()
+}
+_OVERRIDE = _TEXT_RULES["override"]
+_AGENT_DIRECTIVE = _TEXT_RULES["agent_directive"]
+_FAKE_TAG = _TEXT_RULES["fake_tag"]
+_EXFIL = _TEXT_RULES["exfil"]
+# Rules that are pure wording, so they also run on the "squashed" form
+# (punctuation and separators collapsed). fake_tag / exfil need their
+# punctuation (<|...|>, URLs, @) and run on the normalized form only.
+_WORD_RULES = tuple(_SPEC["word_rules"])
 
 # Unicode tag block (used to hide ASCII in plain sight), bidi overrides /
 # isolates, and zero-width characters inside words. Pasted web/doc text is
 # full of stray U+200B after bullets, and code that sanitizes these
 # characters lists them as ranges, so: zero-width only counts between word
 # characters, and a bidi character next to a "-" (a range bound) is
-# ignored. ZWJ (U+200D) is left alone (emoji sequences). Escapes only: no
-# literal invisible characters in this file.
-_TAG_CHARS = re.compile("[\U000e0000-\U000e007f]")
-_BIDI = re.compile("(?<!-)[\u202a-\u202e\u2066-\u2069](?!-)")
-_ZERO_WIDTH = re.compile(r"(?<=\w)[\u200b\u200c\u2060\u180e\ufeff]+(?=\w)")
-ZERO_WIDTH_MIN = 3
+# ignored. ZWJ (U+200D) is left alone (emoji sequences).
+_HU = _SPEC["hidden_unicode"]
+_TAG_CHARS = re.compile(_HU["tag_chars"])
+_BIDI = re.compile(_HU["bidi"])
+_ZERO_WIDTH = re.compile(_HU["zero_width_in_word"])
+ZERO_WIDTH_MIN = int(_HU["zero_width_min"])
 
-_TEXT_RULES = {
-    "override": _OVERRIDE,
-    "agent_directive": _AGENT_DIRECTIVE,
-    "fake_tag": _FAKE_TAG,
-    "exfil": _EXFIL,
-}
-# Rules that are pure wording, so they also run on the "squashed" form
-# (punctuation and separators collapsed). fake_tag / exfil need their
-# punctuation (<|...|>, URLs, @) and run on the normalized form only.
-_WORD_RULES = ("override", "agent_directive")
 
 # ── normalization (what a reading model effectively sees) ────────────────────
 #
@@ -164,74 +109,13 @@ _WORD_RULES = ("override", "agent_directive")
 # form, and (wording rules) on a squashed form. A hit that only the
 # normalized or squashed form produces is also flagged "obfuscated".
 
-# Invisible / formatting characters a reader skips: zero-width, bidi
+# Invisible / formatting characters a reader skips (zero-width, bidi
 # controls, word joiner, soft hyphen, combining grapheme joiner, variation
-# selectors, Unicode tag characters.
-_INVISIBLE = re.compile(
-    "[\u00ad\u034f\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069"
-    "\ufe00-\ufe0f\ufeff\U000e0000-\U000e007f]"
-)
-# Common Cyrillic / Greek / Armenian letters that render like Latin ones.
-_HOMOGLYPHS = str.maketrans(
-    {
-        "\u0430": "a",
-        "\u0435": "e",
-        "\u043e": "o",
-        "\u0440": "p",
-        "\u0441": "c",
-        "\u0443": "y",
-        "\u0445": "x",
-        "\u0456": "i",
-        "\u0458": "j",
-        "\u0455": "s",
-        "\u04bb": "h",
-        "\u0501": "d",
-        "\u051b": "q",
-        "\u051d": "w",
-        "\u0261": "g",
-        "\u0410": "a",
-        "\u0412": "b",
-        "\u0415": "e",
-        "\u041a": "k",
-        "\u041c": "m",
-        "\u041d": "h",
-        "\u041e": "o",
-        "\u0420": "p",
-        "\u0421": "c",
-        "\u0422": "t",
-        "\u0425": "x",
-        "\u0406": "i",
-        "\u0408": "j",
-        "\u0405": "s",
-        "\u03bf": "o",
-        "\u03b1": "a",
-        "\u03b5": "e",
-        "\u03b9": "i",
-        "\u03ba": "k",
-        "\u03bd": "v",
-        "\u03c1": "p",
-        "\u03c4": "t",
-        "\u03c5": "u",
-        "\u03c7": "x",
-        "\u039f": "o",
-        "\u0391": "a",
-        "\u0395": "e",
-        "\u0399": "i",
-        "\u039a": "k",
-        "\u039d": "n",
-        "\u03a1": "p",
-        "\u03a4": "t",
-        "\u03a7": "x",
-        "\u0392": "b",
-        "\u0396": "z",
-        "\u0397": "h",
-        "\u039c": "m",
-        "\u0585": "o",
-        "\u0561": "w",
-        "\u0578": "n",
-        "\u057d": "u",
-    }
-)
+# selectors, Unicode tag characters) and letters that render like Latin
+# ones (Cyrillic / Greek / Armenian): both from screening_rules.json.
+_INVISIBLE = re.compile(_SPEC["invisible"])
+_HOMOGLYPHS = str.maketrans(_SPEC["homoglyphs"])
+
 _UNI_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})")
 _PCT_ESCAPE = re.compile(r"%([0-9a-fA-F]{2})")
 
@@ -272,10 +156,9 @@ def squash(normalized: str) -> str:
 
 
 # Transcript line prefixes written by the adapters (base.UniversalSession.to_text).
-_ROLE_LINE = re.compile(
-    r"^(?:\[[^\]\n]{1,40}\]\s)?\[(user|assistant|system|tool|model|human)\]\s?",
-    re.MULTILINE,
-)
+_ROLE_LINE = _compile(_SPEC["role_line"])
+
+
 # Where harness / tool text starts inside a user-role message. Adapters join
 # a message's blocks with newlines, so the person's typed text can be
 # followed by a <system-reminder>, a hook's additional context, a skill or

@@ -1,0 +1,150 @@
+{
+ "_comment": "Prompt-injection screening rules shared by ingest/screening.py and mcp-server/src/screening.ts. Patterns are written in the subset of regex syntax that Python re and JavaScript (u flag) read the same way. Edit here, then run both test suites (ingest/tests/test_screening.py and mcp-server/src/screening.test.ts) - they share ingest/screening_cases.json.",
+ "text_rules": {
+  "override": [
+   {
+    "pattern": "\\b(ignore|disregard|forget|override|bypass)\\s+(all\\s+|any\\s+|the\\s+|your\\s+|my\\s+)?(previous|prior|preceding|above|earlier|former|existing|original|system)\\s+(instructions?|prompts?|directives?|rules|guidelines|messages|context)",
+    "flags": "i"
+   },
+   {
+    "pattern": "\\b(ignore|disregard|forget)\\s+(everything|all)\\s+(you\\s+(were|have\\s+been)\\s+told|(above|before|previously))",
+    "flags": "i"
+   },
+   {
+    "pattern": "\\byou\\s+are\\s+now\\s+(in\\s+)?(an?\\s+)?(DAN|developer\\s+mode|jailbr[eo]ken|unrestricted|unfiltered|god\\s+mode|no\\s+longer\\s+bound)",
+    "flags": "i"
+   },
+   {
+    "pattern": "\\b(new|updated|revised)\\s+system\\s+(prompt|instructions?)\\s*[:=]",
+    "flags": "i"
+   },
+   {
+    "pattern": "\\bfrom\\s+now\\s+on,?\\s+you\\s+(will|must|are\\s+to)\\s+(ignore|disregard)\\b",
+    "flags": "i"
+   }
+  ],
+  "agent_directive": [
+   {
+    "pattern": "\\bif\\s+you\\s+are\\s+an?\\s+(AI|LLM|language\\s+model|assistant|agent|chatbot|AI\\s+(assistant|agent|model))\\b[^.\\n]{0,80}\\b(reading|processing|summari[sz]ing|seeing|parsing)\\b",
+    "flags": "i"
+   },
+   {
+    "pattern": "\\b(note|message|instructions?|attention)\\s+(to|for)\\s+(any\\s+|all\\s+|the\\s+)?(AI\\s+|LLM\\s+)?(AI|LLM|assistant|agent|language\\s+model|model)s?(\\s+(reading|processing|parsing)\\s+this[^:\\n]{0,30})?\\s*(:|\u2014|,)",
+    "flags": "i"
+   },
+   {
+    "pattern": "\\b(AI|LLM)\\s+(agents?|assistants?|models?)\\s+(reading|processing|summari[sz]ing)\\s+this\\b",
+    "flags": "i"
+   }
+  ],
+  "fake_tag": [
+   {
+    "pattern": "<\\|(im_start|im_end|system|user|assistant|endoftext|eot_id|start_header_id)\\|>",
+    "flags": "i"
+   },
+   {
+    "pattern": "\\[/?INST\\]|<<\\/?SYS>>",
+    "flags": ""
+   },
+   {
+    "pattern": "(?:^|(?<=\\s))</?\\s*(system|system_prompt|system-prompt|developer)\\s*>(?=\\s|$)",
+    "flags": "im"
+   },
+   {
+    "pattern": "</\\s*(tool_result|function_results|tool_response)\\s*>",
+    "flags": "i"
+   },
+   {
+    "pattern": "<\\s*/?\\s*antml:",
+    "flags": ""
+   },
+   {
+    "pattern": "\\n\\s*\\n(Human|Assistant):\\s*\\S",
+    "flags": ""
+   }
+  ],
+  "exfil": [
+   {
+    "pattern": "\\b(send|post|upload|forward|email|e-mail|exfiltrate|leak|transmit|paste)\\s+(me\\s+)?(the\\s+|your\\s+|all\\s+|any\\s+|these\\s+|those\\s+)?(api[\\s_-]?keys?|access\\s+tokens?|tokens?|passwords?|secrets?|credentials?|ssh\\s+keys?|private\\s+keys?|\\.env(\\s+file)?|cookies?|session\\s+tokens?)\\b[^\\n]{0,60}\\b(to|at|into)\\s+(https?://|www\\.|[\\w.+-]+@[\\w-]+\\.|[\\w-]+\\.(com|net|org|io|xyz|ru|cn|top|site|app|dev)\\b)",
+    "flags": "i"
+   },
+   {
+    "pattern": "\\b(reveal|print|output|repeat|show|dump|leak)\\s+(me\\s+)?(your|the)\\s+(system\\s+prompt|hidden\\s+instructions|initial\\s+instructions|developer\\s+message)",
+    "flags": "i"
+   }
+  ]
+ },
+ "word_rules": [
+  "override",
+  "agent_directive"
+ ],
+ "hidden_unicode": {
+  "tag_chars": "[\udb40\udc00-\udb40\udc7f]",
+  "bidi": "(?<!-)[\u202a-\u202e\u2066-\u2069](?!-)",
+  "zero_width_in_word": "(?<=\\w)[\\u200b\\u200c\\u2060\\u180e\\ufeff]+(?=\\w)",
+  "zero_width_min": 3
+ },
+ "invisible": "[\u00ad\u034f\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufe00-\ufe0f\ufeff\udb40\udc00-\udb40\udc7f]",
+ "homoglyphs": {
+  "\u0430": "a",
+  "\u0435": "e",
+  "\u043e": "o",
+  "\u0440": "p",
+  "\u0441": "c",
+  "\u0443": "y",
+  "\u0445": "x",
+  "\u0456": "i",
+  "\u0458": "j",
+  "\u0455": "s",
+  "\u04bb": "h",
+  "\u0501": "d",
+  "\u051b": "q",
+  "\u051d": "w",
+  "\u0261": "g",
+  "\u0410": "a",
+  "\u0412": "b",
+  "\u0415": "e",
+  "\u041a": "k",
+  "\u041c": "m",
+  "\u041d": "h",
+  "\u041e": "o",
+  "\u0420": "p",
+  "\u0421": "c",
+  "\u0422": "t",
+  "\u0425": "x",
+  "\u0406": "i",
+  "\u0408": "j",
+  "\u0405": "s",
+  "\u03bf": "o",
+  "\u03b1": "a",
+  "\u03b5": "e",
+  "\u03b9": "i",
+  "\u03ba": "k",
+  "\u03bd": "v",
+  "\u03c1": "p",
+  "\u03c4": "t",
+  "\u03c5": "u",
+  "\u03c7": "x",
+  "\u039f": "o",
+  "\u0391": "a",
+  "\u0395": "e",
+  "\u0399": "i",
+  "\u039a": "k",
+  "\u039d": "n",
+  "\u03a1": "p",
+  "\u03a4": "t",
+  "\u03a7": "x",
+  "\u0392": "b",
+  "\u0396": "z",
+  "\u0397": "h",
+  "\u039c": "m",
+  "\u0585": "o",
+  "\u0561": "w",
+  "\u0578": "n",
+  "\u057d": "u"
+ },
+ "role_line": {
+  "pattern": "^(?:\\[[^\\]\\n]{1,40}\\]\\s)?\\[(user|assistant|system|tool|model|human)\\]\\s?",
+  "flags": "m"
+ }
+}

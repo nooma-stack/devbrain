@@ -43,6 +43,34 @@ export interface RecordMemoryArgs {
    * partial unique index has WHERE provenance_id IS NOT NULL).
    */
   provenanceId?: string | null
+  /**
+   * Prompt-injection screening flags (migration 049). Written only when
+   * non-empty and the column exists, so clean rows and pre-049 databases
+   * are unaffected.
+   */
+  screenFlags?: string[] | null
+}
+
+let screenFlagsColumn: Promise<boolean> | null = null
+
+/** Whether devbrain.memory.screen_flags exists (cached per process). */
+export function hasScreenFlagsColumn(): Promise<boolean> {
+  screenFlagsColumn ??= query<{ ok: number }>(
+    `SELECT 1 AS ok FROM information_schema.columns
+      WHERE table_schema = 'devbrain' AND table_name = 'memory'
+        AND column_name = 'screen_flags'`,
+  )
+    .then((r) => r.rows.length > 0)
+    .catch(() => {
+      screenFlagsColumn = null
+      return false
+    })
+  return screenFlagsColumn
+}
+
+/** Test-only: forget the cached column check. */
+export function _resetScreenFlagsColumnCache(): void {
+  screenFlagsColumn = null
 }
 
 export async function recordMemory(args: RecordMemoryArgs): Promise<string | null> {
@@ -82,11 +110,12 @@ export async function recordMemory(args: RecordMemoryArgs): Promise<string | nul
       onConflict = ''
       dedupSelect = 'SELECT NULL::uuid AS id WHERE false'
     }
+    const withFlags = !!args.screenFlags?.length && (await hasScreenFlagsColumn())
     const result = await query<{ id: string }>(
       `WITH inserted AS (
          INSERT INTO devbrain.memory
-             (project_id, kind, title, content, embedding, provenance_id)
-         VALUES ($1, $2, $3, $4, $5::vector, $6)
+             (project_id, kind, title, content, embedding, provenance_id${withFlags ? ', screen_flags' : ''})
+         VALUES ($1, $2, $3, $4, $5::vector, $6${withFlags ? ', $7' : ''})
          ${onConflict}
          RETURNING id
        )
@@ -100,6 +129,7 @@ export async function recordMemory(args: RecordMemoryArgs): Promise<string | nul
         args.content,
         args.embeddingSql ?? null,
         args.provenanceId ?? null,
+        ...(withFlags ? [args.screenFlags] : []),
       ],
     )
     return result.rows[0]?.id ?? null

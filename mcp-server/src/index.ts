@@ -11,7 +11,8 @@ import { z } from 'zod'
 import { getSearchConfig, query, queryWithTimeout, waitForDb } from './db.js'
 import { embed, embedQuery, toSqlVector } from './embeddings.js'
 import { collapseNearDuplicates, keywordParams, keywordSql, matchedBy, nearDupSql, rrfFuse } from './hybrid.js'
-import { enqueueCascades, recordMemory, recordMemoryDependency, resolveMemoryId } from './memory.js'
+import { enqueueCascades, hasScreenFlagsColumn, recordMemory, recordMemoryDependency, resolveMemoryId } from './memory.js'
+import { screenFlags } from './screening.js'
 import { relationCheckMode, relationStoreNote, triggerRelationCheckInBackground } from './relation.js'
 import {
   computeRecencyWarning,
@@ -1027,6 +1028,9 @@ server.tool(
     // We dual-write here (the canonical legacy row) — NOT the
     // auxiliary chunk insert below — so each store() lands exactly one
     // memory row per logical entity.
+    // Write-time injection screening (flags only, never blocks): the row
+    // is stored as "title\n\ncontent", so that is what gets screened.
+    const storeFlags = screenFlags(`${title}\n\n${content}`)
     const memoryId = await recordMemory({
       projectId,
       kind: type,
@@ -1034,6 +1038,7 @@ server.tool(
       content: `${title}\n\n${content}`,
       embeddingSql: vectorStr,
       provenanceId: recordId,
+      screenFlags: storeFlags,
     })
 
     // Atlas / Phase 3 dependency edges. Each agent-supplied UUID may be
@@ -1155,7 +1160,10 @@ server.tool(
         })
       : false
     const relationNote = relationQueued ? relationStoreNote(relationCheckMode(), memoryId!) : ''
-    return { content: [{ type: 'text', text: baseMsg + edgeSummary + noteSummary + relationNote }] }
+    const screenNote = storeFlags
+      ? ` Flagged by injection screening (${storeFlags.join(', ')}): it will be withheld from extraction prompts.`
+      : ''
+    return { content: [{ type: 'text', text: baseMsg + edgeSummary + noteSummary + relationNote + screenNote }] }
   },
 )
 
@@ -1243,6 +1251,8 @@ server.tool(
       content: fullContent,
       embeddingSql: vectorStr,
       provenanceId: chunkResult.rows[0]?.id ?? null,
+      // Write-time injection screening (flags only).
+      screenFlags: screenFlags(fullContent),
     })
 
     // Trigger a cognify-extract pass in the background so this session's
@@ -2483,16 +2493,20 @@ async function writeBreadcrumbRow(args: {
     appliesWhen.is_session_start = true
   }
 
+  // Write-time injection screening (flags only, never blocks).
+  const flags = screenFlags(embedText)
+  const withFlags = !!flags && (await hasScreenFlagsColumn())
   const result = await query<{ id: string }>(
     `INSERT INTO devbrain.memory
        (project_id, kind, title, content, embedding,
-        provenance_id, tier, strength, applies_when)
+        provenance_id, tier, strength, applies_when${withFlags ? ', screen_flags' : ''})
      VALUES ($1, 'session_breadcrumb', $2, $3, $4::vector,
-             $5, 'memory', 1.0, $6::jsonb)
+             $5, 'memory', 1.0, $6::jsonb${withFlags ? ', $7' : ''})
      RETURNING id`,
     [
       args.projectId, args.title, args.content, vectorStr,
       args.conversationUuid, JSON.stringify(appliesWhen),
+      ...(withFlags ? [flags] : []),
     ],
   )
   return {
