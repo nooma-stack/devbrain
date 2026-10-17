@@ -26,7 +26,7 @@ import {
   type MatchStrength,
 } from './hybrid.js'
 import { rerankScores } from './rerank.js'
-import { screeningLabel, untrustedText } from './untrusted.js'
+import { REMOTE_REPLY_NOTICE, screeningLabel, untrustedText } from './untrusted.js'
 
 /** A stored title (factory job, memory) made inert for echoing in tool text. */
 const safeTitle = (t: string): string => untrustedText(getSearchConfig().untrustedWrap).title(t)
@@ -2335,11 +2335,14 @@ server.tool(
       return { content: [{ type: 'text', text: 'Daemon returned unparseable response.' }] }
     }
 
+    // The reply is another agent's output: untrusted, like retrieved memory.
+    const u = untrustedText(getSearchConfig().untrustedWrap)
+    const head = u.notice ? `${REMOTE_REPLY_NOTICE}\n` : ''
     if (payload.exit_code !== 0) {
       return {
         content: [{
           type: 'text',
-          text: `Remote claude exited ${payload.exit_code}\nstderr: ${payload.stderr ?? '(empty)'}\nsession_id: ${payload.session_id ?? '(none)'}`,
+          text: `${head}Remote claude exited ${payload.exit_code}\nstderr: ${u.body(payload.stderr ?? '(empty)')}\nsession_id: ${payload.session_id ?? '(none)'}`,
         }],
       }
     }
@@ -2347,7 +2350,7 @@ server.tool(
     return {
       content: [{
         type: 'text',
-        text: `[session: ${payload.session_id ?? 'unknown'}]\n\n${payload.result ?? '(empty response)'}`,
+        text: `${head}[session: ${payload.session_id ?? 'unknown'}]\n\n${u.body(payload.result ?? '(empty response)')}`,
       }],
     }
   },

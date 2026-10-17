@@ -160,3 +160,15 @@ describe('every read tool that returns stored text is covered', () => {
     assert.match(tool('end_session'), /Enrichment applied; raw output: \$\{untrustedText\(getSearchConfig\(\)\.untrustedWrap\)\.body\(/)
   })
 })
+
+describe('agent_remote_prompt reply is untrusted', () => {
+  const src = readFileSync(resolve(import.meta.dirname, 'index.ts'), 'utf-8')
+  const start = src.indexOf("'agent_remote_prompt',")
+  const body = src.slice(start, src.indexOf('server.tool(', start + 1))
+  test('notice line first, reply and stderr wrapped, behind the flag', () => {
+    assert.match(body, /const u = untrustedText\(getSearchConfig\(\)\.untrustedWrap\)/)
+    assert.match(body, /const head = u\.notice \? `\$\{REMOTE_REPLY_NOTICE\}\\n` : ''/)
+    assert.match(body, /u\.body\(payload\.result \?\? '\(empty response\)'\)/)
+    assert.match(body, /u\.body\(payload\.stderr \?\? '\(empty\)'\)/)
+  })
+})
