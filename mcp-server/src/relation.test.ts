@@ -12,7 +12,13 @@ const cfgPath = join(dir, 'devbrain.yaml')
 writeFileSync(cfgPath, 'write_path:\n  relation_check:\n    mode: shadow\n')
 process.env.DEVBRAIN_CONFIG = cfgPath
 
-const { normalizeMode, relateArgs, relationCheckMode, triggerRelationCheckInBackground } =
+const {
+  normalizeMode,
+  relateArgs,
+  relationCheckMode,
+  relationStoreNote,
+  triggerRelationCheckInBackground,
+} =
   await import('./relation.js')
 
 after(() => rmSync(dir, { recursive: true, force: true }))
@@ -78,5 +84,23 @@ describe('triggerRelationCheckInBackground', () => {
       triggerRelationCheckInBackground({ memoryId: 'abc', projectSlug: 'p1', source: 'mcp:store' }),
       false,
     )
+  })
+})
+
+describe('relationStoreNote', () => {
+  const id = '0123456789abcdef'
+  test('on: says it may be merged', () => {
+    const note = relationStoreNote('on', id)
+    assert.match(note, /merged into the existing memory/)
+    assert.match(note, /memory 01234567/)
+  })
+  test('shadow: says it is only logged and nothing changes', () => {
+    const note = relationStoreNote('shadow', id)
+    assert.match(note, /logged \(shadow mode/)
+    assert.match(note, /nothing will change/)
+    assert.doesNotMatch(note, /merged/)
+  })
+  test('off: no note', () => {
+    assert.equal(relationStoreNote('off', id), '')
   })
 })

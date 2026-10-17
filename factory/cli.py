@@ -3784,6 +3784,74 @@ def cognify_relate_command(memory_ids, project_slug, sweep, lookback_hours,
             click.echo(f"sweep: {out['sweep']}")
 
 
+@cli.command("cognify-gate")
+@click.option("--project", "project_slug", required=True, help="Project slug.")
+@click.option("--last", "last_n", type=int, default=200, show_default=True,
+              help="Evaluate the N most recent extract units.")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Emit per-unit decisions as JSON.")
+def cognify_gate_command(project_slug, last_n, as_json):
+    """Report what the extract gate would do on recent units (read-only).
+
+    Uses the cognify.extract_gate thresholds from config regardless of its
+    mode, and shows how many atoms each unit has produced so far, so the
+    skip list can be checked against history before turning the gate on.
+    """
+    import sys
+    import json as _json
+    from collections import Counter
+
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
+    from cognify import gate
+
+    cfg = gate.get_config()
+    db = get_db()
+    conn = db._conn()
+    try:
+        conn.set_session(readonly=True)
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM devbrain.projects WHERE slug = %s", (project_slug,))
+            row = cur.fetchone()
+        if not row:
+            raise click.ClickException(f"Project {project_slug!r} not found.")
+        project_id = row[0]
+        units = gate.recent_units(conn, project_id, last_n)
+        atoms = gate.atom_counts(conn, units)
+        decisions = [gate.evaluate(conn, u, project_id, cfg) for u in units]
+        conn.rollback()
+    finally:
+        conn.close()
+
+    rows = [
+        {
+            "unit_id": d.features.unit_id,
+            "shape": d.features.shape,
+            "action": d.action,
+            "reasons": d.reasons,
+            "source_chars": d.features.source_chars,
+            "human_turns": d.features.human_turns,
+            "tool_share": d.features.tool_share,
+            "novel_share": d.features.novel_share,
+            "atoms_so_far": atoms.get(d.features.unit_id, 0),
+        }
+        for d in decisions
+    ]
+    if as_json:
+        click.echo(_json.dumps({"mode": cfg.mode, "units": rows}, indent=2, default=str))
+        return
+    actions = Counter(r["action"] for r in rows)
+    reasons = Counter(x for r in rows for x in r["reasons"])
+    click.echo(f"gate mode in config: {cfg.mode}; units evaluated: {len(rows)}")
+    for a in ("extract", "downgrade", "skip"):
+        rs = [r for r in rows if r["action"] == a]
+        click.echo(
+            f"  {a:9s} {len(rs):4d}  with atoms so far: "
+            f"{sum(1 for r in rs if r['atoms_so_far'])}  atoms: "
+            f"{sum(r['atoms_so_far'] for r in rs)}"
+        )
+    click.echo("  reasons: " + ", ".join(f"{k}={v}" for k, v in reasons.most_common()))
+
+
 @cli.command("cognify-bulk")
 @click.option("--project", "project_slug", required=True,
               help="Project slug.")
