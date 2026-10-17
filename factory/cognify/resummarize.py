@@ -232,6 +232,49 @@ def _call_sonnet(
     return text, usage_dict, None
 
 
+def _call_openai(
+    raw_content: str, model: str,
+) -> tuple[str | None, dict, str | None]:
+    """The summary on the OpenAI platform API (cognify.backend=openai).
+    Same return contract as _call_sonnet."""
+    from cognify import openai_api  # noqa: PLC0415
+
+    sys_text, user_text = _build_summarize_prompt(raw_content)
+    res = openai_api.complete(
+        sys_text, user_text,
+        pass_name="resummarize",
+        model=model,
+        max_output_tokens=8_000,
+    )
+    if res.failure:
+        label = res.failure if res.failure in ("refused", "no_auth", "empty") \
+            else f"{res.failure}:openai"
+        return None, res.usage, label
+    return res.text, res.usage, None
+
+
+def _summarize(
+    raw_content: str, model: str,
+) -> tuple[str | None, dict, str | None]:
+    """Dispatch to the backend cognify.backend selects (no fallback)."""
+    from cognify import backends  # noqa: PLC0415
+
+    selected = backends.selected()
+    if selected == "openai":
+        return _call_openai(raw_content, model)
+    if selected not in (None, "anthropic"):
+        # No codex path here; an explicit backend never falls back.
+        if selected == "codex":
+            backends.unsupported(selected, "resummarize")
+        else:
+            backends.check(selected, "resummarize")
+        return None, {
+            "input_tokens": 0, "output_tokens": 0,
+            "cache_read_tokens": 0, "cache_write_tokens": 0,
+        }, "refused"
+    return _call_sonnet(raw_content, model)
+
+
 def _replace_session_summary(
     conn: Any,
     *,
@@ -385,8 +428,12 @@ def run_resummarize(
         get_pricing, compute_cost_usd, SONNET_4_6,
     )
     from observability.spend import record_spend  # noqa: PLC0415
+    from cognify import backends, openai_api  # noqa: PLC0415
 
     result = ResummarizeResult(dry_run=dry_run)
+    use_openai = backends.selected() == "openai"
+    if use_openai:
+        model = openai_api.model_for(model)
     pricing = get_pricing(model) or SONNET_4_6
 
     targets = discover_sessions_needing_resummarize(
@@ -411,7 +458,7 @@ def run_resummarize(
                 })
             continue
 
-        summary, usage, failure = _call_sonnet(raw_content, model)
+        summary, usage, failure = _summarize(raw_content, model)
 
         # Record spend regardless of outcome (we paid for the call).
         if any(usage.get(k, 0) for k in ("input_tokens", "output_tokens")):
@@ -454,7 +501,8 @@ def run_resummarize(
                 session_id=session_id,
                 project_id=sess_project_id,
                 new_summary=summary or "",
-                source="sonnet" if model.startswith("claude-sonnet")
+                source="openai" if use_openai
+                       else "sonnet" if model.startswith("claude-sonnet")
                        else "opus" if model.startswith("claude-opus")
                        else "anthropic",
             )

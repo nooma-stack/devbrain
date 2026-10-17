@@ -26,7 +26,7 @@ from uuid import UUID
 
 from cognify.orchestrator import CognifyPass, PassResult, register_pass
 from graph.walker import walk
-from observability.pricing import SONNET_4_6, compute_cost_usd
+from observability.pricing import SONNET_4_6, compute_cost_usd, get_pricing
 from observability.spend import record_spend
 
 logger = logging.getLogger(__name__)
@@ -320,6 +320,15 @@ def _detect_contradicts(
         m["id"]: m.get("content", "") for m in all_memories
     }
 
+    from cognify import backends, openai_api  # noqa: PLC0415
+
+    # Spend is billed to the model actually judging the pairs.
+    if backends.selected() == "openai":
+        spend_model = openai_api.configured_model()
+        spend_pricing = get_pricing(spend_model) or SONNET_4_6
+    else:
+        spend_model, spend_pricing = _EDGES_MODEL, SONNET_4_6
+
     new_edges = 0
     llm_calls = 0
     for from_id, to_id in candidate_pairs[:cap]:
@@ -338,7 +347,7 @@ def _detect_contradicts(
             usage.get(k, 0) for k in ("input_tokens", "output_tokens")
         ):
             cost = compute_cost_usd(
-                SONNET_4_6,
+                spend_pricing,
                 input_tokens=usage.get("input_tokens", 0),
                 output_tokens=usage.get("output_tokens", 0),
                 cache_read_tokens=usage.get("cache_read_tokens", 0),
@@ -348,7 +357,7 @@ def _detect_contradicts(
                 record_conn,
                 project_id=project_id,
                 pass_name="edges",
-                model=_EDGES_MODEL,
+                model=spend_model,
                 input_tokens=usage.get("input_tokens", 0),
                 output_tokens=usage.get("output_tokens", 0),
                 cache_read_tokens=usage.get("cache_read_tokens", 0),
@@ -400,6 +409,16 @@ def _llm_judge_contradiction(
     }
     from cognify import backends  # noqa: PLC0415
 
+    selected = backends.selected()
+    if selected == "openai":
+        return _openai_judge_contradiction(content_a, content_b)
+    if selected not in (None, "anthropic"):
+        # No codex path here; an explicit backend never falls back.
+        if selected == "codex":
+            backends.unsupported(selected, "edges")
+        else:
+            backends.check(selected, "edges")
+        return False, _empty_usage
     if not backends.check("anthropic", "edges"):
         return False, _empty_usage
     try:
@@ -446,6 +465,38 @@ def _llm_judge_contradiction(
     except Exception as exc:  # noqa: BLE001
         logger.warning("cognify_edges: LLM contradiction check failed: %s", exc)
         return False, _empty_usage
+
+
+_JUDGE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["contradicts"],
+    "properties": {"contradicts": {"type": "boolean"}},
+}
+
+
+def _openai_judge_contradiction(content_a: str, content_b: str) -> tuple[bool, dict]:
+    """The contradiction judgment on the OpenAI platform API
+    (cognify.backend=openai). Any failure reads as "no contradiction",
+    exactly like the Anthropic path."""
+    from cognify import openai_api  # noqa: PLC0415
+
+    res = openai_api.complete(
+        "You judge whether two memory entries contradict each other. "
+        'Return {"contradicts": true} only if they make conflicting claims.',
+        f"Entry A:\n{content_a[:500]}\n\nEntry B:\n{content_b[:500]}",
+        pass_name="edges",
+        json_schema=_JUDGE_SCHEMA,
+        schema_name="contradiction",
+        max_output_tokens=4_000,
+    )
+    if res.failure:
+        if res.failure not in ("refused", "no_auth"):
+            logger.warning(
+                "cognify_edges: LLM contradiction check failed: %s", res.detail
+            )
+        return False, res.usage
+    return bool((res.parsed or {}).get("contradicts") is True), res.usage
 
 
 # ── Shared helpers ────────────────────────────────────────────────────────────

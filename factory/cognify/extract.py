@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
-from cognify import backends, codex_home, gate, relate, screen
+from cognify import backends, codex_home, gate, openai_api, relate, screen
 from cognify.embedding import embed_text, to_vector_literal
 from cognify.orchestrator import CognifyPass, PassResult, register_pass
 from observability.pricing import (
@@ -83,6 +83,10 @@ _EXTRACT_MODEL = os.environ.get("DEVBRAIN_EXTRACT_MODEL", "codex")
 # model so extraction never stalls on a quota wall. Set DEVBRAIN_EXTRACT_FALLBACK
 # to "" / "none" to disable the fallback.
 _FALLBACK_MODEL = os.environ.get("DEVBRAIN_EXTRACT_FALLBACK", "claude-sonnet-5")
+
+# Anthropic model used when cognify.backend=anthropic but the requested
+# extract model is the "codex" sentinel / an OpenAI id.
+_ANTHROPIC_DEFAULT_MODEL = "claude-sonnet-5"
 
 # ── Codex (OpenAI CLI) extraction backend ──────────────────────────────────
 # When the requested model routes here (model == "codex" or an OpenAI model id
@@ -265,19 +269,36 @@ _CODEX_OUTPUT_SCHEMA = {
 
 
 def _fallback_configured() -> bool:
+    # An explicit cognify.backend disables the cross-backend fallback: with
+    # backend=openai nothing may ever go to Anthropic or codex instead.
     return bool(
-        _FALLBACK_MODEL
+        backends.fallback_enabled()
+        and _FALLBACK_MODEL
         and _FALLBACK_MODEL.lower() not in ("none", "")
         and not _routes_to_codex(_FALLBACK_MODEL)
     )
 
 
-def _usable_backends() -> list[str]:
-    """Backends this pass could use, after cognify.allowed_backends."""
-    chain = [backends.backend_for_model(_EXTRACT_MODEL)]
-    if _routes_to_codex(_EXTRACT_MODEL) and _fallback_configured():
+def _backend_chain() -> list[str]:
+    """Backends this pass would try, in order, before the allow-list."""
+    primary = backends.route(_EXTRACT_MODEL)
+    chain = [primary]
+    if primary == "codex" and _fallback_configured():
         chain.append("anthropic")
-    return [b for b in chain if backends.is_allowed(b)]
+    return chain
+
+
+def _usable_backends() -> list[str]:
+    """Backends this pass could use, after cognify.allowed_backends (and,
+    for openai, a resolvable API key)."""
+    out = []
+    for b in _backend_chain():
+        if not backends.is_allowed(b):
+            continue
+        if b == "openai" and not openai_api.api_key():
+            continue
+        out.append(b)
+    return out
 
 
 def _refused_result(detail: str) -> dict:
@@ -365,7 +386,7 @@ class ExtractPass(CognifyPass):
             # Nothing this deployment allows can run. The row is marked
             # "refused" so it moves neither the watermark nor the backlog:
             # once a backend is allowed, nothing ingested meanwhile is lost.
-            for b in {backends.backend_for_model(_EXTRACT_MODEL), "anthropic"}:
+            for b in _backend_chain():
                 backends.check(b, "extract")
             return PassResult(
                 rows_processed=0,
@@ -541,11 +562,28 @@ def extract_from_session(
     if not combined.strip():
         return ExtractResult(session_id=session_id)
 
-    # Call LLM for extraction. Route to the codex CLI (schema-constrained,
-    # reliable JSON) when the requested model is "codex"/an OpenAI id;
-    # otherwise use the Anthropic SDK path.
+    # Call LLM for extraction. An explicit cognify.backend wins and gets no
+    # fallback. Otherwise route to the codex CLI (schema-constrained,
+    # reliable JSON) when the requested model is "codex"/an OpenAI id, else
+    # the Anthropic SDK path.
     effective_model = model or _EXTRACT_MODEL
-    if _routes_to_codex(effective_model):
+    selected = backends.selected()
+    if selected == "openai":
+        # Explicit OpenAI platform backend: no fallback of any kind.
+        effective_model = openai_api.model_for(effective_model)
+        extracted = _openai_extract(combined, model=effective_model)
+    elif selected == "anthropic":
+        if _routes_to_codex(effective_model):
+            effective_model = _ANTHROPIC_DEFAULT_MODEL
+        extracted = _llm_extract(
+            combined, max_llm_calls=max_llm_calls, model=effective_model,
+        )
+    elif selected is not None and selected != "codex":
+        backends.check(selected, "extract")  # INVALID: logs the refusal
+        extracted = _refused_result(f"cognify.backend {selected!r} not usable")
+    elif selected == "codex" or _routes_to_codex(effective_model):
+        if not _routes_to_codex(effective_model):
+            effective_model = "codex"
         extracted = _codex_extract(combined, model=effective_model)
         # Fall back to Anthropic when codex hits a usage-limit / timeout /
         # error ("api"), so a ChatGPT quota wall can't stall extraction. We
@@ -957,6 +995,41 @@ def _codex_extract(content: str, *, model: str | None = None) -> dict:
     if not result.get("lessons") and not result.get("decisions"):
         result["_failure"] = "empty"
     return result
+
+
+def _openai_extract(content: str, *, model: str | None = None) -> dict:
+    """Extract lessons/decisions via the OpenAI platform API.
+
+    Same dict shape as `_llm_extract` / `_codex_extract`. Strict
+    json_schema output (the codex schema). A missing key is reported as
+    ``refused`` so the session stays eligible instead of being marked done.
+    """
+    res = openai_api.complete(
+        "You are a structured knowledge extractor. From the dev session the "
+        "user provides, extract generalizable lessons and the specific "
+        "architecture/implementation decisions that were made. Each item needs "
+        "a short title (<= 80 chars) and a detailed content string. Return "
+        "ONLY the structured object matching the provided schema.",
+        "Session:\n\n" + content[:200_000],
+        pass_name="extract",
+        model=model,
+        json_schema=_CODEX_OUTPUT_SCHEMA,
+        schema_name="extraction",
+        max_output_tokens=32_000,
+    )
+    if res.failure in ("refused", "no_auth"):
+        return _refused_result(res.detail or res.failure)
+    out: dict = {"lessons": [], "decisions": []}
+    if res.parsed is not None:
+        out.update(res.parsed)
+        out.setdefault("lessons", [])
+        out.setdefault("decisions", [])
+    out["_usage"] = res.usage
+    if res.failure:
+        out["_failure"], out["_failure_detail"] = res.failure, res.detail
+    elif not out.get("lessons") and not out.get("decisions"):
+        out["_failure"] = "empty"
+    return out
 
 
 def _llm_extract(

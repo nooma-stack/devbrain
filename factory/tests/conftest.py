@@ -39,7 +39,7 @@ def _cognify_backend_defaults(tmp_path, monkeypatch):
     DEVBRAIN_CODEX_HOME / backends.reset() themselves."""
     home = tmp_path / "codex-cognify-home"
     try:
-        from cognify import backends, codex_home
+        from cognify import backends, codex_home, openai_api
     except ImportError:  # pragma: no cover — module not importable here
         yield
         return
@@ -47,9 +47,18 @@ def _cognify_backend_defaults(tmp_path, monkeypatch):
     (home / "auth.json").write_text("{}")
     monkeypatch.setenv("DEVBRAIN_CODEX_HOME", str(home))
     monkeypatch.delenv("DEVBRAIN_COGNIFY_ALLOWED_BACKENDS", raising=False)
+    # Model-based routing unless a test selects a backend; no host OpenAI
+    # key or Secret Manager fetch.
+    # ("" = unset, and it shadows any cognify.backend in the host yaml.)
+    monkeypatch.setenv("DEVBRAIN_COGNIFY_BACKEND", "")
+    for var in ("DEVBRAIN_OPENAI_MODEL", "DEVBRAIN_OPENAI_REASONING_EFFORT",
+                "OPENAI_API_KEY", "GOOGLE_APPLICATION_CREDENTIALS"):
+        monkeypatch.delenv(var, raising=False)
     backends.reset()
+    openai_api.reset()
     yield
     backends.reset()
+    openai_api.reset()
 
 
 # Every row inserted by a factory fixture is tagged with this prefix so

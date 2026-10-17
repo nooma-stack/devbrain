@@ -138,11 +138,36 @@ characters, bidi overrides, zero-width characters inside words).
 ### Hosted backends: allow-list and codex isolation
 - `cognify.allowed_backends` (`factory/cognify/backends.py`) lists the hosted
   backends a deployment may send memory/transcript text to: `codex` (ChatGPT
-  login) and `anthropic` (Anthropic API). Unset = both; `[]` = none. Checked
+  login), `anthropic` (Anthropic API) and `openai` (OpenAI platform API).
+  Unset = codex + anthropic (openai is opt-in only); `[]` = none. Checked
   in extract, fanout, edges and resummarize right before each call;
   fail-closed (non-list value → none, unknown names ignored) and every refusal
   is logged. A refused extract run moves neither the watermark nor the
   backlog; refused fanout/resummarize sessions stay eligible.
+- `cognify.backend` (env `DEVBRAIN_COGNIFY_BACKEND`) selects one backend for
+  every pass. Unset keeps model-based routing (codex for `codex`/gpt-*/o3/o4,
+  Anthropic otherwise, codex → Anthropic fallback in extract/fanout). Set,
+  there is no fallback of any kind; a pass without a path for that backend
+  does not run (edges and resummarize have no codex path); an unknown value
+  refuses everything. `backend: openai` calls Chat Completions
+  (`factory/cognify/openai_api.py`) with `cognify.openai_model` (env
+  `DEVBRAIN_OPENAI_MODEL`, default `gpt-5.6-luna`; `DEVBRAIN_CODEX_MODEL` is
+  not used), strict JSON-schema output for extract/fanout/edges, 120 s
+  timeout, retries on 429/5xx/network errors. Key: `OPENAI_API_KEY`, else
+  (with `GOOGLE_APPLICATION_CREDENTIALS` set) Secret Manager secret
+  `openai-api-key` in `DEVBRAIN_OPENAI_SECRET_PROJECT` (default
+  `brightbot-478117`), fetched once per process; no key → the extract pass
+  is refused up front. Token usage goes to `cognify_spend_log` under the
+  OpenAI model id (cost estimated at Sonnet rates until that model is added
+  to `observability/pricing.py`). The PHI deployment recipe (BAA covers the
+  OpenAI API platform, not ChatGPT plans):
+
+  ```yaml
+  cognify:
+    backend: openai
+    openai_model: gpt-5.6-luna
+    allowed_backends: [openai]
+  ```
 - Cognify runs `codex exec` with its own `CODEX_HOME`
   (`factory/cognify/codex_home.py`, default `~/.devbrain/codex-cognify`): its
   own login and a config.toml with no MCP servers, plugins, apps or

@@ -98,13 +98,32 @@ ask:
 # Cognify pass settings.
 cognify:
   # Hosted LLM backends cognify (extract, fanout, edges, resummarize) may
-  # send memory/transcript text to: codex (ChatGPT login) and anthropic
-  # (Anthropic API). A compliance decision per deployment: a ChatGPT plan is
-  # not BAA-covered, so a deployment holding PHI must not list codex.
-  # Unset = both. [] = none (passes are refused and logged; nothing ingested
-  # meanwhile is lost). A non-list value allows nothing.
+  # send memory/transcript text to: codex (ChatGPT login), anthropic
+  # (Anthropic API) and openai (OpenAI platform API). A compliance decision
+  # per deployment: a ChatGPT plan is not BAA-covered, so a deployment
+  # holding PHI must not list codex.
+  # Unset = [codex, anthropic] (openai must be listed explicitly). [] = none
+  # (passes are refused and logged; nothing ingested meanwhile is lost). A
+  # non-list value allows nothing.
   # Env DEVBRAIN_COGNIFY_ALLOWED_BACKENDS="codex,anthropic" overrides.
   # allowed_backends: [codex, anthropic]
+  # One backend for every pass: codex | anthropic | openai. Unset = route by
+  # model id (codex for codex/gpt-*/o3, Anthropic otherwise, with a codex ->
+  # Anthropic fallback). Set = that backend only, never a fallback; a pass
+  # with no path for it (edges/resummarize have no codex path) does not run.
+  # Env DEVBRAIN_COGNIFY_BACKEND overrides.
+  # backend: openai
+  # Model for backend=openai (Chat Completions). Env DEVBRAIN_OPENAI_MODEL
+  # wins; DEVBRAIN_CODEX_MODEL / codex_model are not used for it. Key:
+  # OPENAI_API_KEY, else (GOOGLE_APPLICATION_CREDENTIALS set) GCP Secret
+  # Manager secret openai-api-key in env DEVBRAIN_OPENAI_SECRET_PROJECT
+  # (default brightbot-478117). Optional openai_reasoning_effort (env
+  # DEVBRAIN_OPENAI_REASONING_EFFORT); unset sends none.
+  # openai_model: gpt-5.6-luna
+  # PHI deployment (Lighthouse: OpenAI BAA covers the API platform only):
+  #   backend: openai
+  #   openai_model: gpt-5.6-luna
+  #   allowed_backends: [openai]
   # Dedicated CODEX_HOME for cognify's codex calls: its own login and a
   # config with no MCP servers, plugins or apps, so transcript text never
   # reaches write-capable tools. Set up with `devbrain cognify-codex-home
@@ -116,6 +135,7 @@ cognify:
   # with "model is not supported when using Codex with a ChatGPT account".
   # The account's current list: ~/.codex/models_cache.json (visibility
   # "list"). Env DEVBRAIN_CODEX_MODEL wins over this (check launchd plists).
+  # Not used when backend: openai.
   # codex_model: gpt-5.6-luna
   # Reasoning effort for codex exec; "inherit" uses ~/.codex/config.toml.
   # Env DEVBRAIN_CODEX_REASONING_EFFORT.

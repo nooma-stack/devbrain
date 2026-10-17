@@ -28,8 +28,15 @@ Placeholders
   (extract + edges + strengthen) should scope to.
 - ``@CREDENTIAL_ENV_BLOCK@`` — XML marker replaced by either an
   ``ANTHROPIC_API_KEY`` or ``CLAUDE_CODE_OAUTH_TOKEN`` env entry in
-  the two LLM-cost plists (extract + edges). The non-LLM plists
-  (decay + strengthen + gc) don't carry this marker.
+  the LLM-cost plists (extract, edges, fanout, resummarize). The non-LLM
+  plists (decay + strengthen + gc) don't carry this marker. When
+  ``cognify.backend: openai`` (or env DEVBRAIN_COGNIFY_BACKEND=openai) at
+  install time, the OpenAI key source set in the installing shell is
+  emitted too — ``GOOGLE_APPLICATION_CREDENTIALS`` (+ optional
+  ``DEVBRAIN_OPENAI_SECRET_PROJECT`` / ``DEVBRAIN_OPENAI_SECRET``) for the
+  Secret Manager fetch, or ``OPENAI_API_KEY`` — and an Anthropic
+  credential is then optional. Prefer the Secret Manager route: it keeps
+  the key out of the plist.
 
 Idempotency
 -----------
@@ -45,6 +52,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+from xml.sax.saxutils import escape as _xml_escape
 
 _TEMPLATE_DIR = Path(__file__).resolve().parent / "launchd"
 
@@ -65,6 +73,15 @@ _CRED_PLISTS = (
 
 # All cognify plists, in installation order.
 ALL_PLISTS = _NO_CRED_PLISTS + _CRED_PLISTS
+
+# OpenAI key-source env (cognify/openai_api.py) copied into the LLM-cost
+# plists when the openai backend is selected at install time.
+_OPENAI_ENV = (
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "DEVBRAIN_OPENAI_SECRET_PROJECT",
+    "DEVBRAIN_OPENAI_SECRET",
+    "OPENAI_API_KEY",
+)
 
 # The marker the credential block replaces. Multi-line; the installer
 # replaces the *entire* HTML comment block plus the marker line.
@@ -115,6 +132,20 @@ def resolve_credential_from_env() -> CredentialChoice | None:
     return None
 
 
+def resolve_openai_env() -> dict[str, str]:
+    """OpenAI key-source env to bake into the LLM plists — only when this
+    deployment selects the openai backend, so other installs never copy
+    an OpenAI key into a plist."""
+    from cognify import backends  # noqa: PLC0415
+
+    if backends.selected() != "openai":
+        return {}
+    env = {k: os.environ[k] for k in _OPENAI_ENV if os.environ.get(k)}
+    if "GOOGLE_APPLICATION_CREDENTIALS" in env:
+        env.pop("OPENAI_API_KEY", None)  # Secret Manager: no key on disk
+    return env
+
+
 def render_plist(
     template_text: str,
     *,
@@ -122,6 +153,7 @@ def render_plist(
     user: str,
     project_slug: str,
     credential: CredentialChoice | None,
+    extra_env: dict[str, str] | None = None,
 ) -> str:
     """Substitute the four placeholder kinds in a template.
 
@@ -136,15 +168,18 @@ def render_plist(
     out = out.replace("${PROJECT_SLUG}", project_slug)
 
     if _CRED_MARKER in out:
-        if credential is None:
+        if credential is None and not extra_env:
             raise ValueError(
                 "template carries @CREDENTIAL_ENV_BLOCK@ but no credential "
                 "was supplied — extract + edges plists require one of "
                 "ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN"
             )
-        cred_xml = (
-            f"        <key>{credential.env_name}</key>\n"
-            f"        <string>{credential.value}</string>"
+        pairs: list[tuple[str, str]] = []
+        if credential is not None:
+            pairs.append((credential.env_name, credential.value))
+        pairs += [(k, _xml_escape(v)) for k, v in (extra_env or {}).items()]
+        cred_xml = "\n".join(
+            f"        <key>{k}</key>\n        <string>{v}</string>" for k, v in pairs
         )
         # Replace the entire two-line comment block + marker with the
         # rendered key/string pair. The template uses:
@@ -178,6 +213,7 @@ def install_one(
     user: str,
     project_slug: str,
     credential: CredentialChoice | None,
+    extra_env: dict[str, str] | None = None,
 ) -> Path:
     """Render one template and write it to ``target_dir``.
 
@@ -193,6 +229,7 @@ def install_one(
         user=user,
         project_slug=project_slug,
         credential=credential,
+        extra_env=extra_env,
     )
     target = target_dir / template_path.name
     needs_secret_perms = template_path.name in _CRED_PLISTS
@@ -224,11 +261,13 @@ def install_cognify_launchd(
     target_dir: Path | None = None,
     reload: bool = False,
     runner: callable = subprocess.run,  # injection point for tests
+    extra_env: dict[str, str] | None = None,
 ) -> list[Path]:
     """Render and install all five cognify launchd plists.
 
     Defaults:
       * ``credential`` ← ``resolve_credential_from_env()``
+      * ``extra_env`` ← ``resolve_openai_env()``
       * ``devbrain_home`` ← parent-parent of this file
       * ``user`` ← $USER
       * ``target_dir`` ← ``~/Library/LaunchAgents``
@@ -242,6 +281,8 @@ def install_cognify_launchd(
         credential = resolve_credential_from_env()
         # OK if it's None — render_plist will raise only on plists
         # that need it.
+    if extra_env is None:
+        extra_env = resolve_openai_env()
 
     if devbrain_home is None:
         # /factory/cognify/setup_launchd.py → devbrain root is 2 levels up
@@ -269,6 +310,7 @@ def install_cognify_launchd(
             user=user,
             project_slug=project_slug,
             credential=credential,
+            extra_env=extra_env,
         )
         installed.append(out_path)
 
