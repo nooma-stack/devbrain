@@ -143,6 +143,12 @@ def resolve_openai_env() -> dict[str, str]:
     env = {k: os.environ[k] for k in _OPENAI_ENV if os.environ.get(k)}
     if "GOOGLE_APPLICATION_CREDENTIALS" in env:
         env.pop("OPENAI_API_KEY", None)  # Secret Manager: no key on disk
+    # Pin the selection in the plist itself. Without this, a selection that
+    # came from the installing shell's env (or a later yaml edit that drops
+    # cognify.backend) would leave the jobs on model-based routing with
+    # codex/Anthropic allowed: fail-open for a PHI deployment.
+    env["DEVBRAIN_COGNIFY_BACKEND"] = "openai"
+    env["DEVBRAIN_COGNIFY_ALLOWED_BACKENDS"] = "openai"
     return env
 
 
@@ -277,12 +283,15 @@ def install_cognify_launchd(
 
     Returns the list of installed plist paths.
     """
-    if credential is None:
+    if extra_env is None:
+        extra_env = resolve_openai_env()
+    if extra_env.get("DEVBRAIN_COGNIFY_BACKEND") == "openai":
+        # openai-only deployment: never bake an Anthropic credential in.
+        credential = None
+    elif credential is None:
         credential = resolve_credential_from_env()
         # OK if it's None — render_plist will raise only on plists
         # that need it.
-    if extra_env is None:
-        extra_env = resolve_openai_env()
 
     if devbrain_home is None:
         # /factory/cognify/setup_launchd.py → devbrain root is 2 levels up

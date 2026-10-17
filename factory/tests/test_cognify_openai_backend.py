@@ -553,10 +553,14 @@ def test_openai_env_only_passed_through_when_selected(monkeypatch):
     backends.reset(None, selected=None)
     assert setup_launchd.resolve_openai_env() == {}
     backends.reset(None, selected="openai")
+    pinned = {
+        "DEVBRAIN_COGNIFY_BACKEND": "openai",
+        "DEVBRAIN_COGNIFY_ALLOWED_BACKENDS": "openai",
+    }
     env = setup_launchd.resolve_openai_env()
-    assert env == {"GOOGLE_APPLICATION_CREDENTIALS": "/Users/x/sa.json"}
+    assert env == {"GOOGLE_APPLICATION_CREDENTIALS": "/Users/x/sa.json", **pinned}
     monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS")
-    assert setup_launchd.resolve_openai_env() == {"OPENAI_API_KEY": FAKE_KEY}
+    assert setup_launchd.resolve_openai_env() == {"OPENAI_API_KEY": FAKE_KEY, **pinned}
 
 
 def test_render_with_openai_env_and_no_anthropic_credential():
@@ -570,3 +574,26 @@ def test_render_with_openai_env_and_no_anthropic_credential():
     assert "<string>/Users/u/sa &amp; key.json</string>" in out
     assert "@CREDENTIAL_ENV_BLOCK@" not in out
     assert "ANTHROPIC_API_KEY" not in out
+
+
+def test_install_pins_openai_and_drops_anthropic_credential(monkeypatch, tmp_path):
+    """Selection from the installing shell must survive into the plists:
+    the jobs run with openai pinned and no Anthropic credential, so a later
+    yaml drift cannot route PHI to codex or Anthropic."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-should-not-appear")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/Users/x/sa.json")
+    backends.reset(None, selected="openai")
+    paths = setup_launchd.install_cognify_launchd(
+        project_slug="brightbot", devbrain_home="/d", user="u",
+        target_dir=tmp_path, reload=False,
+    )
+    cred_names = set(setup_launchd._CRED_PLISTS)
+    seen = 0
+    for p in paths:
+        text = p.read_text()
+        assert "sk-ant-should-not-appear" not in text
+        if p.name in cred_names:
+            seen += 1
+            assert "<key>DEVBRAIN_COGNIFY_BACKEND</key>\n        <string>openai</string>" in text
+            assert "<key>DEVBRAIN_COGNIFY_ALLOWED_BACKENDS</key>\n        <string>openai</string>" in text
+    assert seen == len(cred_names)
