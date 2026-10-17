@@ -226,6 +226,12 @@ jobs:
         run: |
           python -m pytest tests/postulates/ -v --tb=short
 
+      - name: Run ingest DB tests (project repair / late attach)
+        env:
+          DEVBRAIN_DATABASE_URL: postgresql://devbrain:devbrain-ci@localhost:5432/devbrain
+        run: |
+          cd ingest && python -m pytest tests/test_repair_projects_db.py -v --tb=short -p no:cacheprovider
+
       - name: Run curator + migration + cascade integration tests (rootdir = factory/)
         # factory/tests/conftest.py uses the same env-var contract; rootdir
         # differs because pytest discovers factory/pytest.ini.
