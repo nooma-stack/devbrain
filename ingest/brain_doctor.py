@@ -69,15 +69,21 @@ def check_embedding_drift(cur):
         ORDER BY created_at DESC LIMIT 4)""")
     worst = 1.0
     for mid, title, content, kind in cur.fetchall():
-        # The MCP store tool embeds "title\ncontent" but saves content as
-        # "title\n\ncontent", so prefixing the title again double-counts it
-        # and reports drift that is not there (0.98 on 2026-10-16).
-        text = (content if not title or content.startswith(title)
-                else f"{title}\n{content}")
-        vs = "[" + ",".join(f"{x:.6f}" for x in _embed(text)) + "]"
-        cur.execute("SELECT 1-(embedding <=> %s::vector) FROM devbrain.memory WHERE id=%s",
-                    (vs, mid))
-        worst = min(worst, float(cur.fetchone()[0]))
+        # Writers disagree on the embed text: the MCP store tool embeds
+        # "title\ncontent" but saves content as "title\n\ncontent"; older
+        # writers embedded "title\ncontent" of content that may itself open
+        # with the title. Score every plausible form and keep the best —
+        # real runtime drift matches none of them.
+        texts = [f"{title}\n{content}" if title else content]
+        if title and content.startswith(title):
+            texts.append(content)
+        best = 0.0
+        for text in texts:
+            vs = "[" + ",".join(f"{x:.6f}" for x in _embed(text)) + "]"
+            cur.execute("SELECT 1-(embedding <=> %s::vector) FROM devbrain.memory WHERE id=%s",
+                        (vs, mid))
+            best = max(best, float(cur.fetchone()[0]))
+        worst = min(worst, best)
     if worst < 0.999:
         return "FAIL", (f"stored-vs-recomputed cosine {worst:.5f} < 0.999 — "
                         "embedding runtime drifted; corpus re-embed required "
