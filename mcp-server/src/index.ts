@@ -26,10 +26,19 @@ import {
   type MatchStrength,
 } from './hybrid.js'
 import { rerankScores } from './rerank.js'
-import { REMOTE_REPLY_NOTICE, screeningLabel, untrustedText } from './untrusted.js'
+import { REMOTE_REPLY_NOTICE, isUuid, screeningLabel, untrustedText } from './untrusted.js'
+
+/** Wrappers for this call (search.untrusted_wrap / DEVBRAIN_UNTRUSTED_WRAP). */
+const untrusted = () => untrustedText(getSearchConfig().untrustedWrap)
 
 /** A stored title (factory job, memory) made inert for echoing in tool text. */
-const safeTitle = (t: string): string => untrustedText(getSearchConfig().untrustedWrap).title(t)
+const safeTitle = (t: string): string => untrusted().title(String(t ?? ''))
+
+/** Notice line to prepend to a plain-text tool response ('' when wrapping is off). */
+const noticeLine = (): string => {
+  const n = untrusted().notice
+  return n ? `${n}\n` : ''
+}
 import { enqueueCascades, hasScreenFlagsColumn, recordMemory, recordMemoryDependency, resolveMemoryId } from './memory.js'
 import { screenFlags } from './screening.js'
 import { relationCheckMode, relationStoreNote, triggerRelationCheckInBackground } from './relation.js'
@@ -168,15 +177,17 @@ function runDevbrainCli(args: string[]): { stdout: string; stderr: string; exitC
 
 function cliResultToToolResponse(args: string[]): { content: Array<{ type: 'text'; text: string }> } {
   const { stdout, stderr, exitCode } = runDevbrainCli(args)
+  // CLI output echoes stored project names / purposes: untrusted.
+  const u = untrusted()
   if (exitCode !== 0) {
     return {
       content: [{
         type: 'text',
-        text: `devbrain ${args[0]} exited ${exitCode}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+        text: `${noticeLine()}devbrain ${args[0]} exited ${exitCode}\nstdout:\n${u.body(stdout)}\nstderr:\n${u.body(stderr)}`,
       }],
     }
   }
-  return { content: [{ type: 'text', text: stdout || `devbrain ${args[0]} completed.` }] }
+  return { content: [{ type: 'text', text: stdout ? `${noticeLine()}${u.body(stdout)}` : `devbrain ${args[0]} completed.` }] }
 }
 
 const server = new McpServer({
@@ -257,14 +268,17 @@ server.tool(
       const fails = last.split('\n').filter((l) => l.startsWith('FAIL'))
       const warns = last.split('\n').filter((l) => l.startsWith('WARN'))
       const ageMs = Date.now() - new Date(stampLine.replace(' ===', '').replace(' ', 'T').replace('Z', ':00Z')).getTime()
+      // The doctor log is a file on disk whose lines can quote stored text.
+      const uh = untrusted()
+      const stamp = uh.title(stampLine.replace(' ===', ''))
       if (fails.length > 0) {
-        healthBanner = `\n\n## ⚠ SYSTEM HEALTH — BRAIN DOCTOR FAILING (${stampLine.replace(' ===', '')})\n`
-          + fails.join('\n')
+        healthBanner = `\n\n## ⚠ SYSTEM HEALTH — BRAIN DOCTOR FAILING (${stamp})\n`
+          + uh.body(fails.join('\n'))
           + '\nMemory quality may be degraded. See logs/brain-doctor.log and the handoff doc §12 before trusting recall-sensitive work.'
       } else if (Number.isFinite(ageMs) && ageMs > 48 * 3600 * 1000) {
-        healthBanner = `\n\n## ⚠ SYSTEM HEALTH — brain doctor has not run since ${stampLine.replace(' ===', '')} (stale >48h); the launchd job may be dead.`
+        healthBanner = `\n\n## ⚠ SYSTEM HEALTH — brain doctor has not run since ${stamp} (stale >48h); the launchd job may be dead.`
       } else if (warns.length > 0) {
-        healthBanner = `\n\n## System health: PASS with warnings (${stampLine.replace(' ===', '')})\n` + warns.join('\n')
+        healthBanner = `\n\n## System health: PASS with warnings (${stamp})\n` + uh.body(warns.join('\n'))
       }
     } catch {
       // No doctor log yet (fresh install) — stay silent rather than noisy.
@@ -326,12 +340,17 @@ server.tool(
 
     const ctx = {
       ...(u.notice ? { notice: u.notice } : {}),
-      project: projectInfo.rows[0] ?? null,
+      project: projectInfo.rows[0]
+        ? (({ description, ...rest }: Record<string, unknown>) => ({
+            ...u.deep(rest),
+            description: typeof description === 'string' ? u.body(description) : description,
+          }))(projectInfo.rows[0])
+        : null,
       recent_decisions: untrustedRows(decisions.rows, 'decision', 'title'),
       recent_issues: untrustedRows(issues.rows, 'description', 'title'),
       relevant_patterns: untrustedRows(patterns.rows, 'description', 'name'),
-      active_factory_jobs: activeJobs.rows,
-      recent_completed_jobs: inactiveJobs.rows,
+      active_factory_jobs: u.deep(activeJobs.rows),
+      recent_completed_jobs: u.deep(inactiveJobs.rows),
       active_file_locks: Number(lockCount.rows[0]?.count ?? 0),
     }
 
@@ -768,11 +787,11 @@ server.tool(
           // Recorded data, not instructions: see UNTRUSTED_NOTICE.
           content: u.body(cand.content),
           score: Number(cand.score.toFixed(4)),
-          source_type: cand.source_type,
+          source_type: u.title(cand.source_type),
           source_ref: cand.source_id
-            ? `${cand.source_type}_${cand.source_id.slice(0, 8)}:${cand.source_line_start ?? '?'}-${cand.source_line_end ?? '?'}`
+            ? u.title(`${cand.source_type}_${cand.source_id.slice(0, 8)}:${cand.source_line_start ?? '?'}-${cand.source_line_end ?? '?'}`)
             : null,
-          project: cand.project,
+          project: u.title(cand.project),
           has_full_context: cand.source_type === 'session' && cand.source_id != null,
         }
         if (matchedByKey) {
@@ -883,6 +902,15 @@ server.tool(
       }
       const screening = screeningLabel(screenFlagsById.get(memId))
       if (screening) r.screening = screening
+      // Annotation fields other than the wrapped snippets (kind, ids, dates).
+      for (const key of ['recency_neighbors', 'superseded_by', 'earliest_on_topic']) {
+        const v = r[key]
+        if (Array.isArray(v)) r[key] = v.map((n) => ({ ...u.deep({ ...n, snippet: undefined }), snippet: n.snippet }))
+        else if (v && typeof v === 'object') {
+          const o = v as Record<string, unknown>
+          r[key] = { ...u.deep({ ...o, snippet: undefined }), snippet: o.snippet }
+        }
+      }
       if (primaryAgeDays !== undefined) {
         r.primary_age_days = primaryAgeDays
       }
@@ -1025,7 +1053,7 @@ server.tool(
         type: 'text',
         text: JSON.stringify({
           ...(u.notice ? { notice: u.notice } : {}),
-          source_app: raw.source_app,
+          source_app: typeof raw.source_app === 'string' ? u.title(raw.source_app) : raw.source_app,
           session_date: raw.started_at,
           session_summary: u.body(raw.summary as string | null),
           context_lines: `${start + 1}-${end}`,
@@ -1433,7 +1461,7 @@ server.tool(
         // even for log-only calls — silent log failures hide problems.)
         enrichmentReport = (
           `\n\nWARNING: end_session enrichment failed (exit ${result.status}).` +
-          `\nstderr: ${(result.stderr ?? '').toString().slice(0, 800)}`
+          `\nstderr: ${untrusted().body((result.stderr ?? '').toString().slice(0, 800))}`
         )
       } else if (hasJudgment) {
         // Only surface success details when the agent volunteered
@@ -1442,13 +1470,14 @@ server.tool(
         try {
           const parsed = JSON.parse((result.stdout ?? '').toString())
           const drained = parsed.cascades_drained ?? 0
+          const ue = untrusted()
           enrichmentReport = (
-            `\n\nEnrichment applied: ${parsed.status}.` +
-            ` Cascades drained: ${drained}.` +
-            (parsed.drain_error ? ` (drain warning: ${parsed.drain_error})` : '')
+            `\n\nEnrichment applied: ${ue.title(String(parsed.status))}.` +
+            ` Cascades drained: ${Number(drained) || 0}.` +
+            (parsed.drain_error ? ` (drain warning: ${ue.body(String(parsed.drain_error))})` : '')
           )
         } catch {
-          enrichmentReport = `\n\nEnrichment applied; raw output: ${untrustedText(getSearchConfig().untrustedWrap).body((result.stdout ?? '').toString().slice(0, 200))}`
+          enrichmentReport = `\n\nEnrichment applied; raw output: ${untrusted().body((result.stdout ?? '').toString().slice(0, 200))}`
         }
       }
       // Lesson candidates are written without a relation check (the
@@ -1603,7 +1632,7 @@ server.tool(
       return {
         content: [{
           type: 'text',
-          text: `graph_walk failed (exit ${result.status}).\nstderr: ${(result.stderr ?? '').toString().slice(0, 800)}`,
+          text: `${noticeLine()}graph_walk failed (exit ${result.status}).\nstderr: ${untrusted().body((result.stderr ?? '').toString().slice(0, 800))}`,
         }],
       }
     }
@@ -1615,14 +1644,14 @@ server.tool(
       return {
         content: [{
           type: 'text',
-          text: `graph_walk returned unparseable output:\n${(result.stdout ?? '').toString().slice(0, 400)}`,
+          text: `${noticeLine()}graph_walk returned unparseable output:\n${untrusted().body((result.stdout ?? '').toString().slice(0, 400))}`,
         }],
       }
     }
 
     const out = parsed as { error?: string; memories?: unknown[]; edges?: unknown[]; truncated?: boolean }
     if (out.error) {
-      return { content: [{ type: 'text', text: `graph_walk error: ${out.error}` }] }
+      return { content: [{ type: 'text', text: `${noticeLine()}graph_walk error: ${untrusted().body(String(out.error))}` }] }
     }
 
     // Recorded data, not instructions (untrusted.ts): notice first, bodies
@@ -1645,12 +1674,12 @@ server.tool(
       memories: memories.map((m) => {
         const label = screeningLabel(flagsById.get(String(m.id ?? '')))
         return {
-          ...m,
-          title: typeof m.title === 'string' ? u.title(m.title) : m.title,
+          ...u.deep(m),
           content: typeof m.content === 'string' ? u.body(m.content) : m.content,
           ...(label ? { screening: label } : {}),
         }
       }),
+      edges: u.deep(out.edges ?? []),
     }
 
     return {
@@ -1815,11 +1844,11 @@ server.tool(
 
     // Job titles are stored text written by agents: neutralize them under the notice.
     const u = untrustedText(getSearchConfig().untrustedWrap)
-    const jobs = result.rows.map((j) => ({ ...j, title: typeof j.title === 'string' ? u.title(j.title) : j.title }))
+    const jobs = u.deep(result.rows)
     return {
       content: [{
         type: 'text',
-        text: JSON.stringify({ ...(u.notice ? { notice: u.notice } : {}), jobs, artifacts }, null, 2),
+        text: JSON.stringify({ ...(u.notice ? { notice: u.notice } : {}), jobs, artifacts: u.deep(artifacts) }, null, 2),
       }],
     }
   },
@@ -1859,7 +1888,7 @@ server.tool(
 
     if (action === 'approve') {
       if (status !== 'ready_for_approval') {
-        return { content: [{ type: 'text', text: `Job is not ready for approval (status: ${status}).` }] }
+        return { content: [{ type: 'text', text: `Job is not ready for approval (status: ${safeTitle(status)}).` }] }
       }
 
       // Transition to APPROVED first. If the subsequent push fails we
@@ -1875,7 +1904,7 @@ server.tool(
         return { content: [{ type: 'text', text: `Job "${safeTitle(title)}" APPROVED, but the job has no branch_name on record — nothing to push. Push any commits manually.` }] }
       }
       if (!root_path) {
-        return { content: [{ type: 'text', text: `Job "${safeTitle(title)}" APPROVED, but the project has no root_path on record — can't locate the git worktree. Push branch '${branch_name}' manually.` }] }
+        return { content: [{ type: 'text', text: `Job "${safeTitle(title)}" APPROVED, but the project has no root_path on record — can't locate the git worktree. Push branch '${safeTitle(branch_name)}' manually.` }] }
       }
 
       // Worktree-aware cwd: factory jobs run in per-job worktrees at
@@ -1924,7 +1953,7 @@ server.tool(
           return {
             content: [{
               type: 'text',
-              text: `Job "${safeTitle(title)}" approval SYNC FAILED (worktree diverged from origin/${branch_name}). Status reverted to ready_for_approval.\n\ngit output tail:\n${detail}\n\nResolve the divergence in the worktree (rebase or reset to origin) then re-run factory_approve.`,
+              text: `${noticeLine()}Job "${safeTitle(title)}" approval SYNC FAILED (worktree diverged from origin/${safeTitle(branch_name)}). Status reverted to ready_for_approval.\n\ngit output tail:\n${untrusted().body(detail)}\n\nResolve the divergence in the worktree (rebase or reset to origin) then re-run factory_approve.`,
             }],
           }
         }
@@ -1951,8 +1980,9 @@ server.tool(
       if (push.status === 0) {
         // Post-push success — trim any warnings from stdout/stderr for the caller.
         const trimmedStderr = (push.stderr ?? '').trim()
-        const hint = trimmedStderr ? `\n\n(git output:\n${trimmedStderr.slice(-512)})` : ''
-        return { content: [{ type: 'text', text: `Job "${safeTitle(title)}" APPROVED and PUSHED to origin/${branch_name}.\n\nNext: create a PR with \`gh pr create --base main --head ${branch_name}\`.${hint}` }] }
+        const hint = trimmedStderr ? `\n\n(git output:\n${untrusted().body(trimmedStderr.slice(-512))})` : ''
+        const br = safeTitle(branch_name)
+        return { content: [{ type: 'text', text: `${trimmedStderr ? noticeLine() : ''}Job "${safeTitle(title)}" APPROVED and PUSHED to origin/${br}.\n\nNext: create a PR with \`gh pr create --base main --head ${br}\`.${hint}` }] }
       }
 
       // Non-zero exit — auth failure, diverged ref, network, etc.
@@ -1968,7 +1998,7 @@ server.tool(
       return {
         content: [{
           type: 'text',
-          text: `Job "${safeTitle(title)}" approval PUSH FAILED (exit ${push.status}). Status reverted to ready_for_approval so you can retry after fixing the underlying issue.\n\ngit output tail:\n${tail || '(empty)'}\n\nOnce fixed, re-run factory_approve to retry.`,
+          text: `${noticeLine()}Job "${safeTitle(title)}" approval PUSH FAILED (exit ${push.status}). Status reverted to ready_for_approval so you can retry after fixing the underlying issue.\n\ngit output tail:\n${tail ? untrusted().body(tail) : '(empty)'}\n\nOnce fixed, re-run factory_approve to retry.`,
         }],
       }
     } else if (action === 'reject') {
@@ -2016,7 +2046,7 @@ server.tool(
 
     const terminalStatuses = ['approved', 'rejected', 'deployed', 'failed']
     if (!terminalStatuses.includes(status)) {
-      return { content: [{ type: 'text', text: `Cannot clean up active jobs. Job "${safeTitle(title)}" is currently in status: ${status}.` }] }
+      return { content: [{ type: 'text', text: `Cannot clean up active jobs. Job "${safeTitle(title)}" is currently in status: ${safeTitle(status)}.` }] }
     }
 
     await query(
@@ -2035,14 +2065,14 @@ server.tool(
     let reportInfo = ''
     if (reportResult.rows.length > 0) {
       const report = reportResult.rows[0]
-      reportInfo = `\nCleanup report: ${report.outcome} — ${u.body(String(report.summary ?? ''))}`
+      reportInfo = `\nCleanup report: ${u.title(String(report.outcome ?? ''))} — ${u.body(String(report.summary ?? ''))}`
       if (u.notice) reportInfo += `\n(${u.notice})`
     }
 
     return {
       content: [{
         type: 'text',
-        text: `Job "${u.title(title)}" archived successfully (status: ${status}).${reportInfo}`,
+        text: `Job "${u.title(title)}" archived successfully (status: ${u.title(String(status))}).${reportInfo}`,
       }],
     }
   },
@@ -2083,7 +2113,7 @@ server.tool(
       return {
         content: [{
           type: 'text',
-          text: `devbrain_notify result:\n${output.trim()}`,
+          text: `${noticeLine()}devbrain_notify result:\n${untrusted().body(output.trim())}`,
         }],
       }
     } finally {
@@ -2126,18 +2156,15 @@ server.tool(
       return { content: [{ type: 'text', text: `No file locks active for project "${slug}".` }] }
     }
 
-    const untrusted = untrustedText(getSearchConfig().untrustedWrap)
+    const ul = untrusted()
     return {
       content: [{
         type: 'text',
         text: JSON.stringify({
-          ...(untrusted.notice ? { notice: untrusted.notice } : {}),
+          ...(ul.notice ? { notice: ul.notice } : {}),
           project: slug,
           active_locks: result.rows.length,
-          locks: result.rows.map((l) => ({
-            ...l,
-            job_title: typeof l.job_title === 'string' ? untrusted.title(l.job_title) : l.job_title,
-          })),
+          locks: ul.deep(result.rows),
         }, null, 2),
       }],
     }
@@ -2197,7 +2224,7 @@ server.tool(
       return {
         content: [{
           type: 'text',
-          text: `Job "${safeTitle(title)}" is not blocked (status: ${status}). Cannot apply resolution.`,
+          text: `Job "${safeTitle(title)}" is not blocked (status: ${safeTitle(String(status))}). Cannot apply resolution.`,
         }],
       }
     }
@@ -2296,7 +2323,7 @@ server.tool(
       const hint = available.length > 0
         ? `Available targets: ${available.join(', ')}.`
         : 'No agent-bus targets configured yet. See github.com/nooma-stack/agent-bus#use for provisioning.'
-      return { content: [{ type: 'text', text: `Target "${target}" not found in agent-bus config. ${hint}` }] }
+      return { content: [{ type: 'text', text: `Target "${target}" not found in agent-bus config. ${safeTitle(hint)}` }] }
     }
     if (!cfg.url || !cfg.token) {
       return { content: [{ type: 'text', text: `Target "${target}" is missing url or token in agent-bus.yaml.` }] }
@@ -2317,7 +2344,7 @@ server.tool(
         body: JSON.stringify(body),
       })
     } catch (err) {
-      return { content: [{ type: 'text', text: `Network error reaching ${cfg.url}: ${err}. Is the SSH tunnel up and the daemon running?` }] }
+      return { content: [{ type: 'text', text: `Network error reaching ${safeTitle(String(cfg.url))}: ${safeTitle(String(err))}. Is the SSH tunnel up and the daemon running?` }] }
     }
 
     const payload = await response.json().catch(() => null) as {
@@ -2328,8 +2355,11 @@ server.tool(
     } | null
 
     if (!response.ok) {
+      // The error body is remote text: untrusted like the reply itself.
       const detail = payload ? JSON.stringify(payload) : await response.text().catch(() => '(no body)')
-      return { content: [{ type: 'text', text: `Daemon returned ${response.status}: ${detail}` }] }
+      const ud = untrusted()
+      const head = ud.notice ? `${REMOTE_REPLY_NOTICE}\n` : ''
+      return { content: [{ type: 'text', text: `${head}Daemon returned ${Number(response.status) || 0}: ${ud.body(String(detail))}` }] }
     }
 
     if (!payload) {
@@ -2339,11 +2369,22 @@ server.tool(
     // The reply is another agent's output: untrusted, like retrieved memory.
     const u = untrustedText(getSearchConfig().untrustedWrap)
     const head = u.notice ? `${REMOTE_REPLY_NOTICE}\n` : ''
-    if (payload.exit_code !== 0) {
+    // session_id is printed outside the wrapper only when it is a UUID; any
+    // other value is remote text (neutralized and wrapped). exit_code is
+    // coerced to a number (NaN → -1).
+    const sessionText = (fallback: string) =>
+      payload.session_id === undefined || payload.session_id === null
+        ? fallback
+        : isUuid(payload.session_id)
+          ? payload.session_id
+          : u.body(u.title(String(payload.session_id)))
+    const rawExit = Number(payload.exit_code ?? 0)
+    const exitCode = Number.isFinite(rawExit) ? Math.trunc(rawExit) : -1
+    if (exitCode !== 0) {
       return {
         content: [{
           type: 'text',
-          text: `${head}Remote claude exited ${payload.exit_code}\nstderr: ${u.body(payload.stderr ?? '(empty)')}\nsession_id: ${payload.session_id ?? '(none)'}`,
+          text: `${head}Remote claude exited ${exitCode}\nstderr: ${u.body(String(payload.stderr ?? '(empty)'))}\nsession_id: ${sessionText('(none)')}`,
         }],
       }
     }
@@ -2351,7 +2392,7 @@ server.tool(
     return {
       content: [{
         type: 'text',
-        text: `${head}[session: ${payload.session_id ?? 'unknown'}]\n\n${u.body(payload.result ?? '(empty response)')}`,
+        text: `${head}[session: ${sessionText('unknown')}]\n\n${u.body(String(payload.result ?? '(empty response)'))}`,
       }],
     }
   },
@@ -2403,7 +2444,8 @@ server.tool(
         String(r.port_count), r.root_path ?? '-',
       ].join('\t'))
     }
-    return { content: [{ type: 'text', text: lines.join('\n') }] }
+    // Stored names and paths: neutralized, under the notice.
+    return { content: [{ type: 'text', text: noticeLine() + untrusted().title(lines.join('\n')) }] }
   },
 )
 
@@ -2458,7 +2500,8 @@ server.tool(
         r.notes ?? '-',
       ].join('\t'))
     }
-    return { content: [{ type: 'text', text: lines.join('\n') }] }
+    // Stored purposes and notes: neutralized, under the notice.
+    return { content: [{ type: 'text', text: noticeLine() + untrusted().title(lines.join('\n')) }] }
   },
 )
 
@@ -2503,7 +2546,10 @@ server.tool(
     if (projRow.rows[0].compose_project) {
       env['COMPOSE_PROJECT_NAME'] = projRow.rows[0].compose_project
     }
-    return { content: [{ type: 'text', text: JSON.stringify(env, null, 2) }] }
+    // Consumed as an env map, so no notice key; stored names are neutralized.
+    const ue = untrusted()
+    const safeEnv = Object.fromEntries(Object.entries(env).map(([k, v]) => [ue.title(k), ue.title(v)]))
+    return { content: [{ type: 'text', text: JSON.stringify(safeEnv, null, 2) }] }
   },
 )
 

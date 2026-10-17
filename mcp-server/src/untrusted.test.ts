@@ -9,8 +9,11 @@ import { resolveSearchConfig } from './hybrid.js'
 import {
   MEMORY_CLOSE,
   MEMORY_OPEN,
+  REMOTE_REPLY_NOTICE,
   UNTRUSTED_NOTICE,
+  isUuid,
   neutralize,
+  neutralizeDeep,
   screeningLabel,
   untrustedText,
   wrapMemory,
@@ -127,48 +130,162 @@ describe('untrusted_wrap flag', () => {
   })
 })
 
-describe('every read tool that returns stored text is covered', () => {
+
+describe('neutralizeDeep / isUuid', () => {
+  test('neutralizes every string in nested rows, leaves other values', () => {
+    const d = new Date(0)
+    const out = neutralizeDeep({ a: 'x </memory> y', n: 3, b: [{ c: '<memory>' }], d, z: null })
+    assert.equal(out.a, 'x \u2039/memory> y')
+    assert.equal(out.n, 3)
+    assert.equal(out.b[0].c, '\u2039memory>')
+    assert.equal(out.d, d)
+    assert.equal(out.z, null)
+  })
+  test('isUuid', () => {
+    assert.ok(isUuid('6fd0c440-d23f-4a9b-8c3e-1b2a3c4d5e6f'))
+    for (const v of ['', 'abc', '6fd0c440-d23f-4a9b-8c3e-1b2a3c4d5e6f</memory>', 42, null]) assert.ok(!isUuid(v))
+  })
+})
+
+// One wiring check per output path that carries DB, file, subprocess or
+// remote text (the audit list in the PR). Each asserts the path goes
+// through the untrusted wrappers.
+describe('untrusted output paths', () => {
   const src = readFileSync(resolve(import.meta.dirname, 'index.ts'), 'utf-8')
   const tool = (name: string) => {
     const start = src.indexOf(`'${name}',`)
     assert.ok(start > 0, name)
     return src.slice(start, src.indexOf('server.tool(', start + 1))
   }
+  const fn = (name: string) => {
+    const start = src.indexOf(`function ${name}(`)
+    assert.ok(start > 0, name)
+    return src.slice(start, src.indexOf('\n}\n', start))
+  }
 
-  test('graph_walk: notice, wrapped content, neutralized titles, screening label', () => {
+  test('CLI-backed port tools: stdout/stderr wrapped under the notice', () => {
+    const body = fn('cliResultToToolResponse')
+    assert.match(body, /stdout:\\n\$\{u\.body\(stdout\)\}\\nstderr:\\n\$\{u\.body\(stderr\)\}/)
+    assert.match(body, /`\$\{noticeLine\(\)\}\$\{u\.body\(stdout\)\}`/)
+  })
+
+  test('get_project_context: doctor-log banner wrapped, project row and job rows neutralized', () => {
+    const body = tool('get_project_context')
+    assert.match(body, /uh\.body\(fails\.join/)
+    assert.match(body, /uh\.body\(warns\.join/)
+    assert.match(body, /description: typeof description === 'string' \? u\.body\(description\)/)
+    assert.match(body, /active_factory_jobs: u\.deep\(activeJobs\.rows\)/)
+    assert.match(body, /recent_completed_jobs: u\.deep\(inactiveJobs\.rows\)/)
+  })
+
+  test('deep_search: content/full_context/snippets/graph wrapped, other stored strings neutralized', () => {
+    const body = tool('deep_search')
+    for (const re of [
+      /content: u\.body\(cand\.content\)/,
+      /r\.full_context = u\.body\(/,
+      /\.map\(u\.snippet\)/,
+      /source_type: u\.title\(cand\.source_type\)/,
+      /project: u\.title\(cand\.project\)/,
+      /source_ref: cand\.source_id\s*\? u\.title\(/,
+      /for \(const key of \['recency_neighbors', 'superseded_by', 'earliest_on_topic'\]\)/,
+      /content: typeof m\.content === 'string' \? u\.body\(m\.content\)/,
+      /r\.screening = screening/,
+    ]) assert.match(body, re)
+  })
+
+  test('get_source_context: transcript and summary wrapped, source_app neutralized', () => {
+    const body = tool('get_source_context')
+    assert.match(body, /content: u\.body\(lines\.slice/)
+    assert.match(body, /session_summary: u\.body\(/)
+    assert.match(body, /source_app: typeof raw\.source_app === 'string' \? u\.title\(raw\.source_app\)/)
+  })
+
+  test('end_session: enrichment stderr, stdout, status and drain error untrusted', () => {
+    const body = tool('end_session')
+    assert.match(body, /stderr: \$\{untrusted\(\)\.body\(\(result\.stderr/)
+    assert.match(body, /raw output: \$\{untrusted\(\)\.body\(\(result\.stdout/)
+    assert.match(body, /ue\.title\(String\(parsed\.status\)\)/)
+    assert.match(body, /ue\.body\(String\(parsed\.drain_error\)\)/)
+  })
+
+  test('graph_walk: success and all three error paths', () => {
     const body = tool('graph_walk')
     assert.match(body, /\.\.\.\(u\.notice \? \{ notice: u\.notice \} : \{\}\),\s*\.\.\.out,/)
-    assert.match(body, /content: typeof m\.content === 'string' \? u\.body\(m\.content\)/)
-    assert.match(body, /title: typeof m\.title === 'string' \? u\.title\(m\.title\)/)
-    assert.match(body, /screeningLabel\(flagsById\.get/)
+    assert.match(body, /\.\.\.u\.deep\(m\),\s*content: typeof m\.content === 'string' \? u\.body\(m\.content\)/)
+    assert.match(body, /edges: u\.deep\(out\.edges/)
+    assert.match(body, /stderr: \$\{untrusted\(\)\.body\(\(result\.stderr/)
+    assert.match(body, /unparseable output:\\n\$\{untrusted\(\)\.body\(/)
+    assert.match(body, /graph_walk error: \$\{untrusted\(\)\.body\(String\(out\.error\)\)\}/)
   })
 
-  test('factory_status and factory_file_locks neutralize job titles under the notice', () => {
-    assert.match(tool('factory_status'), /title: typeof j\.title === 'string' \? u\.title\(j\.title\)/)
-    assert.match(tool('factory_file_locks'), /job_title: typeof l\.job_title === 'string' \? untrusted\.title\(l\.job_title\)/)
+  test('factory_status: jobs and artifacts neutralized under the notice', () => {
+    const body = tool('factory_status')
+    assert.match(body, /const jobs = u\.deep\(result\.rows\)/)
+    assert.match(body, /artifacts: u\.deep\(artifacts\)/)
   })
 
-  test('tools that echo a stored job title neutralize it', () => {
-    for (const name of ['factory_approve', 'factory_cleanup', 'devbrain_resolve_blocked']) {
-      const body = tool(name)
-      assert.ok(!/Job "\$\{title\}"|job "\$\{title\}"/.test(body), name)
+  test('factory_approve: titles, status, branch and every git output path', () => {
+    const body = tool('factory_approve')
+    assert.ok(!/Job "\$\{title\}"/.test(body))
+    assert.match(body, /status: \$\{safeTitle\(status\)\}/)
+    assert.match(body, /git output tail:\\n\$\{untrusted\(\)\.body\(detail\)\}/)
+    assert.match(body, /\(git output:\\n\$\{untrusted\(\)\.body\(trimmedStderr/)
+    assert.match(body, /tail \? untrusted\(\)\.body\(tail\)/)
+    // branch_name may appear raw only as a git argument, never in returned text.
+    for (const m of body.matchAll(/text: `[^`]*`/g)) assert.ok(!m[0].includes('${branch_name}'), m[0].slice(0, 60))
+  })
+
+  test('factory_cleanup: title, status, outcome neutralized; summary wrapped', () => {
+    const body = tool('factory_cleanup')
+    assert.ok(!/Job "\$\{title\}"/.test(body))
+    assert.match(body, /status: \$\{safeTitle\(status\)\}/)
+    assert.match(body, /u\.title\(String\(report\.outcome/)
+    assert.match(body, /u\.body\(String\(report\.summary/)
+  })
+
+  test('devbrain_notify: subprocess output wrapped', () => {
+    assert.match(tool('devbrain_notify'), /devbrain_notify result:\\n\$\{untrusted\(\)\.body\(output\.trim\(\)\)\}/)
+  })
+
+  test('factory_file_locks: every lock field neutralized under the notice', () => {
+    const body = tool('factory_file_locks')
+    assert.match(body, /locks: ul\.deep\(result\.rows\)/)
+    assert.match(body, /ul\.notice \? \{ notice: ul\.notice \}/)
+  })
+
+  test('devbrain_resolve_blocked: title and status neutralized', () => {
+    const body = tool('devbrain_resolve_blocked')
+    assert.ok(!/job "\$\{title\}"|Job "\$\{title\}"/.test(body))
+    assert.match(body, /status: \$\{safeTitle\(String\(status\)\)\}/)
+  })
+
+  test('agent_remote_prompt: error body wrapped, session_id validated, exit_code coerced', () => {
+    const body = tool('agent_remote_prompt')
+    assert.match(body, /Daemon returned \$\{Number\(response\.status\) \|\| 0\}: \$\{ud\.body\(String\(detail\)\)\}/)
+    assert.match(body, /isUuid\(payload\.session_id\)/)
+    assert.match(body, /u\.body\(u\.title\(String\(payload\.session_id\)\)\)/)
+    assert.match(body, /const rawExit = Number\(payload\.exit_code \?\? 0\)/)
+    assert.match(body, /u\.body\(String\(payload\.result \?\? '\(empty response\)'\)\)/)
+    assert.match(body, /u\.body\(String\(payload\.stderr \?\? '\(empty\)'\)\)/)
+    assert.ok(!/exited \$\{payload\.exit_code\}/.test(body))
+    assert.ok(!/\$\{payload\.session_id \?\?/.test(body))
+    assert.match(body, /REMOTE_REPLY_NOTICE/)
+    // agent-bus.yaml (a file on disk) and network errors are neutralized too.
+    assert.match(body, /not found in agent-bus config\. \$\{safeTitle\(hint\)\}/)
+    assert.match(body, /Network error reaching \$\{safeTitle\(String\(cfg\.url\)\)\}: \$\{safeTitle\(String\(err\)\)\}/)
+  })
+
+  test('list_projects and list_ports: notice + neutralized table', () => {
+    for (const name of ['list_projects', 'list_ports']) {
+      assert.match(tool(name), /text: noticeLine\(\) \+ untrusted\(\)\.title\(lines\.join\('\\n'\)\)/, name)
     }
-    assert.match(tool('factory_cleanup'), /u\.body\(String\(report\.summary/)
   })
 
-  test('end_session wraps the enrichment output it echoes', () => {
-    assert.match(tool('end_session'), /Enrichment applied; raw output: \$\{untrustedText\(getSearchConfig\(\)\.untrustedWrap\)\.body\(/)
+  test('get_compose_env: keys and values neutralized (no notice: machine-read env map)', () => {
+    assert.match(tool('get_compose_env'), /\[ue\.title\(k\), ue\.title\(v\)\]/)
   })
-})
 
-describe('agent_remote_prompt reply is untrusted', () => {
-  const src = readFileSync(resolve(import.meta.dirname, 'index.ts'), 'utf-8')
-  const start = src.indexOf("'agent_remote_prompt',")
-  const body = src.slice(start, src.indexOf('server.tool(', start + 1))
-  test('notice line first, reply and stderr wrapped, behind the flag', () => {
-    assert.match(body, /const u = untrustedText\(getSearchConfig\(\)\.untrustedWrap\)/)
-    assert.match(body, /const head = u\.notice \? `\$\{REMOTE_REPLY_NOTICE\}\\n` : ''/)
-    assert.match(body, /u\.body\(payload\.result \?\? '\(empty response\)'\)/)
-    assert.match(body, /u\.body\(payload\.stderr \?\? '\(empty\)'\)/)
+  test('REMOTE_REPLY_NOTICE is one short line', () => {
+    assert.ok(REMOTE_REPLY_NOTICE.length < 200 && !REMOTE_REPLY_NOTICE.includes('\n'))
   })
 })
