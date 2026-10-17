@@ -92,8 +92,11 @@ def main() -> int:
             rows = cur.fetchall()
         if not rows:
             break
+        # Content alone when it already opens with the title (the MCP store
+        # tool saves "title\n\ncontent"), so the title is not embedded twice.
         texts = [
-            (f"{t}\n{c}" if t else (c or "")) for (_id, t, c) in rows
+            (c or "") if not t or (c or "").startswith(t) else f"{t}\n{c}"
+            for (_id, t, c) in rows
         ]
         try:
             embs = embed_batch(texts)
