@@ -66,6 +66,26 @@ export function getEmbeddingConfig(): OllamaConfig {
   }
 }
 
+/**
+ * Prefix prepended to search QUERIES (never documents) before embedding.
+ *
+ * Precedence: env DEVBRAIN_QUERY_PREFIX > yaml embedding.query_prefix >
+ * model default. An empty string (env or yaml) disables the prefix, so the
+ * checks below are `!== undefined`, not truthiness. Model default is
+ * "query: " for snowflake-arctic-embed* (asymmetric retrieval model trained
+ * with prefixed queries and bare documents), "" for anything else.
+ * Resolved per call so tests and operators can flip it without a reload.
+ * Mirrors ingest/config.py resolve_query_prefix().
+ */
+export function getQueryPrefix(): string {
+  const env = process.env.DEVBRAIN_QUERY_PREFIX
+  if (env !== undefined) return env
+  const fromYaml = _config.embedding?.query_prefix
+  if (fromYaml !== undefined && fromYaml !== null) return String(fromYaml)
+  const model = String(_config.embedding?.model ?? '')
+  return model.startsWith('snowflake-arctic-embed') ? 'query: ' : ''
+}
+
 export function getSummarizationConfig(): OllamaConfig {
   return {
     url: _config.summarization.url,

@@ -9,7 +9,7 @@ import { homedir, tmpdir } from 'os'
 import { join, resolve } from 'path'
 import { z } from 'zod'
 import { query, waitForDb } from './db.js'
-import { embed, toSqlVector } from './embeddings.js'
+import { embed, embedQuery, toSqlVector } from './embeddings.js'
 import { enqueueCascades, recordMemory, recordMemoryDependency, resolveMemoryId } from './memory.js'
 import {
   computeRecencyWarning,
@@ -335,7 +335,9 @@ server.tool(
       .describe('Trigger recency_warning when the primary memory itself is at least this many days old, regardless of neighbors. Default 30. Pass a very large number (e.g. 100000) to disable this trigger.'),
   },
   async ({ query: searchQuery, project, cross_project, source_types, depth, limit, with_graph, graph_max_hops, graph_max_nodes, recency_neighbors, recency_neighbors_k, recency_min_age_days, follow_supersedes, earliest_on_topic, primary_age_floor_days }) => {
-    const queryEmbedding = await embed(searchQuery)
+    // Query side: embedQuery adds the model's "query: " prefix (see
+    // embeddings.ts). Write paths below keep using embed() — documents bare.
+    const queryEmbedding = await embedQuery(searchQuery)
     const vectorStr = toSqlVector(queryEmbedding)
 
     // P2.d.i read-path switch.
