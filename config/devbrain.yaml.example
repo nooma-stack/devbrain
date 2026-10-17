@@ -148,7 +148,7 @@ ingest:
 
   # Prompt-injection screening (ingest/screening.py). Rules flag text that
   # tries to instruct a model that later reads it (override, agent_directive,
-  # fake_tag, exfil, hidden_unicode). Flagged chunks get memory.screen_flags
+  # fake_tag, exfil, hidden_unicode, obfuscated). Flagged chunks get memory.screen_flags
   # (migration 049); flagged segments are withheld from summary, extraction,
   # fan-out and re-summary prompts. The person's own typed turns are only
   # checked for hidden unicode. Env DEVBRAIN_SCREENING / _MODEL_CHECK.

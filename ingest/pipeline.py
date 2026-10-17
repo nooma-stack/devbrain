@@ -18,7 +18,7 @@ from chunker import chunk_text
 from config import INGEST_EXCLUDE_PATH_PARTS
 from db import delete_chunks_for_session, get_connection, get_or_create_project_id, get_existing_session_id, insert_chunk, insert_raw_session, session_exists, update_session_summary
 from embeddings import embed, embed_batch
-from screening_runtime import chunk_flags, redact_for_model
+from screening_runtime import session_chunk_flags, session_text_for_model
 
 # CodexAdapter MUST precede ClaudeCodeAdapter: both match .jsonl, and
 # claude_code's detect() greedily claims anything under ingest-incoming —
@@ -155,11 +155,12 @@ def _process_session(session: UniversalSession, source_path: Path, source_hash: 
         if is_update:
             delete_chunks_for_session(session_db_id, cur=cur)
             print(f"  Cleared old chunks for re-embedding")
+        # Injection screening on the structured messages: mark each chunk
+        # (memory.screen_flags) so extraction withholds it and deep_search
+        # can label it.
+        chunk_flags = session_chunk_flags(session.messages, chunks)
         flagged = 0
-        for chunk, emb in zip(chunks, embeddings):
-            # Injection screening: mark the chunk (memory.screen_flags) so
-            # extraction withholds it and deep_search can label it.
-            flags = chunk_flags(chunk.content)
+        for chunk, emb, flags in zip(chunks, embeddings, chunk_flags):
             flagged += bool(flags)
             insert_chunk(
                 project_id=project_id,
@@ -179,8 +180,9 @@ def _process_session(session: UniversalSession, source_path: Path, source_hash: 
     print(f"  Stored {total_stored} embedded chunks"
           + (f" ({flagged} flagged by injection screening)" if flagged else ""))
 
-    # Auto-summarize using local LLM
-    _summarize_session(session_db_id, raw_text, project_id)
+    # Auto-summarize using local LLM, from the transcript with flagged
+    # messages withheld.
+    _summarize_session(session_db_id, session_text_for_model(session), project_id)
 
     return True
 
@@ -190,8 +192,7 @@ def _summarize_session(session_db_id: str, raw_text: str, project_id: str | None
     try:
         from summarize import summarize_text
         print("  Summarizing...")
-        # Flagged segments never reach the summarizer.
-        summary = summarize_text(redact_for_model(raw_text))
+        summary = summarize_text(raw_text)
         if summary:
             update_session_summary(session_db_id, summary)
             # Chunk the summary to stay within embedding model token limits

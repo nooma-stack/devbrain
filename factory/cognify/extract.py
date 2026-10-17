@@ -837,9 +837,16 @@ def _combine_chunks(chunks: list[dict]) -> str:
             parts.append(f"## {title}\n{content}")
         else:
             parts.append(content)
-    if withheld:
-        logger.info("cognify_extract: injection screening withheld text in %d row(s)", withheld)
-    return "\n\n".join(parts)
+    combined = "\n\n".join(parts)
+    # Screen the exact prompt text too: a payload split across two rows, or
+    # between a title and its content, only exists once they are joined.
+    combined, joined_flags = screen.withhold(combined)
+    if withheld or joined_flags:
+        logger.info(
+            "cognify_extract: injection screening withheld text (%d row(s); joined: %s)",
+            withheld, ",".join(joined_flags) or "-",
+        )
+    return combined
 
 
 def _codex_extract(content: str, *, model: str | None = None) -> dict:

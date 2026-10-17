@@ -3939,7 +3939,7 @@ def screen_memory_command(project_slug, kinds, since, limit, apply_flags, as_jso
             params.append(since)
         flags_col = "m.screen_flags" if screen.has_flag_column(conn) else "NULL::text[]"
         sql = (
-            f"SELECT m.id, m.kind, m.content, {flags_col} FROM devbrain.memory m "
+            f"SELECT m.id, m.kind, m.title, m.content, {flags_col} FROM devbrain.memory m "
             "JOIN devbrain.projects p ON p.id = m.project_id WHERE "
             + " AND ".join(where)
             + " ORDER BY m.created_at DESC LIMIT %s"
@@ -3953,9 +3953,12 @@ def screen_memory_command(project_slug, kinds, since, limit, apply_flags, as_jso
         with conn.cursor(name="screen_memory") as cur:
             cur.itersize = 2000
             cur.execute(sql, params)
-            for mid, kind, content, stored in cur:
+            for mid, kind, title, content, stored in cur:
                 scanned[kind] += 1
-                flags = screen.rules.flags_for(content)
+                # Title and content together: that is how extraction and
+                # deep_search present an atom.
+                text = f"{title}\n{content}" if title and not (content or "").startswith(title) else content
+                flags = screen.rules.flags_for(text)
                 if not flags:
                     continue
                 flagged[kind] += 1

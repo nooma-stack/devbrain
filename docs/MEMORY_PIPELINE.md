@@ -92,16 +92,27 @@ assistant:"), `fake_tag` (`<|im_start|>`, `[INST]`, `<<SYS>>`, a bare
 an address, reveal the system prompt), `hidden_unicode` (Unicode tag
 characters, bidi overrides, zero-width characters inside words).
 
-- Transcript text is role-tagged; the person's own typed turns are the
-  principal and are only checked for hidden unicode. Tool results,
-  assistant text, harness-injected user-role text and untagged text
-  (summaries, notes, a chunk's mid-message head) get every rule.
-- Ingest stores the flags on the chunk's `memory.screen_flags` (NULL =
-  no flag) and summarizes the transcript with flagged segments withheld.
-- extract, fanout and resummarize re-screen their input on the fly (so
-  older rows are covered) and replace flagged segments with
-  `[segment withheld by injection screening: <flags>]`; a row with stored
-  flags the rules no longer reproduce is withheld whole.
+- Every rule runs on the raw text, on a normalized form (HTML entities and
+  `\uXXXX` / `%XX` escapes decoded, NFKC, invisible characters removed,
+  Cyrillic/Greek look-alikes mapped to Latin, case-folded) and, for the
+  wording rules, on a squashed form (separators collapsed, spelled-out
+  letters rejoined). A hit only the normalized/squashed form produces also
+  gets `obfuscated`.
+- Trust comes only from structure. In a structured message (ingest's
+  parsed session, raw_content JSON) the person's own typed user turn is
+  the principal and only gets the hidden-unicode check; a `[tool_result]`
+  line inside it starts an untrusted part. FLAT text (chunks, assembled
+  prompts, summaries, notes) is never trusted: a role prefix there is just
+  text a tool result could forge.
+- Ingest screens each message and stores on each chunk the union of the
+  flags of the messages it overlaps (`memory.screen_flags`, NULL = no
+  flag), so a payload split across chunks flags them all; the summary is
+  built from the messages with flagged ones withheld.
+- extract and fanout screen the exact assembled prompt text (titles,
+  contents and chunk joins included) and replace flagged segments with
+  `[segment withheld by injection screening: <flags>]`; resummarize screens
+  raw_content per message. A row with stored flags the rules no longer
+  reproduce is withheld whole.
 - `deep_search` can select `memory.screen_flags` to label results.
 - `devbrain screen-memory [--project] [--kind] [--since] [--apply]` reports
   (default, read-only) or sets flags on existing rows; it writes flagged rows

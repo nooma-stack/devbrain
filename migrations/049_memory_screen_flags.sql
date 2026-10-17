@@ -3,7 +3,8 @@
 -- ─────────────────────────────────────────────────────────────────────────────
 --
 -- Rule ids from ingest/screening.py for rows whose text looks like a prompt
--- injection: override, agent_directive, fake_tag, exfil, hidden_unicode.
+-- injection: override, agent_directive, fake_tag, exfil, hidden_unicode,
+-- obfuscated.
 -- NULL means no flag (clean, or not screened yet); only flagged rows ever
 -- get a value, so neither ingest nor the backfill
 -- (`devbrain screen-memory --apply`) touches clean rows.

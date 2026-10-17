@@ -16,11 +16,15 @@ from deep_search):
   hidden_unicode  invisible characters used to smuggle text: Unicode tag
                   characters, bidi overrides, runs of zero-width characters
 
-Transcript text is role-tagged by the adapters ("[ts] [user] ...",
-"[tool_result] ..."). The person's own typed turns are the principal, so
-only ``hidden_unicode`` applies to them; every other rule applies to tool
-results, assistant text, and any text without a role (summaries, notes,
-the head of a chunk that starts mid-message).
+  obfuscated      a text rule matched only after normalization (escapes,
+                  NFKC, invisible characters, look-alike letters, separators)
+
+Trust comes only from structure: in a parsed message (``screen_message``)
+the person's own typed user turn is the principal and only gets the
+hidden_unicode check. Flat text (``screen``: chunks, assembled prompts,
+summaries, notes) is never trusted, because a role prefix there is just
+text a tool result could forge. Callers screen the exact string a model
+will receive.
 
 Pure stdlib, no I/O: imported by the ingest pipeline and (via
 factory/cognify/screen.py) by the cognify passes.
@@ -28,13 +32,22 @@ factory/cognify/screen.py) by the cognify passes.
 
 from __future__ import annotations
 
+import html
 import json
 import re
+import unicodedata
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
-RULES = ("override", "agent_directive", "fake_tag", "exfil", "hidden_unicode")
+RULES = (
+    "override",
+    "agent_directive",
+    "fake_tag",
+    "exfil",
+    "hidden_unicode",
+    "obfuscated",
+)
 
 # ── patterns ─────────────────────────────────────────────────────────────────
 
@@ -136,13 +149,133 @@ _TEXT_RULES = {
     "fake_tag": _FAKE_TAG,
     "exfil": _EXFIL,
 }
+# Rules that are pure wording, so they also run on the "squashed" form
+# (punctuation and separators collapsed). fake_tag / exfil need their
+# punctuation (<|...|>, URLs, @) and run on the normalized form only.
+_WORD_RULES = ("override", "agent_directive")
+
+# ── normalization (what a reading model effectively sees) ────────────────────
+#
+# A model reading the text is not fooled by tricks that defeat a literal
+# regex: "ig<ZWSP>nore", full-width letters, Cyrillic look-alikes,
+# "&#105;gnore", "ignore", "ignore_previous_instructions",
+# "i g n o r e". So every text rule runs on the raw text, on a normalized
+# form, and (wording rules) on a squashed form. A hit that only the
+# normalized or squashed form produces is also flagged "obfuscated".
+
+# Invisible / formatting characters a reader skips: zero-width, bidi
+# controls, word joiner, soft hyphen, combining grapheme joiner, variation
+# selectors, Unicode tag characters.
+_INVISIBLE = re.compile(
+    "[\u00ad\u034f\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069"
+    "\ufe00-\ufe0f\ufeff\U000e0000-\U000e007f]"
+)
+# Common Cyrillic / Greek / Armenian letters that render like Latin ones.
+_HOMOGLYPHS = str.maketrans(
+    {
+        "\u0430": "a",
+        "\u0435": "e",
+        "\u043e": "o",
+        "\u0440": "p",
+        "\u0441": "c",
+        "\u0443": "y",
+        "\u0445": "x",
+        "\u0456": "i",
+        "\u0458": "j",
+        "\u0455": "s",
+        "\u04bb": "h",
+        "\u0501": "d",
+        "\u051b": "q",
+        "\u051d": "w",
+        "\u0261": "g",
+        "\u0410": "a",
+        "\u0412": "b",
+        "\u0415": "e",
+        "\u041a": "k",
+        "\u041c": "m",
+        "\u041d": "h",
+        "\u041e": "o",
+        "\u0420": "p",
+        "\u0421": "c",
+        "\u0422": "t",
+        "\u0425": "x",
+        "\u0406": "i",
+        "\u0408": "j",
+        "\u0405": "s",
+        "\u03bf": "o",
+        "\u03b1": "a",
+        "\u03b5": "e",
+        "\u03b9": "i",
+        "\u03ba": "k",
+        "\u03bd": "v",
+        "\u03c1": "p",
+        "\u03c4": "t",
+        "\u03c5": "u",
+        "\u03c7": "x",
+        "\u039f": "o",
+        "\u0391": "a",
+        "\u0395": "e",
+        "\u0399": "i",
+        "\u039a": "k",
+        "\u039d": "n",
+        "\u03a1": "p",
+        "\u03a4": "t",
+        "\u03a7": "x",
+        "\u0392": "b",
+        "\u0396": "z",
+        "\u0397": "h",
+        "\u039c": "m",
+        "\u0585": "o",
+        "\u0561": "w",
+        "\u0578": "n",
+        "\u057d": "u",
+    }
+)
+_UNI_ESCAPE = re.compile(r"\\u([0-9a-fA-F]{4})|\\x([0-9a-fA-F]{2})")
+_PCT_ESCAPE = re.compile(r"%([0-9a-fA-F]{2})")
+
+
+def _unescape(text: str) -> str:
+    """Decode HTML entities and \\uXXXX / \\xXX / %XX escapes once."""
+    text = html.unescape(text)
+
+    def _u(m: re.Match) -> str:
+        code = int(m.group(1) or m.group(2), 16)
+        return chr(code)
+
+    text = _UNI_ESCAPE.sub(_u, text)
+    if "%" in text:
+        text = _PCT_ESCAPE.sub(lambda m: chr(int(m.group(1), 16)), text)
+    return text
+
+
+def normalize(text: str) -> str:
+    """The form a reading model effectively sees: escapes decoded, NFKC
+    (full-width and compatibility characters folded), invisible characters
+    removed, look-alike letters mapped to Latin, case-folded."""
+    text = _unescape(text)
+    text = unicodedata.normalize("NFKC", text)
+    text = _INVISIBLE.sub("", text)
+    text = text.translate(_HOMOGLYPHS)
+    return text.casefold()
+
+
+_SPACED_LETTERS = re.compile(r"\b(?:[a-z0-9] ){3,}[a-z0-9]\b")
+
+
+def squash(normalized: str) -> str:
+    """Wording only: every run of non-alphanumerics becomes one space, and
+    letters spelled out one by one ("i g n o r e") are rejoined."""
+    s = re.sub(r"[^0-9a-z]+", " ", normalized)
+    return _SPACED_LETTERS.sub(lambda m: m.group(0).replace(" ", ""), s)
+
 
 # Transcript line prefixes written by the adapters (base.UniversalSession.to_text).
 _ROLE_LINE = re.compile(
     r"^(?:\[[^\]\n]{1,40}\]\s)?\[(user|assistant|system|tool|model|human)\]\s?",
     re.MULTILINE,
 )
-_TOOL_PREFIX = "[tool_result]"
+_TOOL_LINE = re.compile(r"^\s*\[tool_result\]", re.MULTILINE)
 # Harness-injected user-role text: not typed by the person, so screened.
 _INJECTED_USER = re.compile(
     r"^\s*(\[tool_result\]|<command-|<local-command|<system-reminder>|<task-notification>|"
@@ -162,9 +295,10 @@ class Segment:
 
 
 def segments(text: str) -> list[Segment]:
-    """Split role-tagged transcript text into segments. Text before the
-    first role prefix (a chunk that starts mid-message) and text with no
-    prefixes at all are untrusted."""
+    """Split flat transcript text at role prefixes. Every segment of FLAT
+    text is untrusted: role prefixes are just text, and a tool result can
+    contain a line that looks like "[ts] [user] ...". Only the structured
+    message path (screen_message) knows who typed what."""
     marks = list(_ROLE_LINE.finditer(text))
     if not marks:
         return [Segment(0, len(text), "untrusted")] if text else []
@@ -173,10 +307,25 @@ def segments(text: str) -> list[Segment]:
         out.append(Segment(0, marks[0].start(), "untrusted"))
     for i, m in enumerate(marks):
         end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
-        role = m.group(1).lower()
-        body = text[m.end() : end]
-        principal = role in ("user", "human") and not _INJECTED_USER.match(body)
-        out.append(Segment(m.start(), end, "principal" if principal else "untrusted"))
+        out.append(Segment(m.start(), end, "untrusted"))
+    return out
+
+
+def _message_segments(role: str, content: str) -> list[Segment]:
+    """Segments of one structured message. A user message is the person's
+    own words unless it is harness text; any "[tool_result]" line inside it
+    (adapters join a message's text and tool-result blocks) starts an
+    untrusted part that runs to the end of the message."""
+    role = (role or "").lower()
+    if role not in ("user", "human") or _INJECTED_USER.match(content):
+        return [Segment(0, len(content), "untrusted")]
+    m = _TOOL_LINE.search(content)
+    if not m:
+        return [Segment(0, len(content), "principal")]
+    out = []
+    if m.start() > 0:
+        out.append(Segment(0, m.start(), "principal"))
+    out.append(Segment(m.start(), len(content), "untrusted"))
     return out
 
 
@@ -209,27 +358,64 @@ def _hidden_unicode(s: str) -> bool:
     )
 
 
-def screen(text: str | None) -> ScreenResult:
-    """Rule hits for ``text``. Flags are sorted rule ids."""
-    res = ScreenResult()
-    if not text:
-        return res
-    for seg in segments(text):
-        body = text[seg.start : seg.end]
-        if _hidden_unicode(body):
-            res.hits.append(Hit("hidden_unicode", seg.start, seg.end, seg))
-        if seg.trust == "principal":
+def _first_match(patterns, s: str):
+    for pat in patterns:
+        m = pat.search(s)
+        if m:
+            return m
+    return None
+
+
+def _screen_segment(text: str, seg: Segment, hits: list[Hit]) -> None:
+    body = text[seg.start : seg.end]
+    if _hidden_unicode(body):
+        hits.append(Hit("hidden_unicode", seg.start, seg.end, seg))
+    if seg.trust == "principal":
+        return
+    norm = None
+    squashed = None
+    for rule, patterns in _TEXT_RULES.items():
+        m = _first_match(patterns, body)
+        if m:
+            hits.append(Hit(rule, seg.start + m.start(), seg.start + m.end(), seg))
             continue
-        for rule, patterns in _TEXT_RULES.items():
-            for pat in patterns:
-                m = pat.search(body)
-                if m:
-                    res.hits.append(
-                        Hit(rule, seg.start + m.start(), seg.start + m.end(), seg)
-                    )
-                    break
-    res.flags = sorted({h.rule for h in res.hits})
-    return res
+        if norm is None:
+            norm = normalize(body)
+        if _first_match(patterns, norm) or (
+            rule in _WORD_RULES
+            and _first_match(
+                patterns,
+                squashed if squashed is not None else (squashed := squash(norm)),
+            )
+        ):
+            hits.append(Hit(rule, seg.start, seg.end, seg))
+            hits.append(Hit("obfuscated", seg.start, seg.end, seg))
+
+
+def _result(hits: list[Hit]) -> ScreenResult:
+    return ScreenResult(flags=sorted({h.rule for h in hits}), hits=hits)
+
+
+def screen(text: str | None) -> ScreenResult:
+    """Rule hits for FLAT text (chunks, prompts, summaries, notes): every
+    segment untrusted. Flags are sorted rule ids."""
+    if not text:
+        return ScreenResult()
+    hits: list[Hit] = []
+    for seg in segments(text):
+        _screen_segment(text, seg, hits)
+    return _result(hits)
+
+
+def screen_message(role: str, content: str | None) -> ScreenResult:
+    """Rule hits for ONE structured message, where the role is known: the
+    person's own typed text is only checked for hidden unicode."""
+    if not content:
+        return ScreenResult()
+    hits: list[Hit] = []
+    for seg in _message_segments(role, content):
+        _screen_segment(content, seg, hits)
+    return _result(hits)
 
 
 def flags_for(text: str | None) -> list[str] | None:
@@ -238,9 +424,15 @@ def flags_for(text: str | None) -> list[str] | None:
     return r.flags or None
 
 
+def _withheld(flags) -> str:
+    return "[segment withheld by injection screening: " + ",".join(sorted(flags)) + "]"
+
+
 def redact(text: str | None) -> tuple[str, list[str]]:
-    """Text with every flagged segment replaced by a placeholder, plus the
-    flags. Used before text reaches a summarizer or extractor."""
+    """Flat text with every flagged segment replaced by a placeholder, plus
+    the flags. Callers screen the exact string the model will receive (the
+    assembled prompt), so a payload split across chunks or between a title
+    and its content is caught."""
     if not text:
         return text or "", []
     r = screen(text)
@@ -255,19 +447,83 @@ def redact(text: str | None) -> tuple[str, list[str]]:
         if start < pos:
             continue
         out.append(text[pos:start])
-        out.append(
-            f"[segment withheld by injection screening: {','.join(sorted(rules))}]\n"
-        )
+        out.append(_withheld(rules) + "\n")
         pos = end
     out.append(text[pos:])
     return "".join(out), r.flags
 
 
+def _msg_role_content(m) -> tuple[str, str]:
+    if isinstance(m, dict):
+        return str(m.get("role") or ""), m.get("content") or ""
+    return str(getattr(m, "role", "") or ""), getattr(m, "content", "") or ""
+
+
+def message_flags(messages) -> list[list[str]]:
+    """Per-message flags for a structured session (dicts or
+    adapters.base.UniversalMessage objects)."""
+    out = []
+    for m in messages:
+        role, content = _msg_role_content(m)
+        out.append(
+            screen_message(role, content if isinstance(content, str) else "").flags
+        )
+    return out
+
+
+def message_line_spans(
+    messages, max_content_chars: int = 2000
+) -> list[tuple[int, int]]:
+    """(first_line, last_line) of each message in UniversalSession.to_text()
+    output (one "[ts] [role] content[:2000]" entry per message, joined by
+    newlines), so chunk line ranges can be mapped back to messages."""
+    spans = []
+    line = 0
+    for m in messages:
+        _, content = _msg_role_content(m)
+        n = (content[:max_content_chars] if isinstance(content, str) else "").count(
+            "\n"
+        )
+        spans.append((line, line + n))
+        line += n + 1
+    return spans
+
+
+def chunk_flags_from_messages(messages, chunks) -> list[list[str] | None]:
+    """Flags for each chunk (objects with line_start/line_end, 0-based
+    inclusive) = the union of the flags of every message it overlaps.
+    Screening whole messages means a payload split across two chunks still
+    flags both."""
+    per_msg = message_flags(messages)
+    spans = message_line_spans(messages)
+    out: list[list[str] | None] = []
+    for c in chunks:
+        flags: set[str] = set()
+        for (lo, hi), f in zip(spans, per_msg):
+            if f and lo <= c.line_end and hi >= c.line_start:
+                flags.update(f)
+        out.append(sorted(flags) or None)
+    return out
+
+
+def redact_messages(messages) -> tuple[list[str], list[str]]:
+    """Each message's content with flagged messages replaced, plus the
+    union of flags (for building a summarizer prompt from a session)."""
+    contents, flags = [], set()
+    for m, f in zip(messages, message_flags(messages)):
+        _, content = _msg_role_content(m)
+        if f:
+            flags.update(f)
+            contents.append(_withheld(f))
+        else:
+            contents.append(content)
+    return contents, sorted(flags)
+
+
 def redact_usf_json(raw: str | None) -> tuple[str, list[str]]:
-    """Like ``redact`` for a raw_sessions.raw_content USF JSON document:
-    each message is screened on its own (user messages a person typed are
-    the principal) and a flagged message's content is replaced. Non-JSON
-    input falls back to ``redact`` on the whole text."""
+    """``redact`` for a raw_sessions.raw_content USF JSON document: each
+    message is screened with its known role and a flagged message's content
+    is replaced. Non-JSON input falls back to flat ``redact``."""
     if not raw:
         return raw or "", []
     try:
@@ -279,19 +535,12 @@ def redact_usf_json(raw: str | None) -> tuple[str, list[str]]:
         return redact(raw)
     flags: set[str] = set()
     for m in messages:
-        if not isinstance(m, dict):
+        if not isinstance(m, dict) or not isinstance(m.get("content"), str):
             continue
-        role = str(m.get("role") or "")
-        content = m.get("content") or ""
-        if not isinstance(content, str) or not content:
-            continue
-        text = f"[{role}] {content}"
-        r = screen(text)
+        r = screen_message(str(m.get("role") or ""), m["content"])
         if r.flags:
             flags.update(r.flags)
-            m["content"] = (
-                "[message withheld by injection screening: " + ",".join(r.flags) + "]"
-            )
+            m["content"] = _withheld(r.flags)
     if not flags:
         return raw, []
     return json.dumps(doc), sorted(flags)
