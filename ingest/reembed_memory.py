@@ -16,7 +16,9 @@ title\\ncontent when titled; end_session + fanout session summaries and
 chunk-kind rows: content only):
 
     chunk, session_summary        -> content
-    everything else               -> title\\ncontent if titled else content
+    everything else               -> title\\ncontent if titled else content,
+                                     but content alone when it already opens
+                                     with the title (store saves title\\n\\ncontent)
 
 Safe to run against a LIVE database: row-wise UPDATEs, commits per batch,
 readers never blocked, and re-embedding an already-current row writes an
@@ -51,7 +53,11 @@ COMMIT_EVERY = 200
 def embed_input(kind: str, title: str | None, content: str) -> str:
     if kind in ("chunk", "session_summary"):
         return content
-    return f"{title}\n{content}" if title else content
+    # The MCP store tool saves content as "title\n\ncontent"; prefixing the
+    # title again would embed it twice.
+    if not title or content.startswith(title):
+        return content
+    return f"{title}\n{content}"
 
 
 def main() -> None:
