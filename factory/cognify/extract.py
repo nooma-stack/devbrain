@@ -513,6 +513,13 @@ def _sessions_since(conn: Any, project_id: Any, since) -> list[str]:
 
     If ``since`` is None, returns all sessions for the project.
     Sessions are ordered oldest-first so re-runs converge in order.
+
+    Only SOURCE rows count (``tier <> 'lesson'``). Extracted atoms carry the
+    unit's provenance_id and are created after the run's watermark, so
+    counting them made every extracted unit a candidate again on the next
+    run: one 2.9k-char session summary was re-extracted in 229 separate
+    hours into 2,628 atoms (2026-08). _load_session_chunks already excludes
+    lesson rows from the input, so they never carried anything to extract.
     """
     if since is None:
         with conn.cursor() as cur:
@@ -521,6 +528,7 @@ def _sessions_since(conn: Any, project_id: Any, since) -> list[str]:
                 "WHERE project_id = %s "
                 "  AND provenance_id IS NOT NULL "
                 "  AND archived_at IS NULL "
+                "  AND tier <> 'lesson' "
                 "ORDER BY provenance_id::text",
                 (project_id,),
             )
@@ -532,6 +540,7 @@ def _sessions_since(conn: Any, project_id: Any, since) -> list[str]:
             "WHERE project_id = %s "
             "  AND provenance_id IS NOT NULL "
             "  AND archived_at IS NULL "
+            "  AND tier <> 'lesson' "
             "  AND created_at > %s "
             "ORDER BY provenance_id::text",
             (project_id, since),
