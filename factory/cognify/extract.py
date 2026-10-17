@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
-from cognify import gate, relate
+from cognify import backends, codex_home, gate, relate
 from cognify.embedding import embed_text, to_vector_literal
 from cognify.orchestrator import CognifyPass, PassResult, register_pass
 from observability.pricing import (
@@ -218,7 +218,7 @@ def codex_error(*streams: str) -> str | None:
 def codex_listed_models() -> list[str]:
     """Model slugs the logged-in account lists, from codex's own catalog
     cache. Best-effort (empty when the cache is missing or changes shape)."""
-    home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    home = os.environ.get("CODEX_HOME") or str(codex_home.resolve_home())
     try:
         with open(os.path.join(home, "models_cache.json")) as fh:
             models = json.load(fh).get("models") or []
@@ -262,6 +262,31 @@ _CODEX_OUTPUT_SCHEMA = {
         },
     },
 }
+
+
+def _fallback_configured() -> bool:
+    return bool(
+        _FALLBACK_MODEL
+        and _FALLBACK_MODEL.lower() not in ("none", "")
+        and not _routes_to_codex(_FALLBACK_MODEL)
+    )
+
+
+def _usable_backends() -> list[str]:
+    """Backends this pass could use, after cognify.allowed_backends."""
+    chain = [backends.backend_for_model(_EXTRACT_MODEL)]
+    if _routes_to_codex(_EXTRACT_MODEL) and _fallback_configured():
+        chain.append("anthropic")
+    return [b for b in chain if backends.is_allowed(b)]
+
+
+def _refused_result(detail: str) -> dict:
+    return {
+        "lessons": [], "decisions": [],
+        "_usage": {"input_tokens": 0, "output_tokens": 0,
+                   "cache_read_tokens": 0, "cache_write_tokens": 0},
+        "_failure": "refused", "_failure_detail": detail,
+    }
 
 
 def _routes_to_codex(model: str | None) -> bool:
@@ -336,6 +361,19 @@ class ExtractPass(CognifyPass):
 
         cap = max_llm_calls if max_llm_calls is not None else MAX_LLM_CALLS_PER_PASS
 
+        if not dry_run and not _usable_backends():
+            # Nothing this deployment allows can run. The row is marked
+            # "refused" so it moves neither the watermark nor the backlog:
+            # once a backend is allowed, nothing ingested meanwhile is lost.
+            for b in {backends.backend_for_model(_EXTRACT_MODEL), "anthropic"}:
+                backends.check(b, "extract")
+            return PassResult(
+                rows_processed=0,
+                llm_calls=0,
+                metadata={"pass": "extract", "refused": True,
+                          "allowed_backends": sorted(backends.allowed())},
+            )
+
         since = _last_successful_run(conn, "extract", project_id)
         # Units the last run could not finish (LLM cap reached, or an api
         # failure) come first; without this they fell behind the watermark
@@ -407,7 +445,9 @@ class ExtractPass(CognifyPass):
             total_decisions += result.decisions_created
             total_llm += result.llm_calls
             sessions_processed += 1
-            done.add(session_id)
+            if result.failure != "refused":
+                # A refused unit made no call: carry it (tries unchanged).
+                done.add(session_id)
             if result.failure:
                 failure_counts[result.failure] = failure_counts.get(result.failure, 0) + 1
             if result.failure == "api":
@@ -511,11 +551,11 @@ def extract_from_session(
         # error ("api"), so a ChatGPT quota wall can't stall extraction. We
         # only fall back on "api" (not "empty"): an empty result is a valid
         # "this session had nothing to extract", not a failure to retry.
+        # A codex refusal (cognify.allowed_backends, or no safe codex home)
+        # goes straight to the fallback too, when that backend is allowed.
         if (
-            extracted.get("_failure") == "api"
-            and _FALLBACK_MODEL
-            and _FALLBACK_MODEL.lower() not in ("none", "")
-            and not _routes_to_codex(_FALLBACK_MODEL)
+            extracted.get("_failure") in ("api", "refused")
+            and _fallback_configured()
         ):
             logger.warning(
                 "cognify_extract: codex failed (%s); falling back to %s",
@@ -525,15 +565,19 @@ def extract_from_session(
                 combined, max_llm_calls=max_llm_calls, model=_FALLBACK_MODEL,
             )
             # Use the fallback only if it actually succeeded; otherwise keep
-            # codex's failure so telemetry reflects the primary backend.
+            # codex's failure so telemetry reflects the primary backend
+            # (unless codex never ran: then report the fallback's outcome).
             if not fallback.get("_failure"):
                 extracted = fallback
                 effective_model = _FALLBACK_MODEL  # spend block bills the right model
+            elif extracted.get("_failure") == "refused":
+                extracted = fallback
     else:
         extracted = _llm_extract(
             combined, max_llm_calls=max_llm_calls, model=effective_model,
         )
-    llm_calls = 1  # one call per session for v1
+    # One call per session for v1; a refusal made no call.
+    llm_calls = 0 if extracted.get("_failure") == "refused" else 1
 
     # Record spend for this LLM call. Use the pricing registry to
     # look up the right rates; fall back to SONNET_4_6 if the caller
@@ -618,7 +662,12 @@ def extract_from_session(
 # row too. It extracts nothing, so it must not move the watermark (it used
 # to: a dry run silently dropped every unit ingested since the last real
 # run) or replace the backlog.
-_NOT_DRY_RUN = "coalesce(metadata ->> 'dry_run', 'false') <> 'true'"
+#
+# A run refused by cognify.allowed_backends extracted nothing either.
+_NOT_DRY_RUN = (
+    "coalesce(metadata ->> 'dry_run', 'false') <> 'true' "
+    "AND coalesce(metadata ->> 'refused', 'false') <> 'true'"
+)
 
 
 def _last_successful_run(conn: Any, pass_name: str, project_id: Any):
@@ -803,6 +852,13 @@ def _codex_extract(content: str, *, model: str | None = None) -> dict:
         "input_tokens": 0, "output_tokens": 0,
         "cache_read_tokens": 0, "cache_write_tokens": 0,
     }
+    if not backends.check("codex", "extract"):
+        return _refused_result("codex not in cognify.allowed_backends")
+    home = codex_home.resolve_home()
+    ok, reason = codex_home.check(home)
+    if not ok:
+        logger.error("cognify_extract(codex): refusing to run codex: %s", reason)
+        return _refused_result(f"codex isolation: {reason}")
     if not _CODEX_BIN or not os.path.exists(_CODEX_BIN):
         logger.warning("cognify_extract(codex): codex binary not found at %s", _CODEX_BIN)
         return {"lessons": [], "decisions": [], "_usage": empty_usage,
@@ -844,6 +900,7 @@ def _codex_extract(content: str, *, model: str | None = None) -> dict:
             proc = subprocess.run(
                 cmd, stdin=subprocess.DEVNULL,
                 capture_output=True, text=True, timeout=_CODEX_TIMEOUT_S,
+                env=codex_home.env_for(home),
             )
         except subprocess.TimeoutExpired:
             return {"lessons": [], "decisions": [], "_usage": empty_usage,
@@ -911,6 +968,8 @@ def _llm_extract(
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
     }
+    if not backends.check("anthropic", "extract"):
+        return _refused_result("anthropic not in cognify.allowed_backends")
     try:
         import anthropic  # noqa: PLC0415
     except ImportError:

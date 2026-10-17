@@ -83,6 +83,23 @@ agent's volunteered judgment (promote / contradict / refine / new-edges) and dra
 `curator_re_eval_queue`, decaying `strength` along `depends_on` cascade edges with a
 subtractive penalty and 24h-half-life freshness.
 
+### Hosted backends: allow-list and codex isolation
+- `cognify.allowed_backends` (`factory/cognify/backends.py`) lists the hosted
+  backends a deployment may send memory/transcript text to: `codex` (ChatGPT
+  login) and `anthropic` (Anthropic API). Unset = both; `[]` = none. Checked
+  in extract, fanout, edges and resummarize right before each call;
+  fail-closed (non-list value → none, unknown names ignored) and every refusal
+  is logged. A refused extract run moves neither the watermark nor the
+  backlog; refused fanout/resummarize sessions stay eligible.
+- Cognify runs `codex exec` with its own `CODEX_HOME`
+  (`factory/cognify/codex_home.py`, default `~/.devbrain/codex-cognify`): its
+  own login and a config.toml with no MCP servers, plugins, apps or
+  browser/computer-use tools, so an injected transcript cannot reach the
+  host user's write-capable tools. Every codex call checks the directory and
+  refuses codex (falling back to an allowed backend) when it is missing or
+  unsafe. `devbrain cognify-codex-home --init` writes it; the login is
+  `CODEX_HOME=<dir> codex login --device-auth`.
+
 ### Extract gate (`factory/cognify/gate.py`)
 Off by default (`cognify.extract_gate.mode: off | dry_run | on`, env
 `DEVBRAIN_EXTRACT_GATE`). Before extract sends a unit (one `provenance_id`

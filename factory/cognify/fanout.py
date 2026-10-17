@@ -90,6 +90,7 @@ def _codex_classify(
     Mirrors cognify_extract._codex_extract; codex bills the ChatGPT-sub login
     so there's no token spend to record.
     """
+    from cognify import backends, codex_home  # noqa: PLC0415
     from cognify.extract import (  # noqa: PLC0415
         _CODEX_BIN,
         _CODEX_DEFAULT_MODEL,
@@ -99,6 +100,13 @@ def _codex_classify(
         codex_error,
     )
 
+    if not backends.check("codex", "fanout"):
+        return None, "refused", "codex not in cognify.allowed_backends"
+    home = codex_home.resolve_home()
+    ok, reason = codex_home.check(home)
+    if not ok:
+        logger.error("cognify_fanout(codex): refusing to run codex: %s", reason)
+        return None, "refused", f"codex isolation: {reason}"
     if not _CODEX_BIN or not os.path.exists(_CODEX_BIN):
         return None, "api", f"codex binary not found at {_CODEX_BIN}"
 
@@ -127,6 +135,7 @@ def _codex_classify(
             proc = subprocess.run(
                 cmd, stdin=subprocess.DEVNULL,
                 capture_output=True, text=True, timeout=_CODEX_TIMEOUT_S,
+                env=codex_home.env_for(home),
             )
         except subprocess.TimeoutExpired:
             return None, "api", "codex exec timeout"
@@ -160,6 +169,10 @@ def _anthropic_classify(
     Best-effort JSON parse (no schema/prefill on the OAuth path) — this is the
     json_parse-prone path codex avoids; kept as the fallback.
     """
+    from cognify import backends  # noqa: PLC0415
+
+    if not backends.check("anthropic", "fanout"):
+        return None, "refused", "anthropic not in cognify.allowed_backends", None
     try:
         import anthropic  # noqa: PLC0415
     except ImportError:
@@ -398,7 +411,7 @@ def classify_session(
         }
         if parsed is None:
             if (
-                c_fail == "api"
+                c_fail in ("api", "refused")
                 and _FANOUT_FALLBACK
                 and _FANOUT_FALLBACK.lower() not in ("none", "")
                 and not _routes_to_codex(_FANOUT_FALLBACK)

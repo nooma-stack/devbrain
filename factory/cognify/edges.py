@@ -398,6 +398,10 @@ def _llm_judge_contradiction(
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
     }
+    from cognify import backends  # noqa: PLC0415
+
+    if not backends.check("anthropic", "edges"):
+        return False, _empty_usage
     try:
         import anthropic  # noqa: PLC0415
     except ImportError:
