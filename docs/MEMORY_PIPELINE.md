@@ -83,6 +83,32 @@ agent's volunteered judgment (promote / contradict / refine / new-edges) and dra
 `curator_re_eval_queue`, decaying `strength` along `depends_on` cascade edges with a
 subtractive penalty and 24h-half-life freshness.
 
+### Prompt-injection screening (`ingest/screening.py`, migration 049)
+Rules, no model call, ~1 ms per transcript. Flags: `override` ("ignore
+previous instructions", "you are now in developer mode", "new system
+prompt:"), `agent_directive` ("if you are an AI reading this", "note to the
+assistant:"), `fake_tag` (`<|im_start|>`, `[INST]`, `<<SYS>>`, a bare
+`<system>` tag, `</tool_result>`, `\n\nHuman:`), `exfil` (send credentials to
+an address, reveal the system prompt), `hidden_unicode` (Unicode tag
+characters, bidi overrides, zero-width characters inside words).
+
+- Transcript text is role-tagged; the person's own typed turns are the
+  principal and are only checked for hidden unicode. Tool results,
+  assistant text, harness-injected user-role text and untagged text
+  (summaries, notes, a chunk's mid-message head) get every rule.
+- Ingest stores the flags on the chunk's `memory.screen_flags` (NULL =
+  no flag) and summarizes the transcript with flagged segments withheld.
+- extract, fanout and resummarize re-screen their input on the fly (so
+  older rows are covered) and replace flagged segments with
+  `[segment withheld by injection screening: <flags>]`; a row with stored
+  flags the rules no longer reproduce is withheld whole.
+- `deep_search` can select `memory.screen_flags` to label results.
+- `devbrain screen-memory [--project] [--kind] [--since] [--apply]` reports
+  (default, read-only) or sets flags on existing rows; it writes flagged rows
+  only, never clean ones.
+- `ingest.screening.model_check: true` adds a local-model confirmation of
+  rule hits at ingest (loopback only unless `allow_remote_model`).
+
 ### Hosted backends: allow-list and codex isolation
 - `cognify.allowed_backends` (`factory/cognify/backends.py`) lists the hosted
   backends a deployment may send memory/transcript text to: `codex` (ChatGPT

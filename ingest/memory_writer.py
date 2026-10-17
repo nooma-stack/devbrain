@@ -32,6 +32,24 @@ logger = logging.getLogger(__name__)
 
 _SAVEPOINT_NAME = "memory_write_sp"
 
+_SCREEN_COLUMN: bool | None = None
+
+
+def _has_screen_flags_column(cur) -> bool:
+    """memory.screen_flags exists (migration 049)? Cached per process."""
+    global _SCREEN_COLUMN
+    if _SCREEN_COLUMN is None:
+        try:
+            cur.execute(
+                "SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = 'devbrain' AND table_name = 'memory' "
+                "  AND column_name = 'screen_flags'"
+            )
+            _SCREEN_COLUMN = cur.fetchone() is not None
+        except Exception:  # noqa: BLE001
+            return False
+    return _SCREEN_COLUMN
+
 
 def record_memory(
     cur,
@@ -43,6 +61,7 @@ def record_memory(
     embedding_sql: str | None = None,
     provenance_id: str | None = None,
     applies_when: dict | None = None,
+    screen_flags: list[str] | None = None,
 ) -> None:
     """Insert a row into devbrain.memory inside the caller's transaction.
 
@@ -78,6 +97,9 @@ def record_memory(
             curated rows so canonical filters (e.g. factory_review
             lessons) match without falling back to content-LIKE
             heuristics.
+        screen_flags: injection-screening rule ids (migration 049). Only
+            written when non-empty and the column exists, so clean rows
+            and pre-049 databases are unaffected.
     """
     # SAVEPOINT itself is inside the try: if the caller's transaction is
     # already InFailedSqlTransaction, even SAVEPOINT raises — and the
@@ -121,21 +143,26 @@ def record_memory(
         # Any future non-deduped kind just inserts.
         on_conflict = ""
 
+    flag_cols, flag_vals = "", ""
+    params: list = [
+        project_id, kind, title, content, embedding_sql,
+        provenance_id,
+        json.dumps(applies_when) if applies_when is not None else None,
+    ]
+    if screen_flags and _has_screen_flags_column(cur):
+        flag_cols, flag_vals = ", screen_flags", ", %s"
+        params.append(list(screen_flags))
     try:
         cur.execute(f"SAVEPOINT {_SAVEPOINT_NAME}")
         cur.execute(
             f"""
             INSERT INTO devbrain.memory
                 (project_id, kind, title, content, embedding,
-                 provenance_id, applies_when)
-            VALUES (%s, %s, %s, %s, %s::vector, %s, %s::jsonb)
+                 provenance_id, applies_when{flag_cols})
+            VALUES (%s, %s, %s, %s, %s::vector, %s, %s::jsonb{flag_vals})
             {on_conflict}
             """,
-            (
-                project_id, kind, title, content, embedding_sql,
-                provenance_id,
-                json.dumps(applies_when) if applies_when is not None else None,
-            ),
+            params,
         )
         cur.execute(f"RELEASE SAVEPOINT {_SAVEPOINT_NAME}")
     except Exception as exc:

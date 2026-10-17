@@ -262,4 +262,5 @@ jobs:
             tests/test_cognify_relate_db.py \
             tests/test_cognify_gate_db.py \
             tests/test_cognify_extract_codex.py \
+            tests/test_cognify_screen.py \
             -v --tb=short

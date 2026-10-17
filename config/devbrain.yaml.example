@@ -146,6 +146,22 @@ ingest:
     # "/Users/youruser/code/myproject": myproject
     # "/Users/youruser/code/another":   another
 
+  # Prompt-injection screening (ingest/screening.py). Rules flag text that
+  # tries to instruct a model that later reads it (override, agent_directive,
+  # fake_tag, exfil, hidden_unicode). Flagged chunks get memory.screen_flags
+  # (migration 049); flagged segments are withheld from summary, extraction,
+  # fan-out and re-summary prompts. The person's own typed turns are only
+  # checked for hidden unicode. Env DEVBRAIN_SCREENING / _MODEL_CHECK.
+  screening:
+    mode: "on"              # on | off
+    # Optional second pass: the LOCAL summarization model must confirm a
+    # rule hit before a chunk is marked (a failed call keeps the rule
+    # verdict). A non-loopback model URL disables it unless
+    # allow_remote_model is true (transcripts may contain PHI).
+    model_check: false
+    # model: qwen2.5:7b     # default: summarization.model
+    allow_remote_model: false
+
   # Path components that keep a transcript out of the brain entirely.
   # Default: ["subagents"] (Claude Code subagent transcripts). Add the
   # project dir of any headless agent whose sessions should not be
