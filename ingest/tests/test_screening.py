@@ -640,3 +640,15 @@ def test_model_may_veto_a_plain_agent_directive_and_it_is_logged(monkeypatch, ca
         )
     assert got is None
     assert any("vetoed soft flag" in r.getMessage() for r in caplog.records)
+
+
+def test_shared_cases_match_this_screener():
+    """ingest/screening_cases.json is what mcp-server/src/screening.ts is
+    tested against; it must stay what this module returns."""
+    import pathlib
+
+    path = pathlib.Path(screening.__file__).with_name("screening_cases.json")
+    cases = json.loads(path.read_text("utf-8"))["cases"]
+    assert len(cases) >= 80
+    for c in cases:
+        assert screening.screen(c["text"]).flags == c["flags"], c["text"][:60]

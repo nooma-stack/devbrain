@@ -176,39 +176,35 @@ def handle_lesson_candidates(
     """
     if not candidates:
         return
+    from cognify import screen  # noqa: PLC0415
+
+    flags_col = screen.has_flag_column(conn)
     with conn.cursor() as cur:
         for c in candidates:
+            text = f"{c.title}\n{c.content}" if c.title else c.content
             # Embed so deep_search can find the lesson (it filters
             # embedding IS NOT NULL). Graceful None if Ollama is down — the
             # row is still written and a reembed pass backfills the vector.
-            emb = embed_text(f"{c.title}\n{c.content}" if c.title else c.content)
+            emb = embed_text(text)
+            cols = ["project_id", "kind", "title", "content", "tier", "strength", "applies_when"]
+            vals: list = [session_project_id, "pattern", c.title, c.content, "lesson", 1.0,
+                          _json.dumps(c.applies_when)]
+            marks = ["%s", "%s", "%s", "%s", "%s", "%s", "%s::jsonb"]
             if emb is not None:
-                cur.execute(
-                    "INSERT INTO devbrain.memory "
-                    "(project_id, kind, title, content, tier, strength, "
-                    " applies_when, embedding) "
-                    "VALUES (%s, 'pattern', %s, %s, 'lesson', 1.0, %s::jsonb, %s::vector)",
-                    (
-                        session_project_id,
-                        c.title,
-                        c.content,
-                        _json.dumps(c.applies_when),
-                        to_vector_literal(emb),
-                    ),
-                )
-            else:
-                cur.execute(
-                    "INSERT INTO devbrain.memory "
-                    "(project_id, kind, title, content, tier, strength, "
-                    " applies_when) "
-                    "VALUES (%s, 'pattern', %s, %s, 'lesson', 1.0, %s::jsonb)",
-                    (
-                        session_project_id,
-                        c.title,
-                        c.content,
-                        _json.dumps(c.applies_when),
-                    ),
-                )
+                cols.append("embedding")
+                vals.append(to_vector_literal(emb))
+                marks.append("%s::vector")
+            # Write-time injection screening (flags only, never blocks).
+            flags = screen.rules.flags_for(text) if screen.enabled() else None
+            if flags and flags_col:
+                cols.append("screen_flags")
+                vals.append(flags)
+                marks.append("%s")
+            cur.execute(
+                f"INSERT INTO devbrain.memory ({', '.join(cols)}) "
+                f"VALUES ({', '.join(marks)})",
+                vals,
+            )
     conn.commit()
 
 

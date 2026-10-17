@@ -119,6 +119,13 @@ characters, bidi overrides, zero-width characters inside words).
   `[segment withheld by injection screening: <flags>]`; resummarize screens
   raw_content per message. A row with stored flags the rules no longer
   reproduce is withheld whole.
+- Rows written through MCP are screened at write time (flags only, never
+  blocked): `store` (the saved `title\n\ncontent`), `breadcrumb` /
+  `start_session`, the `end_session` summary, and end_session lesson
+  candidates. The MCP side (`mcp-server/src/screening.ts`) is a port of the
+  flat-text path that reads the same `ingest/screening_rules.json`; both test
+  suites run `ingest/screening_cases.json`, so a rule change that the two
+  implementations disagree on fails CI.
 - `deep_search` can select `memory.screen_flags` to label results.
 - `devbrain screen-memory [--project] [--kind] [--since] [--apply]` reports
   (default, read-only) or sets flags on existing rows; it writes flagged rows
