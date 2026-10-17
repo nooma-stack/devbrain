@@ -124,6 +124,7 @@ pre AS (
   SELECT
     m.id AS memory_id,
     m.kind AS memory_kind,
+    m.title,
     m.content,
     m.embedding,
     c.id AS legacy_chunk_id,
@@ -147,7 +148,7 @@ pre AS (
   LIMIT 4 * $4::int
 )
 SELECT
-  memory_id, memory_kind, content,
+  memory_id, memory_kind, title, content,
   1 - (embedding <=> $5::vector) AS score,
   legacy_chunk_id, chunk_source_type, chunk_source_id, chunk_line_start,
   chunk_line_end, project, keyword_score

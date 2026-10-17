@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  DevBrain local reranker (rerank/server.py) — launchd template.
+
+  Do not load this file directly. Run rerank/install.sh, which substitutes
+  the @...@ placeholders and writes ~/Library/LaunchAgents/com.devbrain.rerank.plist.
+  Loopback only; HF_HUB_OFFLINE=1 so the service never reaches the network.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.devbrain.rerank</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>@DEVBRAIN_HOME@/rerank/.venv/bin/python</string>
+        <string>-u</string>
+        <string>@DEVBRAIN_HOME@/rerank/server.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>@DEVBRAIN_HOME@/rerank</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>StandardOutPath</key>
+    <string>@DEVBRAIN_HOME@/logs/rerank.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>@DEVBRAIN_HOME@/logs/rerank.err.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>DEVBRAIN_RERANK_MODEL</key>
+        <string>@MODEL@</string>
+        <key>DEVBRAIN_RERANK_REVISION</key>
+        <string>@REVISION@</string>
+        <key>DEVBRAIN_RERANK_HOST</key>
+        <string>127.0.0.1</string>
+        <key>DEVBRAIN_RERANK_PORT</key>
+        <string>@PORT@</string>
+        <key>HF_HUB_OFFLINE</key>
+        <string>1</string>
+        <key>TRANSFORMERS_OFFLINE</key>
+        <string>1</string>
+        <key>HF_HUB_DISABLE_TELEMETRY</key>
+        <string>1</string>
+        <key>TOKENIZERS_PARALLELISM</key>
+        <string>false</string>
+    </dict>
+</dict>
+</plist>
