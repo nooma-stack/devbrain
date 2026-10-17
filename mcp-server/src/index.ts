@@ -8,8 +8,9 @@ import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'fs'
 import { homedir, tmpdir } from 'os'
 import { join, resolve } from 'path'
 import { z } from 'zod'
-import { query, waitForDb } from './db.js'
+import { getSearchConfig, query, queryWithTimeout, waitForDb } from './db.js'
 import { embed, embedQuery, toSqlVector } from './embeddings.js'
+import { keywordParams, keywordSql, matchedBy, rrfFuse } from './hybrid.js'
 import { enqueueCascades, recordMemory, recordMemoryDependency, resolveMemoryId } from './memory.js'
 import { triggerRelationCheckInBackground } from './relation.js'
 import {
@@ -434,10 +435,58 @@ server.tool(
 
     const candidates: Candidate[] = []
 
+    // devbrain.memory row (memory SQL and keyword SQL share this shape) →
+    // Candidate. chunk-kind rows report the legacy chunk id/source so
+    // get_source_context keeps working.
+    const memoryRowToCandidate = (row: Record<string, unknown>): Candidate => {
+      const isChunk = row.memory_kind === 'chunk'
+      return {
+        chunk_id: isChunk && row.legacy_chunk_id ? String(row.legacy_chunk_id) : String(row.memory_id),
+        content: String(row.content),
+        score: Number(row.score),
+        source_type: isChunk && row.chunk_source_type ? String(row.chunk_source_type) : String(row.memory_kind),
+        source_id: row.chunk_source_id != null ? String(row.chunk_source_id) : null,
+        source_line_start: row.chunk_line_start != null ? Number(row.chunk_line_start) : null,
+        source_line_end: row.chunk_line_end != null ? Number(row.chunk_line_end) : null,
+        project: String(row.project),
+        memory_id: String(row.memory_id),
+        memory_kind: String(row.memory_kind),
+      }
+    }
+
     // 1. Memory query — runs unless the caller filtered ONLY to codebase.
     const runMemoryQuery = kindFilter !== null || (source_types ?? []).length === 0
+
+    // Hybrid retrieval: a full-text keyword channel over devbrain.memory
+    // (mcp-server/sql/keyword_search.sql) runs alongside the vector query
+    // and the two ranked lists are fused with weighted RRF (hybrid.ts).
+    // Both channels fetch `candidates` rows so the fused top-`limit` is the
+    // same one ingest/recall_audit measures. Any keyword failure (timeout,
+    // missing index → the SQL returns nothing) leaves pure vector order.
+    // DEVBRAIN_HYBRID_SEARCH=off disables it.
+    const searchCfg = getSearchConfig()
+    const useHybrid = searchCfg.hybrid && runMemoryQuery
+    const fetchDepth = useHybrid ? Math.max(limit, searchCfg.candidates) : limit
+    const keywordPromise: Promise<Candidate[] | null> = useHybrid
+      ? queryWithTimeout(
+          keywordSql(),
+          keywordParams(searchQuery, vectorStr, {
+            projectId,
+            kinds: kindFilter,
+            chunkSourceTypes: restrictChunkSourceTypes,
+          }, searchCfg),
+          searchCfg.keywordTimeoutMs,
+        ).then(
+          (res) => res.rows.map(memoryRowToCandidate),
+          (err) => {
+            console.error(`[deep_search] keyword channel skipped: ${err instanceof Error ? err.message : String(err)}`)
+            return null
+          },
+        )
+      : Promise.resolve(null)
+
     if (runMemoryQuery) {
-      const memoryParams: unknown[] = [vectorStr, limit]
+      const memoryParams: unknown[] = [vectorStr, fetchDepth]
       let memoryWhere = ''
       let pIdx = 3
       if (projectId) {
@@ -511,23 +560,7 @@ server.tool(
       }
 
       for (const row of memoryResult.rows) {
-        const isChunk = row.memory_kind === 'chunk'
-        const chunkId = isChunk && row.legacy_chunk_id ? String(row.legacy_chunk_id) : String(row.memory_id)
-        const sourceType = isChunk && row.chunk_source_type
-          ? String(row.chunk_source_type)
-          : String(row.memory_kind)
-        candidates.push({
-          chunk_id: chunkId,
-          content: String(row.content),
-          score: Number(row.score),
-          source_type: sourceType,
-          source_id: row.chunk_source_id != null ? String(row.chunk_source_id) : null,
-          source_line_start: row.chunk_line_start != null ? Number(row.chunk_line_start) : null,
-          source_line_end: row.chunk_line_end != null ? Number(row.chunk_line_end) : null,
-          project: String(row.project),
-          memory_id: String(row.memory_id),
-          memory_kind: String(row.memory_kind),
-        })
+        candidates.push(memoryRowToCandidate(row))
       }
     }
 
@@ -535,7 +568,7 @@ server.tool(
     // codebase_index ingest never landed in P2.b's dual-write, so this
     // remains a legacy-only read until P2.e consolidates it.
     if (includeCodebase) {
-      const codebaseParams: unknown[] = [vectorStr, limit]
+      const codebaseParams: unknown[] = [vectorStr, fetchDepth]
       let codebaseWhere = ''
       if (projectId) {
         codebaseWhere += ` AND c.project_id = $3`
@@ -577,9 +610,35 @@ server.tool(
       }
     }
 
-    // Re-rank merged candidates by descending score, then slice.
+    // Re-rank merged candidates by descending score, then slice — or, with
+    // keyword hits, RRF-fuse the vector order with the keyword order.
     candidates.sort((a, b) => b.score - a.score)
-    const top = candidates.slice(0, limit)
+    const keywordHits = await keywordPromise
+    let top = candidates.slice(0, limit)
+    let matchedByKey: Map<string, string> | null = null
+    if (keywordHits && keywordHits.length > 0) {
+      const keyOf = (c: Candidate) => c.memory_id || `codebase:${c.chunk_id}`
+      const byKey = new Map<string, Candidate>()
+      const cosine = new Map<string, number>()
+      for (const c of [...candidates, ...keywordHits]) {
+        const key = keyOf(c)
+        if (!byKey.has(key)) byKey.set(key, c)
+        cosine.set(key, c.score)
+      }
+      const vectorKeys = candidates.map(keyOf)
+      const keywordKeys = keywordHits.map(keyOf)
+      const fused = rrfFuse(
+        [vectorKeys, keywordKeys],
+        [1, searchCfg.keywordWeight],
+        searchCfg.rrfK,
+        limit,
+        cosine,
+      )
+      top = fused.map((key) => byKey.get(key)!)
+      const vSet = new Set(vectorKeys)
+      const kSet = new Set(keywordKeys)
+      matchedByKey = new Map(fused.map((key) => [key, matchedBy(key, vSet, kSet)]))
+    }
 
     const results = await Promise.all(
       top.map(async (cand) => {
@@ -598,6 +657,10 @@ server.tool(
             : null,
           project: cand.project,
           has_full_context: cand.source_type === 'session' && cand.source_id != null,
+        }
+        if (matchedByKey) {
+          // Which retrieval channel(s) surfaced this result: vector, keyword or both.
+          r.matched_by = matchedByKey.get(cand.memory_id || `codebase:${cand.chunk_id}`) ?? 'vector'
         }
 
         // Auto drill-down: fetch raw context for top results if depth is

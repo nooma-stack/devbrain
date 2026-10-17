@@ -2,6 +2,7 @@ import pg from 'pg'
 import { readFileSync } from 'fs'
 import { parse } from 'yaml'
 import { resolve } from 'path'
+import { resolveSearchConfig, type SearchConfig } from './hybrid.js'
 
 // Raw config (including database.password) stays module-private. Expose
 // narrow accessors below so consumers get only the fields they need and
@@ -96,6 +97,17 @@ export function getQueryPrefix(): string {
   return model.startsWith('snowflake-arctic-embed') ? 'query: ' : ''
 }
 
+/**
+ * deep_search hybrid-retrieval settings: env > yaml `search:` > defaults
+ * (see resolveSearchConfig in hybrid.ts). Resolved per call, like
+ * getQueryPrefix, so DEVBRAIN_HYBRID_SEARCH=off in the MCP's environment
+ * (or .env, which run.sh loads) rolls the keyword channel back without a
+ * redeploy.
+ */
+export function getSearchConfig(): SearchConfig {
+  return resolveSearchConfig(_config.search, process.env)
+}
+
 export function getSummarizationConfig(): OllamaConfig {
   return {
     url: _config.summarization.url,
@@ -114,6 +126,37 @@ export async function query<T extends pg.QueryResultRow = Record<string, unknown
     // user sees "DB unreachable, start Docker" rather than a bare
     // "ECONNREFUSED 127.0.0.1:5433" that doesn't say what to do.
     throw _friendlyDbError(err)
+  }
+}
+
+/**
+ * Run one read query under a server-side statement_timeout, in its own
+ * transaction on a dedicated pool client (SET LOCAL never leaks to other
+ * callers). A timeout surfaces as a pg error (SQLSTATE 57014) for the
+ * caller to handle; Postgres cancels the work, unlike a client-side race.
+ */
+export async function queryWithTimeout<T extends pg.QueryResultRow = Record<string, unknown>>(
+  text: string,
+  params: unknown[],
+  timeoutMs: number,
+): Promise<pg.QueryResult<T>> {
+  let client: pg.PoolClient
+  try {
+    client = await getPool().connect()
+  } catch (err) {
+    throw _friendlyDbError(err)
+  }
+  try {
+    await client.query('BEGIN')
+    await client.query(`SET LOCAL statement_timeout = ${Math.max(1, Math.round(timeoutMs))}`)
+    const result = await client.query<T>(text, params)
+    await client.query('COMMIT')
+    return result
+  } catch (err) {
+    await client.query('ROLLBACK').catch(() => {})
+    throw _friendlyDbError(err)
+  } finally {
+    client.release()
   }
 }
 
