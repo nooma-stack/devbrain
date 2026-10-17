@@ -54,8 +54,16 @@ describe('rerankScores', () => {
   })
 
   test('a timeout returns null', async () => {
+    // AbortSignal.timeout's timer is unref'd: keep a ref'd timer alive so the
+    // test runner does not see an empty event loop before the abort fires.
     const slow = ((_u: unknown, init?: { signal?: AbortSignal }) =>
-      new Promise((_res, rej) => init?.signal?.addEventListener('abort', () => rej(new Error('aborted'))))) as unknown as typeof fetch
+      new Promise((_res, rej) => {
+        const keepAlive = setTimeout(() => rej(new Error('late')), 5000)
+        init?.signal?.addEventListener('abort', () => {
+          clearTimeout(keepAlive)
+          rej(new Error('aborted'))
+        })
+      })) as unknown as typeof fetch
     assert.equal(await rerankScores('http://127.0.0.1:1', 'q', ['a'], 20, slow), null)
   })
 })
