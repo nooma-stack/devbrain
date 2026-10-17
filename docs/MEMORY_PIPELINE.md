@@ -209,6 +209,19 @@ Pending contradictions:
 `factory/graph/walker.py` recursive-CTE, hop/node capped, via subprocess) →
 raw-transcript drill-down from `raw_sessions`.
 
+### Typed questions — `ask` (`mcp-server/src/ask.ts`)
+`ask(question, kind, project?, cross_project?, limit?)`, kind ∈ decision | why |
+howto | issue | status | who_when. Retrieval only and deterministic (no model
+writes the answer). Reuses deep_search's pieces without changing them: vector
++ keyword channels (RRF), the local reranker, near-duplicate collapse, the
+weak-match threshold. The kind picks the memory kinds searched (no raw
+chunks) and small score bonuses for the preferred kind, recency (strong for
+`status`) and, for `issue`, rows that record a cause and fix. The supersedes /
+refined_by graph is walked so the newest version is cited with `replaces` and
+`edge_notes`. Returns the top 1-3 memories wrapped as untrusted data
+(`<memory id=… untrusted="true" screen_flags=…>`), dates, `weak_match` + note.
+Flag: `ask.enabled` / `DEVBRAIN_ASK` (default on).
+
 ## Cross-cutting
 
 - **Ledger**: every `memory` write fires an AFTER trigger writing a SHA-256

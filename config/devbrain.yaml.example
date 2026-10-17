@@ -90,6 +90,11 @@ summarization:
   url: http://localhost:11434
   model: qwen2.5:7b
 
+# MCP `ask` tool: typed questions (decision / why / howto / issue / status /
+# who_when) answered by retrieval only. Env DEVBRAIN_ASK=off removes it.
+ask:
+  enabled: true
+
 # Cognify pass settings.
 cognify:
   # Hosted LLM backends cognify (extract, fanout, edges, resummarize) may
