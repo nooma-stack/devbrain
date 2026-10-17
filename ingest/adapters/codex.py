@@ -181,11 +181,22 @@ class CodexAdapter:
 
                     content = "\n".join(content_parts).strip()
                     if content or tool_calls:
+                        # Typed by the person: a user item with text only
+                        # (environment_context / AGENTS.md items are user
+                        # role too; screening cuts at those markers).
+                        has_output = isinstance(raw_content, list) and any(
+                            isinstance(b, dict)
+                            and b.get("type") == "function_call_output"
+                            for b in raw_content
+                        )
                         messages.append(UniversalMessage(
                             role=std_role,
                             timestamp=ts,
                             content=content,
                             tool_calls=tool_calls,
+                            principal=(
+                                role == "user" and not has_output and bool(content)
+                            ),
                         ))
 
                         # Track file paths from tool calls
@@ -215,6 +226,7 @@ class CodexAdapter:
                             else "assistant",
                             timestamp=ts,
                             content=str(text),
+                            principal=msg_type == "user_message",
                         ))
 
         except Exception as e:

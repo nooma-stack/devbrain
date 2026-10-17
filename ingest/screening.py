@@ -20,7 +20,8 @@ from deep_search):
                   NFKC, invisible characters, look-alike letters, separators)
 
 Trust comes only from structure: in a parsed message (``screen_message``)
-the person's own typed user turn is the principal and only gets the
+the person's own typed user turn (marked ``principal`` by the adapter, up
+to the first harness marker in it) is the principal and only gets the
 hidden_unicode check. Flat text (``screen``: chunks, assembled prompts,
 summaries, notes) is never trusted, because a role prefix there is just
 text a tool result could forge. Callers screen the exact string a model
@@ -275,12 +276,25 @@ _ROLE_LINE = re.compile(
     r"^(?:\[[^\]\n]{1,40}\]\s)?\[(user|assistant|system|tool|model|human)\]\s?",
     re.MULTILINE,
 )
-_TOOL_LINE = re.compile(r"^\s*\[tool_result\]", re.MULTILINE)
-# Harness-injected user-role text: not typed by the person, so screened.
-_INJECTED_USER = re.compile(
-    r"^\s*(\[tool_result\]|<command-|<local-command|<system-reminder>|<task-notification>|"
-    r"<environment_context>|<user_instructions>|<INSTRUCTIONS>|# AGENTS\.md instructions|"
-    r"Caveat: The messages below)"
+# Where harness / tool text starts inside a user-role message. Adapters join
+# a message's blocks with newlines, so the person's typed text can be
+# followed by a <system-reminder>, a hook's additional context, a skill or
+# CLAUDE.md block, MCP server instructions, a tool result, a pasted or
+# mailed document... The principal part of a message ends at the FIRST
+# marker found ANYWHERE in it; everything after is untrusted. Fail closed:
+# any line that starts with an XML-ish tag counts as a marker too.
+_HARNESS_MARKER = re.compile(
+    r"\[tool_result\]"
+    r"|<(system-reminder|task-notification|command-|local-command|bash-input|bash-stdout|"
+    r"bash-stderr|pasted_content|artifact-|environment_context|user_instructions|"
+    r"INSTRUCTIONS|user-prompt-submit-hook|hook|persisted-output|channel|"
+    r"function_results|tool_use_error|available_skills|skill|mcp)"
+    r"|^\s*(\[tool_result\]|\[Request interrupted|\[Image\b|# AGENTS\.md instructions|"
+    r"Caveat: The messages below|This session is being continued|MAILROOM DELIVERY|"
+    r"Base directory for this skill|Contents of /|As you answer the user's questions|"
+    r"[^\n]{0,40}hook (additional context|blocking error|feedback))"
+    r"|^\s*<[A-Za-z][\w:-]*[\s>/]",
+    re.MULTILINE,
 )
 
 
@@ -311,15 +325,19 @@ def segments(text: str) -> list[Segment]:
     return out
 
 
-def _message_segments(role: str, content: str) -> list[Segment]:
-    """Segments of one structured message. A user message is the person's
-    own words unless it is harness text; any "[tool_result]" line inside it
-    (adapters join a message's text and tool-result blocks) starts an
-    untrusted part that runs to the end of the message."""
+def _message_segments(role: str, content: str, principal: bool) -> list[Segment]:
+    """Segments of one structured message.
+
+    Principal trust is opt-in: only a user message the adapter marked as
+    typed by the person (``principal=True``: a plain user text entry, not
+    isMeta, no tool result) can be principal, and only up to the first
+    harness marker anywhere in it. Everything else, including messages
+    from adapters that don't set the flag and stored JSON written before
+    it existed, is untrusted."""
     role = (role or "").lower()
-    if role not in ("user", "human") or _INJECTED_USER.match(content):
+    if not principal or role not in ("user", "human"):
         return [Segment(0, len(content), "untrusted")]
-    m = _TOOL_LINE.search(content)
+    m = _HARNESS_MARKER.search(content)
     if not m:
         return [Segment(0, len(content), "principal")]
     out = []
@@ -407,13 +425,16 @@ def screen(text: str | None) -> ScreenResult:
     return _result(hits)
 
 
-def screen_message(role: str, content: str | None) -> ScreenResult:
-    """Rule hits for ONE structured message, where the role is known: the
-    person's own typed text is only checked for hidden unicode."""
+def screen_message(
+    role: str, content: str | None, principal: bool = False
+) -> ScreenResult:
+    """Rule hits for ONE structured message. The person's own typed text
+    (``principal=True`` from the adapter, before any harness marker) is only
+    checked for hidden unicode; the rest gets every rule."""
     if not content:
         return ScreenResult()
     hits: list[Hit] = []
-    for seg in _message_segments(role, content):
+    for seg in _message_segments(role, content, principal):
         _screen_segment(content, seg, hits)
     return _result(hits)
 
@@ -459,6 +480,12 @@ def _msg_role_content(m) -> tuple[str, str]:
     return str(getattr(m, "role", "") or ""), getattr(m, "content", "") or ""
 
 
+def _msg_principal(m) -> bool:
+    """Only an explicit True counts (fail closed)."""
+    v = m.get("principal") if isinstance(m, dict) else getattr(m, "principal", False)
+    return v is True
+
+
 def message_flags(messages) -> list[list[str]]:
     """Per-message flags for a structured session (dicts or
     adapters.base.UniversalMessage objects)."""
@@ -466,7 +493,9 @@ def message_flags(messages) -> list[list[str]]:
     for m in messages:
         role, content = _msg_role_content(m)
         out.append(
-            screen_message(role, content if isinstance(content, str) else "").flags
+            screen_message(
+                role, content if isinstance(content, str) else "", _msg_principal(m)
+            ).flags
         )
     return out
 
@@ -537,7 +566,7 @@ def redact_usf_json(raw: str | None) -> tuple[str, list[str]]:
     for m in messages:
         if not isinstance(m, dict) or not isinstance(m.get("content"), str):
             continue
-        r = screen_message(str(m.get("role") or ""), m["content"])
+        r = screen_message(str(m.get("role") or ""), m["content"], _msg_principal(m))
         if r.flags:
             flags.update(r.flags)
             m["content"] = _withheld(r.flags)

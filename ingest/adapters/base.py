@@ -15,6 +15,10 @@ class UniversalMessage:
     content: str = ""
     tool_calls: list[dict] = field(default_factory=list)
     files_touched: list[str] = field(default_factory=list)
+    # True only when the adapter knows the person typed this message (a
+    # plain user text entry: not harness/meta text, no tool result).
+    # Injection screening trusts nothing else; default False fails closed.
+    principal: bool = False
 
 
 @dataclass
@@ -62,6 +66,7 @@ class UniversalSession:
                         "content": msg.content,
                         "tool_calls": msg.tool_calls,
                         "files_touched": msg.files_touched,
+                        "principal": msg.principal,
                     }
                     for msg in self.messages
                 ],

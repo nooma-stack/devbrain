@@ -3,6 +3,8 @@ optional local-model second pass. Rules live in screening.py."""
 
 from __future__ import annotations
 
+import hashlib
+import logging
 from urllib.parse import urlparse
 
 import screening
@@ -14,6 +16,8 @@ from config import (
     SCREENING_MODEL_CHECK,
     SCREENING_URL,
 )
+
+logger = logging.getLogger(__name__)
 
 _LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 
@@ -28,15 +32,33 @@ def _model_allowed(url: str) -> bool:
     return host in _LOOPBACK or host.startswith("127.")
 
 
+# The only rule a model "benign" verdict may clear. The model reads the
+# attacker's text, so it can be talked out of a flag: it may never clear
+# override, fake_tag, exfil, hidden_unicode or obfuscated hits.
+SOFT_VETO_RULES = frozenset({"agent_directive"})
+
+
 def _confirmed(text: str, flags: list[str] | None, chat) -> list[str] | None:
-    """With model_check on, the local model must agree before a rule hit is
-    stored; a failed model call keeps the rule verdict (fail-closed)."""
-    if flags and SCREENING_MODEL_CHECK and _model_allowed(SCREENING_URL):
-        verdict = screening.model_confirms(
-            text, url=SCREENING_URL, model=SCREENING_MODEL, chat=chat
+    """Optional local-model pass over rule hits. It can only ADD: a
+    confirmation adds ``model_confirmed``. A "benign" verdict clears the
+    hit only when every flag is a soft rule (a plain agent_directive), and
+    that veto is logged. A failed call keeps the rule verdict."""
+    if not (flags and SCREENING_MODEL_CHECK and _model_allowed(SCREENING_URL)):
+        return flags
+    verdict = screening.model_confirms(
+        text, url=SCREENING_URL, model=SCREENING_MODEL, chat=chat
+    )
+    if verdict is True:
+        return sorted(set(flags) | {"model_confirmed"})
+    if verdict is False and set(flags) <= SOFT_VETO_RULES:
+        logger.warning(
+            "injection screening: local model vetoed soft flag(s) %s "
+            "(text sha1 %s, %d chars)",
+            ",".join(flags),
+            hashlib.sha1(text.encode("utf-8", "replace")).hexdigest()[:12],
+            len(text),
         )
-        if verdict is False:
-            return None
+        return None
     return flags
 
 

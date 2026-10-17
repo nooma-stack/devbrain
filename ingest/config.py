@@ -179,9 +179,9 @@ INGEST_EXCLUDE_PATH_PARTS = list(
 )
 
 # Prompt-injection screening (ingest/screening.py). mode: on (default) |
-# off; env DEVBRAIN_SCREENING. model_check: optional second pass where the
-# LOCAL summarization model confirms rule hits before a chunk is marked;
-# env DEVBRAIN_SCREENING_MODEL_CHECK. A non-loopback model URL disables the
+# off; env DEVBRAIN_SCREENING. model_check: optional second pass over rule
+# hits by the LOCAL summarization model; it can only add flags (see
+# screening_runtime.SOFT_VETO_RULES); env DEVBRAIN_SCREENING_MODEL_CHECK. A non-loopback model URL disables the
 # second pass unless allow_remote_model is set (transcripts may hold PHI).
 _SCREENING = _config["ingest"].get("screening") or {}
 
