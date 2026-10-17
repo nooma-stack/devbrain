@@ -192,3 +192,36 @@ def test_recency_audit_helpers():
     for path in (NEIGHBORS_SQL_PATH, EARLIEST_SQL_PATH):
         sql = load_keyword_sql(path)
         assert sorted(set(re.findall(r"%\(p(\d+)\)s", sql))) == ["1", "2", "3", "4"]
+
+
+def test_apply_rerank_matches_mcp():
+    from recall_audit.audit import apply_rerank
+
+    # Same case as 'rrf blend fuses ...' in mcp-server/src/rerank.test.ts.
+    scores = {"m1": 0.1, "m2": 0.8, "m3": 0.9, "m4": 0.2}
+    pool = ["m1", "m2", "m3", "m4", "m5"]
+    assert apply_rerank(pool, scores, 4, "rrf") == ["m3", "m2", "m1", "m4", "m5"]
+    assert apply_rerank(pool, scores, 4, "rerank") == ["m3", "m2", "m4", "m1", "m5"]
+    assert apply_rerank(["a", "codebase:x", "c", "d"], {"a": 0.1, "c": 0.5}, 3, "rerank") == ["c", "a", "codebase:x", "d"]
+
+
+def test_rerank_doc_text_matches_mcp():
+    from recall_audit.audit import rerank_doc_text
+
+    assert rerank_doc_text("Use HNSW", "Because recall.") == "Use HNSW\nBecause recall."
+    assert rerank_doc_text("Use HNSW", "Use HNSW\nBecause recall.") == "Use HNSW\nBecause recall."
+    assert rerank_doc_text("", "body") == "body"
+    assert len(rerank_doc_text("t", "x" * 5000)) == 2000
+
+
+def test_rerank_defaults_match_the_mcp():
+    from recall_audit.audit import RerankParams
+
+    ts = HYBRID_TS.read_text()
+    block = ts[ts.index("export const SEARCH_DEFAULTS") :]
+    block = block[: block.index("}")]
+    rp = RerankParams()
+    assert re.search(r"\brerank:\s*(true|false)", block).group(1) == ("true" if rp.enabled else "false")
+    assert re.search(r"rerankUrl:\s*'([^']+)'", block).group(1) == rp.url
+    assert int(re.search(r"rerankCandidates:\s*(\d+)", block).group(1)) == rp.candidates
+    assert re.search(r"rerankBlend:\s*'(\w+)'", block).group(1) == rp.blend

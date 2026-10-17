@@ -10,7 +10,17 @@ import { join, resolve } from 'path'
 import { z } from 'zod'
 import { getSearchConfig, query, queryWithTimeout, waitForDb } from './db.js'
 import { embed, embedQuery, toSqlVector } from './embeddings.js'
-import { collapseNearDuplicates, keywordParams, keywordSql, matchedBy, nearDupSql, rrfFuse } from './hybrid.js'
+import {
+  applyRerank,
+  collapseNearDuplicates,
+  keywordParams,
+  keywordSql,
+  matchedBy,
+  nearDupSql,
+  rerankDocText,
+  rrfFuse,
+} from './hybrid.js'
+import { rerankScores } from './rerank.js'
 import { enqueueCascades, hasScreenFlagsColumn, recordMemory, recordMemoryDependency, resolveMemoryId } from './memory.js'
 import { screenFlags } from './screening.js'
 import { relationCheckMode, relationStoreNote, triggerRelationCheckInBackground } from './relation.js'
@@ -432,6 +442,7 @@ server.tool(
       project: string
       memory_id: string
       memory_kind: string
+      title: string | null
     }
 
     const candidates: Candidate[] = []
@@ -452,6 +463,7 @@ server.tool(
         project: String(row.project),
         memory_id: String(row.memory_id),
         memory_kind: String(row.memory_kind),
+        title: row.title != null ? String(row.title) : null,
       }
     }
 
@@ -523,6 +535,7 @@ server.tool(
         SELECT
           m.id as memory_id,
           m.kind as memory_kind,
+          m.title,
           m.content,
           1 - (m.embedding <=> $1::vector) as score,
           c.id as legacy_chunk_id,
@@ -609,6 +622,7 @@ server.tool(
           project: String(row.project),
           memory_id: '',
           memory_kind: 'codebase',
+          title: null,
         })
       }
     }
@@ -633,6 +647,21 @@ server.tool(
       const kSet = new Set(keywordKeys)
       pool = rrfFuse([pool, keywordKeys], [1, searchCfg.keywordWeight], searchCfg.rrfK, byKey.size, cosine)
       matchedByKey = new Map(pool.map((key) => [key, matchedBy(key, vSet, kSet)]))
+    }
+
+    // Local cross-encoder rerank of the pool head (rerank/ service on
+    // loopback). Runs before the collapse so each group is anchored by the
+    // copy the reranker liked best. Any failure keeps the incoming order.
+    // DEVBRAIN_RERANK=off disables it.
+    let rerankByKey: Map<string, number> | null = null
+    if (searchCfg.rerank && pool.length > 1) {
+      const head = pool.slice(0, searchCfg.rerankCandidates).filter((k) => !k.startsWith('codebase:'))
+      const docs = head.map((k) => rerankDocText(byKey.get(k)!.title, byKey.get(k)!.content))
+      const rr = await rerankScores(searchCfg.rerankUrl, searchQuery, docs, searchCfg.rerankTimeoutMs)
+      if (rr) {
+        rerankByKey = new Map(head.map((k, i) => [k, rr.scores[i]]))
+        pool = applyRerank(pool, rerankByKey, searchCfg.rerankCandidates, searchCfg.rerankBlend)
+      }
     }
 
     // Near-duplicate collapse: cognify re-extracts the same fact many times,
@@ -697,6 +726,11 @@ server.tool(
         if (matchedByKey) {
           // Which retrieval channel(s) surfaced this result: vector, keyword or both.
           r.matched_by = matchedByKey.get(keyOf(cand)) ?? 'vector'
+        }
+        const rerankScore = rerankByKey?.get(keyOf(cand))
+        if (rerankScore !== undefined) {
+          // Local cross-encoder relevance (0..1) for this result.
+          r.rerank_score = Number(rerankScore.toFixed(4))
         }
         const similar = similarByKey?.get(keyOf(cand))
         if (similar) {

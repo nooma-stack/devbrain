@@ -66,6 +66,14 @@ embedding:
 #   recency_strategy: hnsw
 #   recency_max_scan_tuples: 2000
 #   recency_timeout_ms: 2000     # over this, the annotation is left empty
+#   # Local cross-encoder rerank (rerank/; env DEVBRAIN_RERANK on/off,
+#   # DEVBRAIN_RERANK_URL). Loopback URLs only. If the service is not
+#   # running, searches keep the un-reranked order.
+#   rerank: true
+#   rerank_url: http://127.0.0.1:18600
+#   rerank_candidates: 30      # top candidates rescored
+#   rerank_blend: rrf          # rrf (fuse with incoming order) | rerank (reranker order alone)
+#   rerank_timeout_ms: 1200
 
 summarization:
   provider: ollama

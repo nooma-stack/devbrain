@@ -46,6 +46,16 @@ export interface SearchConfig {
   recencyMaxScanTuples: number
   /** statement_timeout for the 'hnsw' recency queries; on timeout the annotation is left empty. */
   recencyTimeoutMs: number
+  /** Rescore the head of the ranked pool with the local cross-encoder service (rerank/). */
+  rerank: boolean
+  /** Loopback URL of the reranker service. Non-loopback URLs are refused (memory text may hold PHI). */
+  rerankUrl: string
+  /** How many top candidates the reranker rescores. */
+  rerankCandidates: number
+  /** 'rrf': fuse reranker order with the incoming order; 'rerank': reranker order alone. */
+  rerankBlend: 'rrf' | 'rerank'
+  /** Request timeout; on timeout or error the search keeps the un-reranked order. */
+  rerankTimeoutMs: number
 }
 
 // Measured 2026-10-17 with ingest/recall_audit on the Nooma corpus (see the
@@ -68,6 +78,11 @@ export const SEARCH_DEFAULTS: SearchConfig = {
   recencyStrategy: 'hnsw',
   recencyMaxScanTuples: 2000,
   recencyTimeoutMs: 2000,
+  rerank: true,
+  rerankUrl: 'http://127.0.0.1:18600',
+  rerankCandidates: 30,
+  rerankBlend: 'rrf',
+  rerankTimeoutMs: 1200,
 }
 
 type Env = Record<string, string | undefined>
@@ -102,11 +117,13 @@ function parseTerms(v: unknown): boolean | undefined {
  * Env: DEVBRAIN_HYBRID_SEARCH (on/off), DEVBRAIN_RRF_K,
  * DEVBRAIN_KEYWORD_WEIGHT, DEVBRAIN_KEYWORD_TERMS (identifiers|all),
  * DEVBRAIN_DEDUP_SEARCH (on/off), DEVBRAIN_DEDUP_THRESHOLD,
- * DEVBRAIN_RECENCY_STRATEGY (hnsw|exact).
+ * DEVBRAIN_RECENCY_STRATEGY (hnsw|exact), DEVBRAIN_RERANK (on/off),
+ * DEVBRAIN_RERANK_URL.
  * yaml: search.{hybrid, rrf_k, keyword_weight, candidates, keyword_max_df,
  * keyword_row_budget, keyword_max_terms, keyword_terms, keyword_timeout_ms,
  * dedup, dedup_threshold, dedup_representative, dedup_timeout_ms,
- * recency_strategy, recency_max_scan_tuples, recency_timeout_ms}.
+ * recency_strategy, recency_max_scan_tuples, recency_timeout_ms, rerank,
+ * rerank_url, rerank_candidates, rerank_blend, rerank_timeout_ms}.
  */
 export function resolveSearchConfig(yaml: unknown, env: Env = process.env): SearchConfig {
   const y = (yaml && typeof yaml === 'object' ? yaml : {}) as Record<string, unknown>
@@ -148,7 +165,39 @@ export function resolveSearchConfig(yaml: unknown, env: Env = process.env): Sear
       pick(parseNum(y.recency_max_scan_tuples, (n) => n >= 100 && n <= 1_000_000), d.recencyMaxScanTuples),
     ),
     recencyTimeoutMs: Math.round(pick(parseNum(y.recency_timeout_ms, (n) => n >= 10), d.recencyTimeoutMs)),
+    rerank: pick(parseBool(env.DEVBRAIN_RERANK), parseBool(y.rerank), d.rerank),
+    rerankUrl: pick(parseUrl(env.DEVBRAIN_RERANK_URL), parseUrl(y.rerank_url), d.rerankUrl),
+    rerankCandidates: Math.round(pick(parseNum(y.rerank_candidates, (n) => n >= 2 && n <= 100), d.rerankCandidates)),
+    rerankBlend: pick(parseBlend(y.rerank_blend), d.rerankBlend),
+    rerankTimeoutMs: Math.round(pick(parseNum(y.rerank_timeout_ms, (n) => n >= 10), d.rerankTimeoutMs)),
   }
+}
+
+function parseUrl(v: unknown): string | undefined {
+  if (v === undefined || v === null || String(v).trim() === '') return undefined
+  try {
+    return isLoopbackUrl(String(v).trim()) ? String(v).trim().replace(/\/+$/, '') : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function parseBlend(v: unknown): 'rrf' | 'rerank' | undefined {
+  const s = v === undefined || v === null ? '' : String(v).trim().toLowerCase()
+  return s === 'rrf' || s === 'rerank' ? s : undefined
+}
+
+/** http(s) URL whose host is a loopback address (127.0.0.0/8, ::1, localhost). */
+export function isLoopbackUrl(url: string): boolean {
+  let u: URL
+  try {
+    u = new URL(url)
+  } catch {
+    return false
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false
+  const h = u.hostname.replace(/^\[|\]$/g, '')
+  return h === 'localhost' || h === '::1' || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(h)
 }
 
 function parseRecencyStrategy(v: unknown): 'hnsw' | 'exact' | undefined {
@@ -307,4 +356,43 @@ export function collapseNearDuplicates(
     }
   }
   return groups
+}
+
+// ─── Reranking ──────────────────────────────────────────────────────────────
+
+/** Characters of memory text sent per candidate (mirror of RERANK_DOC_CHARS in the audit). */
+export const RERANK_DOC_CHARS = 2000
+
+/**
+ * Text the reranker scores for one memory. cognify atoms keep the title out
+ * of the content, so prepend it unless the content already starts with it.
+ * Mirror of rerank_doc_text in ingest/recall_audit/audit.py.
+ */
+export function rerankDocText(title: string | null | undefined, content: string): string {
+  const t = (title ?? '').trim()
+  const c = content ?? ''
+  const text = !t || c.trimStart().startsWith(t) ? c : `${t}\n${c}`
+  return text.slice(0, RERANK_DOC_CHARS)
+}
+
+/**
+ * Reorder the first `n` pool keys by reranker score; the rest keep their
+ * order. Keys without a score (codebase rows) follow the scored ones. With
+ * blend 'rrf', the reranker order is RRF-fused with the incoming order
+ * inside the head. Mirror of apply_rerank in ingest/recall_audit/audit.py.
+ */
+export function applyRerank(
+  pool: string[],
+  scores: Map<string, number>,
+  n: number,
+  blend: 'rrf' | 'rerank' = 'rrf',
+  k = 60,
+): string[] {
+  const head = pool.slice(0, n)
+  const scored = head.filter((key) => scores.has(key))
+  const unscored = head.filter((key) => !scores.has(key))
+  // Array.prototype.sort is stable: equal scores keep the incoming order.
+  let byScore = [...scored].sort((a, b) => scores.get(b)! - scores.get(a)!)
+  if (blend === 'rrf') byScore = rrfFuse([byScore, scored], [1, 1], k, scored.length)
+  return [...byScore, ...unscored, ...pool.slice(n)]
 }

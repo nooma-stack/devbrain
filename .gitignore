@@ -6,6 +6,7 @@ mcp-server/node_modules/
 mcp-server/dist/
 ingest/__pycache__/
 ingest/.venv/
+rerank/.venv/
 __pycache__/
 
 # Local config with secrets

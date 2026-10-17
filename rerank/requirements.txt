@@ -1,0 +1,7 @@
+# DevBrain local reranker (rerank/server.py). Installed into rerank/.venv by
+# rerank/install.sh; kept apart from the ingest venv (torch is large).
+# Tested 2026-10-17 on an M3 Ultra: torch 2.14.1, transformers 5.20.1,
+# sentence-transformers 5.7.0 (the ettin rerankers need transformers 5).
+sentence-transformers>=5.4,<6
+transformers>=4.48,<6
+torch>=2.5

@@ -176,6 +176,80 @@ def collapse_near_duplicates(
     return groups
 
 
+@dataclass(frozen=True)
+class RerankParams:
+    """Defaults mirror SEARCH_DEFAULTS.rerank* in mcp-server/src/hybrid.ts."""
+
+    enabled: bool = True
+    url: str = "http://127.0.0.1:18600"
+    candidates: int = 30
+    blend: str = "rrf"  # rrf | rerank
+    timeout_s: float = 1.5
+
+
+DOC_TEXT_SQL = """
+SELECT id::text, coalesce(title, ''), content
+FROM devbrain.memory
+WHERE id = ANY(%(ids)s::uuid[])
+"""
+
+# Characters of memory text sent per candidate (mirror of RERANK_DOC_CHARS).
+RERANK_DOC_CHARS = 2000
+
+
+def rerank_doc_text(title: str, content: str) -> str:
+    """Text the reranker scores for one memory. Mirror of rerankDocText in hybrid.ts.
+
+    cognify atoms keep the title out of the content, so prepend it unless
+    the content already starts with it.
+    """
+    t = (title or "").strip()
+    c = content or ""
+    text = c if not t or c.lstrip().startswith(t) else f"{t}\n{c}"
+    return text[:RERANK_DOC_CHARS]
+
+
+def apply_rerank(pool: list[str], scores: dict[str, float], n: int, blend: str = "rerank", k: float = 60.0) -> list[str]:
+    """Reorder the first ``n`` pool entries by reranker score; the rest keep
+    their order. ``blend="rrf"`` instead RRF-fuses the reranker order with the
+    incoming order inside the head. Mirror of applyRerank in hybrid.ts."""
+    head = [key for key in pool[:n]]
+    scored = [key for key in head if key in scores]
+    unscored = [key for key in head if key not in scores]
+    by_score = sorted(scored, key=lambda key: -scores[key])  # stable: ties keep incoming order
+    if blend == "rrf":
+        by_score = rrf_fuse([by_score, scored], [1.0, 1.0], k, len(scored))
+    return by_score + unscored + pool[n:]
+
+
+def run_rerank(
+    cur: Any,
+    query_text: str,
+    pool: list[str],
+    rp: RerankParams,
+    timings: dict[str, list[float]] | None = None,
+) -> list[str]:
+    """deep_search's rerank stage: score the pool head with the local service."""
+    import urllib.request  # noqa: PLC0415
+
+    head = [k for k in pool[: rp.candidates] if not k.startswith("codebase:")]
+    cur.execute(DOC_TEXT_SQL, {"ids": head})
+    texts = {r[0]: rerank_doc_text(r[1], r[2]) for r in cur.fetchall()}
+    cur.connection.rollback()
+    keys = [k for k in head if k in texts]
+    t0 = time.monotonic()
+    req = urllib.request.Request(
+        rp.url.rstrip("/") + "/rerank",
+        data=json.dumps({"query": query_text, "documents": [texts[k] for k in keys]}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=rp.timeout_s * 10) as resp:  # audit: generous
+        scores = json.loads(resp.read())["scores"]
+    if timings is not None:
+        timings.setdefault("rerank", []).append((time.monotonic() - t0) * 1000)
+    return apply_rerank(pool, dict(zip(keys, scores)), rp.candidates, rp.blend)
+
+
 def first_hit_rank_groups(groups: list[Group], expected: Iterable[str], rep_only: bool = False) -> int | None:
     """1-based rank of the first group holding an expected id (any member,
     or only the representative when ``rep_only``)."""
@@ -245,6 +319,7 @@ class RunResult:
     # per-query SQL wall time (ms) per channel: "vector", "keyword", "dedup"
     timings: dict[str, list[float]] = field(default_factory=dict)
     dedup: str = "off"
+    rerank: str = "off"
     # with dedup: rank of the first group whose representative is expected
     rep_ranks: dict[str, int | None] = field(default_factory=dict)
     # with dedup: duplicate entries in the un-collapsed top 10 (slots freed)
@@ -415,7 +490,9 @@ def run_search(
             "p10": hp.keyword_identifiers_only,
         },
     )
-    kw_rows = [(str(r[0]), float(r[3])) for r in cur.fetchall()]
+    cols = [d[0] for d in cur.description]
+    i_id, i_score = cols.index("memory_id"), cols.index("score")
+    kw_rows = [(str(r[i_id]), float(r[i_score])) for r in cur.fetchall()]
     if timings is not None:
         timings.setdefault("keyword", []).append((time.monotonic() - t1) * 1000)
     cur.connection.rollback()
@@ -473,14 +550,14 @@ def render_table(results: list[RunResult], items: list[GoldItem]) -> str:
     lines = [
         f"Gold items: {len(items)}",
         "",
-        "| query prefix | scope | search | pipeline | dedup | items | recall@5 | recall@10 | MRR |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| query prefix | scope | search | pipeline | rerank | dedup | items | recall@5 | recall@10 | MRR |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
         for name, subset in _subsets(items):
             m = summarize(r.ranks[i.id] for i in subset)
             lines.append(
-                f"| {r.prefix_mode} | {r.scope} | {r.mode} | {r.pipeline} | {r.dedup} | {name} ({m.n}) | {_fmt(m)} |"
+                f"| {r.prefix_mode} | {r.scope} | {r.mode} | {r.pipeline} | {r.rerank} | {r.dedup} | {name} ({m.n}) | {_fmt(m)} |"
             )
     dd = [r for r in results if r.rep_ranks]
     if dd:
@@ -489,34 +566,36 @@ def render_table(results: list[RunResult], items: list[GoldItem]) -> str:
             "Near-duplicate collapse: rep-only = hit only when the representative itself is expected;",
             "freed = duplicate entries absorbed from the un-collapsed top 10 (mean per query, and queries with any).",
             "",
-            "| scope | search | pipeline | dedup | rep-only R@5 | rep-only R@10 | rep-only MRR | freed / query | queries with freed slots |",
-            "|---|---|---|---|---|---|---|---|---|",
+            "| scope | search | pipeline | rerank | dedup | rep-only R@5 | rep-only R@10 | rep-only MRR | freed / query | queries with freed slots |",
+            "|---|---|---|---|---|---|---|---|---|---|",
         ]
         for r in dd:
             m = summarize(r.rep_ranks[i.id] for i in items)
             fr = [r.freed[i.id] for i in items]
             lines.append(
-                f"| {r.scope} | {r.mode} | {r.pipeline} | {r.dedup} | {_fmt(m).replace(' | ', ' | ')} | "
+                f"| {r.scope} | {r.mode} | {r.pipeline} | {r.rerank} | {r.dedup} | {_fmt(m)} | "
                 f"{sum(fr) / len(fr):.2f} | {sum(1 for f in fr if f)} |"
             )
     lines += [
         "",
-        "| scope | search | pipeline | dedup | channel | p50 ms | p95 ms | max ms |",
-        "|---|---|---|---|---|---|---|---|",
+        "| scope | search | pipeline | rerank | dedup | channel | p50 ms | p95 ms | max ms |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for r in results:
         for ch, ts in sorted(r.timings.items()):
             lines.append(
-                f"| {r.scope} | {r.mode} | {r.pipeline} | {r.dedup} | {ch} | {percentile(ts, 50):.1f} | "
+                f"| {r.scope} | {r.mode} | {r.pipeline} | {r.rerank} | {r.dedup} | {ch} | {percentile(ts, 50):.1f} | "
                 f"{percentile(ts, 95):.1f} | {max(ts):.1f} |"
             )
-    by_key = {(r.prefix_mode, r.scope, r.mode, r.pipeline, r.dedup): r for r in results}
+    by_key = {(r.prefix_mode, r.scope, r.mode, r.pipeline, r.dedup, r.rerank): r for r in results}
     loss_lines = []
-    for (p, s, mode, pl, dd_), r in by_key.items():
-        if not mode.startswith("index") or (p, s, "exact", pl, dd_) not in by_key:
+    for (p, s, mode, pl, dd_, rk), r in by_key.items():
+        if not mode.startswith("index") or (p, s, "exact", pl, dd_, rk) not in by_key:
             continue
-        lost = index_loss(by_key[(p, s, "exact", pl, dd_)].ranks, r.ranks)
-        loss_lines.append(f"- prefix {p}, scope {s}, {mode}, {pl}, dedup {dd_}: lost {len(lost)} exact top-10 hit(s) {lost}")
+        lost = index_loss(by_key[(p, s, "exact", pl, dd_, rk)].ranks, r.ranks)
+        loss_lines.append(
+            f"- prefix {p}, scope {s}, {mode}, {pl}, rerank {rk}, dedup {dd_}: lost {len(lost)} exact top-10 hit(s) {lost}"
+        )
     if loss_lines:
         lines += ["", "Index loss (exact top-10 hits missing from index top-10):", *loss_lines]
     return "\n".join(lines)
@@ -558,6 +637,11 @@ def main(argv: list[str] | None = None) -> int:
         help="comma list of cosine thresholds for dedup=on (e.g. 0.92,0.94,0.96)",
     )
     ap.add_argument("--dedup-representative", choices=["best", "newest"], default=ddp.representative)
+    rpd = RerankParams()
+    ap.add_argument("--rerank", default="off", help="comma list of off,on: local cross-encoder over the pool head")
+    ap.add_argument("--rerank-url", default=rpd.url)
+    ap.add_argument("--rerank-candidates", default=str(rpd.candidates), help="comma list of head sizes, e.g. 20,30")
+    ap.add_argument("--rerank-blend", default=rpd.blend, help="comma list of rerank,rrf")
     ap.add_argument(
         "--keyword-sql",
         type=Path,
@@ -606,6 +690,15 @@ def main(argv: list[str] | None = None) -> int:
             for t in (float(x) for x in args.dedup_thresholds.split(",") if x.strip()):
                 dedup_modes.append((f"{t:g}", t))
     near_dup_sql = load_near_dup_sql() if any(t is not None for _, t in dedup_modes) else None
+    rerank_modes: list[tuple[str, RerankParams | None]] = []
+    for r in (x.strip() for x in args.rerank.split(",") if x.strip()):
+        if r == "off":
+            rerank_modes.append(("off", None))
+            continue
+        for n in (int(x) for x in args.rerank_candidates.split(",") if x.strip()):
+            for b in (x.strip() for x in args.rerank_blend.split(",") if x.strip()):
+                rp = RerankParams(url=args.rerank_url, candidates=n, blend=b)
+                rerank_modes.append((f"{n}" + ("" if b == "rerank" else f"-{b}"), rp))
 
     conn = psycopg2.connect(args.dsn or config.DATABASE_URL)
     conn.set_session(readonly=True, autocommit=False)
@@ -628,11 +721,17 @@ def main(argv: list[str] | None = None) -> int:
                 if mode == "index" and iterative:
                     label = f"index+{iterative}"
                 for pipeline in pipelines:
+                    variants = [(rk, rp, dname, thr) for rk, rp in rerank_modes for dname, thr in dedup_modes]
                     runs = [
                         RunResult(
-                            prefix_mode=f"{pm} ({prefix!r})", scope=scope, mode=label, pipeline=pipeline, dedup=dname
+                            prefix_mode=f"{pm} ({prefix!r})",
+                            scope=scope,
+                            mode=label,
+                            pipeline=pipeline,
+                            dedup=dname,
+                            rerank=rk,
                         )
-                        for dname, _ in dedup_modes
+                        for rk, _, dname, _ in variants
                     ]
                     t0 = time.monotonic()
                     for it in items:
@@ -653,12 +752,19 @@ def main(argv: list[str] | None = None) -> int:
                             timings=runs[0].timings,
                             return_pool=True,
                         )
-                        for rr, (_, thr) in zip(runs, dedup_modes):
+                        reranked: dict[str, list[str]] = {}
+                        for rr, (rk, rp, _, thr) in zip(runs, variants):
+                            if rp is None:
+                                ordered = pool
+                            else:
+                                if rk not in reranked:
+                                    reranked[rk] = run_rerank(cur, it.query, pool, rp, rr.timings)
+                                ordered = reranked[rk]
                             if thr is None:
-                                rr.ranks[it.id] = first_hit_rank(pool[: args.depth], it.expected_ids)
+                                rr.ranks[it.id] = first_hit_rank(ordered[: args.depth], it.expected_ids)
                                 continue
                             groups, freed = run_dedup(
-                                cur, pool, thr, args.depth, near_dup_sql, rr.timings, args.dedup_representative
+                                cur, ordered, thr, args.depth, near_dup_sql, rr.timings, args.dedup_representative
                             )
                             rr.ranks[it.id] = first_hit_rank_groups(groups, it.expected_ids)
                             rr.rep_ranks[it.id] = first_hit_rank_groups(groups, it.expected_ids, rep_only=True)
@@ -669,7 +775,8 @@ def main(argv: list[str] | None = None) -> int:
                         results.append(rr)
                         m = summarize(rr.ranks.values())
                         print(
-                            f"[{rr.prefix_mode} {scope} {mode} {pipeline} dedup={rr.dedup}] R@5={m.recall_at_5:.3f} "
+                            f"[{rr.prefix_mode} {scope} {mode} {pipeline} rerank={rr.rerank} dedup={rr.dedup}] "
+                            f"R@5={m.recall_at_5:.3f} "
                             f"R@10={m.recall_at_10:.3f} MRR={m.mrr:.3f} ({rr.seconds:.1f}s)",
                             file=sys.stderr,
                         )
@@ -677,7 +784,9 @@ def main(argv: list[str] | None = None) -> int:
 
     print(render_table(results, items))
     if args.per_item:
-        header = "item | " + " | ".join(f"{r.prefix_mode}/{r.scope}/{r.mode}/{r.pipeline}/{r.dedup}" for r in results)
+        header = "item | " + " | ".join(
+            f"{r.prefix_mode}/{r.scope}/{r.mode}/{r.pipeline}/{r.rerank}/{r.dedup}" for r in results
+        )
         print("\n" + header)
         for it in items:
             cells = " | ".join(str(r.ranks[it.id] or f">{args.depth}") for r in results)
@@ -692,6 +801,7 @@ def main(argv: list[str] | None = None) -> int:
                         "mode": r.mode,
                         "pipeline": r.pipeline,
                         "dedup": r.dedup,
+                        "rerank": r.rerank,
                         "rep_ranks": r.rep_ranks,
                         "freed": r.freed,
                         "seconds": r.seconds,
