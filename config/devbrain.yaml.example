@@ -38,6 +38,22 @@ embedding:
   # otherwise. "" disables. Env DEVBRAIN_QUERY_PREFIX overrides.
   # query_prefix: "query: "
 
+# deep_search hybrid retrieval: a Postgres full-text keyword channel (needs
+# migration 047's index) fused with vector search by Reciprocal Rank Fusion.
+# All optional; the values shown are the defaults. Env overrides:
+# DEVBRAIN_HYBRID_SEARCH (on/off), DEVBRAIN_RRF_K, DEVBRAIN_KEYWORD_WEIGHT,
+# DEVBRAIN_KEYWORD_TERMS.
+# search:
+#   hybrid: true               # false = vector-only (the pre-047 behavior)
+#   rrf_k: 60
+#   keyword_weight: 1.0        # RRF weight of the keyword list (vector = 1)
+#   candidates: 50             # rows per channel before fusion
+#   keyword_terms: identifiers # identifiers (snake_case, file.ext, CONSTANT, ...) | all
+#   keyword_max_df: 0.002      # drop query terms found in more than this share of rows
+#   keyword_row_budget: 3000   # max summed row count of the kept terms
+#   keyword_max_terms: 12
+#   keyword_timeout_ms: 1000   # over this, the search falls back to vector-only
+
 summarization:
   provider: ollama
   url: http://localhost:11434
