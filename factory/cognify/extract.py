@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
-from cognify import backends, codex_home, gate, relate
+from cognify import backends, codex_home, gate, relate, screen
 from cognify.embedding import embed_text, to_vector_literal
 from cognify.orchestrator import CognifyPass, PassResult, register_pass
 from observability.pricing import (
@@ -806,9 +806,10 @@ def _load_session_chunks(conn: Any, session_id: str, project_id: Any) -> list[di
     We exclude tier='lesson' rows to avoid feeding the LLM its own prior
     extraction outputs.
     """
+    flags_col = ", screen_flags" if screen.has_flag_column(conn) else ""
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id, kind, title, content FROM devbrain.memory "
+            f"SELECT id, kind, title, content{flags_col} FROM devbrain.memory "
             "WHERE provenance_id = %s::uuid "
             "  AND project_id = %s "
             "  AND archived_at IS NULL "
@@ -821,16 +822,31 @@ def _load_session_chunks(conn: Any, session_id: str, project_id: Any) -> list[di
 
 
 def _combine_chunks(chunks: list[dict]) -> str:
-    """Combine chunks into a single text block for LLM input."""
+    """Combine chunks into a single text block for LLM input.
+
+    Segments flagged by injection screening (cognify/screen.py) are
+    replaced by a placeholder: text that tries to instruct the model must
+    not reach the extraction prompt."""
     parts = []
+    withheld = 0
     for c in chunks:
         title = c.get("title") or ""
-        content = c.get("content") or ""
+        content, flags = screen.withhold(c.get("content") or "", c.get("screen_flags"))
+        withheld += bool(flags)
         if title:
             parts.append(f"## {title}\n{content}")
         else:
             parts.append(content)
-    return "\n\n".join(parts)
+    combined = "\n\n".join(parts)
+    # Screen the exact prompt text too: a payload split across two rows, or
+    # between a title and its content, only exists once they are joined.
+    combined, joined_flags = screen.withhold(combined)
+    if withheld or joined_flags:
+        logger.info(
+            "cognify_extract: injection screening withheld text (%d row(s); joined: %s)",
+            withheld, ",".join(joined_flags) or "-",
+        )
+    return combined
 
 
 def _codex_extract(content: str, *, model: str | None = None) -> dict:

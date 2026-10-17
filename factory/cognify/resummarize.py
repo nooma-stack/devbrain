@@ -124,7 +124,12 @@ def _load_session_raw_content(conn: Any, session_id: str) -> str | None:
             (session_id,),
         )
         row = cur.fetchone()
-    return row[0] if row else None
+    if not row or row[0] is None:
+        return None
+    from cognify import screen  # noqa: PLC0415
+
+    # Withhold injection-flagged messages before the summarizer sees them.
+    return screen.withhold_usf(row[0])[0]
 
 
 def _build_summarize_prompt(raw_content: str) -> tuple[str, str]:

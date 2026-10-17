@@ -83,6 +83,43 @@ agent's volunteered judgment (promote / contradict / refine / new-edges) and dra
 `curator_re_eval_queue`, decaying `strength` along `depends_on` cascade edges with a
 subtractive penalty and 24h-half-life freshness.
 
+### Prompt-injection screening (`ingest/screening.py`, migration 049)
+Rules, no model call, ~1 ms per transcript. Flags: `override` ("ignore
+previous instructions", "you are now in developer mode", "new system
+prompt:"), `agent_directive` ("if you are an AI reading this", "note to the
+assistant:"), `fake_tag` (`<|im_start|>`, `[INST]`, `<<SYS>>`, a bare
+`<system>` tag, `</tool_result>`, `\n\nHuman:`), `exfil` (send credentials to
+an address, reveal the system prompt), `hidden_unicode` (Unicode tag
+characters, bidi overrides, zero-width characters inside words).
+
+- Every rule runs on the raw text, on a normalized form (HTML entities and
+  `\uXXXX` / `%XX` escapes decoded, NFKC, invisible characters removed,
+  Cyrillic/Greek look-alikes mapped to Latin, case-folded) and, for the
+  wording rules, on a squashed form (separators collapsed, spelled-out
+  letters rejoined). A hit only the normalized/squashed form produces also
+  gets `obfuscated`.
+- Trust comes only from structure. In a structured message (ingest's
+  parsed session, raw_content JSON) the person's own typed user turn is
+  the principal and only gets the hidden-unicode check; a `[tool_result]`
+  line inside it starts an untrusted part. FLAT text (chunks, assembled
+  prompts, summaries, notes) is never trusted: a role prefix there is just
+  text a tool result could forge.
+- Ingest screens each message and stores on each chunk the union of the
+  flags of the messages it overlaps (`memory.screen_flags`, NULL = no
+  flag), so a payload split across chunks flags them all; the summary is
+  built from the messages with flagged ones withheld.
+- extract and fanout screen the exact assembled prompt text (titles,
+  contents and chunk joins included) and replace flagged segments with
+  `[segment withheld by injection screening: <flags>]`; resummarize screens
+  raw_content per message. A row with stored flags the rules no longer
+  reproduce is withheld whole.
+- `deep_search` can select `memory.screen_flags` to label results.
+- `devbrain screen-memory [--project] [--kind] [--since] [--apply]` reports
+  (default, read-only) or sets flags on existing rows; it writes flagged rows
+  only, never clean ones.
+- `ingest.screening.model_check: true` adds a local-model confirmation of
+  rule hits at ingest (loopback only unless `allow_remote_model`).
+
 ### Hosted backends: allow-list and codex isolation
 - `cognify.allowed_backends` (`factory/cognify/backends.py`) lists the hosted
   backends a deployment may send memory/transcript text to: `codex` (ChatGPT

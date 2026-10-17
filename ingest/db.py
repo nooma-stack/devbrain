@@ -186,6 +186,7 @@ def _insert_chunk_on_cursor(
     content: str,
     vector_str: str,
     token_count: int,
+    screen_flags: list[str] | None = None,
 ) -> str:
     """INSERT the chunk + dual-write its memory row on the given cursor.
     Does NOT commit — the caller owns the transaction."""
@@ -220,6 +221,7 @@ def _insert_chunk_on_cursor(
             content=content,
             embedding_sql=vector_str,
             provenance_id=source_id,
+            screen_flags=screen_flags,
         )
     return chunk_id
 
@@ -235,6 +237,7 @@ def insert_chunk(
     embedding: list[float],
     token_count: int,
     cur=None,
+    screen_flags: list[str] | None = None,
 ) -> str:
     """Insert a chunk + dual-write its memory row.
 
@@ -249,6 +252,7 @@ def insert_chunk(
         project_id=project_id, source_type=source_type, source_id=source_id,
         source_line_start=source_line_start, source_line_end=source_line_end,
         content=content, vector_str=vector_str, token_count=token_count,
+        screen_flags=screen_flags,
     )
     if cur is not None:
         return _insert_chunk_on_cursor(cur, **kw)

@@ -341,7 +341,11 @@ def _load_session_content(conn: Any, session_id: str) -> str | None:
 
     if not rows:
         return ""
-    return "\n\n".join(r[0] for r in rows if r[0])
+    from cognify import screen  # noqa: PLC0415
+
+    # Withhold injection-flagged segments before the classifier sees them;
+    # screened after joining so a payload split across chunks is caught.
+    return screen.withhold("\n\n".join(r[0] for r in rows if r[0]))[0]
 
 
 def classify_session(

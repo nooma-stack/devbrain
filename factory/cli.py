@@ -3892,6 +3892,114 @@ def cognify_codex_home_command(do_init, force):
         sys.exit(1)
 
 
+@cli.command("screen-memory")
+@click.option("--project", "project_slug", default=None, help="Limit to one project.")
+@click.option("--kind", "kinds", multiple=True,
+              help="Memory kinds to screen (repeatable; default all).")
+@click.option("--since", default=None, help="Only rows created on/after this ISO date.")
+@click.option("--limit", type=int, default=50000, show_default=True,
+              help="Maximum rows to read (newest first).")
+@click.option("--apply", "apply_flags", is_flag=True, default=False,
+              help="Write memory.screen_flags on flagged rows (default: report only).")
+@click.option("--json", "as_json", is_flag=True, default=False, help="Emit JSON.")
+def screen_memory_command(project_slug, kinds, since, limit, apply_flags, as_json):
+    """Screen stored memory rows for prompt-injection content.
+
+    Read-only by default: reports how many rows each rule flags. With
+    --apply, sets memory.screen_flags (migration 049) on flagged rows only;
+    clean rows are never written. Ingest screens new chunks itself; this
+    covers older rows and rows written by store / breadcrumb / end_session.
+    """
+    import json as _json
+    import sys
+    from collections import Counter
+
+    sys.path.insert(0, str(__import__("pathlib").Path(__file__).parent))
+    from cognify import screen
+
+    db = get_db()
+    conn = db._conn()
+    try:
+        if not apply_flags:
+            conn.set_session(readonly=True)
+        if apply_flags and not screen.has_flag_column(conn):
+            raise click.ClickException(
+                "memory.screen_flags is missing: run `devbrain migrate` (049) first"
+            )
+        where = ["m.archived_at IS NULL"]
+        params: list = []
+        if project_slug:
+            where.append("p.slug = %s")
+            params.append(project_slug)
+        if kinds:
+            where.append("m.kind = ANY(%s)")
+            params.append(list(kinds))
+        if since:
+            where.append("m.created_at >= %s")
+            params.append(since)
+        flags_col = "m.screen_flags" if screen.has_flag_column(conn) else "NULL::text[]"
+        sql = (
+            f"SELECT m.id, m.kind, m.title, m.content, {flags_col} FROM devbrain.memory m "
+            "JOIN devbrain.projects p ON p.id = m.project_id WHERE "
+            + " AND ".join(where)
+            + " ORDER BY m.created_at DESC LIMIT %s"
+        )
+        params.append(int(limit))
+        scanned: Counter = Counter()
+        flagged: Counter = Counter()
+        rules: Counter = Counter()
+        ids: list[str] = []
+        updates: list[tuple[list[str], str]] = []
+        with conn.cursor(name="screen_memory") as cur:
+            cur.itersize = 2000
+            cur.execute(sql, params)
+            for mid, kind, title, content, stored in cur:
+                scanned[kind] += 1
+                # Title and content together: that is how extraction and
+                # deep_search present an atom.
+                text = f"{title}\n{content}" if title and not (content or "").startswith(title) else content
+                flags = screen.rules.flags_for(text)
+                if not flags:
+                    continue
+                flagged[kind] += 1
+                rules.update(flags)
+                if len(ids) < 200:
+                    ids.append(str(mid))
+                if sorted(stored or []) != flags:
+                    updates.append((flags, str(mid)))
+        written = 0
+        if apply_flags and updates:
+            with conn.cursor() as cur:
+                for flags, mid in updates:
+                    cur.execute(
+                        "UPDATE devbrain.memory SET screen_flags = %s WHERE id = %s",
+                        (flags, mid),
+                    )
+                    written += cur.rowcount
+            conn.commit()
+        else:
+            conn.rollback()
+    finally:
+        conn.close()
+
+    out = {
+        "scanned": dict(scanned),
+        "flagged": dict(flagged),
+        "rules": dict(rules),
+        "would_write" if not apply_flags else "written": written if apply_flags else len(updates),
+        "flagged_ids": ids,
+    }
+    if as_json:
+        click.echo(_json.dumps(out, indent=2))
+        return
+    click.echo(f"scanned {sum(scanned.values())} rows: {dict(scanned)}")
+    click.echo(f"flagged {sum(flagged.values())}: {dict(flagged)}  rules: {dict(rules)}")
+    if apply_flags:
+        click.echo(f"wrote screen_flags on {written} row(s)")
+    else:
+        click.echo(f"{len(updates)} row(s) would be written; rerun with --apply")
+
+
 @cli.command("cognify-bulk")
 @click.option("--project", "project_slug", required=True,
               help="Project slug.")

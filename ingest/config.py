@@ -177,3 +177,29 @@ AUTO_PROJECT_ROOTS = _config["ingest"].get("auto_project_roots", [])
 INGEST_EXCLUDE_PATH_PARTS = list(
     _config["ingest"].get("exclude_path_parts", ["subagents"])
 )
+
+# Prompt-injection screening (ingest/screening.py). mode: on (default) |
+# off; env DEVBRAIN_SCREENING. model_check: optional second pass where the
+# LOCAL summarization model confirms rule hits before a chunk is marked;
+# env DEVBRAIN_SCREENING_MODEL_CHECK. A non-loopback model URL disables the
+# second pass unless allow_remote_model is set (transcripts may hold PHI).
+_SCREENING = _config["ingest"].get("screening") or {}
+
+
+def _flag(v, default: bool) -> bool:
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() not in ("off", "0", "false", "no", "")
+
+
+SCREENING_ENABLED = _flag(
+    os.environ.get("DEVBRAIN_SCREENING", _SCREENING.get("mode")), True
+)
+SCREENING_MODEL_CHECK = _flag(
+    os.environ.get("DEVBRAIN_SCREENING_MODEL_CHECK", _SCREENING.get("model_check")), False
+)
+SCREENING_MODEL = str(_SCREENING.get("model") or SUMMARIZE_MODEL)
+SCREENING_URL = str(_SCREENING.get("url") or SUMMARIZE_URL)
+SCREENING_ALLOW_REMOTE_MODEL = _flag(_SCREENING.get("allow_remote_model"), False)
