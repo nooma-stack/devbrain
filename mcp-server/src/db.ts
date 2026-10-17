@@ -35,8 +35,18 @@ function getPool(): pg.Pool {
     // until ef_search 200 (2026-08-27; 19ms vs 992ms for an exact scan,
     // so the recall headroom is nearly free). Applied per-connection:
     // SET is session-scoped and pool connections are long-lived.
+    //
+    // 2026-10-17 recall audit (ingest/recall_audit, #214): with 200, the
+    // project filter is applied AFTER the index scan, so big projects lost
+    // rows (a trifekta-ai query asked for 50 and got 4) and some unfiltered
+    // queries missed exact ranks 1 and 3. ef_search 400 matched the exact
+    // scan in all 8 audit setups (~17ms/query). iterative_scan (pgvector
+    // >= 0.8) keeps scanning until the filtered LIMIT is filled; relaxed
+    // order is safe because callers re-rank by score. Older pgvector
+    // rejects the setting, which the catch ignores.
     _pool.on('connect', (client) => {
-      client.query("SET hnsw.ef_search = 200").catch(() => {})
+      client.query("SET hnsw.ef_search = 400").catch(() => {})
+      client.query("SET hnsw.iterative_scan = relaxed_order").catch(() => {})
     })
   }
   return _pool
