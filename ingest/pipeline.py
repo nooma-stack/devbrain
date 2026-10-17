@@ -16,7 +16,7 @@ from adapters.markdown_memory import MarkdownMemoryAdapter
 from adapters.openclaw import OpenClawAdapter
 from chunker import chunk_text
 from config import INGEST_EXCLUDE_PATH_PARTS
-from db import delete_chunks_for_session, get_connection, get_or_create_project_id, get_existing_session_id, insert_chunk, insert_raw_session, session_exists, update_session_summary
+from db import delete_chunks_for_session, get_connection, get_or_create_project_id, get_existing_session_id, get_session_by_hash, insert_chunk, insert_raw_session, session_exists, update_session_summary
 from embeddings import embed, embed_batch
 from screening_runtime import session_chunk_flags, session_text_for_model
 
@@ -59,9 +59,17 @@ def ingest_file(path: Path, *, force: bool = False) -> bool:
 
     fhash = file_hash(path)
 
-    # Skip if exact same content already ingested (hash match)
-    if not force and session_exists(adapter.app_name, fhash):
-        return False
+    # Skip if exact same content already ingested (hash match) — unless it
+    # was stored without a project and one resolves now (a mapping was
+    # added since): then attach it and write the missing memory rows from
+    # the stored chunks, without re-embedding anything.
+    if not force:
+        existing = get_session_by_hash(adapter.app_name, fhash)
+        if existing is not None:
+            raw_id, project = existing
+            if project is None:
+                return _attach_project(adapter, path, raw_id)
+            return False
 
     print(f"  Parsing {path.name} with {adapter.app_name} adapter...")
     session = adapter.parse(path)
@@ -78,6 +86,21 @@ def ingest_file(path: Path, *, force: bool = False) -> bool:
             print(f"  Updating existing session (content grew)")
 
     return _process_session(session, path, fhash, is_update=is_update)
+
+
+def _attach_project(adapter, path: Path, raw_id: str) -> bool:
+    """Late project resolution for an already-ingested session."""
+    slug = adapter.detect_project(path)
+    if not slug:
+        return False
+    from repair_projects import repair_session  # noqa: PLC0415
+
+    project_id = get_or_create_project_id(slug)
+    with get_connection() as conn, conn.cursor() as cur:
+        n = repair_session(cur, raw_id, project_id)
+        conn.commit()
+    print(f"  Attached {path.name} to project {slug} ({n} memory rows from stored chunks)")
+    return True
 
 
 def _embed_chunks(chunks) -> list[list[float]]:
@@ -109,6 +132,12 @@ def _process_session(session: UniversalSession, source_path: Path, source_hash: 
     project_id = None
     if session.project_slug:
         project_id = get_or_create_project_id(session.project_slug)
+    else:
+        print(
+            "  No project matched this path: stored without one, so it is not "
+            "searchable. Add an ingest.project_mappings entry, then run "
+            "ingest/repair_projects.py (or let the watcher re-see the file)."
+        )
 
     # Structured USF JSON for raw_content storage (structured access later)
     # Strip NUL bytes — PostgreSQL TEXT columns reject them

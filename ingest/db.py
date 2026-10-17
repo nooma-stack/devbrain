@@ -53,6 +53,20 @@ def session_exists(source_app: str, source_hash: str) -> bool:
         return cur.fetchone() is not None
 
 
+def get_session_by_hash(source_app: str, source_hash: str) -> tuple[str, str | None] | None:
+    """(raw_sessions.id, project_id) for an already-ingested file, or None."""
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, project_id FROM devbrain.raw_sessions "
+            "WHERE source_app = %s AND source_hash = %s",
+            (source_app, source_hash),
+        )
+        row = cur.fetchone()
+    if not row:
+        return None
+    return str(row[0]), (str(row[1]) if row[1] else None)
+
+
 def get_existing_session_id(source_app: str, session_id: str) -> str | None:
     """Check if a session already exists by app + session_id (not hash)."""
     if not session_id:
@@ -141,14 +155,17 @@ def _insert_raw_session_on_cursor(
             """
             UPDATE devbrain.raw_sessions
             SET source_hash = %s, source_path = %s, message_count = %s,
-                raw_content = %s, ended_at = %s, files_touched = %s::jsonb
+                raw_content = %s, ended_at = %s, files_touched = %s::jsonb,
+                -- A session first ingested before its folder had a mapping
+                -- gets its project now; an existing project never changes.
+                project_id = COALESCE(project_id, %s)
             WHERE id = %s
             RETURNING id
             """,
             (
                 source_hash, source_path, message_count,
                 raw_content, ended_at, psycopg2.extras.Json(files_touched),
-                existing_id,
+                project_id, existing_id,
             ),
         )
         row = cur.fetchone()

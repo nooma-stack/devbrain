@@ -253,6 +253,19 @@ Each encodes a past incident or invariant:
 
 ## Known seams that have bitten us
 
+- **Project-less sessions never reached memory (fixed 2026-10).** A
+  session whose path matched no project mapping was stored with
+  `raw_sessions.project_id` / `chunks.project_id` NULL; the memory dual-write
+  needs a project, so its chunks were invisible to search, extraction and
+  fan-out. Re-ingest never re-resolved the project (the content-grew UPDATE
+  did not touch it, and an unchanged file was skipped by hash). Now the
+  UPDATE fills a NULL project, the watcher attaches an already-ingested
+  project-less file once a mapping resolves it, and
+  `ingest/repair_projects.py` backfills: it skips paths the current
+  `exclude_path_parts` reject, copies each chunk's stored embedding into the
+  new memory row (never re-embeds) with its screening flags, and throttles
+  (`--rows-per-second`). A prefix mapping for a bare workspace root no
+  longer overrides `auto_project_roots` for the root's sub-folders.
 - **Extract "empty" outage (2026-09-17 → 2026-10).** The codex model slug was
   retired for ChatGPT accounts; codex printed the 400 as
   `ERROR: {"type":"error",...}` and exited 1. `_salvage_last_json` took that

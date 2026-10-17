@@ -151,6 +151,11 @@ ingest:
   project_mappings: {}
     # "/Users/youruser/code/myproject": myproject
     # "/Users/youruser/code/another":   another
+    # A mapping for a bare workspace root that is also in auto_project_roots
+    # applies only to sessions started in the root itself; <root>/<folder>
+    # keeps the auto-root slug. A session that matches nothing is stored
+    # without a project and is NOT searchable: add a mapping, then run
+    # `ingest/repair_projects.py` (report first, then --apply).
 
   # Prompt-injection screening (ingest/screening.py). Rules flag text that
   # tries to instruct a model that later reads it (override, agent_directive,

@@ -16,6 +16,21 @@ from config import AUTO_PROJECT_ROOTS, PROJECT_MAPPINGS
 from .base import TranscriptAdapter, UniversalMessage, UniversalSession
 
 
+def _auto_root_match(absolute_path: str) -> tuple[str | None, int]:
+    """(slug, number of path segments in the matched root pattern) for the
+    auto-project-root convention; (None, 0) when no root matches."""
+    segs = Path(absolute_path).parts
+    for pattern in AUTO_PROJECT_ROOTS:
+        pat_segs = Path(pattern).parts
+        if len(segs) <= len(pat_segs):
+            continue
+        if all(fnmatch(s, p) for s, p in zip(segs, pat_segs)):
+            slug = segs[len(pat_segs)].lower()
+            slug = re.sub(r"[^a-z0-9_-]+", "-", slug).strip("-")
+            return (slug or None), len(pat_segs)
+    return None, 0
+
+
 def _auto_root_slug(absolute_path: str) -> str | None:
     """Derive a project slug from a workspace-root convention.
 
@@ -27,16 +42,7 @@ def _auto_root_slug(absolute_path: str) -> str | None:
     transcript-dir encoding turns dashes into slashes, which would split
     the folder name before it reaches us.
     """
-    segs = Path(absolute_path).parts
-    for pattern in AUTO_PROJECT_ROOTS:
-        pat_segs = Path(pattern).parts
-        if len(segs) <= len(pat_segs):
-            continue
-        if all(fnmatch(s, p) for s, p in zip(segs, pat_segs)):
-            slug = segs[len(pat_segs)].lower()
-            slug = re.sub(r"[^a-z0-9_-]+", "-", slug).strip("-")
-            return slug or None
-    return None
+    return _auto_root_match(absolute_path)[0]
 
 
 def _lookup_slug(absolute_path: str) -> str | None:
@@ -55,10 +61,19 @@ def _lookup_slug(absolute_path: str) -> str | None:
         (path, slug) for path, slug in expanded.items()
         if absolute_path.startswith(path) and slug
     ]
+    matches.sort(key=lambda x: len(x[0]), reverse=True)  # longest prefix wins
+    auto_slug, auto_depth = _auto_root_match(absolute_path)
     if matches:
-        matches.sort(key=lambda x: len(x[0]), reverse=True)  # longest prefix wins
-        return matches[0][1]
-    return _auto_root_slug(absolute_path)
+        best_path, best_slug = matches[0]
+        # A prefix mapping only beats the auto-root convention when it is
+        # more specific than the root itself. Otherwise a mapping for a
+        # bare workspace root (e.g. ~/Trifekta -> some-project, meant for
+        # sessions started in the root folder) would swallow every
+        # <root>/<folder> session the convention should name <folder>.
+        if auto_slug and len(Path(best_path).parts) <= auto_depth:
+            return auto_slug
+        return best_slug
+    return auto_slug
 
 
 class ClaudeCodeAdapter:
