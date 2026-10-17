@@ -11,14 +11,19 @@ import { z } from 'zod'
 import { getSearchConfig, query, queryWithTimeout, waitForDb } from './db.js'
 import { embed, embedQuery, toSqlVector } from './embeddings.js'
 import {
+  WEAK_MATCH_NOTE,
   applyRerank,
   collapseNearDuplicates,
+  groupStrength,
+  isWeak,
   keywordParams,
   keywordSql,
   matchedBy,
   nearDupSql,
   rerankDocText,
+  responseStrength,
   rrfFuse,
+  type MatchStrength,
 } from './hybrid.js'
 import { rerankScores } from './rerank.js'
 import { enqueueCascades, hasScreenFlagsColumn, recordMemory, recordMemoryDependency, resolveMemoryId } from './memory.js'
@@ -705,6 +710,15 @@ server.tool(
     }
     const top = topKeys.map((key) => byKey.get(key)!)
 
+    // Match strength per result group (reranker score, or cosine when the
+    // reranker did not score it) and for the response: drives rerank_score
+    // and the weak-match flag.
+    const cosineByKey = new Map([...byKey].map(([k, c]) => [k, c.score]))
+    const strengthByKey = new Map<string, MatchStrength | undefined>(
+      topKeys.map((k) => [k, groupStrength([k, ...(similarByKey?.get(k) ?? [])], rerankByKey, cosineByKey)]),
+    )
+    const responseWeak = searchCfg.weakMatch && isWeak(responseStrength([...strengthByKey.values()]), searchCfg)
+
     const results = await Promise.all(
       top.map(async (cand) => {
         const r: Record<string, unknown> = {
@@ -727,12 +741,13 @@ server.tool(
           // Which retrieval channel(s) surfaced this result: vector, keyword or both.
           r.matched_by = matchedByKey.get(keyOf(cand)) ?? 'vector'
         }
-        const rerankScore = rerankByKey?.get(keyOf(cand))
-        if (rerankScore !== undefined) {
-          // Local cross-encoder relevance (0..1) for this result.
-          r.rerank_score = Number(rerankScore.toFixed(4))
-        }
         const similar = similarByKey?.get(keyOf(cand))
+        const strength = strengthByKey.get(keyOf(cand))
+        if (strength?.basis === 'rerank') {
+          // Local cross-encoder relevance (0..1): best among this result and its similar_ids.
+          r.rerank_score = Number(strength.score.toFixed(4))
+        }
+        if (searchCfg.weakMatch && isWeak(strength, searchCfg)) r.weak_match = true
         if (similar) {
           // Near-duplicates collapsed into this slot (same fact, other copies).
           r.similar_count = similar.length
@@ -888,12 +903,16 @@ server.tool(
       }
     }
 
-    const responseBody: Record<string, unknown> = {
-      results,
-      hint: results.some((r) => r.has_full_context)
-        ? 'Call get_source_context(chunk_id) for full raw transcript around any result.'
-        : 'No raw session context available for these results.',
+    // weak_match / note first so a reader sees them before the results.
+    const responseBody: Record<string, unknown> = {}
+    if (searchCfg.weakMatch) {
+      responseBody.weak_match = responseWeak
+      if (responseWeak) responseBody.note = WEAK_MATCH_NOTE
     }
+    responseBody.results = results
+    responseBody.hint = results.some((r) => r.has_full_context)
+      ? 'Call get_source_context(chunk_id) for full raw transcript around any result.'
+      : 'No raw session context available for these results.'
     if (with_graph) {
       responseBody.graph = graphField ?? { memories: [], edges: [], seeds: [] }
     }

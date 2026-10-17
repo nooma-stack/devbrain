@@ -56,6 +56,12 @@ export interface SearchConfig {
   rerankBlend: 'rrf' | 'rerank'
   /** Request timeout; on timeout or error the search keeps the un-reranked order. */
   rerankTimeoutMs: number
+  /** Flag responses / results whose best score says DevBrain probably lacks the answer. */
+  weakMatch: boolean
+  /** Weak below this reranker score (0..1). */
+  weakMatchRerankThreshold: number
+  /** Weak below this cosine similarity when no reranker score is available. */
+  weakMatchCosineThreshold: number
 }
 
 // Measured 2026-10-17 with ingest/recall_audit on the Nooma corpus (see the
@@ -83,6 +89,12 @@ export const SEARCH_DEFAULTS: SearchConfig = {
   rerankCandidates: 30,
   rerankBlend: 'rrf',
   rerankTimeoutMs: 1200,
+  // ingest/recall_audit/weak.py, 2026-10-17 (76 gold + 50 absent-topic
+  // queries x 2 scopes): rerank < 0.88 → precision 0.92, recall 0.94;
+  // cosine < 0.41 → precision 0.94, recall 0.34 (fallback only).
+  weakMatch: true,
+  weakMatchRerankThreshold: 0.88,
+  weakMatchCosineThreshold: 0.41,
 }
 
 type Env = Record<string, string | undefined>
@@ -118,12 +130,13 @@ function parseTerms(v: unknown): boolean | undefined {
  * DEVBRAIN_KEYWORD_WEIGHT, DEVBRAIN_KEYWORD_TERMS (identifiers|all),
  * DEVBRAIN_DEDUP_SEARCH (on/off), DEVBRAIN_DEDUP_THRESHOLD,
  * DEVBRAIN_RECENCY_STRATEGY (hnsw|exact), DEVBRAIN_RERANK (on/off),
- * DEVBRAIN_RERANK_URL.
+ * DEVBRAIN_RERANK_URL, DEVBRAIN_WEAK_MATCH (on/off).
  * yaml: search.{hybrid, rrf_k, keyword_weight, candidates, keyword_max_df,
  * keyword_row_budget, keyword_max_terms, keyword_terms, keyword_timeout_ms,
  * dedup, dedup_threshold, dedup_representative, dedup_timeout_ms,
  * recency_strategy, recency_max_scan_tuples, recency_timeout_ms, rerank,
- * rerank_url, rerank_candidates, rerank_blend, rerank_timeout_ms}.
+ * rerank_url, rerank_candidates, rerank_blend, rerank_timeout_ms, weak_match,
+ * weak_match_rerank_threshold, weak_match_cosine_threshold}.
  */
 export function resolveSearchConfig(yaml: unknown, env: Env = process.env): SearchConfig {
   const y = (yaml && typeof yaml === 'object' ? yaml : {}) as Record<string, unknown>
@@ -170,6 +183,15 @@ export function resolveSearchConfig(yaml: unknown, env: Env = process.env): Sear
     rerankCandidates: Math.round(pick(parseNum(y.rerank_candidates, (n) => n >= 2 && n <= 100), d.rerankCandidates)),
     rerankBlend: pick(parseBlend(y.rerank_blend), d.rerankBlend),
     rerankTimeoutMs: Math.round(pick(parseNum(y.rerank_timeout_ms, (n) => n >= 10), d.rerankTimeoutMs)),
+    weakMatch: pick(parseBool(env.DEVBRAIN_WEAK_MATCH), parseBool(y.weak_match), d.weakMatch),
+    weakMatchRerankThreshold: pick(
+      parseNum(y.weak_match_rerank_threshold, (n) => n >= 0 && n <= 1),
+      d.weakMatchRerankThreshold,
+    ),
+    weakMatchCosineThreshold: pick(
+      parseNum(y.weak_match_cosine_threshold, (n) => n >= -1 && n <= 1),
+      d.weakMatchCosineThreshold,
+    ),
   }
 }
 
@@ -396,3 +418,50 @@ export function applyRerank(
   if (blend === 'rrf') byScore = rrfFuse([byScore, scored], [1, 1], k, scored.length)
   return [...byScore, ...unscored, ...pool.slice(n)]
 }
+
+// ─── Weak-match flag ────────────────────────────────────────────────────────
+
+export type MatchBasis = 'rerank' | 'cosine'
+
+export interface MatchStrength {
+  /** Best score for this result / response. */
+  score: number
+  basis: MatchBasis
+}
+
+/**
+ * Strength of one result group: the highest reranker score among its
+ * members when any was reranked, else the highest cosine. Mirror of the
+ * per-group max in ingest/recall_audit/weak.py.
+ */
+export function groupStrength(
+  members: string[],
+  rerank: Map<string, number> | null,
+  cosine: Map<string, number>,
+): MatchStrength | undefined {
+  const rr = rerank ? members.map((k) => rerank.get(k)).filter((v): v is number => v !== undefined) : []
+  if (rr.length > 0) return { score: Math.max(...rr), basis: 'rerank' }
+  const cc = members.map((k) => cosine.get(k)).filter((v): v is number => v !== undefined)
+  return cc.length > 0 ? { score: Math.max(...cc), basis: 'cosine' } : undefined
+}
+
+/**
+ * Response strength: reranker basis when the reranker scored any returned
+ * group (its scores are on one scale), else cosine.
+ */
+export function responseStrength(groups: Array<MatchStrength | undefined>): MatchStrength | undefined {
+  const rr = groups.filter((g): g is MatchStrength => g?.basis === 'rerank')
+  const pool = rr.length > 0 ? rr : groups.filter((g): g is MatchStrength => g !== undefined)
+  if (pool.length === 0) return undefined
+  return { score: Math.max(...pool.map((g) => g.score)), basis: pool[0].basis }
+}
+
+/** True when the strength is below its basis' threshold (no strength = weak). */
+export function isWeak(strength: MatchStrength | undefined, cfg: SearchConfig): boolean {
+  if (!strength) return true
+  const t = strength.basis === 'rerank' ? cfg.weakMatchRerankThreshold : cfg.weakMatchCosineThreshold
+  return strength.score < t
+}
+
+export const WEAK_MATCH_NOTE =
+  'Weak match: no result clears the relevance threshold, so DevBrain probably has no memory that answers this; treat these results as loosely related, not as the answer.'

@@ -141,3 +141,54 @@ describe('deep_search wiring', () => {
     assert.match(kw, /memory_id, memory_kind, title, content,/)
   })
 })
+
+describe('weak-match flag', () => {
+  test('group strength prefers reranker scores, falls back to cosine', async () => {
+    const { groupStrength } = await import('./hybrid.js')
+    const rr = new Map([['b', 0.9]])
+    const cos = new Map([['a', 0.5], ['b', 0.4], ['c', 0.7]])
+    assert.deepEqual(groupStrength(['a', 'b'], rr, cos), { score: 0.9, basis: 'rerank' })
+    assert.deepEqual(groupStrength(['a', 'c'], rr, cos), { score: 0.7, basis: 'cosine' })
+    assert.deepEqual(groupStrength(['a', 'c'], null, cos), { score: 0.7, basis: 'cosine' })
+    assert.equal(groupStrength(['z'], null, cos), undefined)
+  })
+
+  test('response strength uses the reranker scale when any group has it', async () => {
+    const { responseStrength } = await import('./hybrid.js')
+    assert.deepEqual(
+      responseStrength([{ score: 0.6, basis: 'cosine' }, { score: 0.85, basis: 'rerank' }, undefined]),
+      { score: 0.85, basis: 'rerank' },
+    )
+    assert.deepEqual(responseStrength([{ score: 0.6, basis: 'cosine' }]), { score: 0.6, basis: 'cosine' })
+    assert.equal(responseStrength([]), undefined)
+  })
+
+  test('isWeak applies the basis threshold; nothing returned is weak', async () => {
+    const { isWeak } = await import('./hybrid.js')
+    const cfg = resolveSearchConfig({}, {})
+    assert.equal(isWeak({ score: 0.87, basis: 'rerank' }, cfg), true)
+    assert.equal(isWeak({ score: 0.95, basis: 'rerank' }, cfg), false)
+    assert.equal(isWeak({ score: 0.40, basis: 'cosine' }, cfg), true)
+    assert.equal(isWeak({ score: 0.60, basis: 'cosine' }, cfg), false)
+    assert.equal(isWeak(undefined, cfg), true)
+  })
+
+  test('config: defaults, env switch, yaml thresholds', () => {
+    const d = resolveSearchConfig({}, {})
+    assert.equal(d.weakMatch, true)
+    assert.equal(d.weakMatchRerankThreshold, 0.88)
+    assert.equal(d.weakMatchCosineThreshold, 0.41)
+    const c = resolveSearchConfig({ weak_match_rerank_threshold: 0.8, weak_match_cosine_threshold: 0.5 }, { DEVBRAIN_WEAK_MATCH: 'off' })
+    assert.equal(c.weakMatch, false)
+    assert.equal(c.weakMatchRerankThreshold, 0.8)
+    assert.equal(c.weakMatchCosineThreshold, 0.5)
+  })
+
+  test('deep_search puts weak_match and the note ahead of the results', () => {
+    const src = readFileSync(resolve(import.meta.dirname, 'index.ts'), 'utf-8')
+    const w = src.indexOf('responseBody.weak_match = responseWeak')
+    const r = src.indexOf('responseBody.results = results')
+    assert.ok(w > 0 && r > w)
+    assert.match(src, /if \(searchCfg\.weakMatch && isWeak\(strength, searchCfg\)\) r\.weak_match = true/)
+  })
+})
