@@ -83,6 +83,37 @@ agent's volunteered judgment (promote / contradict / refine / new-edges) and dra
 `curator_re_eval_queue`, decaying `strength` along `depends_on` cascade edges with a
 subtractive penalty and 24h-half-life freshness.
 
+### Write-time relation check (`factory/cognify/relate.py`, migration 048)
+Off by default (`write_path.relation_check.mode: off | shadow | on`). When on,
+each new decision/pattern/issue atom is compared with its nearest live atoms in
+the same project (cosine >= `threshold`, default 0.80) and the local model
+labels it:
+
+| verdict | effect |
+|---------|--------|
+| `same` | nothing new is kept; the existing atom gets `strength + 0.1` (cap 1.0) and `last_hit = now()` |
+| `refines` | row kept + `refined_by` edge old -> new |
+| `contradicts` | row kept + `supersedes` edge new -> old, depends_on dependents queued, log row `review_status = 'pending'` |
+| `new` | plain write |
+
+- **extract** checks synchronously before its INSERT (a batch pass can wait for
+  the model); a `same` atom is never inserted.
+- **store** and **end_session lesson candidates** write first and spawn
+  `devbrain cognify-relate` detached, so tool latency is unchanged. A `same`
+  verdict there **archives** the new row (never deletes it).
+- Every check writes one `devbrain.memory_relation_log` row (ids, scores, model,
+  latency — no memory text). `shadow` mode logs without acting.
+- `refines`/`contradicts` below `edge_min_similarity` (0.85) are written as plain
+  rows: at lower similarity the 7B model's non-`same` answers were mostly wrong.
+- **PHI**: the model is the deployment's own Ollama (`summarization.url` /
+  `.model` unless overridden). A non-loopback URL turns the check off unless
+  `allow_remote_model: true` is set explicitly. There is no hosted-API path.
+- Any failure (Ollama down, timeout, bad JSON) is a plain write. `hit_count` is
+  not touched (it is graduation's violation signal).
+
+Pending contradictions:
+`SELECT * FROM devbrain.memory_relation_log WHERE review_status = 'pending';`
+
 ### C. Retrieval (read path) — `deep_search`
 `mcp-server/src/index.ts:281`: embed query → ivfflat ANN over `memory` (filtered
 `project_id` / `kind` / `archived_at`) → annotate each hit via `recency.ts`
@@ -117,6 +148,8 @@ Each encodes a past incident or invariant:
   deleted rows; cascade source is the audit anchor.
 - **Dedup indexes are provenance/content-scoped; `idx_memory_import_dedup` is
   deliberately non-unique** — identical text from *different* sessions is kept.
+  Semantic dedup across sessions is the relation check's job (above), which is
+  opt-in and archives rather than deletes.
 - **Never reinstate migration 011's `(provenance_id, kind)` unique index** — an
   operator did and hard-deleted 76k rows (2026-05-28). `backfill_memory._ensure_schema`
   asserts the 037 index *specifically* to prevent this.

@@ -11,6 +11,7 @@ import { z } from 'zod'
 import { query, waitForDb } from './db.js'
 import { embed, embedQuery, toSqlVector } from './embeddings.js'
 import { enqueueCascades, recordMemory, recordMemoryDependency, resolveMemoryId } from './memory.js'
+import { triggerRelationCheckInBackground } from './relation.js'
 import {
   computeRecencyWarning,
   expandRecencyNeighbors,
@@ -1026,7 +1027,24 @@ server.tool(
       return parts.length ? ` Edges: ${parts.join(', ')}.` : ''
     })()
     const noteSummary = edgeNotes.length ? ` (${edgeNotes.join('; ')})` : ''
-    return { content: [{ type: 'text', text: baseMsg + edgeSummary + noteSummary }] }
+
+    // Write-time relation check (write_path.relation_check). Runs after the
+    // write, detached, so store latency is unchanged. If the memory turns
+    // out to be already known, the check archives this new row and
+    // reinforces the existing one; refinements / contradictions get edges.
+    // The small sweep catches rows whose earlier spawn never ran.
+    const relationQueued = memoryId
+      ? triggerRelationCheckInBackground({
+          memoryId,
+          projectSlug: project,
+          source: 'mcp:store',
+          sweepMax: 5,
+        })
+      : false
+    const relationNote = relationQueued
+      ? ` Duplicate check queued: if this is already known it will be merged into the existing memory (memory ${memoryId!.slice(0, 8)}).`
+      : ''
+    return { content: [{ type: 'text', text: baseMsg + edgeSummary + noteSummary + relationNote }] }
   },
 )
 
@@ -1209,6 +1227,15 @@ server.tool(
         } catch {
           enrichmentReport = `\n\nEnrichment applied; raw output: ${(result.stdout ?? '').toString().slice(0, 200)}`
         }
+      }
+      // Lesson candidates are written without a relation check (the
+      // handler is synchronous); a detached sweep checks them now.
+      if (result.status === 0 && (lesson_candidates?.length ?? 0) > 0) {
+        triggerRelationCheckInBackground({
+          projectSlug: project,
+          source: 'mcp:end_session',
+          sweepMax: Math.min(50, (lesson_candidates?.length ?? 0) + 5),
+        })
       }
     }
 

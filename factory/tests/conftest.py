@@ -184,6 +184,13 @@ def project_factory(conn):
                 )
             except Exception:
                 conn.rollback()
+            # memory_relation_log (migration 048) FKs project_id.
+            cur.execute("SELECT to_regclass('devbrain.memory_relation_log')")
+            if cur.fetchone()[0] is not None:
+                cur.execute(
+                    "DELETE FROM devbrain.memory_relation_log WHERE project_id = %s",
+                    (pid,),
+                )
             cur.execute(
                 "DELETE FROM devbrain.memory WHERE project_id = %s", (pid,)
             )
