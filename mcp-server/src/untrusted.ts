@@ -51,12 +51,36 @@ export function wrapSnippet<T extends { snippet?: string } | null | undefined>(o
   return { ...obj, snippet: wrapMemory(obj.snippet) }
 }
 
+/**
+ * Neutralize every string inside a JSON-like value (rows, arrays, nested
+ * objects). For stored fields that are echoed as data but not wrapped:
+ * names, titles, statuses, branch names, file paths.
+ */
+export function neutralizeDeep<T>(value: T): T {
+  if (typeof value === 'string') return neutralize(value) as T
+  if (Array.isArray(value)) return value.map((v) => neutralizeDeep(v)) as T
+  if (value && typeof value === 'object' && !(value instanceof Date)) {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, neutralizeDeep(v)])) as T
+  }
+  return value
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+export function isUuid(v: unknown): v is string {
+  return typeof v === 'string' && UUID_RE.test(v)
+}
+
 export interface UntrustedText {
   /** Top-level notice for the response, or undefined when wrapping is off. */
   notice: string | undefined
+  /** Wrap a body: stored memory text, transcripts, subprocess or remote output. */
   body: <T extends string | null | undefined>(text: T) => T
+  /** Neutralize a short stored string (title, name, status, path). */
   title: (text: string) => string
   snippet: <T extends { snippet?: string } | null | undefined>(obj: T) => T
+  /** Neutralize every string in a row / object / array. */
+  deep: <T>(value: T) => T
 }
 
 /**
@@ -65,7 +89,7 @@ export interface UntrustedText {
  */
 export function untrustedText(enabled: boolean): UntrustedText {
   if (!enabled) {
-    return { notice: undefined, body: (t) => t, title: (t) => t, snippet: (o) => o }
+    return { notice: undefined, body: (t) => t, title: (t) => t, snippet: (o) => o, deep: (v) => v }
   }
-  return { notice: UNTRUSTED_NOTICE, body: wrapMemory, title: neutralize, snippet: wrapSnippet }
+  return { notice: UNTRUSTED_NOTICE, body: wrapMemory, title: neutralize, snippet: wrapSnippet, deep: neutralizeDeep }
 }
