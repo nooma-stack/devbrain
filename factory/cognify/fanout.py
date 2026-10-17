@@ -95,6 +95,8 @@ def _codex_classify(
         _CODEX_DEFAULT_MODEL,
         _CODEX_TIMEOUT_S,
         _salvage_last_json,
+        codex_config_args,
+        codex_error,
     )
 
     if not _CODEX_BIN or not os.path.exists(_CODEX_BIN):
@@ -119,6 +121,7 @@ def _codex_classify(
         # than extract ever did.
         codex_model = model if (model and model.lower() != "codex") else _CODEX_DEFAULT_MODEL
         cmd += ["-m", codex_model]
+        cmd += codex_config_args()
         cmd.append(prompt)
         try:
             proc = subprocess.run(
@@ -129,9 +132,15 @@ def _codex_classify(
             return None, "api", "codex exec timeout"
         if not os.path.exists(out_path):
             # Salvage before failing over — see _salvage_last_json.
-            salvaged = _salvage_last_json(proc.stdout or "", proc.stderr or "")
+            salvaged = _salvage_last_json(
+                proc.stdout or "", proc.stderr or "", required_keys=("per_project",)
+            )
             if salvaged is not None:
                 return salvaged, None, None
+            err = codex_error(proc.stdout or "", proc.stderr or "")
+            if err:
+                logger.error("cognify_fanout(codex): codex -m %s failed: %s", codex_model, err)
+                return None, "api", f"codex error (rc={proc.returncode}): {err}"
             return None, "api", (
                 f"codex no output (rc={proc.returncode}): "
                 f"{(proc.stderr or '')[-300:]}"

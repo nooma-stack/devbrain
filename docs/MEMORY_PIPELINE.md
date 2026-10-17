@@ -184,6 +184,16 @@ Each encodes a past incident or invariant:
 
 ## Known seams that have bitten us
 
+- **Extract "empty" outage (2026-09-17 → 2026-10).** The codex model slug was
+  retired for ChatGPT accounts; codex printed the 400 as
+  `ERROR: {"type":"error",...}` and exited 1. `_salvage_last_json` took that
+  JSON as the result, so every unit read as zero lessons (`failure: empty`)
+  and the Anthropic fallback never ran. Salvage now only accepts objects with
+  the schema's keys, codex errors are api failures (logged with the account's
+  listed models), the slug is set once in `cognify.codex_model`, and the
+  reasoning effort is pinned. Units past the LLM cap and api failures are
+  carried to the next run (`metadata.backlog`) instead of falling behind the
+  watermark, and dry runs no longer move it.
 - **Extract re-extraction loop (fixed 2026-10).** `_sessions_since` counted
   extracted atoms (`tier='lesson'`, same `provenance_id`, created after the
   watermark), so every extracted unit became a candidate again on the next

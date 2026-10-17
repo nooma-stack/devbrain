@@ -119,6 +119,7 @@ jobs:
             tests/test_resilience_surfaces.py \
             tests/test_cognify_relate_unit.py \
             tests/test_cognify_gate_unit.py \
+            tests/test_cognify_max_llm_calls.py \
             -p no:cacheprovider --tb=short -q
 
   mcp-server:
@@ -259,4 +260,5 @@ jobs:
             tests/test_cognify_edges_contradicts.py \
             tests/test_cognify_relate_db.py \
             tests/test_cognify_gate_db.py \
+            tests/test_cognify_extract_codex.py \
             -v --tb=short

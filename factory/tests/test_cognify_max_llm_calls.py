@@ -20,6 +20,14 @@ from cognify import extract as extract_mod
 from cognify.orchestrator import run_pass
 
 
+@pytest.fixture(autouse=True)
+def _no_backlog():
+    """The stub connections below can't run SQL; the run-to-run backlog
+    read (_last_backlog) is covered in test_cognify_extract_codex.py."""
+    with patch("cognify.extract._last_backlog", return_value={}):
+        yield
+
+
 # ─── Signatures: confirm the kwarg exists on every layer ─────────────────────
 
 

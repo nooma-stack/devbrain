@@ -97,8 +97,17 @@ _CODEX_BIN = os.environ.get("DEVBRAIN_CODEX_BIN") or shutil.which("codex") \
 _CODEX_TIMEOUT_S = int(os.environ.get("DEVBRAIN_CODEX_TIMEOUT_S", "240"))
 
 
-def _salvage_last_json(*streams: str) -> dict | None:
+def _salvage_last_json(
+    *streams: str, required_keys: tuple[str, ...] = ("lessons", "decisions"),
+) -> dict | None:
     """Recover the final JSON object codex printed but never wrote to -o.
+
+    Only an object carrying at least one of ``required_keys`` counts. codex
+    also prints its API errors as JSON (``ERROR: {"type":"error",...}``);
+    before 2026-10 such an error object was "salvaged" as the result, read
+    as zero lessons, and reported as ``empty`` — so a rejected model looked
+    like sessions with nothing to extract and the Anthropic fallback never
+    ran (all extraction on one Studio from 2026-09-17).
 
     codex-cli 0.144.x intermittently completed the model call, echoed the
     schema-valid JSON to its progress streams, then exited 1 WITHOUT writing
@@ -126,22 +135,99 @@ def _salvage_last_json(*streams: str) -> dict | None:
             except json.JSONDecodeError:
                 continue
             skip_until = idx + consumed
-            if isinstance(obj, dict):
+            if isinstance(obj, dict) and any(k in obj for k in required_keys):
                 last = obj
         if last is not None:
             return last
     return None
 
 
+def _cognify_yaml() -> dict:
+    try:
+        from config import load_config as _load  # noqa: PLC0415 — factory/config.py
+
+        return (_load().get("cognify") or {})
+    except Exception:  # noqa: BLE001 — missing/odd config: built-in defaults
+        return {}
+
+
 # Model passed to `codex exec` when the extract model is the "codex" sentinel.
-# We must pass an EXPLICIT -m: as of 2026-06-02 OpenAI retired the
-# `-codex`-suffixed models (gpt-5.x-codex) for ChatGPT-account auth, and the
-# codex CLI's built-in default is one of those — so letting codex pick its
-# default 400s with "model is not supported when using Codex with a ChatGPT
-# account" on every call. gpt-5.4-mini is the current ChatGPT-account-eligible
-# model (verified working on the Studio); gpt-5.5 needs a newer codex CLI.
-# Override via env when the slug rotates again.
-_CODEX_DEFAULT_MODEL = os.environ.get("DEVBRAIN_CODEX_MODEL", "gpt-5.4-mini")
+# We must pass an EXPLICIT -m: the codex CLI's built-in default and the slugs
+# a ChatGPT account accepts both rotate (the -codex models were retired
+# 2026-06-02; gpt-5.4-mini and gpt-5.5 by 2026-10). A retired slug 400s with
+# "model is not supported when using Codex with a ChatGPT account".
+# Precedence: env DEVBRAIN_CODEX_MODEL > yaml cognify.codex_model > default.
+# The account's current list is in ~/.codex/models_cache.json.
+_CODEX_FALLBACK_DEFAULT_MODEL = "gpt-5.6-luna"
+_CODEX_DEFAULT_MODEL = (
+    os.environ.get("DEVBRAIN_CODEX_MODEL")
+    or str(_cognify_yaml().get("codex_model") or "")
+    or _CODEX_FALLBACK_DEFAULT_MODEL
+)
+
+# Reasoning effort for codex exec. Without it codex inherits whatever the
+# host's interactive ~/.codex/config.toml says (xhigh on one Studio), which
+# is slow and costly for a structured extraction and risks the exec timeout.
+# env DEVBRAIN_CODEX_REASONING_EFFORT > yaml cognify.codex_reasoning_effort >
+# "medium". "inherit" (or "") leaves config.toml in charge.
+_CODEX_REASONING_EFFORT = (
+    os.environ.get("DEVBRAIN_CODEX_REASONING_EFFORT")
+    if os.environ.get("DEVBRAIN_CODEX_REASONING_EFFORT") is not None
+    else str(_cognify_yaml().get("codex_reasoning_effort", "medium") or "")
+)
+
+
+def codex_config_args() -> list[str]:
+    """Extra ``codex exec`` flags shared by extract and fanout."""
+    effort = (_CODEX_REASONING_EFFORT or "").strip()
+    if not effort or effort.lower() == "inherit":
+        return []
+    if not effort.replace("-", "").replace("_", "").isalnum():
+        logger.warning("cognify codex: ignoring odd reasoning effort %r", effort)
+        return []
+    return ["-c", f'model_reasoning_effort="{effort}"']
+
+
+def codex_error(*streams: str) -> str | None:
+    """The API error codex printed (``ERROR: {...}``), as one line, with a
+    hint when the model slug was rejected. None when there is none."""
+    msg = None
+    for text in streams:
+        for line in (text or "").splitlines():
+            line = line.strip()
+            if not line.startswith("ERROR:"):
+                continue
+            body = line[len("ERROR:"):].strip()
+            try:
+                obj = json.loads(body)
+                err = obj.get("error") if isinstance(obj, dict) else None
+                msg = (err or {}).get("message") if isinstance(err, dict) else None
+                msg = msg or body
+            except (json.JSONDecodeError, AttributeError):
+                msg = body
+    if msg and "model is not supported" in msg:
+        avail = codex_listed_models()
+        msg += (
+            " Set DEVBRAIN_CODEX_MODEL or cognify.codex_model"
+            + (f" (account lists: {', '.join(avail)})" if avail else "")
+            + "."
+        )
+    return msg[:400] if msg else None
+
+
+def codex_listed_models() -> list[str]:
+    """Model slugs the logged-in account lists, from codex's own catalog
+    cache. Best-effort (empty when the cache is missing or changes shape)."""
+    home = os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex")
+    try:
+        with open(os.path.join(home, "models_cache.json")) as fh:
+            models = json.load(fh).get("models") or []
+        return [
+            m["slug"] for m in models
+            if isinstance(m, dict) and m.get("slug") and m.get("visibility") == "list"
+        ]
+    except Exception:  # noqa: BLE001
+        return []
 
 # JSON Schema for the extractor's final response — same shape the Anthropic
 # path parses ({lessons:[{title,content}], decisions:[...]}).
@@ -251,7 +337,14 @@ class ExtractPass(CognifyPass):
         cap = max_llm_calls if max_llm_calls is not None else MAX_LLM_CALLS_PER_PASS
 
         since = _last_successful_run(conn, "extract", project_id)
-        candidate_sessions = _sessions_since(conn, project_id, since)
+        # Units the last run could not finish (LLM cap reached, or an api
+        # failure) come first; without this they fell behind the watermark
+        # and were never extracted.
+        tries = _last_backlog(conn, "extract", project_id)
+        candidate_sessions = list(tries)
+        candidate_sessions += [
+            s for s in _sessions_since(conn, project_id, since) if s not in tries
+        ]
 
         if dry_run:
             return PassResult(
@@ -260,6 +353,7 @@ class ExtractPass(CognifyPass):
                 metadata={
                     "pass": "extract",
                     "dry_run_candidate_sessions": len(candidate_sessions),
+                    "dry_run_backlog_sessions": len(tries),
                     "since": since.isoformat() if since else None,
                 },
             )
@@ -278,6 +372,9 @@ class ExtractPass(CognifyPass):
         gate_log = gate.GateLog(gate_cfg.mode) if gate_cfg.enabled else None
         deferred: list[str] = []
         evaluated: set[str] = set()
+        done: set[str] = set()
+        gate_skipped: set[str] = set()
+        retry: list[str] = []
 
         def _queue():
             yield from candidate_sessions
@@ -295,6 +392,7 @@ class ExtractPass(CognifyPass):
                 decision = gate.evaluate(conn, session_id, project_id, gate_cfg)
                 gate_log.add(decision)
                 if gate_cfg.applies and decision.action == "skip":
+                    gate_skipped.add(session_id)
                     continue
                 if gate_cfg.applies and decision.action == "downgrade":
                     deferred.append(session_id)
@@ -309,8 +407,19 @@ class ExtractPass(CognifyPass):
             total_decisions += result.decisions_created
             total_llm += result.llm_calls
             sessions_processed += 1
+            done.add(session_id)
             if result.failure:
                 failure_counts[result.failure] = failure_counts.get(result.failure, 0) + 1
+            if result.failure == "api":
+                retry.append(session_id)
+
+        backlog = _next_backlog(
+            candidate_sessions + deferred, done, gate_skipped, retry, tries
+        )
+        if backlog:
+            logger.info(
+                "cognify_extract: %d session(s) carried to the next run", len(backlog)
+            )
 
         rows = total_lessons + total_decisions
         return PassResult(
@@ -329,6 +438,8 @@ class ExtractPass(CognifyPass):
                 "failure_counts": failure_counts,
                 "since": since.isoformat() if since else None,
                 "gate": gate_log.summary() if gate_log is not None else None,
+                # Read back by the next run (_last_backlog). Ids only.
+                "backlog": backlog,
             },
         )
 
@@ -503,6 +614,13 @@ def extract_from_session(
 # ── Private helpers ───────────────────────────────────────────────────────────
 
 
+# `devbrain cognify --pass=extract --dry-run` writes a completed run-log
+# row too. It extracts nothing, so it must not move the watermark (it used
+# to: a dry run silently dropped every unit ingested since the last real
+# run) or replace the backlog.
+_NOT_DRY_RUN = "coalesce(metadata ->> 'dry_run', 'false') <> 'true'"
+
+
 def _last_successful_run(conn: Any, pass_name: str, project_id: Any):
     """Return the started_at of the most recent *completed* successful run, or None.
 
@@ -523,11 +641,74 @@ def _last_successful_run(conn: Any, pass_name: str, project_id: Any):
             "SELECT started_at FROM devbrain.cognify_run_log "
             "WHERE pass_name = %s AND project_id = %s "
             "  AND completed_at IS NOT NULL AND error IS NULL "
+            f"  AND {_NOT_DRY_RUN} "
             "ORDER BY started_at DESC LIMIT 1",
             (pass_name, project_id),
         )
         row = cur.fetchone()
     return row[0] if row else None
+
+
+# Backlog carried between extract runs (see ExtractPass.run).
+MAX_BACKLOG = 5000
+MAX_API_TRIES = 3
+
+
+def _last_backlog(conn: Any, pass_name: str, project_id: Any) -> dict[str, int]:
+    """{unit_id: api_tries} the last completed run left unfinished. Read from
+    the same run-log row _last_successful_run uses."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT metadata -> 'backlog' FROM devbrain.cognify_run_log "
+            "WHERE pass_name = %s AND project_id = %s "
+            "  AND completed_at IS NOT NULL AND error IS NULL "
+            f"  AND {_NOT_DRY_RUN} "
+            "ORDER BY started_at DESC LIMIT 1",
+            (pass_name, project_id),
+        )
+        row = cur.fetchone()
+    out: dict[str, int] = {}
+    for item in (row[0] if row and isinstance(row[0], list) else []):
+        if isinstance(item, dict) and item.get("id"):
+            out[str(item["id"])] = int(item.get("tries") or 0)
+    return out
+
+
+def _next_backlog(
+    queue: list[str],
+    done: set[str],
+    gate_skipped: set[str],
+    retry: list[str],
+    tries: dict[str, int],
+) -> list[dict]:
+    """Units to carry into the next run: everything queued but not reached
+    (cap) plus api failures, each failure counting one try; a unit that
+    failed MAX_API_TRIES times is dropped with a warning."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for s in queue:
+        if s in seen or s in done or s in gate_skipped:
+            continue
+        seen.add(s)
+        out.append({"id": s, "tries": tries.get(s, 0)})
+    for s in retry:
+        if s in seen:
+            continue
+        seen.add(s)
+        n = tries.get(s, 0) + 1
+        if n >= MAX_API_TRIES:
+            logger.warning(
+                "cognify_extract: giving up on %s after %d api failures", s, n
+            )
+            continue
+        out.append({"id": s, "tries": n})
+    if len(out) > MAX_BACKLOG:
+        logger.warning(
+            "cognify_extract: backlog %d > %d; oldest %d dropped",
+            len(out), MAX_BACKLOG, len(out) - MAX_BACKLOG,
+        )
+        out = out[len(out) - MAX_BACKLOG:]
+    return out
 
 
 def _sessions_since(conn: Any, project_id: Any, since) -> list[str]:
@@ -656,6 +837,7 @@ def _codex_extract(content: str, *, model: str | None = None) -> dict:
         # ChatGPT-account auth — see _CODEX_DEFAULT_MODEL).
         codex_model = model if (model and model.lower() != "codex") else _CODEX_DEFAULT_MODEL
         cmd += ["-m", codex_model]
+        cmd += codex_config_args()
         cmd.append(prompt)
 
         try:
@@ -674,10 +856,17 @@ def _codex_extract(content: str, *, model: str | None = None) -> dict:
             # recover from the streams either.
             result = _salvage_last_json(proc.stdout or "", proc.stderr or "")
             if result is None:
-                tail = (proc.stderr or "")[-400:]
+                err = codex_error(proc.stdout or "", proc.stderr or "")
+                if err:
+                    logger.error("cognify_extract(codex): codex -m %s failed: %s", codex_model, err)
+                    detail = f"codex error (rc={proc.returncode}): {err}"
+                else:
+                    detail = (
+                        f"codex produced no output (rc={proc.returncode}): "
+                        f"{(proc.stderr or '')[-400:]}"
+                    )
                 return {"lessons": [], "decisions": [], "_usage": empty_usage,
-                        "_failure": "api",
-                        "_failure_detail": f"codex produced no output (rc={proc.returncode}): {tail}"}
+                        "_failure": "api", "_failure_detail": detail}
         if result is None:
             try:
                 with open(out_path) as fh:

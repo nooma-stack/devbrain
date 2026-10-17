@@ -61,6 +61,15 @@ summarization:
 
 # Cognify pass settings.
 cognify:
+  # Model for `codex exec` (extract + fanout on the ChatGPT-subscription
+  # backend). Slugs a ChatGPT account accepts rotate; a retired one fails
+  # with "model is not supported when using Codex with a ChatGPT account".
+  # The account's current list: ~/.codex/models_cache.json (visibility
+  # "list"). Env DEVBRAIN_CODEX_MODEL wins over this (check launchd plists).
+  # codex_model: gpt-5.6-luna
+  # Reasoning effort for codex exec; "inherit" uses ~/.codex/config.toml.
+  # Env DEVBRAIN_CODEX_REASONING_EFFORT.
+  # codex_reasoning_effort: medium
   # Cheap pre-LLM gate in front of the extract pass. No LLM call; read-only.
   # See docs/MEMORY_PIPELINE.md. Env override in brackets.
   extract_gate:
