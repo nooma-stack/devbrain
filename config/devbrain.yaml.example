@@ -60,6 +60,12 @@ embedding:
 #   dedup_threshold: 0.93
 #   dedup_representative: newest # newest | best (best-ranked copy)
 #   dedup_timeout_ms: 500        # over this, results come back un-collapsed
+#   # recency_neighbors / earliest_on_topic lookup (env DEVBRAIN_RECENCY_STRATEGY):
+#   # hnsw = HNSW index with a bounded scan; exact = full scan (seconds per
+#   # search on a large project).
+#   recency_strategy: hnsw
+#   recency_max_scan_tuples: 2000
+#   recency_timeout_ms: 2000     # over this, the annotation is left empty
 
 summarization:
   provider: ollama

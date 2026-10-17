@@ -251,3 +251,50 @@ describe('near-duplicate SQL', () => {
     assert.match(src, /near-duplicate collapse skipped/)
   })
 })
+
+describe('recency neighbor strategy', () => {
+  test('defaults to hnsw with a bounded scan', () => {
+    const cfg = resolveSearchConfig({}, {})
+    assert.equal(cfg.recencyStrategy, 'hnsw')
+    assert.equal(cfg.recencyMaxScanTuples, 2000)
+    assert.equal(cfg.recencyTimeoutMs, 2000)
+  })
+
+  test('env > yaml, invalid falls back', () => {
+    const cfg = resolveSearchConfig(
+      { recency_strategy: 'hnsw', recency_max_scan_tuples: 5000, recency_timeout_ms: 800 },
+      { DEVBRAIN_RECENCY_STRATEGY: 'exact' },
+    )
+    assert.equal(cfg.recencyStrategy, 'exact')
+    assert.equal(cfg.recencyMaxScanTuples, 5000)
+    assert.equal(cfg.recencyTimeoutMs, 800)
+    const bad = resolveSearchConfig({ recency_strategy: 'fast', recency_max_scan_tuples: 5 }, {})
+    assert.equal(bad.recencyStrategy, 'hnsw')
+    assert.equal(bad.recencyMaxScanTuples, 2000)
+  })
+
+  for (const file of ['recency_neighbors.sql', 'earliest_on_topic.sql']) {
+    test(`${file} takes $1..$4 and has no percent sign`, () => {
+      const sql = readFileSync(resolve(import.meta.dirname, '../sql', file), 'utf-8')
+      const used = new Set([...sql.matchAll(/\$(\d+)/g)].map((m) => Number(m[1])))
+      assert.deepEqual([...used].sort(), [1, 2, 3, 4])
+      assert.ok(!sql.includes('%'))
+      assert.match(sql, /ORDER BY m\.embedding <=> p\.embedding/)
+    })
+  }
+
+  test('recency.ts runs the shared SQL under the hnsw planner settings', () => {
+    const src = readFileSync(resolve(import.meta.dirname, 'recency.ts'), 'utf-8')
+    assert.match(src, /sqlFile\('recency_neighbors\.sql'\)/)
+    assert.match(src, /sqlFile\('earliest_on_topic\.sql'\)/)
+    assert.match(src, /enable_sort: 'off'/)
+    assert.match(src, /'hnsw\.max_scan_tuples': String\(strategy\.maxScanTuples\)/)
+    assert.ok(!/const sql = `\s*WITH primaries/.test(src), 'no inline copy of the neighbor SQL left')
+  })
+
+  test('deep_search passes the configured strategy to both annotations', () => {
+    const src = readFileSync(resolve(import.meta.dirname, 'index.ts'), 'utf-8')
+    assert.match(src, /expandRecencyNeighbors\(memoryBackedIds, \{[\s\S]*?\}, neighborStrategy\)/)
+    assert.match(src, /findEarliestOnTopic\(memoryBackedIds, undefined, neighborStrategy\)/)
+  })
+})

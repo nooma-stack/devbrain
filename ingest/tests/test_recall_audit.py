@@ -173,3 +173,22 @@ def test_dedup_defaults_match_the_mcp():
     assert re.search(r"\bdedup:\s*(true|false)", block).group(1) == ("true" if dp.enabled else "false")
     assert float(re.search(r"dedupThreshold:\s*([\d.]+)", block).group(1)) == dp.threshold
     assert re.search(r"dedupRepresentative:\s*'(\w+)'", block).group(1) == dp.representative
+
+
+def test_recency_audit_helpers():
+    from recall_audit.recency import EARLIEST_SQL_PATH, NEIGHBORS_SQL_PATH, Neighbor, first_k, first_one, warning_b
+
+    rows = [
+        ("p1", "a", "k", "c", None, 0.6, 9.0),
+        ("p1", "b", "k", "c", None, 0.5, 5.0),
+        ("p1", "c", "k", "c", None, 0.9, 4.0),
+        ("p2", "d", "k", "c", None, 0.45, 3.5),
+    ]
+    got = first_k(rows, 2)
+    assert [n.id for n in got["p1"]] == ["a", "b"]
+    assert first_one(rows) == {"p1": "a", "p2": "d"}
+    assert warning_b([Neighbor("x", 0.55, 7.0)])
+    assert not warning_b([Neighbor("x", 0.54, 30.0), Neighbor("y", 0.9, 6.9)])
+    for path in (NEIGHBORS_SQL_PATH, EARLIEST_SQL_PATH):
+        sql = load_keyword_sql(path)
+        assert sorted(set(re.findall(r"%\(p(\d+)\)s", sql))) == ["1", "2", "3", "4"]

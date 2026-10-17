@@ -134,11 +134,14 @@ export async function query<T extends pg.QueryResultRow = Record<string, unknown
  * transaction on a dedicated pool client (SET LOCAL never leaks to other
  * callers). A timeout surfaces as a pg error (SQLSTATE 57014) for the
  * caller to handle; Postgres cancels the work, unlike a client-side race.
+ * `settings` are further transaction-local GUCs (set_config(name, value,
+ * true)), e.g. planner switches for this one statement.
  */
 export async function queryWithTimeout<T extends pg.QueryResultRow = Record<string, unknown>>(
   text: string,
   params: unknown[],
   timeoutMs: number,
+  settings: Record<string, string> = {},
 ): Promise<pg.QueryResult<T>> {
   let client: pg.PoolClient
   try {
@@ -149,6 +152,9 @@ export async function queryWithTimeout<T extends pg.QueryResultRow = Record<stri
   try {
     await client.query('BEGIN')
     await client.query(`SET LOCAL statement_timeout = ${Math.max(1, Math.round(timeoutMs))}`)
+    for (const [name, value] of Object.entries(settings)) {
+      await client.query('SELECT set_config($1, $2, true)', [name, value])
+    }
     const result = await client.query<T>(text, params)
     await client.query('COMMIT')
     return result

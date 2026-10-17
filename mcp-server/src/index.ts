@@ -742,21 +742,30 @@ server.tool(
       .map((c) => c.memory_id)
       .filter((id) => id && id.length > 10)
 
-    const recencyById = recency_neighbors && memoryBackedIds.length > 0
-      ? await expandRecencyNeighbors(memoryBackedIds, {
-          k: recency_neighbors_k ?? 2,
-          minAgeDays: recency_min_age_days ?? 3,
-          similarityFloor: 0.4,
-        })
-      : new Map()
-
-    const supersedersById = follow_supersedes && memoryBackedIds.length > 0
-      ? await findSupersedingMemories(memoryBackedIds)
-      : new Map()
-
-    const earliestById = earliest_on_topic && memoryBackedIds.length > 0
-      ? await findEarliestOnTopic(memoryBackedIds)
-      : new Map()
+    // The annotation queries are independent: run them concurrently.
+    // recency_neighbors / earliest_on_topic use the HNSW strategy by default
+    // (search.recency_strategy; DEVBRAIN_RECENCY_STRATEGY=exact restores the
+    // planner's exact scan, p95 ~4 s on a large project).
+    const neighborStrategy = {
+      strategy: searchCfg.recencyStrategy,
+      maxScanTuples: searchCfg.recencyMaxScanTuples,
+      timeoutMs: searchCfg.recencyTimeoutMs,
+    }
+    const [recencyById, supersedersById, earliestById] = await Promise.all([
+      recency_neighbors && memoryBackedIds.length > 0
+        ? expandRecencyNeighbors(memoryBackedIds, {
+            k: recency_neighbors_k ?? 2,
+            minAgeDays: recency_min_age_days ?? 3,
+            similarityFloor: 0.4,
+          }, neighborStrategy)
+        : Promise.resolve(new Map()),
+      follow_supersedes && memoryBackedIds.length > 0
+        ? findSupersedingMemories(memoryBackedIds)
+        : Promise.resolve(new Map()),
+      earliest_on_topic && memoryBackedIds.length > 0
+        ? findEarliestOnTopic(memoryBackedIds, undefined, neighborStrategy)
+        : Promise.resolve(new Map()),
+    ])
 
     // primary_age_days powers the topic-age-gap trigger of
     // computeRecencyWarning AND surfaces directly so consumers can see

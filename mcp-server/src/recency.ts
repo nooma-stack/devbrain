@@ -26,8 +26,79 @@
 // deep_search retains its sub-second latency budget on a 50K-row
 // project.
 
+import { readFileSync } from 'fs'
+import { resolve } from 'path'
 import type { QueryResult } from 'pg'
-import { query } from './db.js'
+import { query, queryWithTimeout } from './db.js'
+
+// The neighbor SQL lives in mcp-server/sql/ so ingest/recall_audit/recency.py
+// runs the same text.
+const SQL_DIR = resolve(import.meta.dirname, '../sql')
+const _sqlCache = new Map<string, string>()
+function sqlFile(name: string): string {
+  let text = _sqlCache.get(name)
+  if (text === undefined) {
+    text = readFileSync(resolve(SQL_DIR, name), 'utf-8')
+    _sqlCache.set(name, text)
+  }
+  return text
+}
+
+/**
+ * How the same-topic LATERAL is answered.
+ *
+ * 'exact' — whatever the planner picks. It misestimates per-project row
+ * counts and picks an exact bitmap-scan + sort that reads every newer row's
+ * embedding: ~430 ms per primary on a 90K-row project, p95 deep_search
+ * ~4.4 s with 10 results (recall audit, 2026-10-17).
+ *
+ * 'hnsw' — the same SQL under SET LOCAL enable_sort = off (so the ordered
+ * HNSW index scan wins) and a bounded hnsw.max_scan_tuples (iterative scan
+ * stops early when few rows pass the filters). Same audit: p50 64 ms /
+ * p95 164 ms; 76% identical neighbor sets, the rest equally similar
+ * (median cosine identical) and mostly inside the exact candidate set.
+ */
+export interface NeighborStrategy {
+  strategy: 'hnsw' | 'exact'
+  maxScanTuples: number
+  timeoutMs: number
+}
+
+export const DEFAULT_NEIGHBOR_STRATEGY: NeighborStrategy = {
+  strategy: 'hnsw',
+  maxScanTuples: 2000,
+  timeoutMs: 2000,
+}
+
+/**
+ * Run a same-topic query with the chosen strategy. 'hnsw' falls back to the
+ * plain query when the settings are rejected (pgvector < 0.8 has no
+ * hnsw.max_scan_tuples), and to no rows on a timeout (an empty annotation
+ * beats a multi-second search).
+ */
+async function runNeighborQuery(
+  sql: string,
+  params: unknown[],
+  strategy: NeighborStrategy,
+): Promise<QueryResult> {
+  if (strategy.strategy !== 'hnsw') return query(sql, params)
+  try {
+    return await queryWithTimeout(sql, params, strategy.timeoutMs, {
+      enable_sort: 'off',
+      'hnsw.max_scan_tuples': String(strategy.maxScanTuples),
+    })
+  } catch (err) {
+    const code = (err as { code?: string; cause?: { code?: string } }).code
+      ?? (err as { cause?: { code?: string } }).cause?.code
+    const msg = err instanceof Error ? err.message : String(err)
+    if (code === '57014') {
+      console.error(`[deep_search] recency annotation skipped: ${msg}`)
+      return { rows: [], rowCount: 0, command: 'SELECT', oid: 0, fields: [] } as unknown as QueryResult
+    }
+    console.error(`[deep_search] hnsw recency strategy failed, using exact: ${msg}`)
+    return query(sql, params)
+  }
+}
 
 /** A primary deep_search result shape we pull annotations for. */
 export interface PrimaryRef {
@@ -84,6 +155,7 @@ export interface RecencyNeighbor {
 export async function expandRecencyNeighbors(
   primaryMemoryIds: string[],
   opts: RecencyExpandOptions = DEFAULT_RECENCY_OPTIONS,
+  strategy: NeighborStrategy = DEFAULT_NEIGHBOR_STRATEGY,
 ): Promise<Map<string, RecencyNeighbor[]>> {
   const result = new Map<string, RecencyNeighbor[]>()
   if (primaryMemoryIds.length === 0) return result
@@ -96,44 +168,13 @@ export async function expandRecencyNeighbors(
   // doesn't blow up.
   const overfetch = Math.max(20, k * 5)
 
-  const sql = `
-WITH primaries AS (
-    SELECT id, created_at, embedding, project_id
-      FROM devbrain.memory
-     WHERE id = ANY($1::uuid[])
-       AND archived_at IS NULL
-       AND embedding IS NOT NULL
-)
-SELECT
-    p.id::text AS primary_id,
-    n.id::text AS neighbor_id,
-    n.kind     AS neighbor_kind,
-    n.content  AS neighbor_content,
-    n.created_at AS neighbor_created_at,
-    1 - (n.embedding <=> p.embedding) AS similarity,
-    EXTRACT(EPOCH FROM (n.created_at - p.created_at)) / 86400.0
-        AS age_delta_days
-  FROM primaries p
-  CROSS JOIN LATERAL (
-        SELECT m.id, m.kind, m.content, m.created_at, m.embedding
-          FROM devbrain.memory m
-         WHERE m.id <> p.id
-           AND m.archived_at IS NULL
-           AND m.embedding IS NOT NULL
-           AND m.project_id = p.project_id
-           AND m.created_at > p.created_at + ($2 || ' days')::interval
-         ORDER BY m.embedding <=> p.embedding
-         LIMIT $3
-       ) n
- WHERE 1 - (n.embedding <=> p.embedding) >= $4
- ORDER BY p.id, n.created_at DESC
-`
-  const rows: QueryResult = await query(sql, [
+  const sql = sqlFile('recency_neighbors.sql')
+  const rows: QueryResult = await runNeighborQuery(sql, [
     primaryMemoryIds,
     String(opts.minAgeDays),
     overfetch,
     opts.similarityFloor,
-  ])
+  ], strategy)
 
   for (const row of rows.rows) {
     const primaryId = String(row.primary_id)
@@ -293,6 +334,7 @@ export const DEFAULT_EARLIEST_OPTIONS: EarliestOnTopicOptions = {
 export async function findEarliestOnTopic(
   primaryMemoryIds: string[],
   opts: EarliestOnTopicOptions = DEFAULT_EARLIEST_OPTIONS,
+  strategy: NeighborStrategy = DEFAULT_NEIGHBOR_STRATEGY,
 ): Promise<Map<string, EarliestOnTopic>> {
   const result = new Map<string, EarliestOnTopic>()
   if (primaryMemoryIds.length === 0) return result
@@ -303,44 +345,13 @@ export async function findEarliestOnTopic(
   // filter doesn't starve.
   const overfetch = 50
 
-  const sql = `
-WITH primaries AS (
-    SELECT id, created_at, embedding, project_id
-      FROM devbrain.memory
-     WHERE id = ANY($1::uuid[])
-       AND archived_at IS NULL
-       AND embedding IS NOT NULL
-)
-SELECT
-    p.id::text AS primary_id,
-    n.id::text AS neighbor_id,
-    n.kind     AS neighbor_kind,
-    n.content  AS neighbor_content,
-    n.created_at AS neighbor_created_at,
-    1 - (n.embedding <=> p.embedding) AS similarity,
-    EXTRACT(EPOCH FROM (p.created_at - n.created_at)) / 86400.0
-        AS age_delta_days
-  FROM primaries p
-  CROSS JOIN LATERAL (
-        SELECT m.id, m.kind, m.content, m.created_at, m.embedding
-          FROM devbrain.memory m
-         WHERE m.id <> p.id
-           AND m.archived_at IS NULL
-           AND m.embedding IS NOT NULL
-           AND m.project_id = p.project_id
-           AND m.created_at < p.created_at - ($2 || ' days')::interval
-         ORDER BY m.embedding <=> p.embedding
-         LIMIT $3
-       ) n
- WHERE 1 - (n.embedding <=> p.embedding) >= $4
- ORDER BY p.id, n.created_at ASC
-`
-  const rows = await query(sql, [
+  const sql = sqlFile('earliest_on_topic.sql')
+  const rows = await runNeighborQuery(sql, [
     primaryMemoryIds,
     String(opts.minAgeDays),
     overfetch,
     opts.similarityFloor,
-  ])
+  ], strategy)
 
   for (const row of rows.rows) {
     const primaryId = String(row.primary_id)
