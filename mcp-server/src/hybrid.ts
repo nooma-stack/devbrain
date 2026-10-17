@@ -36,6 +36,16 @@ export interface SearchConfig {
   dedupRepresentative: 'best' | 'newest'
   /** statement_timeout for the pair query; on timeout results are returned un-collapsed. */
   dedupTimeoutMs: number
+  /**
+   * How recency_neighbors / earliest_on_topic find same-topic rows:
+   * 'hnsw' (HNSW index, bounded scan) or 'exact' (the planner's exact scan,
+   * seconds per search on a large project).
+   */
+  recencyStrategy: 'hnsw' | 'exact'
+  /** hnsw.max_scan_tuples for the 'hnsw' recency strategy. */
+  recencyMaxScanTuples: number
+  /** statement_timeout for the 'hnsw' recency queries; on timeout the annotation is left empty. */
+  recencyTimeoutMs: number
 }
 
 // Measured 2026-10-17 with ingest/recall_audit on the Nooma corpus (see the
@@ -55,6 +65,9 @@ export const SEARCH_DEFAULTS: SearchConfig = {
   dedupThreshold: 0.93,
   dedupRepresentative: 'newest',
   dedupTimeoutMs: 500,
+  recencyStrategy: 'hnsw',
+  recencyMaxScanTuples: 2000,
+  recencyTimeoutMs: 2000,
 }
 
 type Env = Record<string, string | undefined>
@@ -88,10 +101,12 @@ function parseTerms(v: unknown): boolean | undefined {
  *
  * Env: DEVBRAIN_HYBRID_SEARCH (on/off), DEVBRAIN_RRF_K,
  * DEVBRAIN_KEYWORD_WEIGHT, DEVBRAIN_KEYWORD_TERMS (identifiers|all),
- * DEVBRAIN_DEDUP_SEARCH (on/off), DEVBRAIN_DEDUP_THRESHOLD.
+ * DEVBRAIN_DEDUP_SEARCH (on/off), DEVBRAIN_DEDUP_THRESHOLD,
+ * DEVBRAIN_RECENCY_STRATEGY (hnsw|exact).
  * yaml: search.{hybrid, rrf_k, keyword_weight, candidates, keyword_max_df,
  * keyword_row_budget, keyword_max_terms, keyword_terms, keyword_timeout_ms,
- * dedup, dedup_threshold, dedup_representative, dedup_timeout_ms}.
+ * dedup, dedup_threshold, dedup_representative, dedup_timeout_ms,
+ * recency_strategy, recency_max_scan_tuples, recency_timeout_ms}.
  */
 export function resolveSearchConfig(yaml: unknown, env: Env = process.env): SearchConfig {
   const y = (yaml && typeof yaml === 'object' ? yaml : {}) as Record<string, unknown>
@@ -124,7 +139,21 @@ export function resolveSearchConfig(yaml: unknown, env: Env = process.env): Sear
     ),
     dedupRepresentative: pick(parseRepresentative(y.dedup_representative), d.dedupRepresentative),
     dedupTimeoutMs: Math.round(pick(parseNum(y.dedup_timeout_ms, (n) => n >= 10), d.dedupTimeoutMs)),
+    recencyStrategy: pick(
+      parseRecencyStrategy(env.DEVBRAIN_RECENCY_STRATEGY),
+      parseRecencyStrategy(y.recency_strategy),
+      d.recencyStrategy,
+    ),
+    recencyMaxScanTuples: Math.round(
+      pick(parseNum(y.recency_max_scan_tuples, (n) => n >= 100 && n <= 1_000_000), d.recencyMaxScanTuples),
+    ),
+    recencyTimeoutMs: Math.round(pick(parseNum(y.recency_timeout_ms, (n) => n >= 10), d.recencyTimeoutMs)),
   }
+}
+
+function parseRecencyStrategy(v: unknown): 'hnsw' | 'exact' | undefined {
+  const s = v === undefined || v === null ? '' : String(v).trim().toLowerCase()
+  return s === 'hnsw' || s === 'exact' ? s : undefined
 }
 
 function parseRepresentative(v: unknown): 'best' | 'newest' | undefined {
