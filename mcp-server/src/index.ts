@@ -26,6 +26,7 @@ import {
   type MatchStrength,
 } from './hybrid.js'
 import { rerankScores } from './rerank.js'
+import { screeningLabel, untrustedText } from './untrusted.js'
 import { enqueueCascades, hasScreenFlagsColumn, recordMemory, recordMemoryDependency, resolveMemoryId } from './memory.js'
 import { screenFlags } from './screening.js'
 import { relationCheckMode, relationStoreNote, triggerRelationCheckInBackground } from './relation.js'
@@ -272,10 +273,11 @@ server.tool(
     // fields per spec, preserving the response shape so downstream
     // consumers don't crash on missing keys. P2.d.ii will drop the
     // legacy tables once a soak period confirms no readers regress.
+    const flagCol = (await hasScreenFlagsColumn()) ? ', screen_flags' : ''
     const [projectInfo, decisions, issues, patterns, activeJobs, inactiveJobs, lockCount] = await Promise.all([
       query('SELECT name, description, root_path, constraints, tech_stack FROM devbrain.projects WHERE id = $1', [projectId]),
       query(
-        `SELECT title, content AS decision, NULL AS rationale, created_at
+        `SELECT title, content AS decision, NULL AS rationale, created_at${flagCol}
          FROM devbrain.memory
          WHERE project_id = $1 AND kind = 'decision' AND archived_at IS NULL
          ORDER BY created_at DESC LIMIT 5`,
@@ -283,14 +285,14 @@ server.tool(
       ),
       query(
         `SELECT title, NULL AS category, content AS description,
-                NULL AS fix_applied, created_at
+                NULL AS fix_applied, created_at${flagCol}
          FROM devbrain.memory
          WHERE project_id = $1 AND kind = 'issue' AND archived_at IS NULL
          ORDER BY created_at DESC LIMIT 5`,
         [projectId],
       ),
       query(
-        `SELECT title AS name, NULL AS category, content AS description
+        `SELECT title AS name, NULL AS category, content AS description${flagCol}
          FROM devbrain.memory
          WHERE project_id = $1 AND kind = 'pattern' AND archived_at IS NULL
          ORDER BY created_at DESC LIMIT 5`,
@@ -302,11 +304,28 @@ server.tool(
              WHERE project_id = $1 AND expires_at > now()`, [projectId]),
     ])
 
+    // Memory-derived text is recorded data, not instructions: wrap bodies,
+    // neutralize titles, and label screening-flagged rows.
+    const u = untrustedText(getSearchConfig().untrustedWrap)
+    const untrustedRows = (rows: Record<string, unknown>[], bodyKey: string, titleKey: string) =>
+      rows.map((row) => {
+        const { screen_flags: flags, ...rest } = row
+        const out: Record<string, unknown> = {
+          ...rest,
+          [titleKey]: typeof row[titleKey] === 'string' ? u.title(row[titleKey] as string) : row[titleKey],
+          [bodyKey]: typeof row[bodyKey] === 'string' ? u.body(row[bodyKey] as string) : row[bodyKey],
+        }
+        const label = screeningLabel(flags)
+        if (label) out.screening = label
+        return out
+      })
+
     const ctx = {
+      ...(u.notice ? { notice: u.notice } : {}),
       project: projectInfo.rows[0] ?? null,
-      recent_decisions: decisions.rows,
-      recent_issues: issues.rows,
-      relevant_patterns: patterns.rows,
+      recent_decisions: untrustedRows(decisions.rows, 'decision', 'title'),
+      recent_issues: untrustedRows(issues.rows, 'description', 'title'),
+      relevant_patterns: untrustedRows(patterns.rows, 'description', 'name'),
       active_factory_jobs: activeJobs.rows,
       recent_completed_jobs: inactiveJobs.rows,
       active_file_locks: Number(lockCount.rows[0]?.count ?? 0),
@@ -483,6 +502,7 @@ server.tool(
     // missing index → the SQL returns nothing) leaves pure vector order.
     // DEVBRAIN_HYBRID_SEARCH=off disables it.
     const searchCfg = getSearchConfig()
+    const u = untrustedText(searchCfg.untrustedWrap)
     const useHybrid = searchCfg.hybrid && runMemoryQuery
     // Near-duplicate collapse walks a candidate pool deeper than `limit`.
     const useDedup = searchCfg.dedup && runMemoryQuery
@@ -719,6 +739,19 @@ server.tool(
     )
     const responseWeak = searchCfg.weakMatch && isWeak(responseStrength([...strengthByKey.values()]), searchCfg)
 
+    // memory.screen_flags (prompt-injection screening, migration 049) for the
+    // shown rows. Skipped on installs without the column.
+    const screenFlagsById = new Map<string, string[]>()
+    const shownMemoryIds = top.map((c) => c.memory_id).filter((id) => id && id.length > 10)
+    if (shownMemoryIds.length > 0 && (await hasScreenFlagsColumn())) {
+      const flagged = await query<{ id: string; screen_flags: string[] }>(
+        `SELECT id::text AS id, screen_flags FROM devbrain.memory
+          WHERE id = ANY($1::uuid[]) AND screen_flags IS NOT NULL AND cardinality(screen_flags) > 0`,
+        [shownMemoryIds],
+      )
+      for (const row of flagged.rows) screenFlagsById.set(row.id, row.screen_flags)
+    }
+
     const results = await Promise.all(
       top.map(async (cand) => {
         const r: Record<string, unknown> = {
@@ -728,7 +761,8 @@ server.tool(
           // the seed extraction filters those out by length. Without this
           // field the with_graph seedIds were always empty (silently dead).
           memory_id: cand.memory_id,
-          content: cand.content,
+          // Recorded data, not instructions: see UNTRUSTED_NOTICE.
+          content: u.body(cand.content),
           score: Number(cand.score.toFixed(4)),
           source_type: cand.source_type,
           source_ref: cand.source_id
@@ -772,7 +806,7 @@ server.tool(
             const lines = raw.split('\n')
             const start = Math.max(0, (cand.source_line_start ?? 0) - 25)
             const end = Math.min(lines.length, (cand.source_line_end ?? lines.length) + 25)
-            r.full_context = lines.slice(start, end).join('\n')
+            r.full_context = u.body(lines.slice(start, end).join('\n'))
           }
         }
 
@@ -835,14 +869,16 @@ server.tool(
       const earliest = earliestById.get(memId)
       const primaryAgeDays = primaryAgeById.get(memId)
       if (recency_neighbors) {
-        r.recency_neighbors = neighbors ?? []
+        r.recency_neighbors = (neighbors ?? []).map(u.snippet)
       }
       if (follow_supersedes) {
-        r.superseded_by = superseder ?? null
+        r.superseded_by = u.snippet(superseder ?? null)
       }
       if (earliest_on_topic) {
-        r.earliest_on_topic = earliest ?? null
+        r.earliest_on_topic = u.snippet(earliest ?? null)
       }
+      const screening = screeningLabel(screenFlagsById.get(memId))
+      if (screening) r.screening = screening
       if (primaryAgeDays !== undefined) {
         r.primary_age_days = primaryAgeDays
       }
@@ -888,6 +924,13 @@ server.tool(
           try {
             const parsed = JSON.parse((graphResult.stdout ?? '').toString())
             if (!parsed.error) {
+              if (Array.isArray(parsed.memories)) {
+                parsed.memories = parsed.memories.map((m: Record<string, unknown>) => ({
+                  ...m,
+                  title: typeof m.title === 'string' ? u.title(m.title) : m.title,
+                  content: typeof m.content === 'string' ? u.body(m.content) : m.content,
+                }))
+              }
               graphField = parsed
             } else {
               console.error(`[deep_search] graph walk error: ${parsed.error}`)
@@ -903,8 +946,8 @@ server.tool(
       }
     }
 
-    // weak_match / note first so a reader sees them before the results.
-    const responseBody: Record<string, unknown> = {}
+    // notice, weak_match and note first so a reader sees them before the results.
+    const responseBody: Record<string, unknown> = u.notice ? { notice: u.notice } : {}
     if (searchCfg.weakMatch) {
       responseBody.weak_match = responseWeak
       if (responseWeak) responseBody.note = WEAK_MATCH_NOTE
@@ -972,16 +1015,18 @@ server.tool(
     const start = Math.max(0, (chunk.source_line_start as number ?? 0) - window_lines)
     const end = Math.min(lines.length, (chunk.source_line_end as number ?? lines.length) + window_lines)
 
+    const u = untrustedText(getSearchConfig().untrustedWrap)
     return {
       content: [{
         type: 'text',
         text: JSON.stringify({
+          ...(u.notice ? { notice: u.notice } : {}),
           source_app: raw.source_app,
           session_date: raw.started_at,
-          session_summary: raw.summary,
+          session_summary: u.body(raw.summary as string | null),
           context_lines: `${start + 1}-${end}`,
           total_lines: lines.length,
-          content: lines.slice(start, end).join('\n'),
+          content: u.body(lines.slice(start, end).join('\n')),
         }, null, 2),
       }],
     }
