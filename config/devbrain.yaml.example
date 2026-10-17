@@ -43,6 +43,24 @@ summarization:
   url: http://localhost:11434
   model: qwen2.5:7b
 
+# Cognify pass settings.
+cognify:
+  # Cheap pre-LLM gate in front of the extract pass. No LLM call; read-only.
+  # See docs/MEMORY_PIPELINE.md. Env override in brackets.
+  extract_gate:
+    # off | dry_run (log what would be skipped) | on   [DEVBRAIN_EXTRACT_GATE]
+    mode: "off"
+    min_chars: 300            # skip units with less source text
+    min_human_turns: 1        # transcripts need at least this many human turns
+    max_tool_share: 0.85      # transcripts with more tool output: downgrade
+    skip_path_parts: ["/subagents/", "support-runner"]
+    skip_clis: ["closure-backfill"]   # end_session summaries from these CLIs
+    novelty: true
+    novelty_sample: 12        # source rows checked against older atoms
+    novel_below: 0.80         # a row is novel below this cosine to any atom
+    downgrade_novel_share: 0.25
+    # skip_novel_share: 0.0   # unset = novelty never skips, only downgrades
+
 # Write-path quality checks.
 write_path:
   # Write-time relation check: compare each new decision/pattern/issue atom

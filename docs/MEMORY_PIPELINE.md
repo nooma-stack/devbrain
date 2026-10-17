@@ -83,6 +83,24 @@ agent's volunteered judgment (promote / contradict / refine / new-edges) and dra
 `curator_re_eval_queue`, decaying `strength` along `depends_on` cascade edges with a
 subtractive penalty and 24h-half-life freshness.
 
+### Extract gate (`factory/cognify/gate.py`)
+Off by default (`cognify.extract_gate.mode: off | dry_run | on`, env
+`DEVBRAIN_EXTRACT_GATE`). Before extract sends a unit (one `provenance_id`
+group: a transcript's chunks, an end_session summary, a breadcrumb chain, a
+stored atom) to the LLM, the gate decides with no LLM call:
+
+| decision | when |
+|----------|------|
+| skip | the unit is a stored atom (`atom_source`); an end_session summary written by a listed CLI (`cli:closure-backfill`); a transcript under a listed path part (`/subagents/`, `support-runner`); fewer than `min_chars` (300) source characters; a transcript with no human turn |
+| downgrade (run last, only if LLM budget is left) | transcript text more than 85% tool output; fewer than 25% of sampled source rows below 0.80 cosine to an older atom (`low_novelty`) |
+| extract | otherwise |
+
+`dry_run` logs `extract_gate: would skip …` lines and records counts, reasons
+and up to 50 ids per action in the extract run's `cognify_run_log.metadata.gate`;
+extraction is unchanged. In `on`, a skipped unit is not picked up again unless
+new source rows arrive. `devbrain cognify-gate --project <slug> --last 200`
+reports decisions on recent units, with each unit's atoms so far, read-only.
+
 ### Write-time relation check (`factory/cognify/relate.py`, migration 048)
 Off by default (`write_path.relation_check.mode: off | shadow | on`). When on,
 each new decision/pattern/issue atom is compared with its nearest live atoms in
@@ -166,6 +184,13 @@ Each encodes a past incident or invariant:
 
 ## Known seams that have bitten us
 
+- **Extract re-extraction loop (fixed 2026-10).** `_sessions_since` counted
+  extracted atoms (`tier='lesson'`, same `provenance_id`, created after the
+  watermark), so every extracted unit became a candidate again on the next
+  run. One 2.9k-char session summary was re-extracted in 229 separate hours
+  into 2,628 atoms; ~98% of all atoms came from summaries and breadcrumb chains
+  re-extracted this way, which is where most near-duplicate atoms came from.
+  Candidates now count source rows only.
 - The chunk dual-write had **no** `ON CONFLICT` until migration 045 — re-running
   the backfill duplicated every chunk (BrightBrain hit 83% dup chunk rows, one
   chunk 824×), flooding `deep_search`'s top-K with stale duplicates that tripped

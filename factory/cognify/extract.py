@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
 
-from cognify import relate
+from cognify import gate, relate
 from cognify.embedding import embed_text, to_vector_literal
 from cognify.orchestrator import CognifyPass, PassResult, register_pass
 from observability.pricing import (
@@ -270,14 +270,35 @@ class ExtractPass(CognifyPass):
         sessions_processed = 0
         failure_counts: dict[str, int] = {}
 
-        for session_id in candidate_sessions:
+        # Cheap pre-LLM gate (cognify.extract_gate; off by default). In
+        # dry_run it only logs; in "on" skipped units are dropped and
+        # downgraded units go to the back of the queue, so they only use
+        # LLM budget that is left after the others.
+        gate_cfg = gate.get_config()
+        gate_log = gate.GateLog(gate_cfg.mode) if gate_cfg.enabled else None
+        deferred: list[str] = []
+        evaluated: set[str] = set()
+
+        def _queue():
+            yield from candidate_sessions
+            yield from deferred
+
+        for session_id in _queue():
             if total_llm >= cap:
                 logger.info(
-                    "cognify_extract: LLM cap (%d) reached, deferring %d sessions",
+                    "cognify_extract: LLM cap (%d) reached, deferring remaining sessions",
                     cap,
-                    len(candidate_sessions) - sessions_processed,
                 )
                 break
+            if gate_log is not None and session_id not in evaluated:
+                evaluated.add(session_id)
+                decision = gate.evaluate(conn, session_id, project_id, gate_cfg)
+                gate_log.add(decision)
+                if gate_cfg.applies and decision.action == "skip":
+                    continue
+                if gate_cfg.applies and decision.action == "downgrade":
+                    deferred.append(session_id)
+                    continue
             result = extract_from_session(
                 conn,
                 session_id,
@@ -307,6 +328,7 @@ class ExtractPass(CognifyPass):
                 # errors and API failures are visible in the run log.
                 "failure_counts": failure_counts,
                 "since": since.isoformat() if since else None,
+                "gate": gate_log.summary() if gate_log is not None else None,
             },
         )
 
