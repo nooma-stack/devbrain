@@ -11,7 +11,7 @@ import { z } from 'zod'
 import { query, waitForDb } from './db.js'
 import { embed, embedQuery, toSqlVector } from './embeddings.js'
 import { enqueueCascades, recordMemory, recordMemoryDependency, resolveMemoryId } from './memory.js'
-import { triggerRelationCheckInBackground } from './relation.js'
+import { relationCheckMode, relationStoreNote, triggerRelationCheckInBackground } from './relation.js'
 import {
   computeRecencyWarning,
   expandRecencyNeighbors,
@@ -1041,9 +1041,7 @@ server.tool(
           sweepMax: 5,
         })
       : false
-    const relationNote = relationQueued
-      ? ` Duplicate check queued: if this is already known it will be merged into the existing memory (memory ${memoryId!.slice(0, 8)}).`
-      : ''
+    const relationNote = relationQueued ? relationStoreNote(relationCheckMode(), memoryId!) : ''
     return { content: [{ type: 'text', text: baseMsg + edgeSummary + noteSummary + relationNote }] }
   },
 )

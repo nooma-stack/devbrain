@@ -49,6 +49,21 @@ export function relationCheckMode(): RelationMode {
   return yamlMode()
 }
 
+/**
+ * The sentence the store reply appends once a check has been spawned. It
+ * must match what the check will actually do: shadow mode only logs.
+ */
+export function relationStoreNote(mode: RelationMode, memoryId: string): string {
+  const ref = `memory ${memoryId.slice(0, 8)}`
+  if (mode === 'on') {
+    return ` Duplicate check queued: if this is already known it will be merged into the existing memory (${ref}).`
+  }
+  if (mode === 'shadow') {
+    return ` Duplicate check logged (shadow mode, ${ref}); nothing will change.`
+  }
+  return ''
+}
+
 /** CLI args for one async check (exported for tests). */
 export function relateArgs(opts: {
   memoryId?: string | null
