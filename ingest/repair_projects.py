@@ -69,7 +69,7 @@ def resolve_slug(source_app: str, source_path: str) -> str | None:
             continue
         try:
             return adapter.detect_project(path)
-        except Exception:
+        except Exception:  # noqa: BLE001 - a missing/unreadable file means "unresolved"
             return None
     return None
 
