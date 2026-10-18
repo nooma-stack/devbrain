@@ -1205,7 +1205,9 @@ def _llm_extract(
         "cache_read_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
         "cache_write_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
     }
-    text = response.content[0].text.strip()
+    from cognify._anthropic_auth import response_text
+
+    text = response_text(response).strip()
     # The OAuth path doesn't allow assistant prefill (see comment above
     # the messages.create call) so the response is whatever Sonnet
     # emitted. _parse_json_with_fallbacks handles:

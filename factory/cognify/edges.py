@@ -429,6 +429,7 @@ def _llm_judge_contradiction(
     from cognify._anthropic_auth import (
         claude_code_system_prefix,
         resolve_anthropic_auth,
+        response_text,
     )
     auth_kwargs = resolve_anthropic_auth()
     if auth_kwargs is None:
@@ -460,7 +461,7 @@ def _llm_judge_contradiction(
             "cache_read_tokens": getattr(usage, "cache_read_input_tokens", 0) or 0,
             "cache_write_tokens": getattr(usage, "cache_creation_input_tokens", 0) or 0,
         }
-        text = response.content[0].text.strip().upper()
+        text = response_text(response).strip().upper()
         return text.startswith("YES"), token_usage
     except Exception as exc:  # noqa: BLE001
         logger.warning("cognify_edges: LLM contradiction check failed: %s", exc)

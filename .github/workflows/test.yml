@@ -125,6 +125,7 @@ jobs:
             tests/test_cognify_max_llm_calls.py \
             tests/test_cognify_backends.py \
             tests/test_cognify_openai_backend.py \
+            tests/test_anthropic_response_text.py \
             -p no:cacheprovider --tb=short -q
 
   mcp-server:
