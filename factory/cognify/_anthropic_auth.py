@@ -128,3 +128,20 @@ def claude_code_system_prefix() -> str | None:
     if _resolve_oauth_token():
         return _CLAUDE_CODE_SYSTEM_PREFIX
     return None
+
+
+def response_text(response) -> str:
+    """Join the text blocks of a Messages API response.
+
+    A response can open with a thinking block (the model decides, even
+    when the request doesn't ask for thinking), so ``content[0].text``
+    raises AttributeError. Two extract runs on 2026-10-17/18 died that way.
+    """
+    parts = []
+    for block in response.content or []:
+        if getattr(block, "type", None) in ("thinking", "redacted_thinking"):
+            continue
+        text = getattr(block, "text", None)
+        if isinstance(text, str):
+            parts.append(text)
+    return "".join(parts)
