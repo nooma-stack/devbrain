@@ -101,7 +101,11 @@ describe unfinished steps as done. Respond ONLY with JSON matching this schema:
 
 # Input budgets per backend (chars). ~3.5M chars ≈ 1M tokens: the
 # gpt-5.6 window, so the head+tail cap almost never fires on "openai".
-BUDGETS = {"ollama": 90_000, "codex": 2_000_000, "openrouter": 1_200_000,
+# codex exec refuses input over 1,048,576 characters ("input_too_large");
+# leave room for PROMPT_HEADER, the schema and breadcrumbs. At 2,000,000
+# every long Nooma session failed on every hourly run (2026-10-19).
+CODEX_MAX_INPUT_CHARS = 1_048_576
+BUDGETS = {"ollama": 90_000, "codex": 1_000_000, "openrouter": 1_200_000,
            "openai": 3_500_000}
 
 
