@@ -24,6 +24,9 @@ from pathlib import Path
 # with an end_session-shaped tool would also count, which is fine — the
 # scan answers "did ANY session-closure ritual happen", not "which brain".
 _TOOL_RE = re.compile(r"^mcp__[A-Za-z0-9_-]+__(end_session|breadcrumb|start_session)$")
+# Cheap line-level counters for TranscriptFacts.one_shot (no JSON parse).
+_TOOL_USE_RE = re.compile(r'"type":\s*"tool_use"')
+_USER_RE = re.compile(r'"type":\s*"user"')
 
 
 @dataclass
@@ -36,6 +39,17 @@ class TranscriptFacts:
     last_breadcrumb_line: int | None = None
     breadcrumbs: list[dict] = field(default_factory=list)  # tool inputs, in order
     parse_errors: int = 0
+    user_turns: int = 0  # user prompts (tool results excluded)
+    tool_calls: int = 0
+
+    @property
+    def one_shot(self) -> bool:
+        """A single prompt with no tool calls (a headless ``claude -p``
+        review call, say). Its chunks are already in the brain; a closure
+        summary only says "nothing happened" and trips the junk check.
+        Unparsed rows (pre-USF plain text) have total_lines 0 and never
+        count as one-shot."""
+        return self.total_lines > 0 and self.user_turns <= 1 and self.tool_calls == 0
 
 
 def _iter_tool_uses(entry: dict):
@@ -54,6 +68,10 @@ def parse_transcript(path: str | Path) -> TranscriptFacts:
     with open(path, encoding="utf-8", errors="replace") as fh:
         for lineno, line in enumerate(fh, 1):
             facts.total_lines = lineno
+            if _TOOL_USE_RE.search(line):
+                facts.tool_calls += 1
+            elif _USER_RE.search(line) and "tool_result" not in line:
+                facts.user_turns += 1
             if "mcp__" not in line:
                 continue  # cheap pre-filter; tool_use lines always contain it
             try:
@@ -142,6 +160,9 @@ def parse_usf(raw_json: str, path: str = "<db:raw_content>") -> TranscriptFacts:
     messages = usf.get("messages") or []
     facts.total_lines = len(messages)
     for idx, msg in enumerate(messages, 1):
+        if msg.get("role") == "user":
+            facts.user_turns += 1
+        facts.tool_calls += len(msg.get("tool_calls") or [])
         for call in (msg.get("tool_calls") or []):
             m = _TOOL_RE.match(str(call.get("tool", "")))
             if not m:
