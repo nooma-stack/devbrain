@@ -287,8 +287,10 @@ def main() -> int:
     cur.execute("SELECT session_id FROM devbrain.end_session_log")
     logged_ids = {r[0] for r in cur.fetchall()}
 
+    from pipeline import is_excluded_path  # noqa: PLC0415
+
     stats = {"scanned": 0, "closed": 0, "unclosed": 0, "from_db_copy": 0,
-             "already_logged": 0, "backfilled": 0, "failed": 0}
+             "already_logged": 0, "skipped": 0, "backfilled": 0, "failed": 0}
     todo: list[tuple[str, str, str | None, str, object]] = []
     for row_id, session_uuid, source_path, slug in rows:
         stats["scanned"] += 1
@@ -298,6 +300,12 @@ def main() -> int:
         # "backfill-None" and the first closure would mark them ALL as
         # already-backfilled.
         ident = session_uuid or f"row-{row_id}"
+        # Transcripts ingest now excludes (subagents, headless runners)
+        # were stored before #210; the parent session's closure covers
+        # them, so they never need their own.
+        if source_path and is_excluded_path(Path(source_path)):
+            stats["skipped"] += 1
+            continue
         if source_path and Path(source_path).exists():
             facts = parse_transcript(source_path)
         else:
@@ -323,6 +331,9 @@ def main() -> int:
         if facts.closed:
             stats["closed"] += 1
             continue
+        if facts.one_shot:
+            stats["skipped"] += 1
+            continue
         if (f"backfill-{ident}" in logged_ids
                 or (facts.conversation_uuid
                     and facts.conversation_uuid in logged_ids)):
@@ -336,7 +347,8 @@ def main() -> int:
     print(f"scan: {stats['scanned']} sessions — {stats['closed']} closed, "
           f"{stats['already_logged']} already-backfilled, "
           f"{stats['unclosed']} unclosed "
-          f"(of which {stats['from_db_copy']} via DB copy, file gone)",
+          f"(of which {stats['from_db_copy']} via DB copy, file gone), "
+          f"{stats['skipped']} skipped (subagent or one-shot)",
           flush=True)
     if args.report:
         return 0
