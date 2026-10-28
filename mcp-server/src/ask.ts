@@ -246,7 +246,14 @@ const VECTOR_SQL = `
 `
 
 let screenColumn: Promise<boolean> | null = null
-function hasScreenColumn(q: QueryFn): Promise<boolean> {
+/**
+ * Whether devbrain.memory.screen_flags exists. A failed check is not cached
+ * (it used to be cached as "no column" for the life of the process, which
+ * silently dropped every screening label) and it rejects, so ask fails
+ * rather than answering without labels. Installs without migration 049 get
+ * false and answer without labels, as before.
+ */
+export function hasScreenColumn(q: QueryFn): Promise<boolean> {
   if (q !== query) {
     return q(`SELECT 1 AS ok FROM information_schema.columns WHERE column_name = 'screen_flags'`)
       .then((r) => r.rows.length > 0)
@@ -256,7 +263,10 @@ function hasScreenColumn(q: QueryFn): Promise<boolean> {
        AND table_name = 'memory' AND column_name = 'screen_flags'`,
   )
     .then((r) => r.rows.length > 0)
-    .catch(() => false)
+    .catch((err) => {
+      screenColumn = null
+      throw err
+    })
   return screenColumn
 }
 
