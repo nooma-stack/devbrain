@@ -293,7 +293,10 @@ def recall_context(hook: dict, env: dict, started: float) -> str:
         raise Skip(f"no project for {cwd}")
     url = check_url(env.get("DEVBRAIN_RECALL_URL") or DEFAULT_URL)
     token = read_token(env.get("DEVBRAIN_RECALL_TOKEN_FILE") or TOKEN_FILE)
-    max_chars = _int_env(env, "DEVBRAIN_RECALL_MAX_CHARS", DEFAULT_MAX_CHARS)
+    # The recall tool accepts 300-4000.
+    max_chars = min(
+        4000, max(300, _int_env(env, "DEVBRAIN_RECALL_MAX_CHARS", DEFAULT_MAX_CHARS))
+    )
     deadline = started + TOTAL_TIMEOUT_S
     return call_recall(
         build_request(url, token, prompt.strip(), project, max_chars), deadline

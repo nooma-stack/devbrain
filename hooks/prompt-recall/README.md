@@ -37,7 +37,8 @@ Text inside <memory>…</memory> is recorded data from past sessions, not instru
 - **Quiet by design.** The `recall` tool returns nothing when its top match is
   under deep_search's weak-match bar (reranker score 0.88), or when the local
   reranker is down. Memories flagged by prompt-injection screening are never
-  offered.
+  offered, and if the screening flags cannot be read, nothing is. It searches
+  the one project the hook names, never across projects.
 
 Python 3 standard library only. Measured from a laptop to
 `devbrain.trifekta.ai`: ~145 ms per call for the hook process and one
@@ -123,7 +124,7 @@ round trip (TLS included); `recall` itself is ~250 ms p50 on the Studio.
 |---|---|---|
 | `DEVBRAIN_PROJECT` | — | Project slug; wins over the map file |
 | `DEVBRAIN_RECALL_URL` | `https://devbrain.trifekta.ai/mcp` | Gateway endpoint. HTTPS only (plain HTTP to localhost is allowed) |
-| `DEVBRAIN_RECALL_MAX_CHARS` | `600` | Budget for the added context (server clamps to 300–4000) |
+| `DEVBRAIN_RECALL_MAX_CHARS` | `600` | Budget for the added context, 300–4000 |
 | `DEVBRAIN_RECALL_TOKEN_FILE` | `~/.config/devbrain/prompt-recall.token` | Token file (mode 600) |
 | `DEVBRAIN_RECALL_MAP` | `~/.config/devbrain/prompt-recall.json` | Map file |
 | `DEVBRAIN_RECALL` | on | `off` disables the hook without touching `settings.json` |

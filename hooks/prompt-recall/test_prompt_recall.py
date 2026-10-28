@@ -290,6 +290,9 @@ def test_long_prompt_is_capped_and_budget_passed(setup, gateway):
     args = gateway.requests[0]["body"]["params"]["arguments"]
     assert len(args["prompt"]) == pr.MAX_PROMPT_SEND
     assert args["max_chars"] == 400
+    env["DEVBRAIN_RECALL_MAX_CHARS"] = "50"
+    run_hook(env)
+    assert gateway.requests[-1]["body"]["params"]["arguments"]["max_chars"] == 300
 
 
 @pytest.mark.parametrize(
