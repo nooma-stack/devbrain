@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -I \"$HOME/devbrain/hooks/prompt-recall/prompt_recall.py\"",
+            "timeout": 3
+          }
+        ]
+      }
+    ]
+  }
+}

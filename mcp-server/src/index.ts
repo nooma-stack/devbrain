@@ -51,6 +51,7 @@ import {
 } from './recency.js'
 import { summarizeSession } from './summarize.js'
 import { registerAskTool } from './ask.js'
+import { registerRecallTool } from './recall.js'
 
 // Factory orchestrator runner path
 const FACTORY_RUNNER = resolve(import.meta.dirname, '../../factory/run.py')
@@ -2857,6 +2858,9 @@ server.tool(
 
 // ─── Tool: ask (typed question, retrieval only; mcp-server/src/ask.ts) ───────
 registerAskTool(server, { resolveProjectId, defaultProject: DEFAULT_PROJECT })
+
+// ─── Tool: recall (prompt-hook memory; mcp-server/src/recall.ts) ────────────
+registerRecallTool(server, { resolveProjectId, defaultProject: DEFAULT_PROJECT })
 
 async function main() {
   // Probe the DB before we tell the MCP client we're ready. If the DB
