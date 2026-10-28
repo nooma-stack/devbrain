@@ -392,13 +392,22 @@ def parse_response(text: str, n_candidates: int) -> tuple[str, int, float]:
     return rel, match, conf
 
 
-def _ollama_chat(cfg: RelateConfig, messages: list[dict]) -> str:
+def _ollama_chat(
+    cfg: RelateConfig,
+    messages: list[dict],
+    *,
+    schema: dict | None = None,
+    num_predict: int = 64,
+) -> str:
+    """One non-streaming chat call to the deployment's local Ollama.
+    ``schema`` defaults to the relation verdict schema; the cognify sweep
+    pass passes its own."""
     body: dict[str, Any] = {
         "model": cfg.model,
         "messages": messages,
         "stream": False,
-        "format": _OUTPUT_SCHEMA,
-        "options": {"temperature": 0, "num_predict": 64},
+        "format": schema or _OUTPUT_SCHEMA,
+        "options": {"temperature": 0, "num_predict": num_predict},
     }
     if cfg.think is not None:
         body["think"] = cfg.think

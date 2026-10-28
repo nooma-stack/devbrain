@@ -104,6 +104,7 @@ def _ensure_registry() -> None:
     from cognify import fanout as _  # noqa: F401  # Phase 8 fan-out
     from cognify import resummarize as _  # noqa: F401  # Sonnet summary upgrade
     from cognify import entities as _  # noqa: F401  # facts graph (migration 050)
+    from cognify import sweep as _  # noqa: F401  # outdated-memory sweep (local model)
 
 
 def register_pass(cls: type[CognifyPass]) -> type[CognifyPass]:
@@ -117,7 +118,7 @@ def register_pass(cls: type[CognifyPass]) -> type[CognifyPass]:
 
 PASS_ORDER = [
     "decay", "gc", "extract", "edges", "strengthen", "fanout", "resummarize",
-    "entities",
+    "sweep", "entities",
 ]
 
 

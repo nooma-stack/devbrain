@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- cognify_sweep: nightly outdated-memory sweep across all projects.      -->
+<!-- Judges (older, newer) atom pairs with the LOCAL Ollama model only      -->
+<!-- (no hosted API, no credential). cognify.sweep.mode: shadow (default,   -->
+<!-- log only) | on (write supersedes / contradicts edges). Capped by       -->
+<!-- cognify.sweep.max_pairs per run. See factory/cognify/sweep.py.         -->
+<!-- Placeholders ${DEVBRAIN_HOME} and ${USER} are substituted by           -->
+<!-- `devbrain setup-cognify-launchd`. Do NOT cp this file directly into    -->
+<!-- ~/Library/LaunchAgents/ — placeholders won't expand and launchd will   -->
+<!-- fail at runtime.                                                       -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.devbrain.cognify-sweep</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>${DEVBRAIN_HOME}/.venv/bin/python</string>
+        <string>${DEVBRAIN_HOME}/factory/cli.py</string>
+        <string>cognify</string>
+        <string>--pass=sweep</string>
+    </array>
+
+    <!-- Nightly at 03:40 local time (after the hourly passes' :xx runs   -->
+    <!-- settle; a missed run fires on wake).                             -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>40</integer>
+    </dict>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DEVBRAIN_HOME</key>
+        <string>${DEVBRAIN_HOME}</string>
+        <key>PYTHONPATH</key>
+        <string>${DEVBRAIN_HOME}/factory</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>${DEVBRAIN_HOME}/factory</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/${USER}/.devbrain/logs/cognify-sweep.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/${USER}/.devbrain/logs/cognify-sweep.err</string>
+
+    <key>ThrottleInterval</key>
+    <integer>300</integer>
+</dict>
+</plist>
