@@ -196,6 +196,34 @@ extraction is unchanged. In `on`, a skipped unit is not picked up again unless
 new source rows arrive. `devbrain cognify-gate --project <slug> --last 200`
 reports decisions on recent units, with each unit's atoms so far, read-only.
 
+### Extract evidence and identity (`factory/cognify/extract.py`, extraction_version 2)
+- **Quote check.** Every lesson/decision the model returns must carry a
+  `quote` copied from the session text it was given (the first 200k chars).
+  Code checks it word for word; only whitespace runs are collapsed (case,
+  punctuation and quotation marks must match; at least 12 chars). No quote,
+  no row: failures are dropped before embedding and counted per item in the
+  run's `failure_counts` (`no_quote`, `quote_not_found`, `empty_item`). The
+  normalized quote is stored in `memory.applies_when.quote`.
+- **Content-derived identity.** `content_key` = uuid5 over project, storage
+  kind and the normalized title (NFKC, case-folded, punctuation collapsed;
+  the content when there is no title). A new atom's `id` is its key (random
+  only when an archived row already holds that id) and the key is also in
+  `applies_when.content_key`. Before embedding, a live atom with the same key
+  wins: from the same session it is a plain re-run (`duplicate`); from
+  another session it is a re-observation (`merged`: strength + 0.1 like a
+  relation-check `same`, session appended to `applies_when.also_seen_in`).
+  Order of checks: 037's (session, kind, title) → content key → relation
+  check. No migration: the lookup uses the primary key and the existing GIN
+  index on `applies_when`.
+- **Zero-yield visibility.** The extract run's `cognify_run_log.metadata`
+  carries `zero_yield` (units that wrote nothing, by reason: a failure kind,
+  `no_source`, `all_dropped`, `all_known`), `zero_yield_ids` (first 50, for
+  `devbrain cognify-reextract --session`), `items` (returned / created /
+  duplicate / merged / relation_same / dropped), `fallback` (`used` /
+  `failed:<kind>` for the codex → Anthropic fallback) and `stopped`
+  (`refused`: a backend refusal is deployment-wide, so the pass stops and
+  carries the rest).
+
 ### Write-time relation check (`factory/cognify/relate.py`, migration 048)
 Off by default (`write_path.relation_check.mode: off | shadow | on`). When on,
 each new decision/pattern/issue atom is compared with its nearest live atoms in
@@ -360,6 +388,16 @@ Each encodes a past incident or invariant:
   reasoning effort is pinned. Units past the LLM cap and api failures are
   carried to the next run (`metadata.backlog`) instead of falling behind the
   watermark, and dry runs no longer move it.
+- **Extract silent zero yield (2026-10-21 → 10-28).** With codex failing
+  (its login was being re-authenticated) every unit went to the Anthropic
+  fallback. In the end_session-spawned runs for `trifekta-ai` that process
+  had no Anthropic credential, and `_llm_extract` answered "no credential"
+  with empty lists and no `_failure`. Each unit counted as one LLM call that
+  found nothing, was marked done and dropped: 20 calls, 0 rows and empty
+  `failure_counts` per run, ~120 units lost from the backlog. A missing SDK
+  or credential is now `refused` (no call made, unit stays eligible), the
+  unit keeps codex's `api` failure, and `metadata.fallback` /
+  `metadata.zero_yield` show what happened.
 - **Extract re-extraction loop (fixed 2026-10).** `_sessions_since` counted
   extracted atoms (`tier='lesson'`, same `provenance_id`, created after the
   watermark), so every extracted unit became a candidate again on the next

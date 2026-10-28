@@ -11,8 +11,14 @@ raw session content) lives here. factory/curator/end_session.py delegates
 to this module via ``run_extract_pass`` for any scheduled extraction; the
 end_session orchestration shell remains in end_session.py.
 
-Idempotency: (provenance_id, kind) pairs already present in devbrain.memory
-are skipped. Re-running on the same session is a no-op unless content changed.
+Evidence: every extracted item must carry a quote that occurs word for word
+in the session text the model saw (verify_quote; whitespace normalized only).
+Items without one are dropped and counted, never written.
+
+Idempotency: an atom's identity is its content key (uuid5 over project,
+kind and normalized title — content_key). A re-run of the same session is a
+no-op; the same atom from another session merges into the existing row (see
+_upsert_memory).
 
 PHI constraint: LLM prompts contain session content (which may be sensitive),
 but the cognify_run_log rows written by the orchestrator never receive raw
@@ -37,8 +43,11 @@ import logging
 import os
 import shutil
 import subprocess
+import re
 import tempfile
 import time
+import unicodedata
+import uuid
 from dataclasses import dataclass, field
 from typing import Any
 from uuid import UUID
@@ -69,7 +78,8 @@ _API_BACKOFF_S = (2, 5, 15)  # exponential, applied in order
 # Extraction prompt/model version. Bump this integer when the extraction
 # prompt or model changes, then run `devbrain cognify-reextract --since-version=N`
 # to reprocess existing rows. Starts at 1 per Phase 6 design §6.
-CURRENT_EXTRACTION_VERSION = 1
+# 2: every item carries a verified quote; ids are content-derived.
+CURRENT_EXTRACTION_VERSION = 2
 
 # Default extraction model. Routes to the codex CLI backend (schema-constrained
 # JSON → no json_parse failures; runs on the local ChatGPT-sub auth). Override
@@ -234,38 +244,57 @@ def codex_listed_models() -> list[str]:
         return []
 
 # JSON Schema for the extractor's final response — same shape the Anthropic
-# path parses ({lessons:[{title,content}], decisions:[...]}).
+# path parses ({lessons:[{title,content,quote}], decisions:[...]}).
+_ITEM_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["title", "content", "quote"],
+    "properties": {
+        "title": {"type": "string"},
+        "content": {"type": "string"},
+        "quote": {"type": "string"},
+    },
+}
 _CODEX_OUTPUT_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "required": ["lessons", "decisions"],
     "properties": {
-        "lessons": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["title", "content"],
-                "properties": {
-                    "title": {"type": "string"},
-                    "content": {"type": "string"},
-                },
-            },
-        },
-        "decisions": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "required": ["title", "content"],
-                "properties": {
-                    "title": {"type": "string"},
-                    "content": {"type": "string"},
-                },
-            },
-        },
+        "lessons": {"type": "array", "items": _ITEM_SCHEMA},
+        "decisions": {"type": "array", "items": _ITEM_SCHEMA},
     },
 }
+
+# Characters of session text sent to the model. The quote check runs
+# against exactly this text.
+MAX_PROMPT_CHARS = 200_000
+
+# Shared by every backend's prompt. The quote is the item's evidence: it is
+# checked word for word against the session text in code (see
+# verify_quote) and an item without a matching quote is dropped.
+_EXTRACT_INSTRUCTIONS = (
+    "Extract two kinds of items:\n"
+    "1. Lessons: generalizable insights or patterns worth remembering.\n"
+    "2. Decisions: specific architectural or implementation choices made.\n\n"
+    "Each item has:\n"
+    "- title: short, <= 80 chars.\n"
+    "- content: the lesson or decision in detail.\n"
+    "- quote: one passage copied EXACTLY, character for character, from the "
+    "session text that shows the item (one or two sentences, at most 300 "
+    "chars). Copy it; do not paraphrase, shorten with ellipses, fix typos or "
+    "add quotation marks around it.\n\n"
+    "Only extract items the session text itself supports. An item without "
+    "an exact quote from the session is discarded. If nothing is worth "
+    "keeping, return empty lists."
+)
+
+# Quotes shorter than this (after whitespace normalization) do not count:
+# a two-word "quote" matches almost any session.
+MIN_QUOTE_CHARS = 12
+
+# Namespace for content-derived atom ids (uuid5). Fixed forever: changing it
+# changes every derived id and breaks re-run merging.
+CONTENT_KEY_NAMESPACE = uuid.UUID("6f0c4a1e-3b7d-5c2a-9e41-d3b8a2f17c55")
 
 
 def _fallback_configured() -> bool:
@@ -318,6 +347,55 @@ def _routes_to_codex(model: str | None) -> bool:
     return m == "codex" or m.startswith(("gpt-", "gpt5", "o3", "o4", "codex-"))
 
 
+# ── Quote check + content-derived identity ─────────────────────────────────
+
+
+def normalize_ws(text: str) -> str:
+    """Collapse every whitespace run to one space and strip the ends. The
+    only normalization the quote check applies."""
+    return " ".join((text or "").split())
+
+
+def verify_quote(quote: Any, source_normalized: str) -> str | None:
+    """None when ``quote`` occurs word for word in the (already
+    whitespace-normalized) source; otherwise the reason it fails:
+
+      no_quote         missing, not a string, or shorter than MIN_QUOTE_CHARS
+      quote_not_found  not a verbatim substring of the source
+
+    Case, punctuation and quotation marks must match exactly; only
+    whitespace is normalized."""
+    if not isinstance(quote, str):
+        return "no_quote"
+    q = normalize_ws(quote)
+    if len(q) < MIN_QUOTE_CHARS:
+        return "no_quote"
+    if q not in source_normalized:
+        return "quote_not_found"
+    return None
+
+
+_NON_WORD = re.compile(r"[\W_]+", re.UNICODE)
+
+
+def normalize_claim(text: str) -> str:
+    """Normalization for content keys: NFKC, case-folded, every run of
+    non-alphanumerics collapsed to one space. "Use UUID5 ids!" and
+    "use  uuid5 IDs" map to the same key."""
+    t = unicodedata.normalize("NFKC", text or "").casefold()
+    return _NON_WORD.sub(" ", t).strip()
+
+
+def content_key(project_id: Any, db_kind: str, title: str, content: str) -> UUID:
+    """Content-derived identity of an extracted atom: uuid5 over project,
+    storage kind and the normalized title (the content when there is no
+    title). The same lesson extracted again — from a re-run or from another
+    session of the same project — gets the same key, so it merges into the
+    existing row instead of adding a duplicate."""
+    claim = normalize_claim(title) or normalize_claim(content)
+    return uuid.uuid5(CONTENT_KEY_NAMESPACE, f"{project_id}\x1f{db_kind}\x1f{claim}")
+
+
 @dataclass
 class ExtractResult:
     """Result of extracting lessons/decisions from a single session.
@@ -337,12 +415,45 @@ class ExtractResult:
     skipped_duplicates: int = 0
     llm_calls: int = 0
     memory_ids: list[str] = field(default_factory=list)
-    failure: str | None = None  # None | "api" | "json_parse" | "empty"
+    failure: str | None = None  # None | "api" | "json_parse" | "empty" | "refused"
+    # Items the model returned (lessons + decisions), before any check.
+    items_returned: int = 0
+    # Per-item outcomes: no_quote / quote_not_found / empty_item (dropped
+    # before any write) and created / duplicate / merged / relation_same
+    # (see _upsert_memory).
+    item_outcomes: dict[str, int] = field(default_factory=dict)
+    # When codex failed and the Anthropic fallback ran: "used" or
+    # "failed:<kind>". None when no fallback was attempted.
+    fallback: str | None = None
 
     @property
     def patterns_created(self) -> int:
         """Alias for lessons_created — matches DB storage kind ('pattern')."""
         return self.lessons_created
+
+    @property
+    def zero_yield_reason(self) -> str | None:
+        """Why this unit produced no new row; None when it produced one.
+
+          <failure>          api / json_parse / empty / refused
+          no_source          no source rows (or empty text): no LLM call
+          all_dropped        every item failed the quote check
+          all_known          every kept item already existed (same session
+                             re-run, content-key merge, or a "same" verdict)
+        """
+        if self.lessons_created or self.decisions_created:
+            return None
+        if self.failure:
+            return self.failure
+        if self.items_returned == 0:
+            return "no_source" if self.llm_calls == 0 else "empty"
+        dropped = sum(
+            self.item_outcomes.get(k, 0)
+            for k in ("no_quote", "quote_not_found", "empty_item")
+        )
+        if dropped >= self.items_returned:
+            return "all_dropped"
+        return "all_known"
 
 
 @register_pass
@@ -422,6 +533,14 @@ class ExtractPass(CognifyPass):
         total_llm = 0
         sessions_processed = 0
         failure_counts: dict[str, int] = {}
+        # Why units produced nothing (see ExtractResult.zero_yield_reason),
+        # per-item outcomes, and the codex→Anthropic fallback's results.
+        # Ids and counts only: no memory text reaches the run log.
+        zero_yield: dict[str, int] = {}
+        zero_yield_ids: list[dict] = []
+        items: dict[str, int] = {}
+        fallback: dict[str, int] = {}
+        stopped: str | None = None
 
         # Cheap pre-LLM gate (cognify.extract_gate; off by default). In
         # dry_run it only logs; in "on" skipped units are dropped and
@@ -473,6 +592,32 @@ class ExtractPass(CognifyPass):
                 failure_counts[result.failure] = failure_counts.get(result.failure, 0) + 1
             if result.failure == "api":
                 retry.append(session_id)
+            _tally(items, result.item_outcomes)
+            if result.items_returned:
+                _tally(items, {"returned": result.items_returned})
+            # Items dropped by the quote check count as failures too, so a
+            # model that stops quoting shows up where the other failures do.
+            _tally(failure_counts, {
+                k: v for k, v in result.item_outcomes.items()
+                if k in ("no_quote", "quote_not_found", "empty_item")
+            })
+            if result.fallback:
+                _tally(fallback, {result.fallback: 1})
+            reason = result.zero_yield_reason
+            if reason:
+                _tally(zero_yield, {reason: 1})
+                if len(zero_yield_ids) < _MAX_ZERO_YIELD_IDS:
+                    zero_yield_ids.append({"id": session_id, "reason": reason})
+            if result.failure == "refused":
+                # Refusals are deployment-wide (backend not allowed, no
+                # credential, unsafe codex home): every later unit would be
+                # refused too. Stop; the rest is carried to the next run.
+                stopped = "refused"
+                logger.warning(
+                    "cognify_extract: backend refused; carrying the remaining "
+                    "units to the next run"
+                )
+                break
 
         backlog = _next_backlog(
             candidate_sessions + deferred, done, gate_skipped, retry, tries
@@ -496,13 +641,33 @@ class ExtractPass(CognifyPass):
                 "decisions_created": total_decisions,
                 # A4: surface per-failure-kind counts so silent JSON parse
                 # errors and API failures are visible in the run log.
+                # Includes per-item quote-check drops (no_quote,
+                # quote_not_found, empty_item).
                 "failure_counts": failure_counts,
+                # Units that wrote nothing, by reason, plus the first ids
+                # (for `devbrain cognify-reextract --session=<id>`).
+                "zero_yield": zero_yield,
+                "zero_yield_ids": zero_yield_ids,
+                # returned / created / duplicate / merged / relation_same /
+                # no_quote / quote_not_found / empty_item.
+                "items": items,
+                "fallback": fallback,
+                "stopped": stopped,
                 "since": since.isoformat() if since else None,
                 "gate": gate_log.summary() if gate_log is not None else None,
                 # Read back by the next run (_last_backlog). Ids only.
                 "backlog": backlog,
             },
         )
+
+
+_MAX_ZERO_YIELD_IDS = 50
+
+
+def _tally(into: dict[str, int], add: dict[str, int]) -> None:
+    for k, v in add.items():
+        if v:
+            into[k] = into.get(k, 0) + v
 
 
 def run_extract_pass(
@@ -557,10 +722,12 @@ def extract_from_session(
         )
         return ExtractResult(session_id=session_id)
 
-    # Build combined content for the LLM.
-    combined = _combine_chunks(chunks)
+    # Build combined content for the LLM. The model sees (and must quote
+    # from) only the first MAX_PROMPT_CHARS characters.
+    combined = _combine_chunks(chunks)[:MAX_PROMPT_CHARS]
     if not combined.strip():
         return ExtractResult(session_id=session_id)
+    fallback_outcome: str | None = None
 
     # Call LLM for extraction. An explicit cognify.backend wins and gets no
     # fallback. Otherwise route to the codex CLI (schema-constrained,
@@ -602,10 +769,22 @@ def extract_from_session(
             fallback = _llm_extract(
                 combined, max_llm_calls=max_llm_calls, model=_FALLBACK_MODEL,
             )
+            fallback_outcome = (
+                "used" if fallback.get("_failure") in (None, "empty")
+                else f"failed:{fallback['_failure']}"
+            )
+            if fallback.get("_failure") not in (None, "empty"):
+                logger.warning(
+                    "cognify_extract: fallback %s failed too (%s: %s)",
+                    _FALLBACK_MODEL, fallback.get("_failure"),
+                    (fallback.get("_failure_detail") or "")[:160],
+                )
             # Use the fallback only if it actually succeeded; otherwise keep
             # codex's failure so telemetry reflects the primary backend
             # (unless codex never ran: then report the fallback's outcome).
-            if not fallback.get("_failure"):
+            # "empty" is a completed call that found nothing: accept it (and
+            # its spend) rather than retrying the unit as a codex failure.
+            if fallback.get("_failure") in (None, "empty"):
                 extracted = fallback
                 effective_model = _FALLBACK_MODEL  # spend block bills the right model
             elif extracted.get("_failure") == "refused":
@@ -643,53 +822,78 @@ def extract_from_session(
             cost_usd=cost,
         )
 
-    lessons_created = 0
-    decisions_created = 0
+    created = {"lesson": 0, "decision": 0}
     skipped = 0
     memory_ids: list[str] = []
+    outcomes: dict[str, int] = {}
+    returned = 0
+    # The quote check runs against the exact text the model saw, with
+    # whitespace runs collapsed on both sides.
+    source_normalized = normalize_ws(combined)
 
-    for item in extracted.get("lessons", []):
-        mid, was_new = _upsert_memory(
-            conn,
-            project_id=project_id,
-            kind="lesson",
-            title=item.get("title", ""),
-            content=item.get("content", ""),
-            session_id=session_id,
-            reextract=reextract,
-            reextract_meta=item.get("reextracted_from"),
-        )
-        if was_new:
-            lessons_created += 1
-            memory_ids.append(str(mid))
-        else:
-            skipped += 1
+    for kind, key in (("lesson", "lessons"), ("decision", "decisions")):
+        items = extracted.get(key) or []
+        if not isinstance(items, list):
+            items = []
+        for item in items:
+            returned += 1
+            if not isinstance(item, dict):
+                _tally(outcomes, {"empty_item": 1})
+                continue
+            title = str(item.get("title") or "")
+            content = str(item.get("content") or "")
+            if not normalize_claim(title) and not normalize_claim(content):
+                _tally(outcomes, {"empty_item": 1})
+                continue
+            # No quote, no row: an item the session text does not contain
+            # word for word is dropped before anything is embedded or
+            # written.
+            quote_failure = verify_quote(item.get("quote"), source_normalized)
+            if quote_failure:
+                _tally(outcomes, {quote_failure: 1})
+                continue
+            report: dict = {}
+            mid, was_new = _upsert_memory(
+                conn,
+                project_id=project_id,
+                kind=kind,
+                title=title,
+                content=content,
+                session_id=session_id,
+                reextract=reextract,
+                reextract_meta=item.get("reextracted_from"),
+                quote=normalize_ws(item["quote"]),
+                report=report,
+            )
+            _tally(outcomes, {
+                report.get("outcome") or ("created" if was_new else "duplicate"): 1
+            })
+            if was_new:
+                created[kind] += 1
+                memory_ids.append(str(mid))
+            else:
+                skipped += 1
 
-    for item in extracted.get("decisions", []):
-        mid, was_new = _upsert_memory(
-            conn,
-            project_id=project_id,
-            kind="decision",
-            title=item.get("title", ""),
-            content=item.get("content", ""),
-            session_id=session_id,
-            reextract=reextract,
-            reextract_meta=item.get("reextracted_from"),
+    if outcomes.get("no_quote") or outcomes.get("quote_not_found"):
+        logger.info(
+            "cognify_extract: session %s: %d of %d item(s) dropped by the quote "
+            "check (no_quote=%d quote_not_found=%d)",
+            session_id,
+            outcomes.get("no_quote", 0) + outcomes.get("quote_not_found", 0),
+            returned, outcomes.get("no_quote", 0), outcomes.get("quote_not_found", 0),
         )
-        if was_new:
-            decisions_created += 1
-            memory_ids.append(str(mid))
-        else:
-            skipped += 1
 
     return ExtractResult(
         session_id=session_id,
-        lessons_created=lessons_created,
-        decisions_created=decisions_created,
+        lessons_created=created["lesson"],
+        decisions_created=created["decision"],
         skipped_duplicates=skipped,
         llm_calls=llm_calls,
         memory_ids=memory_ids,
         failure=extracted.get("_failure"),
+        items_returned=returned,
+        item_outcomes=outcomes,
+        fallback=fallback_outcome,
     )
 
 
@@ -920,10 +1124,9 @@ def _codex_extract(content: str, *, model: str | None = None) -> dict:
 
     prompt = (
         "You are a structured knowledge extractor. From the dev session below, "
-        "extract generalizable lessons and the specific architecture/implementation "
-        "decisions that were made. Each item needs a short title (<= 80 chars) and "
-        "a detailed content string. Return ONLY the structured object matching the "
-        "provided schema.\n\nSession:\n\n" + content[:200_000]
+        + _EXTRACT_INSTRUCTIONS
+        + "\n\nReturn ONLY the structured object matching the provided schema."
+        "\n\nSession:\n\n" + content[:MAX_PROMPT_CHARS]
     )
 
     with tempfile.TemporaryDirectory(prefix="cognify-codex-") as wd:
@@ -1006,11 +1209,9 @@ def _openai_extract(content: str, *, model: str | None = None) -> dict:
     """
     res = openai_api.complete(
         "You are a structured knowledge extractor. From the dev session the "
-        "user provides, extract generalizable lessons and the specific "
-        "architecture/implementation decisions that were made. Each item needs "
-        "a short title (<= 80 chars) and a detailed content string. Return "
-        "ONLY the structured object matching the provided schema.",
-        "Session:\n\n" + content[:200_000],
+        "user provides, " + _EXTRACT_INSTRUCTIONS
+        + "\n\nReturn ONLY the structured object matching the provided schema.",
+        "Session:\n\n" + content[:MAX_PROMPT_CHARS],
         pass_name="extract",
         model=model,
         json_schema=_CODEX_OUTPUT_SCHEMA,
@@ -1059,11 +1260,18 @@ def _llm_extract(
     }
     if not backends.check("anthropic", "extract"):
         return _refused_result("anthropic not in cognify.allowed_backends")
+    # No SDK or no credential means no call was made. Report it as
+    # "refused" (the unit stays eligible) — never as an empty success.
+    # Until 2026-10 both returned empty lists with no _failure: when codex
+    # failed and the fallback had no credential, every unit was counted as
+    # one LLM call that legitimately found nothing, marked done, and lost
+    # (trifekta-ai, 2026-10-21 → 10-28: 20 calls, 0 rows, empty
+    # failure_counts per run).
     try:
         import anthropic  # noqa: PLC0415
     except ImportError:
         logger.warning("cognify_extract: anthropic SDK not available; skipping LLM")
-        return {"lessons": [], "decisions": [], "_usage": _empty_usage}
+        return _refused_result("anthropic SDK not installed")
 
     auth_kwargs = _resolve_auth()
     if auth_kwargs is None:
@@ -1072,18 +1280,16 @@ def _llm_extract(
             "(ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_AUTH_TOKEN); "
             "skipping LLM"
         )
-        return {"lessons": [], "decisions": [], "_usage": _empty_usage}
+        return _refused_result("no Anthropic credential")
 
     client = anthropic.Anthropic(**auth_kwargs)
 
     system_prompt = (
         "You are a structured knowledge extractor. Given raw session content, "
-        "identify and extract:\n"
-        "1. Lessons: generalizable insights or patterns worth remembering.\n"
-        "2. Decisions: specific architectural or implementation choices made.\n\n"
-        "Return JSON with keys 'lessons' and 'decisions', each a list of "
-        "objects with 'title' (short, <= 80 chars) and 'content' (detailed). "
-        "Return only the JSON, no preamble."
+        + _EXTRACT_INSTRUCTIONS
+        + "\n\nReturn JSON with keys 'lessons' and 'decisions', each a list of "
+        "objects with 'title', 'content' and 'quote'. Return only the JSON, "
+        "no preamble."
     )
 
     # OAuth path requires the Claude Code SDK fingerprint as the first
@@ -1142,10 +1348,10 @@ def _llm_extract(
                             "no explanatory text, no markdown code fences. The "
                             "first character of your response must be `{` and the "
                             "last character must be `}`. Schema: "
-                            '{"lessons": [{"title": str, "content": str}], '
-                            '"decisions": [{"title": str, "content": str}]}.\n\n'
+                            '{"lessons": [{"title": str, "content": str, "quote": str}], '
+                            '"decisions": [{"title": str, "content": str, "quote": str}]}.\n\n'
                             "Session:\n\n"
-                            f"{content[:200_000]}"
+                            f"{content[:MAX_PROMPT_CHARS]}"
                         ),
                     },
                     # IMPORTANT: do NOT add an assistant prefill here.
@@ -1320,23 +1526,41 @@ def _upsert_memory(
     session_id: str,
     reextract: bool = False,
     reextract_meta: str | None = None,
+    quote: str | None = None,
+    report: dict | None = None,
 ) -> tuple[UUID, bool]:
     """Insert an extracted lesson/decision memory row. Returns (id, was_new).
 
-    Idempotency: if a non-archived row with the same (provenance_id,
-    kind, title) already exists, returns its id with was_new=False.
-    Migration 037's idx_memory_atom_title_unique enforces this at the
-    DB level; this check just avoids the round-trip for the common
-    case.
+    Identity, cheapest check first (each one skips the embedding call and
+    the relation check):
+
+    1. Same session, kind and title as a live row → that row (migration
+       037's idx_memory_atom_title_unique is the DB backstop).
+    2. Same content key (``content_key``: uuid5 over project, kind and the
+       normalized title) as a live row → that row. A hit from ANOTHER
+       session is a re-observation: the row is reinforced (the relation
+       check's "same" nudge) and the session is appended to
+       applies_when.also_seen_in. A hit from the same session is a plain
+       re-run and changes nothing.
+    3. The write-time relation check (embedding near-duplicates; off by
+       default) may still answer "same".
+
+    A new row's id IS its content key, unless an archived row already holds
+    that id (a re-extraction after ``_archive_prior_extracts``): archived
+    rows stay as they are and the new row gets a random id. The key is also
+    stored in applies_when.content_key, so lookups find rows of both kinds.
+
+    ``report["outcome"]`` (when a dict is passed) is set to one of
+    created / duplicate / merged / relation_same.
 
     Memory schema constraints:
     - kind must be in: chunk, decision, pattern, issue, session_summary
       Extracted lessons use kind='pattern'; decisions use kind='decision'.
     - tier: 'lesson' for extracted rows.
-    - No metadata column exists; reextract_meta is stored in applies_when.
-
-    reextract: if True, the row carries reextracted_from info in applies_when.
+    - No metadata column exists; extraction metadata (source_session,
+      reextracted_from, quote, content_key) lives in applies_when.
     """
+    report = report if report is not None else {}
     # Map semantic kind to valid DB kind values.
     # Lessons → kind='pattern'; decisions → kind='decision'.
     # Migration 037 made provenance_id load-bearing for atoms too —
@@ -1344,32 +1568,46 @@ def _upsert_memory(
     # the new idx_memory_atom_title_unique allows N atoms per
     # (session, kind) as long as titles differ.
     db_kind = "pattern" if kind == "lesson" else "decision"
+    key = str(content_key(project_id, db_kind, title, content))
 
     # applies_when is a JSONB column for extract-related metadata.
     # source_session is kept here for backwards compat with any
     # consumer that reads it directly, but provenance_id is now the
     # canonical link to the source session.
-    applies_when: dict = {"source_session": session_id}
+    applies_when: dict = {"source_session": session_id, "content_key": key}
+    if quote:
+        # The verified evidence for this atom (see verify_quote).
+        applies_when["quote"] = quote
     if reextract and reextract_meta:
         applies_when["reextracted_from"] = reextract_meta
 
-    # Idempotency check: same provenance_id + kind + title means we've
+    # (1) Idempotency check: same provenance_id + kind + title means we've
     # already extracted this same atom from this session. Skip the
     # round-trip and short-circuit; the DB constraint is the backstop.
+    existing = _find_title_duplicate(conn, project_id, db_kind, title, session_id)
+    if existing:
+        report["outcome"] = "duplicate"
+        return existing, False
+
+    # (2) Content-derived identity. Indexed: the primary key, and the GIN
+    # index on applies_when for rows whose id could not be the key.
     with conn.cursor() as cur:
         cur.execute(
-            "SELECT id FROM devbrain.memory "
-            "WHERE project_id = %s "
-            "  AND kind = %s "
-            "  AND tier = 'lesson' "
-            "  AND title = %s "
-            "  AND archived_at IS NULL "
-            "  AND provenance_id = %s::uuid",
-            (project_id, db_kind, title, session_id),
+            "SELECT id, provenance_id FROM devbrain.memory "
+            "WHERE project_id = %s AND kind = %s AND archived_at IS NULL "
+            "  AND (id = %s::uuid OR applies_when @> %s::jsonb) "
+            "ORDER BY created_at LIMIT 1",
+            (project_id, db_kind, key, json.dumps({"content_key": key})),
         )
-        existing = cur.fetchone()
-    if existing:
-        return existing[0], False
+        hit = cur.fetchone()
+    if hit:
+        hit_id, hit_session = hit
+        if str(hit_session) == str(session_id):
+            report["outcome"] = "duplicate"
+        else:
+            _merge_observation(conn, hit_id, session_id)
+            report["outcome"] = "merged"
+        return hit_id, False
 
     # Insert new extract row with provenance_id = the source session.
     cols = [
@@ -1382,6 +1620,12 @@ def _upsert_memory(
         json.dumps(applies_when), CURRENT_EXTRACTION_VERSION,
         session_id,
     ]
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM devbrain.memory WHERE id = %s::uuid", (key,))
+        key_taken = cur.fetchone() is not None
+    if not key_taken:
+        cols.insert(0, "id")
+        vals.insert(0, key)
 
     # Embed the atom so deep_search (which filters embedding IS NOT NULL)
     # can find it. Skipping this is what left ~22k decision/pattern atoms
@@ -1395,10 +1639,10 @@ def _upsert_memory(
         vals.append(emb_literal)
         placeholders_list.append("%s::vector")
 
-    # Write-time relation check (write_path.relation_check; off by default).
-    # A "same" verdict means this fact is already known in the project: the
-    # existing atom is reinforced and nothing is written. Any failure in
-    # the check falls through to the plain write below.
+    # (3) Write-time relation check (write_path.relation_check; off by
+    # default). A "same" verdict means this fact is already known in the
+    # project: the existing atom is reinforced and nothing is written. Any
+    # failure in the check falls through to the plain write below.
     rel_cfg = relate.get_config()
     pre = relate.precheck(
         conn, rel_cfg,
@@ -1406,23 +1650,75 @@ def _upsert_memory(
         embedding_literal=emb_literal, source="extract", source_ref=str(session_id),
     )
     if pre.skip_insert:
+        report["outcome"] = "relation_same"
         return pre.existing_id, False
 
     placeholders = ", ".join(placeholders_list)
     with conn.cursor() as cur:
+        # DO NOTHING (no target) covers the id and 037's title index: a
+        # concurrent writer of the same atom loses quietly.
         cur.execute(
             f"INSERT INTO devbrain.memory ({', '.join(cols)}) "
             f"VALUES ({placeholders}) "
+            "ON CONFLICT DO NOTHING "
             "RETURNING id",
             vals,
         )
-        mid = cur.fetchone()[0]
+        row = cur.fetchone()
+    if row is None:
+        conn.commit()
+        winner = _find_title_duplicate(conn, project_id, db_kind, title, session_id)
+        report["outcome"] = "duplicate"
+        return (winner or key), False
+    mid = row[0]
     pre.finish(
         conn, project_id=project_id, new_id=mid, cfg=rel_cfg,
         source="extract", source_ref=str(session_id),
     )
     conn.commit()
+    report["outcome"] = "created"
     return mid, True
+
+
+# Sessions remembered per merged atom (applies_when.also_seen_in).
+_MAX_ALSO_SEEN = 20
+
+
+def _find_title_duplicate(
+    conn: Any, project_id: Any, db_kind: str, title: str, session_id: str
+) -> Any:
+    """Live atom from the same session with the same kind and title."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM devbrain.memory "
+            "WHERE project_id = %s "
+            "  AND kind = %s "
+            "  AND tier = 'lesson' "
+            "  AND title = %s "
+            "  AND archived_at IS NULL "
+            "  AND provenance_id = %s::uuid",
+            (project_id, db_kind, title, session_id),
+        )
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
+def _merge_observation(conn: Any, memory_id: Any, session_id: str) -> None:
+    """Another session produced an atom with the same content key: reinforce
+    the existing row (as a relation-check "same" verdict does) and note the
+    session in applies_when.also_seen_in (capped at _MAX_ALSO_SEEN)."""
+    relate.reinforce(conn, memory_id)
+    seen = "coalesce(applies_when -> 'also_seen_in', '[]'::jsonb)"
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE devbrain.memory SET applies_when = jsonb_set("
+            f"  coalesce(applies_when, '{{}}'::jsonb), '{{also_seen_in}}', "
+            f"  {seen} || to_jsonb(%s::text)) "
+            f"WHERE id = %s AND NOT {seen} ? %s "
+            f"  AND jsonb_array_length({seen}) < %s",
+            (str(session_id), memory_id, str(session_id), _MAX_ALSO_SEEN),
+        )
+    conn.commit()
 
 
 def _archive_prior_extracts(

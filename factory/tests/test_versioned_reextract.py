@@ -96,13 +96,14 @@ def test_extract_sets_extraction_version_on_new_rows(conn, project_factory):
         cur.execute(
             "INSERT INTO devbrain.memory "
             "(project_id, kind, title, content, provenance_id) "
-            "VALUES (%s, 'pattern', 'raw chunk', 'content', %s::uuid)",
+            "VALUES (%s, 'pattern', 'raw chunk', 'We pin the extraction version on every row.', %s::uuid)",
             (project["id"], session_id),
         )
     conn.commit()
 
     mock_response = {
-        "lessons": [{"title": "Versioned Lesson", "content": "A great insight"}],
+        "lessons": [{"title": "Versioned Lesson", "content": "A great insight",
+                     "quote": "We pin the extraction version on every row."}],
         "decisions": [],
         "_usage": {"input_tokens": 0, "output_tokens": 0,
                    "cache_read_tokens": 0, "cache_write_tokens": 0},
@@ -202,7 +203,7 @@ def test_reextract_since_version_archives_old_and_writes_new(conn, project_facto
         cur.execute(
             "INSERT INTO devbrain.memory "
             "(project_id, kind, title, content, provenance_id) "
-            "VALUES (%s, 'pattern', 'raw', 'raw content', %s::uuid)",
+            "VALUES (%s, 'pattern', 'raw', 'The fresh lesson replaces the stale one.', %s::uuid)",
             (project["id"], session_id),
         )
     conn.commit()
@@ -220,7 +221,8 @@ def test_reextract_since_version_archives_old_and_writes_new(conn, project_facto
 
     # Mock the LLM to return a new lesson.
     mock_response = {
-        "lessons": [{"title": "Fresh Lesson", "content": "Updated insight"}],
+        "lessons": [{"title": "Fresh Lesson", "content": "Updated insight",
+                     "quote": "The fresh lesson replaces the stale one."}],
         "decisions": [],
         "_usage": {"input_tokens": 0, "output_tokens": 0,
                    "cache_read_tokens": 0, "cache_write_tokens": 0},
