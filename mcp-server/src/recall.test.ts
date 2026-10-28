@@ -32,6 +32,7 @@ const {
   recallEnabled,
   RECALL_KINDS,
   RECALL_NOTICE,
+  hasScreenColumn,
 } = await import('./recall.js')
 const { SEARCH_DEFAULTS } = await import('./hybrid.js')
 
@@ -159,11 +160,22 @@ interface Mem {
   flags?: string[]
 }
 
-function fakeDb(mems: Mem[], dupPairs: Array<[string, string]> = []) {
+interface FakeOpts {
+  /** 'ok' (default), 'absent' (no screen_flags column) or 'error' (the check fails). */
+  column?: 'ok' | 'absent' | 'error'
+  /** The meta / screening query fails. */
+  metaError?: boolean
+}
+
+function fakeDb(mems: Mem[], dupPairs: Array<[string, string]> = [], opts: FakeOpts = {}) {
   const byId = new Map(mems.map((m) => [m.id, m]))
   const seen: string[] = []
   const query = async (text: string, params: unknown[] = []) => {
-    if (text.includes('information_schema.columns')) return { rows: [{ ok: 1 }] }
+    if (text.includes('information_schema.columns')) {
+      seen.push('column')
+      if (opts.column === 'error') throw new Error('connection reset')
+      return { rows: opts.column === 'absent' ? [] : [{ ok: 1 }] }
+    }
     if (text.includes('m.kind = ANY($3::text[])')) {
       seen.push('vector')
       const kinds = params[2] as string[]
@@ -175,8 +187,9 @@ function fakeDb(mems: Mem[], dupPairs: Array<[string, string]> = []) {
           .map((m) => ({ memory_id: m.id, memory_kind: m.kind ?? 'decision', title: m.title, content: m.content, score: m.cos })),
       }
     }
-    if (text.includes('screen_flags FROM devbrain.memory m') || text.includes('AS screen_flags')) {
+    if (text.includes('AS screen_flags')) {
       seen.push('meta')
+      if (opts.metaError) throw new Error('statement timeout')
       return {
         rows: (params[0] as string[]).filter((id) => byId.has(id)).map((id) => ({
           id,
@@ -228,7 +241,7 @@ describe('recall pipeline (fake DB)', () => {
       { id: 'c', title: 'Gamma', content: 'gamma body', cos: 0.7 },
     ])
     const r = await recall(
-      { prompt, projectId: null },
+      { prompt, projectId: 'p1' },
       { ...db, embed, rerank: rerankBy({ beta: 0.97, alpha: 0.93, gamma: 0.2 }), searchCfg: cfg, facts: null },
     )
     assert.deepEqual(r.memories.map((m) => m.memory_id), ['b', 'a'])
@@ -237,12 +250,55 @@ describe('recall pipeline (fake DB)', () => {
     assert.match(r.text, /\[Beta · pattern · 2026-09-02\] the beta body/)
     assert.ok(!r.text.includes('Gamma'), 'a weak memory is not shown next to strong ones')
     // Cheap path: no recency / supersedes / graph queries were issued.
-    assert.deepEqual([...new Set(db.seen)].sort(), ['dedup', 'keyword', 'meta', 'vector'])
+    assert.deepEqual([...new Set(db.seen)].sort(), ['column', 'dedup', 'keyword', 'meta', 'vector'])
+  })
+
+  test('no project: nothing, and nothing is searched (never across projects)', async () => {
+    const db = fakeDb([{ id: 'a', title: 'Alpha', content: 'alpha', cos: 0.95 }])
+    let embedded = false
+    const r = await recall(
+      { prompt, projectId: null },
+      { ...db, embed: async () => ((embedded = true), [0.1]), rerank: rerankBy({ alpha: 0.99 }), searchCfg: cfg, facts: null },
+    )
+    assert.equal(r.text, '')
+    assert.equal(r.reason, 'no_project')
+    assert.equal(embedded, false)
+    assert.deepEqual(db.seen, [])
+  })
+
+  test('screening fails closed: no column, a failed check or a failed meta query says nothing', async () => {
+    const mems = [{ id: 'a', title: 'Alpha', content: 'alpha', cos: 0.95 }]
+    const deps = { embed, rerank: rerankBy({ alpha: 0.99 }), searchCfg: cfg, facts: null }
+    for (const opts of [{ column: 'absent' as const }, { column: 'error' as const }, { metaError: true }]) {
+      const r = await recall({ prompt, projectId: 'p1' }, { ...fakeDb(mems, [], opts), ...deps })
+      assert.equal(r.text, '', JSON.stringify(opts))
+      assert.equal(r.reason, 'no_meta', JSON.stringify(opts))
+    }
+  })
+
+  test('a failed column check is not cached; a positive one is', async () => {
+    let calls = 0
+    let fail = true
+    const q = async () => {
+      calls++
+      if (fail) throw new Error('down')
+      return { rows: [{ ok: 1 }] }
+    }
+    await assert.rejects(hasScreenColumn(q))
+    fail = false
+    assert.equal(await hasScreenColumn(q), true)
+    assert.equal(await hasScreenColumn(q), true)
+    assert.equal(calls, 2)
+    let absentCalls = 0
+    const absent = async () => ((absentCalls++), { rows: [] })
+    assert.equal(await hasScreenColumn(absent), false)
+    assert.equal(await hasScreenColumn(absent), false)
+    assert.equal(absentCalls, 2)
   })
 
   test('weak top result: nothing at all', async () => {
     const db = fakeDb([{ id: 'a', title: 'Alpha', content: 'alpha', cos: 0.95 }])
-    const r = await recall({ prompt, projectId: null }, { ...db, embed, rerank: rerankBy({ alpha: 0.5 }), searchCfg: cfg, facts: null })
+    const r = await recall({ prompt, projectId: 'p1' }, { ...db, embed, rerank: rerankBy({ alpha: 0.5 }), searchCfg: cfg, facts: null })
     assert.equal(r.text, '')
     assert.equal(r.reason, 'weak_match')
     assert.deepEqual(r.memories, [])
@@ -250,17 +306,17 @@ describe('recall pipeline (fake DB)', () => {
 
   test('reranker unavailable: nothing (cosine alone is not trusted for every prompt)', async () => {
     const db = fakeDb([{ id: 'a', title: 'Alpha', content: 'alpha', cos: 0.99 }])
-    const down = await recall({ prompt, projectId: null }, { ...db, embed, rerank: async () => null, searchCfg: cfg, facts: null })
+    const down = await recall({ prompt, projectId: 'p1' }, { ...db, embed, rerank: async () => null, searchCfg: cfg, facts: null })
     assert.equal(down.text, '')
     assert.equal(down.reason, 'no_rerank')
-    const off = await recall({ prompt, projectId: null }, { ...db, embed, searchCfg: { ...cfg, rerank: false }, facts: null })
+    const off = await recall({ prompt, projectId: 'p1' }, { ...db, embed, searchCfg: { ...cfg, rerank: false }, facts: null })
     assert.equal(off.reason, 'no_rerank')
   })
 
   test('no candidates and empty prompt', async () => {
-    const r = await recall({ prompt, projectId: null }, { ...fakeDb([]), embed, rerank: rerankBy({}), searchCfg: cfg, facts: null })
+    const r = await recall({ prompt, projectId: 'p1' }, { ...fakeDb([]), embed, rerank: rerankBy({}), searchCfg: cfg, facts: null })
     assert.equal(r.reason, 'no_candidates')
-    const e = await recall({ prompt: '   ', projectId: null }, { ...fakeDb([]), embed, searchCfg: cfg, facts: null })
+    const e = await recall({ prompt: '   ', projectId: 'p1' }, { ...fakeDb([]), embed, searchCfg: cfg, facts: null })
     assert.equal(e.reason, 'empty_prompt')
   })
 
@@ -274,7 +330,7 @@ describe('recall pipeline (fake DB)', () => {
       [['a', 'b']],
     )
     const r = await recall(
-      { prompt, projectId: null },
+      { prompt, projectId: 'p1' },
       { ...db, embed, rerank: rerankBy({ alpha: 0.96, charlie: 0.99 }), searchCfg: cfg, facts: null },
     )
     assert.deepEqual(r.memories.map((m) => m.memory_id), ['b'])
@@ -291,7 +347,7 @@ describe('recall pipeline (fake DB)', () => {
       [['a', 'b']],
     )
     const r = await recall(
-      { prompt, projectId: null },
+      { prompt, projectId: 'p1' },
       { ...db, embed, rerank: rerankBy({ 'keep x': 0.95, other: 0.9 }), searchCfg: cfg, facts: null },
     )
     assert.deepEqual(r.memories.map((m) => m.memory_id), ['b', 'c'])
@@ -302,7 +358,7 @@ describe('recall pipeline (fake DB)', () => {
     const db = fakeDb(mems)
     const rerank = rerankBy({ body1: 0.97, body2: 0.96, body3: 0.95 })
     for (const maxChars of [50, 300, 600, 1000, 100000]) {
-      const r = await recall({ prompt, projectId: null, maxChars }, { ...db, embed, rerank, searchCfg: cfg, facts: null })
+      const r = await recall({ prompt, projectId: 'p1', maxChars }, { ...db, embed, rerank, searchCfg: cfg, facts: null })
       const cap = Math.max(300, Math.min(4000, maxChars))
       assert.ok(r.text.length <= cap, `maxChars ${maxChars}: ${r.text.length}`)
       assert.ok(r.text.length > 0)
@@ -322,12 +378,12 @@ describe('recall pipeline (fake DB)', () => {
     assert.equal(got[1], 'p1')
     assert.deepEqual(got[3], { hops: 1, topK: 5 })
     const slow = async () => new Promise<{ triples: unknown[] }>((res) => setTimeout(() => res({ triples: [['a', 'b', 'c']] }), 1000))
-    const r2 = await recall({ prompt, projectId: null }, { ...db, embed, rerank, searchCfg: cfg, facts: slow })
+    const r2 = await recall({ prompt, projectId: 'p1' }, { ...db, embed, rerank, searchCfg: cfg, facts: slow })
     assert.ok(!r2.text.includes('facts:'))
     const broken = async () => {
       throw new Error('boom')
     }
-    const r3 = await recall({ prompt, projectId: null }, { ...db, embed, rerank, searchCfg: cfg, facts: broken })
+    const r3 = await recall({ prompt, projectId: 'p1' }, { ...db, embed, rerank, searchCfg: cfg, facts: broken })
     assert.match(r3.text, /^devbrain: 1 memory/)
   })
 
@@ -336,7 +392,7 @@ describe('recall pipeline (fake DB)', () => {
     let embedded = ''
     let reranked = ''
     await recall(
-      { prompt: 'p'.repeat(50_000), projectId: null },
+      { prompt: 'p'.repeat(50_000), projectId: 'p1' },
       {
         ...db,
         embed: async (q: string) => ((embedded = q), [0.1]),

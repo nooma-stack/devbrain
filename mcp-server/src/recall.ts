@@ -13,7 +13,9 @@
 // (search.weak_match_rerank_threshold, 0.88), and it needs a reranker score:
 // with the reranker down, recall returns nothing, since the cosine fallback
 // catches only a third of absent topics (hybrid.ts) and this text lands in
-// every prompt. Rows flagged by prompt-injection screening are never offered.
+// every prompt. Rows flagged by prompt-injection screening are never offered,
+// and screening fails closed: if the flags cannot be read, nothing is said.
+// It searches one project only, never across projects: no project, no recall.
 //
 // Output (empty when nothing clears the bar):
 //
@@ -287,7 +289,7 @@ export interface RecallResult {
   text: string
   memories: RecallMemory[]
   /** Why nothing was returned, when nothing was. */
-  reason?: 'empty_prompt' | 'no_candidates' | 'no_rerank' | 'weak_match'
+  reason?: 'no_project' | 'empty_prompt' | 'no_candidates' | 'no_rerank' | 'no_meta' | 'weak_match'
   ms: number
   /** Per-step timings, for measurement. */
   timings: Record<string, number>
@@ -304,24 +306,30 @@ const VECTOR_SQL = `
   LIMIT $2
 `
 
-let screenColumn: Promise<boolean> | null = null
-function hasScreenColumn(q: QueryFn): Promise<boolean> {
-  if (q !== query) {
-    return q(`SELECT 1 AS ok FROM information_schema.columns WHERE column_name = 'screen_flags'`).then(
-      (r) => r.rows.length > 0,
-    )
-  }
-  screenColumn ??= query<{ ok: number }>(
-    `SELECT 1 AS ok FROM information_schema.columns WHERE table_schema = 'devbrain'
-       AND table_name = 'memory' AND column_name = 'screen_flags'`,
-  )
-    .then((r) => r.rows.length > 0)
-    .catch(() => false)
-  return screenColumn
+const SCREEN_COLUMN_SQL = `SELECT 1 AS ok FROM information_schema.columns WHERE table_schema = 'devbrain'
+       AND table_name = 'memory' AND column_name = 'screen_flags'`
+
+// Only a positive answer is cached (per query function). A failed check is
+// forgotten, so the next call asks again, and rejects; "no column yet" is
+// asked again too (the migration may land while the server runs).
+const screenColumn = new WeakMap<QueryFn, true>()
+
+/**
+ * True when devbrain.memory.screen_flags exists (migration 049), false when
+ * it does not; rejects when the check itself fails. recall treats both false
+ * and a rejection as "cannot screen" and returns nothing.
+ */
+export async function hasScreenColumn(q: QueryFn = query): Promise<boolean> {
+  if (screenColumn.has(q)) return true
+  const r = await q(SCREEN_COLUMN_SQL)
+  if (r.rows.length === 0) return false
+  screenColumn.set(q, true)
+  return true
 }
 
-const META_SQL = (flags: string) => `
-  SELECT m.id::text AS id, m.created_at, ${flags} AS screen_flags
+
+const META_SQL = `
+  SELECT m.id::text AS id, m.created_at, m.screen_flags AS screen_flags
     FROM devbrain.memory m WHERE m.id = ANY($1::uuid[])`
 
 function isoDate(d: Date | string | null | undefined): string {
@@ -364,6 +372,9 @@ export async function recall(args: RecallArgs, deps: RecallDeps = {}): Promise<R
     const text = formatRecall(memories, { maxChars, ms, wrap: cfg.untrustedWrap, facts })
     return { text, memories: text ? memories : [], ...(reason && !text ? { reason } : {}), ms: Math.round(ms), timings }
   }
+  // Never across projects: recall's text lands in every prompt of a session
+  // that belongs to one project. No project, no recall.
+  if (!args.projectId) return done([], 'no_project')
   if (!prompt) return done([], 'empty_prompt')
 
   // Facts (entity graph) run alongside the memory search, capped in time.
@@ -433,16 +444,24 @@ export async function recall(args: RecallArgs, deps: RecallDeps = {}): Promise<R
   const rerankByKey = new Map(head.map((k, i) => [k, rr.scores[i]]))
   pool = applyRerank(pool, rerankByKey, head.length, cfg.rerankBlend, cfg.rrfK)
 
-  // 3. Near-duplicate collapse and dates / screening flags for the head, in parallel.
+  // 3. Near-duplicate collapse and dates / screening flags for the head, in
+  // parallel. Screening fails closed: no column, a failed check or a failed
+  // meta query means nothing is said, never unscreened memories.
   t = now()
   const top = pool.slice(0, HEAD)
-  const flagsCol = (await hasScreenColumn(q)) ? 'm.screen_flags' : 'NULL::text[]'
-  const [pairs, meta] = await Promise.all([
-    cfg.dedup && top.length > 1
-      ? qt(nearDupSql(), [top, tune.dedupThreshold], Math.min(cfg.dedupTimeoutMs, DEDUP_TIMEOUT_MS)).catch(() => null)
-      : Promise.resolve(null),
-    q(META_SQL(flagsCol), [top]),
-  ])
+  let pairs: { rows: any[] } | null // eslint-disable-line @typescript-eslint/no-explicit-any
+  let meta: { rows: any[] } // eslint-disable-line @typescript-eslint/no-explicit-any
+  try {
+    if (!(await hasScreenColumn(q))) return done([], 'no_meta', await factsP)
+    ;[pairs, meta] = await Promise.all([
+      cfg.dedup && top.length > 1
+        ? qt(nearDupSql(), [top, tune.dedupThreshold], Math.min(cfg.dedupTimeoutMs, DEDUP_TIMEOUT_MS)).catch(() => null)
+        : Promise.resolve(null),
+      q(META_SQL, [top]),
+    ])
+  } catch {
+    return done([], 'no_meta', await factsP)
+  }
   lap('dedup_meta', t)
   const created = new Map<string, Date>()
   const flagged = new Set<string>()
@@ -507,7 +526,10 @@ export function registerRecallTool(
     RECALL_DESCRIPTION,
     {
       prompt: z.string().describe('The user prompt to find memories for'),
-      project: z.string().optional().describe('Project slug (defaults to the current project; omit both for all projects)'),
+      project: z
+        .string()
+        .optional()
+        .describe('Project slug (defaults to the current project). recall never searches across projects: with neither, it returns nothing.'),
       max_chars: z
         .number()
         .int()
@@ -518,14 +540,15 @@ export function registerRecallTool(
         .describe('Character budget for the whole response'),
     },
     async ({ prompt, project, max_chars }) => {
-      let projectId: string | null = null
       const slug = project ?? opts.defaultProject
+      let projectId: string | null = null
       if (slug) {
         projectId = await opts.resolveProjectId(slug)
         if (!projectId) {
           return { isError: true, content: [{ type: 'text', text: `Project "${neutralize(slug)}" not found.` }] }
         }
       }
+      // No project resolved: recall() answers empty with reason 'no_project'.
       const result = await recall({ prompt, projectId, maxChars: max_chars })
       if (process.env.DEVBRAIN_RECALL_LOG === '1') {
         console.error(
