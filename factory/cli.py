@@ -3528,7 +3528,8 @@ def cmd_rules_lint():
     "--pass",
     "pass_name",
     default=None,
-    help="Pass to run: extract | decay | edges | strengthen | gc",
+    help="Pass to run: extract | decay | edges | strengthen | gc | fanout | "
+         "resummarize | entities",
 )
 @click.option("--all", "run_all", is_flag=True, default=False,
               help="Run all passes in dependency order.")
@@ -4497,6 +4498,117 @@ def cognify_resummarize_command(
            if result.failure_counts else ""),
         err=True,
     )
+
+
+# ─── cognify_entities (facts graph, migration 050) ─────────────────────────
+
+
+@cli.command("cognify-entities")
+@click.option("--project", "project_slug", required=True,
+              help="Project slug whose memories are read (the pass is project-scoped).")
+@click.option("--since", default=None,
+              help="ISO date: start at memories created on/after this date instead "
+                   "of the watermark (backfill). The run then records its own "
+                   "watermark, so the scheduled pass continues from there.")
+@click.option("--max-llm-calls", "max_llm_calls", type=int, default=None,
+              help="LLM-call ceiling for this run (default 8; a dry run defaults to 2).")
+@click.option("--max-memories", "max_memories", type=int, default=None,
+              help="Memories read this run (default 64).")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Call the model and print the nodes, edges and aliases a run "
+                   "would merge, with each edge's quote. Writes nothing.")
+@click.option("--json", "as_json", is_flag=True, default=False,
+              help="Emit the run summary as JSON.")
+def cognify_entities_command(project_slug, since, max_llm_calls, max_memories,
+                             dry_run, as_json):
+    """Extract the facts graph (entities, relations, aliases) for one project.
+
+    Same pass as `devbrain cognify --pass=entities`, with backfill and
+    preview options. A real run goes through the orchestrator (pass lock,
+    cognify_run_log row, watermark); --dry-run prints and writes nothing.
+
+    Examples:
+
+      devbrain cognify-entities --project=devbrain --dry-run\n
+      devbrain cognify-entities --project=devbrain --dry-run --since=2026-10-01\n
+      devbrain cognify-entities --project=devbrain --since=2026-08-01
+      --max-llm-calls=200 --max-memories=1600
+    """
+    from datetime import datetime, timezone
+
+    import psycopg2.extras
+
+    psycopg2.extras.register_uuid()
+    sys.path.insert(0, str(Path(__file__).parent))
+    from cognify.entities import run_entities  # noqa: PLC0415
+    from cognify.orchestrator import run_pass as _run_pass  # noqa: PLC0415
+
+    since_dt = None
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since)
+        except ValueError as exc:
+            raise click.ClickException(f"Invalid --since date: {since!r}") from exc
+        if since_dt.tzinfo is None:
+            since_dt = since_dt.replace(tzinfo=timezone.utc)
+
+    db = get_db()
+    with db._conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM devbrain.projects WHERE slug = %s", (project_slug,))
+            row = cur.fetchone()
+        if not row:
+            raise click.ClickException(f"Project {project_slug!r} not found.")
+        project_id = row[0]
+
+        if dry_run:
+            res = run_entities(
+                conn, project_id,
+                dry_run=True, call_model=True,
+                max_llm_calls=2 if max_llm_calls is None else max_llm_calls,
+                max_memories=max_memories, since=since_dt,
+                printer=None if as_json else click.echo,
+            )
+            summary = res.metadata()
+            summary["llm_calls"] = res.llm_calls
+            summary["dry_run"] = True
+        else:
+            result = _run_pass(
+                conn, "entities", project_id,
+                max_llm_calls=max_llm_calls,
+                pass_kwargs={"since": since_dt, "max_memories": max_memories},
+            )
+            summary = dict(result.metadata or {})
+            summary["llm_calls"] = result.llm_calls
+
+    if as_json:
+        click.echo(json.dumps(summary, indent=2, default=str))
+        return
+    writes = summary.get("writes") or {}
+    lines = [
+        "cognify-entities: " + ("DRY RUN, nothing written" if dry_run else "complete"),
+        f"  memories:  {summary.get('memories_processed', 0)} processed of "
+        f"{summary.get('memories_seen', 0)} read (since {summary.get('since')})",
+        f"  llm calls: {summary.get('llm_calls', 0)}",
+        f"  extracted: {summary.get('nodes_extracted', 0)} nodes, "
+        f"{summary.get('edges_extracted', 0)} edges, "
+        f"{summary.get('aliases_extracted', 0)} aliases",
+    ]
+    if summary.get("dropped"):
+        lines.append(f"  dropped:   {summary['dropped']}")
+    if writes and not dry_run:
+        lines.append(f"  writes:    {writes}")
+    if summary.get("failure_counts"):
+        lines.append(f"  failures:  {summary['failure_counts']}")
+    if summary.get("stopped"):
+        lines.append(f"  stopped:   {summary['stopped']}")
+    if summary.get("watermark"):
+        lines.append(f"  watermark: {summary['watermark']}")
+    if summary.get("refused"):
+        lines.append("  REFUSED: no LLM backend allowed (cognify.allowed_backends)")
+    if summary.get("skipped") == "lock_held":
+        lines.append("  skipped: another run of this pass holds the lock")
+    click.echo("\n".join(lines))
 
 
 if __name__ == "__main__":

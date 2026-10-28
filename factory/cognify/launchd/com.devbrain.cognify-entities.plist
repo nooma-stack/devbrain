@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+    "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- cognify_entities: 2-hourly facts-graph extraction (migration 050).   -->
+<!-- Up to 8 LLM calls / 64 memories per run; codex first, then Anthropic. -->
+<!-- Placeholders ${DEVBRAIN_HOME}, ${USER}, ${PROJECT_SLUG}, and the         -->
+<!-- credential-env marker are substituted by                                 -->
+<!-- `devbrain setup-cognify-launchd`. Do NOT cp this file directly into      -->
+<!-- ~/Library/LaunchAgents/ — placeholders won't expand and launchd will     -->
+<!-- fail at runtime with a literal "${PROJECT_SLUG}" error.                  -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.devbrain.cognify-entities</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>${DEVBRAIN_HOME}/.venv/bin/python</string>
+        <string>${DEVBRAIN_HOME}/factory/cli.py</string>
+        <string>cognify</string>
+        <string>--pass=entities</string>
+        <string>--project=${PROJECT_SLUG}</string>
+    </array>
+
+    <!-- Run every 2 hours -->
+    <key>StartInterval</key>
+    <integer>7200</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DEVBRAIN_HOME</key>
+        <string>${DEVBRAIN_HOME}</string>
+        <key>PYTHONPATH</key>
+        <string>${DEVBRAIN_HOME}/factory</string>
+        <!-- launchd's default PATH (/usr/bin:/bin:/usr/sbin:/sbin) omits      -->
+        <!-- Homebrew, so the codex CLI (a `#!/usr/bin/env node` script) fails -->
+        <!-- with "env: node: No such file or directory" (rc=127) under        -->
+        <!-- launchd, silently falling back to the rate-limited Anthropic path.-->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <!-- @CREDENTIAL_ENV_BLOCK@ — installer emits ANTHROPIC_API_KEY or  -->
+        <!-- CLAUDE_CODE_OAUTH_TOKEN here based on env at install time.    -->
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>${DEVBRAIN_HOME}/factory</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/${USER}/.devbrain/logs/cognify-entities.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/${USER}/.devbrain/logs/cognify-entities.err</string>
+
+    <key>ThrottleInterval</key>
+    <integer>300</integer>
+</dict>
+</plist>

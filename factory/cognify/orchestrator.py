@@ -103,6 +103,7 @@ def _ensure_registry() -> None:
     from cognify import strengthen as _  # noqa: F401
     from cognify import fanout as _  # noqa: F401  # Phase 8 fan-out
     from cognify import resummarize as _  # noqa: F401  # Sonnet summary upgrade
+    from cognify import entities as _  # noqa: F401  # facts graph (migration 050)
 
 
 def register_pass(cls: type[CognifyPass]) -> type[CognifyPass]:
@@ -114,7 +115,10 @@ def register_pass(cls: type[CognifyPass]) -> type[CognifyPass]:
 
 # ── Dependency order ──────────────────────────────────────────────────────
 
-PASS_ORDER = ["decay", "gc", "extract", "edges", "strengthen", "fanout", "resummarize"]
+PASS_ORDER = [
+    "decay", "gc", "extract", "edges", "strengthen", "fanout", "resummarize",
+    "entities",
+]
 
 
 # ── Main entrypoints ──────────────────────────────────────────────────────
@@ -128,6 +132,7 @@ def run_pass(
     dry_run: bool = False,
     cross_project: bool = False,
     max_llm_calls: int | None = None,
+    pass_kwargs: dict[str, Any] | None = None,
 ) -> PassResult:
     """Run a single named pass and record it in cognify_run_log.
 
@@ -143,6 +148,9 @@ def run_pass(
             honored by LLM-cost passes (extract + edges). Zero-LLM passes
             (decay, gc, strengthen) ignore it. When None (default), each
             pass uses its own built-in MAX_LLM_CALLS_PER_PASS constant.
+        pass_kwargs: extra pass-specific keyword arguments (e.g. the
+            entities pass's ``since`` / ``max_memories`` for a backfill).
+            Each is forwarded only when the pass's run() declares it.
 
     Returns:
         PassResult from the pass.
@@ -188,6 +196,9 @@ def run_pass(
             kwargs["cross_project"] = cross_project
         if "max_llm_calls" in sig.parameters:
             kwargs["max_llm_calls"] = max_llm_calls
+        for key, value in (pass_kwargs or {}).items():
+            if key in sig.parameters and key not in kwargs:
+                kwargs[key] = value
         result = instance.run(conn, project_id, **kwargs)
     except Exception as exc:
         error_text = traceback.format_exc()[:2000]

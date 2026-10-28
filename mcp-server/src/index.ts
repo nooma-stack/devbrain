@@ -52,6 +52,7 @@ import {
 import { summarizeSession } from './summarize.js'
 import { registerAskTool } from './ask.js'
 import { registerRecallTool } from './recall.js'
+import { registerFactsTool } from './facts.js'
 
 // Factory orchestrator runner path
 const FACTORY_RUNNER = resolve(import.meta.dirname, '../../factory/run.py')
@@ -2861,6 +2862,9 @@ registerAskTool(server, { resolveProjectId, defaultProject: DEFAULT_PROJECT })
 
 // ─── Tool: recall (prompt-hook memory; mcp-server/src/recall.ts) ────────────
 registerRecallTool(server, { resolveProjectId, defaultProject: DEFAULT_PROJECT })
+
+// ─── Tool: facts (facts-graph walk, no model call; mcp-server/src/facts.ts) ──
+registerFactsTool(server, { resolveProjectId })
 
 async function main() {
   // Probe the DB before we tell the MCP client we're ready. If the DB
