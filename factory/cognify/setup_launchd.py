@@ -30,7 +30,8 @@ Placeholders
 - ``@CREDENTIAL_ENV_BLOCK@`` — XML marker replaced by either an
   ``ANTHROPIC_API_KEY`` or ``CLAUDE_CODE_OAUTH_TOKEN`` env entry in
   the LLM-cost plists (extract, edges, fanout, resummarize, entities). The non-LLM
-  plists (decay + strengthen + gc) don't carry this marker. When
+  plists (decay + strengthen + gc) and sweep (local Ollama only) don't
+  carry this marker. When
   ``cognify.backend: openai`` (or env DEVBRAIN_COGNIFY_BACKEND=openai) at
   install time, the OpenAI key source set in the installing shell is
   emitted too — ``GOOGLE_APPLICATION_CREDENTIALS`` (+ optional
@@ -62,6 +63,7 @@ _NO_CRED_PLISTS = (
     "com.devbrain.cognify-decay.plist",
     "com.devbrain.cognify-strengthen.plist",
     "com.devbrain.cognify-gc.plist",
+    "com.devbrain.cognify-sweep.plist",  # local Ollama only
 )
 
 # Plists that DO carry credentials — emitted with mode 0600.

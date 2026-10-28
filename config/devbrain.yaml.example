@@ -154,6 +154,21 @@ cognify:
     novel_below: 0.80         # a row is novel below this cosine to any atom
     downgrade_novel_share: 0.25
     # skip_novel_share: 0.0   # unset = novelty never skips, only downgrades
+  # Nightly outdated-memory sweep (`devbrain cognify --pass=sweep`). Pairs
+  # each atom with older same-project atoms above `threshold` cosine; the
+  # LOCAL model (write_path.relation_check's model/url) judges replaces /
+  # contradicts / refines / unrelated. Never deletes or archives.
+  sweep:
+    # shadow (log to memory_sweep_log only) | on (write supersedes /
+    # contradicts edges, newer -> older) | off       [DEVBRAIN_SWEEP_MODE]
+    mode: "shadow"
+    threshold: 0.85         # cosine floor for a pair  [DEVBRAIN_SWEEP_THRESHOLD]
+    max_pairs: 60           # model calls per run      [DEVBRAIN_SWEEP_MAX_PAIRS]
+    max_anchors: 500        # atoms examined per project per run
+    top_k: 3                # older candidates per atom
+    lookback_days: 30       # first run per project starts this far back (null = all)
+    min_confidence: 0.8     # replaces/contradicts below this are log-only
+    # model: qwen2.5:7b     # default: relation_check / summarization model
 
 # Write-path quality checks.
 write_path:

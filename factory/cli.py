@@ -3538,7 +3538,7 @@ def cmd_rules_lint():
     "pass_name",
     default=None,
     help="Pass to run: extract | decay | edges | strengthen | gc | fanout | "
-         "resummarize | entities",
+         "resummarize | entities | sweep",
 )
 @click.option("--all", "run_all", is_flag=True, default=False,
               help="Run all passes in dependency order.")
@@ -3557,9 +3557,10 @@ def cmd_rules_lint():
                    "as candidate-pair source. Detects when project lessons "
                    "contradict canonical regulatory rules. Other passes ignore.")
 @click.option("--max-llm-calls", "max_llm_calls", type=int, default=None,
-              help="Override the per-pass LLM-call ceiling (extract + edges "
-                   "only; zero-LLM passes ignore). When omitted, each pass "
-                   "uses its built-in default (extract=20, edges=15). "
+              help="Override the per-pass LLM-call ceiling (extract, edges "
+                   "and sweep; zero-LLM passes ignore). When omitted, each "
+                   "pass uses its built-in default (extract=20, edges=15, "
+                   "sweep=cognify.sweep.max_pairs). "
                    "Use 0 to skip LLM work entirely.")
 @click.option("--json", "as_json", is_flag=True, default=False,
               help="Emit result as JSON.")
@@ -3573,7 +3574,8 @@ def cognify_command(pass_name, run_all, project_slug, dry_run, cross_project, ma
       devbrain cognify --pass=decay --dry-run\n
       devbrain cognify --pass=edges --project=brightbot --cross-project\n
       devbrain cognify --pass=edges --project=brightbot --max-llm-calls=5\n
-      devbrain cognify --pass=extract --project=brightbot --max-llm-calls=0
+      devbrain cognify --pass=extract --project=brightbot --max-llm-calls=0\n
+      devbrain cognify --pass=sweep --dry-run      # all projects, pairs only
     """
     import sys
     from config import DATABASE_URL

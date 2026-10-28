@@ -65,7 +65,7 @@ Desktop"`), which the `codex` adapter parses. Notes:
   failures should be watched after Codex app updates.
 
 ### B. Cognify (knowledge maintenance)
-Eight scheduled launchd passes, orchestrated by `factory/cognify/orchestrator.py`
+Nine scheduled launchd passes, orchestrated by `factory/cognify/orchestrator.py`
 (`PASS_ORDER`), each logged to `cognify_run_log` / `cognify_spend_log`:
 
 | pass | cadence | LLM? | mutates |
@@ -78,6 +78,7 @@ Eight scheduled launchd passes, orchestrated by `factory/cognify/orchestrator.py
 | `fanout` | hourly | 1/session, **no cap** | cross-project `session_summary` rows |
 | `resummarize` | hourly | 1/session, codex → Anthropic, cap 20/run | upgrades Ollama summaries |
 | `entities` | 2h | 8 memories/call, cap 8 calls / 64 memories | facts graph: `entities`, `entity_relations`, `entity_aliases` |
+| `sweep` | nightly 03:40 | local Ollama, cap 60 pairs | `memory_sweep_log`; mode `on`: `supersedes` / `contradicts` edges |
 
 The **curator** runs at `end_session` (`factory/curator/end_session.py`): applies the
 agent's volunteered judgment (promote / contradict / refine / new-edges) and drains
@@ -304,6 +305,41 @@ flips it).
 - **Run**: `devbrain cognify-entities --project=<slug> --dry-run` prints what
   would be written (calls the model, writes nothing);
   `--since=<date> --max-llm-calls=N --max-memories=M` backfills.
+
+### Outdated-memory sweep (`factory/cognify/sweep.py`, migration 052)
+Nightly pass `devbrain cognify --pass=sweep` (all projects; `--project` for
+one). It finds memories that a later memory replaced:
+
+- **Pairs (code).** Per project, atoms (decision/pattern/issue) are walked
+  oldest first from a cursor kept in `cognify_run_log.metadata.cursors`
+  (first run: the last `lookback_days`, default 30). Each is paired with
+  its nearest **older** live atoms of the same project at cosine >=
+  `threshold` (0.85), at most `top_k` (3) each. Never paired: atoms of the
+  same source session, pairs already judged in this mode, pairs already
+  linked by supersedes / contradicts / refined_by.
+- **Verdict (local model).** The relation check's Ollama model and client
+  (`qwen2.5:7b`) answer `replaces` / `contradicts` / `refines` /
+  `unrelated` with a confidence. Loopback only unless `allow_remote_model`.
+- **Mode** `cognify.sweep.mode` (env `DEVBRAIN_SWEEP_MODE`): `shadow`
+  (default; log only), `on`, `off`. In `on`, a `replaces` at or above
+  `min_confidence` (0.8) writes `supersedes` newer -> older and queues the
+  older row's depends_on dependents (the store tool's semantics); a
+  `contradicts` writes `contradicts` newer -> older with
+  `review_status = 'pending'`. Edges go into `memory_dependencies` (ledger
+  trigger). Nothing is archived or deleted.
+- **Caps.** `max_pairs` (60) model calls per run, shared by all projects
+  (`--max-llm-calls` overrides); `max_anchors` (500) per project. A capped
+  run's cursor stays before the unfinished atom, so the next run resumes.
+  Candidate lookup is an exact per-project scan (~0.25 s per atom on a
+  23k-atom project).
+- **Log.** One `devbrain.memory_sweep_log` row per judged pair (ids,
+  similarity, verdict, confidence, mode, applied, edge, model, latency; no
+  text). Run metadata: anchors_scanned, pairs_found, pairs_judged,
+  verdicts, edges_earned (what `on` would write), edges_written,
+  below_confidence, capped.
+
+Before switching to `on`, review shadow verdicts:
+`SELECT verdict, count(*), avg(confidence) FROM devbrain.memory_sweep_log WHERE mode = 'shadow' GROUP BY 1;`
 
 ### C. Retrieval (read path) — `deep_search`
 `mcp-server/src/index.ts:281`: embed query → ivfflat ANN over `memory` (filtered
