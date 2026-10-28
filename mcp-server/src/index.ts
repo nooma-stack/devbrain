@@ -2864,7 +2864,7 @@ registerAskTool(server, { resolveProjectId, defaultProject: DEFAULT_PROJECT })
 registerRecallTool(server, { resolveProjectId, defaultProject: DEFAULT_PROJECT })
 
 // ─── Tool: facts (facts-graph walk, no model call; mcp-server/src/facts.ts) ──
-registerFactsTool(server, { resolveProjectId })
+registerFactsTool(server, { resolveProjectId, defaultProject: DEFAULT_PROJECT })
 
 async function main() {
   // Probe the DB before we tell the MCP client we're ready. If the DB

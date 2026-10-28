@@ -171,28 +171,34 @@ export const FACTS_DESCRIPTION =
 
 export function registerFactsTool(
   server: McpServer,
-  opts: { resolveProjectId: (slug: string) => Promise<string | null> },
+  opts: { resolveProjectId: (slug: string) => Promise<string | null>; defaultProject?: string | null },
 ): void {
   server.tool(
     'facts',
     FACTS_DESCRIPTION,
     {
       query: z.string().min(1).describe('Question or text naming the things to look up, e.g. "what runs on the SOHO VPS?"'),
-      project: z.string().optional().describe('Project slug to limit facts to. Omit to use facts from every project.'),
+      project: z.string().optional().describe('Project slug to limit facts to. Defaults to the current project (DEVBRAIN_PROJECT).'),
+      cross_project: z.boolean().optional().default(false).describe('Use facts from every project instead of one.'),
       hops: z.number().int().min(1).max(6).optional().default(3).describe('How many links to follow from the named things. Default 3.'),
     },
-    async ({ query: text, project, hops }) => {
+    async ({ query: text, project, cross_project, hops }) => {
+      // Like deep_search: one project by default, every project only on request.
       let projectId: string | null = null
-      if (project) {
-        projectId = await opts.resolveProjectId(project)
+      const slug = cross_project ? undefined : (project ?? opts.defaultProject)
+      if (!cross_project) {
+        if (!slug) {
+          return { content: [{ type: 'text' as const, text: 'No project: pass `project`, or `cross_project: true` for every project.' }] }
+        }
+        projectId = await opts.resolveProjectId(slug)
         if (!projectId) {
-          return { content: [{ type: 'text' as const, text: `Project "${project}" not found.` }] }
+          return { content: [{ type: 'text' as const, text: `Project "${slug}" not found.` }] }
         }
       }
       const result = await recallFacts({ query }, projectId, text, { hops: hops ?? 3, topK: 8 })
       const u = untrustedText(getSearchConfig().untrustedWrap)
       return {
-        content: [{ type: 'text' as const, text: formatFacts(result, u, project ? `project ${project}` : 'all projects') }],
+        content: [{ type: 'text' as const, text: formatFacts(result, u, slug ? `project ${slug}` : 'all projects') }],
       }
     },
   )
