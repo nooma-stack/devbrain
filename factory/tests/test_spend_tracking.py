@@ -249,14 +249,15 @@ def test_extract_pass_records_spend(conn, project_factory):
         cur.execute(
             "INSERT INTO devbrain.memory "
             "(project_id, kind, title, content, provenance_id) "
-            "VALUES (%s, 'pattern', 'chunk', 'some content', %s::uuid) RETURNING id",
+            "VALUES (%s, 'pattern', 'chunk', 'some content about spend tracking', %s::uuid) RETURNING id",
             (project["id"], session_id),
         )
     conn.commit()
 
     # Mock _llm_extract to return usage data
     mock_response = {
-        "lessons": [{"title": "Test Lesson", "content": "Content about something"}],
+        "lessons": [{"title": "Test Lesson", "content": "Content about something",
+                     "quote": "some content about spend tracking"}],
         "decisions": [],
         "_usage": {
             "input_tokens": 500,

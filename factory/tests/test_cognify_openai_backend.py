@@ -339,9 +339,12 @@ def test_reasoning_effort_sent_when_configured(monkeypatch, lht):
 # ── extract ─────────────────────────────────────────────────────────────────
 
 
+_BODY = "We chose the platform API. Retries back off on 503."
+
+
 def _session(monkeypatch):
     monkeypatch.setattr(
-        ex, "_load_session_chunks", lambda c, s, p: [{"title": "t", "content": "body"}]
+        ex, "_load_session_chunks", lambda c, s, p: [{"title": "t", "content": _BODY}]
     )
     written = []
     monkeypatch.setattr(
@@ -354,8 +357,10 @@ def _session(monkeypatch):
 
 
 _EXTRACTED = json.dumps({
-    "lessons": [{"title": "L1", "content": "lesson body"}],
-    "decisions": [{"title": "D1", "content": "decision body"}],
+    "lessons": [{"title": "L1", "content": "lesson body",
+                 "quote": "Retries back off on 503."}],
+    "decisions": [{"title": "D1", "content": "decision body",
+                   "quote": "We chose the platform API."}],
 })
 
 

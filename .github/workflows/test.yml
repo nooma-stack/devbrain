@@ -130,6 +130,7 @@ jobs:
             tests/test_cognify_openai_backend.py \
             tests/test_anthropic_response_text.py \
             tests/test_cognify_entities_unit.py \
+            tests/test_cognify_extract_quote.py \
             -p no:cacheprovider --tb=short -q
 
   mcp-server:
@@ -279,4 +280,5 @@ jobs:
             tests/test_cognify_extract_codex.py \
             tests/test_cognify_screen.py \
             tests/test_cognify_entities_db.py \
+            tests/test_cognify_extract_identity_db.py \
             -v --tb=short
