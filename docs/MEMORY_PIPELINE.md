@@ -73,7 +73,7 @@ Eight scheduled launchd passes, orchestrated by `factory/cognify/orchestrator.py
 | `decay` | hourly | no | `memory.strength` (two-pass 90d/30d) |
 | `gc` | weekly | no | `memory.archived_at` (**never deletes** — HIPAA) |
 | `extract` | hourly | 1/session, cap 20 | lessons→`pattern`, decisions→`decision` |
-| `edges` | 6h | contradicts cap 15; cites zero-LLM | `memory_dependencies` (cites/contradicts) |
+| `edges` | 6h, all active projects | contradicts cap 15/run (codex → Anthropic); cites zero-LLM | `memory_dependencies` (cites/contradicts) |
 | `strengthen` | daily | no | rule graduate/demote |
 | `fanout` | hourly | 1/session, **no cap** | cross-project `session_summary` rows |
 | `resummarize` | hourly | 1/session, codex → Anthropic, cap 20/run | upgrades Ollama summaries |

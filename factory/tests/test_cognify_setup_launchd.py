@@ -194,9 +194,16 @@ def test_render_no_credential_block_in_non_llm_templates():
 
 
 def test_render_does_not_carry_placeholder_for_project_in_no_project_plists():
-    """decay + gc don't take --project, so ${PROJECT_SLUG} shouldn't appear
-    in their templates at all (sanity check the templates themselves)."""
-    for name in ("com.devbrain.cognify-decay.plist", "com.devbrain.cognify-gc.plist"):
+    """decay, gc and the all-project passes (edges, fanout, resummarize)
+    don't take --project, so ${PROJECT_SLUG} shouldn't appear in their
+    templates at all (sanity check the templates themselves)."""
+    for name in (
+        "com.devbrain.cognify-decay.plist",
+        "com.devbrain.cognify-gc.plist",
+        "com.devbrain.cognify-edges.plist",
+        "com.devbrain.cognify-fanout.plist",
+        "com.devbrain.cognify-resummarize.plist",
+    ):
         text = _read_template(name)
         assert "${PROJECT_SLUG}" not in text, (
             f"{name} should not have ${{PROJECT_SLUG}} — it doesn't pass --project"
@@ -332,3 +339,11 @@ def test_install_without_cred_in_env_installs_codex_only(tmp_path):
         body = path.read_text()
         assert "ANTHROPIC_API_KEY" not in body
         assert "CLAUDE_CODE_OAUTH_TOKEN</key>" not in body
+
+
+def test_codex_passes_get_homebrew_path():
+    """codex is a `#!/usr/bin/env node` script: every plist whose pass can
+    call codex needs Homebrew on PATH under launchd."""
+    for name in _CRED_PLISTS:
+        text = _read_template(name)
+        assert "<key>PATH</key>" in text and "/opt/homebrew/bin" in text, name

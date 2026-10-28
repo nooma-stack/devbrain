@@ -510,20 +510,23 @@ def test_fanout_refused_when_openai_not_allowed(monkeypatch, no_other_backend):
 
 def test_edges_judge_on_openai(monkeypatch, lht, no_other_backend):
     fake = _http(monkeypatch, _completion('{"contradicts": true}'))
-    flag, usage = edges._llm_judge_contradiction("always X", "never X")
+    flag, usage, failure = edges._llm_judge_contradiction("always X", "never X")
+    assert failure is None
     assert flag is True and usage["output_tokens"] == 300
     assert fake.requests[0]["body"]["model"] == "gpt-5.6-luna"
     _http(monkeypatch, _completion('{"contradicts": false}'))
     assert edges._llm_judge_contradiction("a", "b")[0] is False
 
 
-def test_edges_refused_and_codex_unsupported(monkeypatch, no_other_backend):
+def test_edges_refused_and_codex_selected(monkeypatch, tmp_path, no_other_backend):
     monkeypatch.setenv("OPENAI_API_KEY", FAKE_KEY)
+    monkeypatch.setenv("DEVBRAIN_CODEX_HOME", str(tmp_path / "no-codex-home"))
     fake = _http(monkeypatch, _completion('{"contradicts": true}'))
     backends.reset(frozenset({"anthropic"}), selected="openai")
-    assert edges._llm_judge_contradiction("a", "b")[0] is False
+    assert edges._llm_judge_contradiction("a", "b")[::2] == (False, "refused")
+    # backend=codex: codex only; without its isolated home nothing is sent.
     backends.reset(frozenset({"codex", "anthropic"}), selected="codex")
-    assert edges._llm_judge_contradiction("a", "b")[0] is False
+    assert edges._llm_judge_contradiction("a", "b")[::2] == (False, "no_auth")
     assert fake.requests == []
 
 

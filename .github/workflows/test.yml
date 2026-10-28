@@ -132,6 +132,8 @@ jobs:
             tests/test_cognify_entities_unit.py \
             tests/test_cognify_extract_quote.py \
             tests/test_cognify_resummarize_unit.py \
+            tests/test_cognify_edges_unit.py \
+            tests/test_cognify_setup_launchd.py \
             -p no:cacheprovider --tb=short -q
 
   mcp-server:
@@ -276,6 +278,7 @@ jobs:
             tests/test_cognify_edges.py \
             tests/test_cognify_edges_cites.py \
             tests/test_cognify_edges_contradicts.py \
+            tests/test_cognify_edges_candidates.py \
             tests/test_cognify_relate_db.py \
             tests/test_cognify_gate_db.py \
             tests/test_cognify_extract_codex.py \

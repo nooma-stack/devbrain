@@ -110,11 +110,34 @@ def test_insert_edge_idempotent(conn, project_factory, memory_factory):
 
 
 @pytest.mark.db
-def test_edges_pass_requires_project_id(conn):
-    """EdgesPass.run raises ValueError when project_id is None."""
-    pass_ = EdgesPass()
-    with pytest.raises(ValueError, match="project_id"):
-        pass_.run(conn, None)
+def test_edges_pass_without_project_sweeps_active_projects(conn, project_factory):
+    """project_id None (the launchd job) runs every active project; an
+    inactive project is skipped."""
+    active = project_factory("edges_all_a")
+    other = project_factory("edges_all_b")
+    inactive = project_factory("edges_all_off")
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE devbrain.projects SET status = 'inactive' WHERE id = %s",
+            (inactive["id"],),
+        )
+    conn.commit()
+    pairs = {}
+    for proj in (active, other, inactive):
+        src = _insert_memory_with_content(
+            conn, proj["id"], "Source", "This follows the SweepTarget decision."
+        )
+        dst = _insert_memory_with_content(conn, proj["id"], "SweepTarget", "Body.")
+        pairs[proj["id"]] = (src, dst)
+
+    result = EdgesPass().run(conn, None, max_llm_calls=0)
+
+    for proj in (active, other):
+        assert _count_edges_of_type(conn, *pairs[proj["id"]], EDGE_TYPE_CITES) == 1
+        assert result.metadata["projects"][str(proj["id"])]["cites"] == 1
+    assert _count_edges_of_type(conn, *pairs[inactive["id"]], EDGE_TYPE_CITES) == 0
+    assert str(inactive["id"]) not in result.metadata["projects"]
+    assert result.llm_calls == 0
 
 
 @pytest.mark.db
@@ -149,9 +172,16 @@ def test_edges_pass_dry_run_no_edges(conn, project_factory):
 
 
 def test_llm_judge_contradiction_returns_false_without_api_key(monkeypatch):
-    """_llm_judge_contradiction returns (False, empty_usage) when API key is not set."""
+    """_llm_judge_contradiction returns (False, empty_usage, failure) when
+    no backend can be reached (no Anthropic key, no codex login)."""
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    contradicts, usage = _llm_judge_contradiction("Memory A says X.", "Memory B says not X.")
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("DEVBRAIN_CODEX_HOME", "/nonexistent/devbrain-codex-home")
+    contradicts, usage, failure = _llm_judge_contradiction(
+        "Memory A says X.", "Memory B says not X."
+    )
+    assert failure == "no_auth"
     assert contradicts is False
     assert usage["input_tokens"] == 0
     assert usage["output_tokens"] == 0

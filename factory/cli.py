@@ -499,7 +499,8 @@ def setup_multi_dev_cmd(host, port, database, username, password):
 @cli.command(name="setup-cognify-launchd")
 @click.option(
     "--project", "project_slug", required=True,
-    help="Project slug to scope LLM-cost passes (extract, edges, strengthen). "
+    help="Project slug to scope the project-scoped passes (extract, entities, "
+         "strengthen); edges, fanout and resummarize cover every project. "
          "Must match an existing project in DevBrain.",
 )
 @click.option(
@@ -3545,7 +3546,9 @@ def cmd_rules_lint():
     "--project",
     "project_slug",
     default=None,
-    help="Project slug to scope the pass (required for LLM passes).",
+    help="Project slug to scope the pass (required for extract, entities and "
+         "strengthen). Without it, edges sweeps every active project and "
+         "fanout/resummarize cover all projects.",
 )
 @click.option("--dry-run", is_flag=True, default=False,
               help="Report what the pass would do without making changes.")

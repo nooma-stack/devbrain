@@ -29,9 +29,12 @@ from cognify.edges import (
 
 
 def _reference_cites_edges(mems):
-    """The ORIGINAL O(N×T) cites logic, returning the set of (from, to)
+    """The plain O(N×T) cites logic, returning the set of (from, to)
     string-id pairs. Used to prove the optimized _detect_cites is exactly
-    equivalent. `mems` is a list of dicts with str 'id', 'title', 'content'."""
+    equivalent. `mems` is a list of dicts with str 'id', 'title', 'content'.
+    Title AND content are normalised the same way (the 2026-10 fix: the
+    original normalised only the title, so a title with punctuation could
+    never match)."""
     title_index = {}
     for m in mems:
         if m["title"]:
@@ -40,13 +43,11 @@ def _reference_cites_edges(mems):
                 title_index[norm] = m["id"]
     edges = set()
     for m in mems:
-        content = m["content"] or ""
+        content = _normalize_title(m["content"] or "")
         for norm_title, target_id in title_index.items():
             if target_id == m["id"]:
                 continue
-            if _re.search(
-                r"\b" + _re.escape(norm_title) + r"\b", content, _re.IGNORECASE
-            ):
+            if _re.search(r"\b" + _re.escape(norm_title) + r"\b", content):
                 edges.add((m["id"], target_id))
     return edges
 
@@ -90,7 +91,38 @@ def _edge_count(conn, from_id, to_id, edge_type):
 
 
 def test_normalize_title_strips_punctuation():
-    assert _normalize_title("AuthFlow!Decision?") == "authflowdecision"
+    assert _normalize_title("AuthFlow!Decision?") == "authflow decision"
+
+
+def test_normalize_title_collapses_whitespace():
+    assert _normalize_title("Use  psycopg2's —  execute_values") == "use psycopg2 s execute_values"
+
+
+@pytest.mark.db
+def test_cites_title_with_punctuation_matches(conn, project_factory):
+    """A title containing punctuation cites when the content quotes it."""
+    project = project_factory("cites_punct")
+    target = _insert_mem(
+        conn, project["id"], "Retry: back off on 429s (not 5xx)", "Details."
+    )
+    source = _insert_mem(
+        conn, project["id"], "Client notes",
+        "As decided in retry: back off on 429s (not 5xx), the client waits.",
+    )
+    assert _detect_cites(conn, project["id"]) == 1
+    assert _edge_count(conn, source, target, EDGE_TYPE_CITES) == 1
+
+
+@pytest.mark.db
+def test_cites_ignores_transcript_chunks(conn, project_factory):
+    """Raw transcript chunks neither cite nor get cited."""
+    project = project_factory("cites_chunks")
+    target = _insert_mem(conn, project["id"], "OAuthStrategy", "Details.")
+    chunk = _insert_mem(
+        conn, project["id"], None, "user: what about OAuthStrategy?", kind="chunk"
+    )
+    assert _detect_cites(conn, project["id"]) == 0
+    assert _edge_count(conn, chunk, target, EDGE_TYPE_CITES) == 0
 
 
 def test_normalize_title_lowercases():

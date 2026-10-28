@@ -24,8 +24,9 @@ Placeholders
   (typically `/Users/lhtdev/devbrain` on Mac Studio).
 - ``${USER}`` — current user's login name; used to compose the log
   paths under `/Users/<user>/.devbrain/logs/`.
-- ``${PROJECT_SLUG}`` — slug of the project that the LLM-cost passes
-  (extract + edges + strengthen) should scope to.
+- ``${PROJECT_SLUG}`` — slug of the project that the project-scoped
+  passes (extract + strengthen + entities) should scope to. edges, fanout and
+  resummarize run over every project.
 - ``@CREDENTIAL_ENV_BLOCK@`` — XML marker replaced by either an
   ``ANTHROPIC_API_KEY`` or ``CLAUDE_CODE_OAUTH_TOKEN`` env entry in
   the LLM-cost plists (extract, edges, fanout, resummarize, entities). The non-LLM
