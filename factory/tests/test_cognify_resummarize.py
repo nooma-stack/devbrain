@@ -25,6 +25,19 @@ def _live_conn():
     return psycopg2.connect(DATABASE_URL)
 
 
+@pytest.fixture(autouse=True)
+def _anthropic_only(monkeypatch):
+    """These tests stub _call_sonnet: route the pass to Anthropic only, with
+    a fake credential so the once-per-run availability check passes. Codex
+    is never reached (cognify.backend=anthropic means no other backend)."""
+    from cognify import backends
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api03-TEST-ONLY")
+    backends.reset(None, selected="anthropic")
+    yield
+    backends.reset()
+
+
 @pytest.fixture
 def live_db():
     if not os.environ.get("DEVBRAIN_DB_PASSWORD") and not os.environ.get("DEVBRAIN_TEST_DATABASE_URL"):

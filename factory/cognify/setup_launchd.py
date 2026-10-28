@@ -24,8 +24,9 @@ Placeholders
   (typically `/Users/lhtdev/devbrain` on Mac Studio).
 - ``${USER}`` — current user's login name; used to compose the log
   paths under `/Users/<user>/.devbrain/logs/`.
-- ``${PROJECT_SLUG}`` — slug of the project that the LLM-cost passes
-  (extract + edges + strengthen) should scope to.
+- ``${PROJECT_SLUG}`` — slug of the project that the project-scoped
+  passes (extract + strengthen + entities) should scope to. edges, fanout and
+  resummarize run over every project.
 - ``@CREDENTIAL_ENV_BLOCK@`` — XML marker replaced by either an
   ``ANTHROPIC_API_KEY`` or ``CLAUDE_CODE_OAUTH_TOKEN`` env entry in
   the LLM-cost plists (extract, edges, fanout, resummarize, entities). The non-LLM
@@ -166,21 +167,24 @@ def render_plist(
 
     Pure function; no I/O. Tested directly in unit tests.
 
-    Raises ValueError if the template carries `@CREDENTIAL_ENV_BLOCK@`
-    but no `credential` was supplied — that combination would emit
-    a plist that can never authenticate.
+    With no ``credential`` and no ``extra_env`` the credential block is
+    dropped: the LLM passes then run on codex only (its own login in the
+    isolated CODEX_HOME — see cognify/codex_home.py), and each run records
+    ``blocked`` when codex is not usable either.
     """
     out = template_text.replace("${DEVBRAIN_HOME}", devbrain_home)
     out = out.replace("${USER}", user)
     out = out.replace("${PROJECT_SLUG}", project_slug)
 
+    if _CRED_MARKER in out and credential is None and not extra_env:
+        marker_pos = out.find(_CRED_MARKER)
+        first_close = out.index("-->", marker_pos) + len("-->")
+        second_close = out.index("-->", first_close) + len("-->")
+        line_start = out.rfind("\n", 0, marker_pos) + 1
+        end = second_close + 1 if out[second_close:second_close + 1] == "\n" else second_close
+        return out[:line_start] + out[end:]
+
     if _CRED_MARKER in out:
-        if credential is None and not extra_env:
-            raise ValueError(
-                "template carries @CREDENTIAL_ENV_BLOCK@ but no credential "
-                "was supplied — extract + edges plists require one of "
-                "ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN"
-            )
         pairs: list[tuple[str, str]] = []
         if credential is not None:
             pairs.append((credential.env_name, credential.value))
@@ -291,8 +295,8 @@ def install_cognify_launchd(
         credential = None
     elif credential is None:
         credential = resolve_credential_from_env()
-        # OK if it's None — render_plist will raise only on plists
-        # that need it.
+        # OK if it's None — the LLM plists then carry no Anthropic
+        # credential and run on codex only.
 
     if devbrain_home is None:
         # /factory/cognify/setup_launchd.py → devbrain root is 2 levels up

@@ -28,10 +28,9 @@ marked done. ``openai`` is never allowed by default: it must be listed.
 
 ``backend`` — env ``DEVBRAIN_COGNIFY_BACKEND`` overrides the yaml. Unset
 keeps the model-based routing (codex for "codex"/gpt-*/o3/o4 ids, Anthropic
-otherwise, with extract/fanout falling back from codex to Anthropic). Set,
-EVERY pass uses exactly that backend and nothing else: no fallback to
-another backend, and a pass with no path for it (edges and resummarize have
-no codex path) does not run. An unknown value selects nothing, so every
+otherwise, with extract/fanout/resummarize/edges falling back from codex to
+Anthropic). Set, EVERY pass uses exactly that backend and nothing else: no
+fallback to another backend. An unknown value selects nothing, so every
 pass is refused. With ``backend: openai`` the model is
 ``cognify.openai_model`` (env ``DEVBRAIN_OPENAI_MODEL``, default
 gpt-5.6-luna); ``DEVBRAIN_CODEX_MODEL`` / ``cognify.codex_model`` are not
@@ -228,3 +227,93 @@ def route(model: str | None) -> str:
     if sel is not None:
         return sel
     return backend_for_model(model)
+
+
+# ── Per-run backend chain + availability (resummarize, edges) ────────────────
+#
+# A pass that makes many small calls asks once per run which backends it can
+# actually reach, instead of discovering a missing credential once per unit.
+# Reason codes, used in run-log metadata and read by brain_doctor:
+#   refused      — not in cognify.allowed_backends (or cognify.backend is
+#                  invalid): a policy decision, e.g. a PHI deployment
+#   no_auth      — allowed, but no credential / login / safe CODEX_HOME
+#   unavailable  — allowed, but the codex binary or anthropic SDK is missing
+
+
+def chain(primary_model: str | None, fallback_model: str | None) -> list[str]:
+    """Backends a pass would try, in order, before availability.
+
+    An explicit cognify.backend means exactly that backend (no fallback).
+    Otherwise the primary routes by model id (codex for "codex"/gpt-*), and
+    a codex primary falls back to Anthropic when ``fallback_model`` names a
+    non-codex model — the order fanout and extract use."""
+    sel = selected()
+    if sel is not None:
+        return [sel]
+    primary = backend_for_model(primary_model)
+    out = [primary]
+    if (
+        primary == "codex"
+        and fallback_model
+        and fallback_model.strip().lower() not in ("", "none")
+        and backend_for_model(fallback_model) == "anthropic"
+    ):
+        out.append("anthropic")
+    return out
+
+
+def availability(backend: str, pass_name: str) -> tuple[str | None, str]:
+    """(reason_code | None, detail). None means the backend can be called.
+    Never raises; never returns secret material."""
+    if not check(backend, pass_name) or backend not in BACKENDS:
+        return "refused", "not in cognify.allowed_backends"
+    if backend == "codex":
+        from cognify import codex_home  # noqa: PLC0415
+        from cognify.extract import _CODEX_BIN  # noqa: PLC0415
+
+        ok, reason = codex_home.check()
+        if not ok:
+            return "no_auth", f"codex isolation: {reason}"
+        if not _CODEX_BIN or not os.path.exists(_CODEX_BIN):
+            return "unavailable", f"codex binary not found at {_CODEX_BIN}"
+        return None, "ok"
+    if backend == "anthropic":
+        try:
+            import anthropic  # noqa: F401, PLC0415
+        except ImportError:
+            return "unavailable", "anthropic SDK not installed"
+        from cognify._anthropic_auth import resolve_anthropic_auth  # noqa: PLC0415
+
+        if resolve_anthropic_auth() is None:
+            return "no_auth", "no Anthropic credential in the environment"
+        return None, "ok"
+    # openai
+    from cognify import openai_api  # noqa: PLC0415
+
+    if not openai_api.api_key():
+        return "no_auth", "no OpenAI API key"
+    return None, "ok"
+
+
+def usable(backend_chain: list[str], pass_name: str) -> tuple[list[str], dict[str, str]]:
+    """(usable backends in order, {backend: "code: detail"} for the rest)."""
+    ok: list[str] = []
+    reasons: dict[str, str] = {}
+    for b in backend_chain:
+        code, detail = availability(b, pass_name)
+        if code is None:
+            ok.append(b)
+        else:
+            reasons[b] = f"{code}: {detail}"
+    return ok, reasons
+
+
+def blocked_label(reasons: dict[str, str]) -> str:
+    """Run-level label when no backend is usable: "refused" only when every
+    backend was refused by policy; otherwise the first non-policy code."""
+    codes = [r.split(":", 1)[0] for r in reasons.values()]
+    if not codes or all(c == "refused" for c in codes):
+        return "refused"
+    if "no_auth" in codes:
+        return "no_auth"
+    return next(c for c in codes if c != "refused")

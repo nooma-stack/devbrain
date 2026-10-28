@@ -1,13 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
     "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- cognify_edges: every-6h cites + contradicts edge inference.             -->
-<!-- Up to 15 LLM calls per run (contradicts detection only).                -->
-<!-- Placeholders ${DEVBRAIN_HOME}, ${USER}, ${PROJECT_SLUG}, and the        -->
-<!-- credential-env marker are substituted by                                -->
-<!-- `devbrain setup-cognify-launchd`. Do NOT cp this file directly into     -->
-<!-- ~/Library/LaunchAgents/ — placeholders won't expand and launchd will    -->
-<!-- fail at runtime with a literal "${PROJECT_SLUG}" error.                 -->
+<!-- cognify_edges: every-6h cites + contradicts edge inference over EVERY  -->
+<!-- active project (no project argument). Up to 15 judge calls per run,     -->
+<!-- shared round-robin across projects; codex first, Anthropic fallback.    -->
+<!-- Placeholders ${DEVBRAIN_HOME}, ${USER} and the credential-env marker    -->
+<!-- are substituted by `devbrain setup-cognify-launchd`. Do NOT cp this     -->
+<!-- file directly into ~/Library/LaunchAgents/ — placeholders won't expand. -->
 <plist version="1.0">
 <dict>
     <key>Label</key>
@@ -19,7 +18,6 @@
         <string>${DEVBRAIN_HOME}/factory/cli.py</string>
         <string>cognify</string>
         <string>--pass=edges</string>
-        <string>--project=${PROJECT_SLUG}</string>
     </array>
 
     <!-- Run every 6 hours -->
@@ -32,6 +30,11 @@
         <string>${DEVBRAIN_HOME}</string>
         <key>PYTHONPATH</key>
         <string>${DEVBRAIN_HOME}/factory</string>
+        <!-- launchd's default PATH omits Homebrew, so the codex CLI (a   -->
+        <!-- `#!/usr/bin/env node` script) fails with "env: node: No such -->
+        <!-- file or directory" under launchd.                            -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <!-- @CREDENTIAL_ENV_BLOCK@ — installer emits ANTHROPIC_API_KEY or  -->
         <!-- CLAUDE_CODE_OAUTH_TOKEN here based on env at install time.    -->
     </dict>

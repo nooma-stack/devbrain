@@ -168,7 +168,7 @@ def test_detect_contradicts_honors_max_llm_calls_below_default():
             "output_tokens": 0,
             "cache_read_tokens": 0,
             "cache_write_tokens": 0,
-        }
+        }, None
 
     # Fake a graph_walk that returns all other memories as neighbors,
     # so candidate_pairs >= 100 (way over any cap we'd test).
@@ -224,7 +224,7 @@ def test_detect_contradicts_uses_default_cap_when_none():
             "output_tokens": 0,
             "cache_read_tokens": 0,
             "cache_write_tokens": 0,
-        }
+        }, None
 
     class FakeNode:
         def __init__(self, mid):
@@ -270,7 +270,7 @@ def test_detect_contradicts_zero_cap_skips_all_llm_work():
 
     def fake_llm_judge(content_a, content_b):
         fake_call_count["n"] += 1
-        return False, {}
+        return False, {}, None
 
     class FakeNode:
         def __init__(self, mid):

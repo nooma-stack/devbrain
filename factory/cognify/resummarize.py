@@ -1,4 +1,4 @@
-"""cognify_resummarize — upgrade Ollama summaries to Sonnet for orphan sessions.
+"""cognify_resummarize — upgrade Ollama summaries for orphan sessions.
 
 The ingest watcher writes an initial session_summary at ingest time using
 local Ollama (qwen2.5:7b — free, lower quality). Most sessions then get
@@ -11,15 +11,28 @@ the canonical row — and search results degrade accordingly.
 
 This pass closes that gap: it scans for raw_sessions whose summary_source
 is 'ollama' (or NULL — pre-migration-041) AND has no end_session_log
-entry AND the conversation is settled. For each, it re-summarizes with
-Sonnet 4.6, replaces the summary + session_summary chunks, and marks
-summary_source='sonnet' so the pass is idempotent.
+entry AND the conversation is settled. For each, it re-summarizes with a
+hosted model, replaces the summary + session_summary chunks, and marks
+summary_source ('codex', 'sonnet', 'openai', ...) so the pass is
+idempotent.
 
-Cost: ~$0.01–0.02 per session (Sonnet 4.6 with ~9K avg input tokens).
-The all-time backfill on a ~3K-session DB lands around $30–60.
+Backends: the same order fanout uses. Codex first (the isolated CODEX_HOME,
+model cognify.codex_model, ChatGPT login — no per-token spend), then the
+Anthropic API only when a credential exists; an explicit cognify.backend
+means that backend only. cognify.allowed_backends is honoured for each.
+Which backends are usable is decided ONCE per run: with none (no codex
+login, no Anthropic credential, or a policy refusal) the run records
+``blocked`` and attempts nothing, instead of failing every session.
+
+Per-run cap: MAX_SESSIONS_PER_RUN (env DEVBRAIN_RESUMMARIZE_MAX_PER_RUN,
+default 20) so a backlog drains in batches; ``sessions_discovered`` keeps
+the full backlog size for monitoring.
+
+Cost on the Anthropic fallback: ~$0.01–0.02 per session (Sonnet, ~9K avg
+input tokens).
 
 Schedule: 60-min launchd cadence; manual trigger via
-`bin/devbrain cognify-resummarize`.
+`devbrain cognify --pass=resummarize`.
 """
 from __future__ import annotations
 
@@ -34,9 +47,37 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# Sonnet is the right tradeoff for summarization — strong reasoning, much
-# cheaper than Opus. Caller can override via --model.
-DEFAULT_MODEL = os.environ.get("DEVBRAIN_RESUMMARIZE_MODEL", "claude-sonnet-5")
+# Primary model. "codex" routes to the codex CLI with cognify.codex_model;
+# a claude-* id routes to the Anthropic API (no codex attempt). Same
+# convention as DEVBRAIN_FANOUT_MODEL.
+DEFAULT_MODEL = os.environ.get("DEVBRAIN_RESUMMARIZE_MODEL", "codex")
+
+# Anthropic model used when codex is unavailable or fails (model-based
+# routing only). "none" disables the fallback.
+FALLBACK_MODEL = os.environ.get("DEVBRAIN_RESUMMARIZE_FALLBACK", "claude-sonnet-5")
+
+# Sessions attempted per run. The backlog drains in batches of this size.
+MAX_SESSIONS_PER_RUN = int(os.environ.get("DEVBRAIN_RESUMMARIZE_MAX_PER_RUN", "20"))
+
+# Stop the run after this many sessions in a row fail on every backend
+# with an API error (quota, outage): the rest would fail the same way.
+MAX_CONSECUTIVE_API_FAILURES = 3
+
+# A session that failed this many runs goes to the back of the queue, so
+# a few bad sessions (empty transcript, one that always times out) cannot
+# block the oldest-first batch forever.
+MAX_SESSION_TRIES = 3
+
+# Failures that mean a backend cannot be used at all this run.
+_DEAD_BACKEND_FAILURES = ("no_auth", "refused", "unavailable")
+
+# codex --output-schema for the summary (strict structured output).
+_CODEX_SUMMARY_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["summary"],
+    "properties": {"summary": {"type": "string"}},
+}
 
 # How long after the last raw_sessions write before we consider the
 # session "settled" and safe to upgrade. Avoids running on a still-
@@ -59,6 +100,16 @@ class ResummarizeResult:
     llm_calls: int = 0
     failure_counts: dict = field(default_factory=dict)
     dry_run: bool = False
+    sessions_attempted: int = 0
+    # Set when the run attempted nothing because no backend was usable:
+    # "refused" (policy) or "no_auth" / "unavailable".
+    blocked: str | None = None
+    # {backend: "code: detail"} for backends that could not be used.
+    backend_status: dict = field(default_factory=dict)
+    backends_used: dict = field(default_factory=dict)
+    aborted: str | None = None
+    # {raw_session_id: failed runs} carried to the next run (ids only).
+    failed_tries: dict = field(default_factory=dict)
 
 
 def discover_sessions_needing_resummarize(
@@ -253,26 +304,117 @@ def _call_openai(
     return res.text, res.usage, None
 
 
+def _empty_usage() -> dict:
+    return {
+        "input_tokens": 0, "output_tokens": 0,
+        "cache_read_tokens": 0, "cache_write_tokens": 0,
+    }
+
+
+def _call_codex(
+    raw_content: str, model: str | None,
+) -> tuple[str | None, dict, str | None]:
+    """The summary via `codex exec` on the isolated CODEX_HOME (no token
+    spend). Same return contract as _call_sonnet. ``model`` is used only
+    when it is a codex/OpenAI id; otherwise cognify.codex_model."""
+    from cognify import codex_exec  # noqa: PLC0415
+    from cognify.extract import _routes_to_codex  # noqa: PLC0415
+
+    sys_text, user_text = _build_summarize_prompt(raw_content)
+    prompt = (
+        sys_text
+        + "\n\nPut the summary text in the `summary` field.\n\n"
+        + user_text
+    )
+    parsed, failure, detail = codex_exec.run_json(
+        prompt,
+        _CODEX_SUMMARY_SCHEMA,
+        pass_name="resummarize",
+        required_keys=("summary",),
+        model=model if _routes_to_codex(model) else None,
+    )
+    if failure:
+        if failure not in _DEAD_BACKEND_FAILURES:
+            logger.warning("resummarize(codex): %s: %s", failure, (detail or "")[:200])
+        return None, _empty_usage(), failure
+    text = str((parsed or {}).get("summary") or "").strip()
+    if not text:
+        return None, _empty_usage(), "empty"
+    return text, _empty_usage(), None
+
+
+def _anthropic_model(model: str) -> str:
+    """The Anthropic model for a call whose primary ``model`` may be a
+    codex id: the primary when it is an Anthropic id, else the fallback."""
+    from cognify.extract import _ANTHROPIC_DEFAULT_MODEL, _routes_to_codex  # noqa: PLC0415
+
+    if model and not _routes_to_codex(model):
+        return model
+    if FALLBACK_MODEL and not _routes_to_codex(FALLBACK_MODEL) \
+            and FALLBACK_MODEL.lower() != "none":
+        return FALLBACK_MODEL
+    return _ANTHROPIC_DEFAULT_MODEL
+
+
+@dataclass
+class _Attempt:
+    text: str | None
+    usage: dict
+    failure: str | None
+    backend: str | None  # the backend that produced text (or failed last)
+    model: str | None
+    calls: int  # backend invocations that reached a model
+    dead: dict = field(default_factory=dict)  # backend -> failure, removed
+
+
+def _summarize_with(raw_content: str, model: str, order: list[str]) -> _Attempt:
+    """Try ``order`` in turn until one returns a summary.
+
+    A backend that answers no_auth / refused / unavailable is REMOVED from
+    ``order`` (the caller's list), so the rest of the run skips it."""
+    last = _Attempt(None, _empty_usage(), "refused", None, None, 0)
+    calls = 0
+    dead_backends: dict[str, str] = {}
+    for backend in list(order):
+        if backend == "codex":
+            used_model = model
+            text, usage, failure = _call_codex(raw_content, model)
+        elif backend == "anthropic":
+            used_model = _anthropic_model(model)
+            text, usage, failure = _call_sonnet(raw_content, used_model)
+        elif backend == "openai":
+            from cognify import openai_api  # noqa: PLC0415
+
+            used_model = openai_api.model_for(model)
+            text, usage, failure = _call_openai(raw_content, used_model)
+        else:
+            from cognify import backends  # noqa: PLC0415
+
+            backends.check(backend, "resummarize")  # logs the refusal
+            used_model, text, usage, failure = None, None, _empty_usage(), "refused"
+        dead = failure is not None and failure.split(":", 1)[0] in _DEAD_BACKEND_FAILURES
+        if not dead:
+            calls += 1
+        if dead:
+            dead_backends[backend] = failure
+            if backend in order:
+                order.remove(backend)
+        last = _Attempt(text, usage, failure, backend, used_model, calls, dead_backends)
+        if failure is None:
+            return last
+    return last
+
+
 def _summarize(
     raw_content: str, model: str,
 ) -> tuple[str | None, dict, str | None]:
-    """Dispatch to the backend cognify.backend selects (no fallback)."""
+    """One summary through this deployment's backend chain (see
+    backends.chain). Returns (text, usage, failure)."""
     from cognify import backends  # noqa: PLC0415
 
-    selected = backends.selected()
-    if selected == "openai":
-        return _call_openai(raw_content, model)
-    if selected not in (None, "anthropic"):
-        # No codex path here; an explicit backend never falls back.
-        if selected == "codex":
-            backends.unsupported(selected, "resummarize")
-        else:
-            backends.check(selected, "resummarize")
-        return None, {
-            "input_tokens": 0, "output_tokens": 0,
-            "cache_read_tokens": 0, "cache_write_tokens": 0,
-        }, "refused"
-    return _call_sonnet(raw_content, model)
+    order = backends.chain(model, FALLBACK_MODEL)
+    a = _summarize_with(raw_content, model, order)
+    return a.text, a.usage, a.failure
 
 
 def _replace_session_summary(
@@ -418,8 +560,10 @@ def run_resummarize(
     max_sessions: int | None = None,
     progress_callback=None,
 ) -> ResummarizeResult:
-    """Discover + upgrade orphan-of-end_session sessions to Sonnet summaries.
+    """Discover + upgrade orphan-of-end_session sessions' summaries.
 
+    Attempts at most ``max_sessions`` (default MAX_SESSIONS_PER_RUN)
+    sessions, oldest first; ``sessions_discovered`` is the whole backlog.
     Idempotent against the summary_source marker — re-running won't
     re-summarize already-upgraded sessions. Safe to interrupt at any
     point; the next run picks up unfinished work.
@@ -428,42 +572,80 @@ def run_resummarize(
         get_pricing, compute_cost_usd, SONNET_4_6,
     )
     from observability.spend import record_spend  # noqa: PLC0415
-    from cognify import backends, openai_api  # noqa: PLC0415
+    from cognify import backends  # noqa: PLC0415
 
     result = ResummarizeResult(dry_run=dry_run)
-    use_openai = backends.selected() == "openai"
-    if use_openai:
-        model = openai_api.model_for(model)
-    pricing = get_pricing(model) or SONNET_4_6
+    cap = MAX_SESSIONS_PER_RUN if max_sessions is None else max(0, int(max_sessions))
 
     targets = discover_sessions_needing_resummarize(
-        conn, project_id=project_id, since=since, limit=max_sessions,
+        conn, project_id=project_id, since=since,
     )
     result.sessions_discovered = len(targets)
+    tries = _last_failed_tries(conn, project_id) if targets and not dry_run else {}
+    if tries:
+        waiting = {sid for sid, _ in targets}
+        result.failed_tries = {k: v for k, v in tries.items() if k in waiting}
+        # Stable: oldest-first within each group.
+        targets.sort(key=lambda t: result.failed_tries.get(t[0], 0) >= MAX_SESSION_TRIES)
 
-    if dry_run or not targets:
+    if dry_run or not targets or cap == 0:
         return result
 
-    for idx, (session_id, sess_project_id) in enumerate(targets, start=1):
+    # Decide once which backends this run can use. With none, attempt
+    # nothing: the old per-session check failed every session of the
+    # backlog with the same no_auth, every hour (859 a run on the Studio).
+    order, result.backend_status = backends.usable(
+        backends.chain(model, FALLBACK_MODEL), "resummarize"
+    )
+    if not order:
+        result.blocked = backends.blocked_label(result.backend_status)
+        logger.warning(
+            "resummarize: no usable backend (%s) — %d session(s) waiting",
+            "; ".join(f"{b}: {r}" for b, r in result.backend_status.items()) or "none",
+            len(targets),
+        )
+        return result
+
+    batch = targets[:cap]
+    api_streak = 0
+    for idx, (session_id, sess_project_id) in enumerate(batch, start=1):
+        if not order:
+            # Every backend died mid-run (e.g. the codex login was revoked).
+            result.blocked = backends.blocked_label(result.backend_status)
+            break
+        if api_streak >= MAX_CONSECUTIVE_API_FAILURES:
+            result.aborted = "api_failures"
+            logger.warning(
+                "resummarize: %d sessions in a row failed with API errors; "
+                "stopping this run", api_streak,
+            )
+            break
+        result.sessions_attempted += 1
         raw_content = _load_session_raw_content(conn, session_id)
         if raw_content is None or not raw_content.strip():
             result.sessions_failed += 1
+            result.failed_tries[session_id] = result.failed_tries.get(session_id, 0) + 1
             result.failure_counts["no_content"] = (
                 result.failure_counts.get("no_content", 0) + 1
             )
             if progress_callback:
-                progress_callback(idx, len(targets), {
+                progress_callback(idx, len(batch), {
                     "session_id": session_id,
                     "failure": "no_content",
                 })
             continue
 
-        summary, usage, failure = _summarize(raw_content, model)
+        attempt = _summarize_with(raw_content, model, order)
+        for gone, why in attempt.dead.items():
+            result.backend_status[gone] = f"{why}: failed mid-run"
+        result.llm_calls += attempt.calls
+        usage = attempt.usage
 
         # Record spend regardless of outcome (we paid for the call).
         if any(usage.get(k, 0) for k in ("input_tokens", "output_tokens")):
+            spend_model = attempt.model or model
             cost = compute_cost_usd(
-                pricing,
+                get_pricing(spend_model) or SONNET_4_6,
                 input_tokens=usage["input_tokens"],
                 output_tokens=usage["output_tokens"],
                 cache_read_tokens=usage["cache_read_tokens"],
@@ -472,7 +654,7 @@ def run_resummarize(
             try:
                 record_spend(
                     conn, project_id=sess_project_id,
-                    pass_name="resummarize", model=model,
+                    pass_name="resummarize", model=spend_model,
                     input_tokens=usage["input_tokens"],
                     output_tokens=usage["output_tokens"],
                     cache_read_tokens=usage["cache_read_tokens"],
@@ -481,30 +663,34 @@ def run_resummarize(
                 )
             except Exception:  # noqa: BLE001
                 logger.exception("resummarize: record_spend failed")
-            result.llm_calls += 1
 
+        failure = attempt.failure
         if failure:
             result.sessions_failed += 1
+            if failure.split(":", 1)[0] not in _DEAD_BACKEND_FAILURES:
+                # The session's own fault (or a transient API error), not a
+                # missing backend: count it toward deprioritising.
+                result.failed_tries[session_id] = result.failed_tries.get(session_id, 0) + 1
             result.failure_counts[failure] = (
                 result.failure_counts.get(failure, 0) + 1
             )
+            if failure.split(":", 1)[0] == "api":
+                api_streak += 1
             if progress_callback:
-                progress_callback(idx, len(targets), {
+                progress_callback(idx, len(batch), {
                     "session_id": session_id,
                     "failure": failure,
                 })
             continue
+        api_streak = 0
 
         try:
             _replace_session_summary(
                 conn,
                 session_id=session_id,
                 project_id=sess_project_id,
-                new_summary=summary or "",
-                source="openai" if use_openai
-                       else "sonnet" if model.startswith("claude-sonnet")
-                       else "opus" if model.startswith("claude-opus")
-                       else "anthropic",
+                new_summary=attempt.text or "",
+                source=_summary_source(attempt.backend, attempt.model),
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("resummarize: replace failed for %s", session_id)
@@ -517,7 +703,7 @@ def run_resummarize(
             except Exception:  # noqa: BLE001
                 pass
             if progress_callback:
-                progress_callback(idx, len(targets), {
+                progress_callback(idx, len(batch), {
                     "session_id": session_id,
                     "failure": "replace_error",
                     "detail": str(exc)[:200],
@@ -525,13 +711,54 @@ def run_resummarize(
             continue
 
         result.sessions_processed += 1
+        result.failed_tries.pop(session_id, None)
+        result.backends_used[attempt.backend] = (
+            result.backends_used.get(attempt.backend, 0) + 1
+        )
         if progress_callback:
-            progress_callback(idx, len(targets), {
+            progress_callback(idx, len(batch), {
                 "session_id": session_id,
                 "failure": None,
             })
 
+    if not order and result.blocked is None:
+        result.blocked = backends.blocked_label(result.backend_status)
     return result
+
+
+def _last_failed_tries(conn: Any, project_id: Any) -> dict[str, int]:
+    """{raw_session_id: failed runs} from the last completed real run."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT metadata -> 'failed_tries' FROM devbrain.cognify_run_log "
+            "WHERE pass_name = 'resummarize' "
+            "  AND project_id IS NOT DISTINCT FROM %s "
+            "  AND completed_at IS NOT NULL AND error IS NULL "
+            "  AND coalesce(metadata ->> 'dry_run', 'false') <> 'true' "
+            "ORDER BY started_at DESC LIMIT 1",
+            (project_id,),
+        )
+        row = cur.fetchone()
+    raw = row[0] if row and isinstance(row[0], dict) else {}
+    out: dict[str, int] = {}
+    for k, v in raw.items():
+        try:
+            out[str(k)] = int(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _summary_source(backend: str | None, model: str | None) -> str:
+    """raw_sessions.summary_source for a summary from ``backend``."""
+    if backend in ("codex", "openai"):
+        return backend
+    m = (model or "").lower()
+    if m.startswith("claude-sonnet"):
+        return "sonnet"
+    if m.startswith("claude-opus"):
+        return "opus"
+    return "anthropic"
 
 
 # ─── Pass registration ──────────────────────────────────────────────────────
@@ -547,16 +774,34 @@ def _register_resummarize_pass() -> None:
         pass_name = "resummarize"
 
         def run(self, conn, project_id, *, dry_run=False) -> "PassResult":
+            from cognify import backends  # noqa: PLC0415
+
             res = run_resummarize(conn, project_id=project_id, dry_run=dry_run)
+            metadata = {
+                "pass": "resummarize",
+                "sessions_discovered": res.sessions_discovered,
+                "sessions_attempted": res.sessions_attempted,
+                "sessions_processed": res.sessions_processed,
+                "sessions_failed": res.sessions_failed,
+                "backlog_remaining": res.sessions_discovered - res.sessions_processed,
+                "failure_counts": res.failure_counts,
+                "max_per_run": MAX_SESSIONS_PER_RUN,
+                "backends_used": res.backends_used,
+            }
+            if res.blocked:
+                metadata["blocked"] = res.blocked
+                metadata["allowed_backends"] = sorted(backends.allowed())
+            if res.backend_status:
+                metadata["backend_status"] = res.backend_status
+            if res.aborted:
+                metadata["aborted"] = res.aborted
+            if res.failed_tries:
+                # Read back by the next run (_last_failed_tries). Ids only.
+                metadata["failed_tries"] = res.failed_tries
             return PassResult(
                 rows_processed=res.sessions_processed,
                 llm_calls=res.llm_calls,
-                metadata={
-                    "pass": "resummarize",
-                    "sessions_discovered": res.sessions_discovered,
-                    "sessions_failed": res.sessions_failed,
-                    "failure_counts": res.failure_counts,
-                },
+                metadata=metadata,
                 dry_run=dry_run,
             )
 
@@ -568,6 +813,8 @@ _register_resummarize_pass()
 
 __all__ = [
     "DEFAULT_MODEL",
+    "FALLBACK_MODEL",
+    "MAX_SESSIONS_PER_RUN",
     "SETTLED_AFTER_MINUTES",
     "ResummarizeResult",
     "discover_sessions_needing_resummarize",

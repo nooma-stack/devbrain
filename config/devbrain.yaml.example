@@ -109,8 +109,7 @@ cognify:
   # allowed_backends: [codex, anthropic]
   # One backend for every pass: codex | anthropic | openai. Unset = route by
   # model id (codex for codex/gpt-*/o3, Anthropic otherwise, with a codex ->
-  # Anthropic fallback). Set = that backend only, never a fallback; a pass
-  # with no path for it (edges/resummarize have no codex path) does not run.
+  # Anthropic fallback). Set = that backend only, never a fallback.
   # Env DEVBRAIN_COGNIFY_BACKEND overrides.
   # backend: openai
   # Model for backend=openai (Chat Completions). Env DEVBRAIN_OPENAI_MODEL

@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
     "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- cognify_resummarize: upgrade Ollama session summaries to Sonnet      -->
-<!-- when end_session was never called. 60-min cadence — conversations    -->
+<!-- cognify_resummarize: upgrade Ollama session summaries (codex first, -->
+<!-- Anthropic fallback) when end_session was never called. Up to 20      -->
+<!-- sessions per run. 60-min cadence — conversations                     -->
 <!-- need to be "settled" (no JSONL writes in last 30 min) before they    -->
 <!-- become candidates, so the cadence below is intentionally slower.     -->
 <!-- See factory/cognify/resummarize.py for design notes.                 -->
@@ -31,6 +32,11 @@
         <string>${DEVBRAIN_HOME}</string>
         <key>PYTHONPATH</key>
         <string>${DEVBRAIN_HOME}/factory</string>
+        <!-- launchd's default PATH omits Homebrew, so the codex CLI (a   -->
+        <!-- `#!/usr/bin/env node` script) fails with "env: node: No such -->
+        <!-- file or directory" under launchd.                            -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <!-- @CREDENTIAL_ENV_BLOCK@ — installer emits ANTHROPIC_API_KEY  -->
         <!-- or CLAUDE_CODE_OAUTH_TOKEN here based on env at install     -->
         <!-- time.                                                       -->

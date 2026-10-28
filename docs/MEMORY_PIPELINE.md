@@ -73,10 +73,10 @@ Eight scheduled launchd passes, orchestrated by `factory/cognify/orchestrator.py
 | `decay` | hourly | no | `memory.strength` (two-pass 90d/30d) |
 | `gc` | weekly | no | `memory.archived_at` (**never deletes** — HIPAA) |
 | `extract` | hourly | 1/session, cap 20 | lessons→`pattern`, decisions→`decision` |
-| `edges` | 6h | contradicts cap 15; cites zero-LLM | `memory_dependencies` (cites/contradicts) |
+| `edges` | 6h, all active projects | contradicts cap 15/run (codex → Anthropic); cites zero-LLM | `memory_dependencies` (cites/contradicts) |
 | `strengthen` | daily | no | rule graduate/demote |
 | `fanout` | hourly | 1/session, **no cap** | cross-project `session_summary` rows |
-| `resummarize` | hourly | 1/session Sonnet, **no cap** | upgrades Ollama summaries |
+| `resummarize` | hourly | 1/session, codex → Anthropic, cap 20/run | upgrades Ollama summaries |
 | `entities` | 2h | 8 memories/call, cap 8 calls / 64 memories | facts graph: `entities`, `entity_relations`, `entity_aliases` |
 
 The **curator** runs at `end_session` (`factory/curator/end_session.py`): applies the
@@ -147,10 +147,15 @@ characters, bidi overrides, zero-width characters inside words).
   backlog; refused fanout/resummarize sessions stay eligible.
 - `cognify.backend` (env `DEVBRAIN_COGNIFY_BACKEND`) selects one backend for
   every pass. Unset keeps model-based routing (codex for `codex`/gpt-*/o3/o4,
-  Anthropic otherwise, codex → Anthropic fallback in extract/fanout). Set,
-  there is no fallback of any kind; a pass without a path for that backend
-  does not run (edges and resummarize have no codex path); an unknown value
-  refuses everything. `backend: openai` calls Chat Completions
+  Anthropic otherwise, codex → Anthropic fallback in extract, fanout,
+  resummarize and edges). Set, there is no fallback of any kind; an unknown
+  value refuses everything.
+- resummarize and edges decide once per run which backends they can reach
+  (`backends.usable`: allow-list, codex isolation/login, Anthropic
+  credential). With none they attempt nothing and record `blocked`
+  (`refused` = policy, `no_auth`, `unavailable`) plus `backend_status` in
+  `cognify_run_log.metadata`; brain-doctor's `cognify_output` check reads
+  it. `backend: openai` calls Chat Completions
   (`factory/cognify/openai_api.py`) with `cognify.openai_model` (env
   `DEVBRAIN_OPENAI_MODEL`, default `gpt-5.6-luna`; `DEVBRAIN_CODEX_MODEL` is
   not used), strict JSON-schema output for extract/fanout/edges, 120 s

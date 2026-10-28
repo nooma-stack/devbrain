@@ -16,6 +16,10 @@ originally caught by ACCIDENT (2026-08-24 → 09-01):
   ingest_liveness   — a dead watcher silently stops all new memory
   cognify_liveness  — passes stall or error-loop (codex failure storm burned
                       62K fallbacks before anyone looked)
+  cognify_output    — passes that "succeed" while failing every unit: no
+                      LLM backend reachable (resummarize/fanout logged [ok]
+                      with 859 no_auth a run for six weeks), or work waiting
+                      and nothing done; WARN on slow runs
   orphan_backlog    — unclosed sessions accumulating again
   summary_coverage  — sessions ingested but never summarized
   worker_quota      — closure worker hitting rate limits / exhausted credits
@@ -171,6 +175,158 @@ def check_cognify_liveness(cur):
     return "PASS", "all passes on cadence, no errors 24h"
 
 
+# ── cognify_output: silent failures the run log hides ────────────────────────
+#
+# Passes record per-unit failures in metadata and still finish "ok", so
+# cognify_liveness (cadence + error column) stayed PASS while resummarize
+# and fanout failed every session with no_auth for six weeks (2026-09-17 →
+# 2026-10-28) and edges judged nothing. This check reads the metadata.
+
+# Failure codes that mean "could not reach a backend at all".
+AUTH_FAILURES = ("no_auth", "refused", "unavailable")
+
+# A (pass, project) needs at least this many runs in 24 h, ALL with work
+# waiting and nothing done, to count as stalled (one empty run is noise).
+STALL_MIN_RUNS = 2
+
+
+def _code(label) -> str:
+    return str(label).split(":", 1)[0]
+
+
+def _waiting_and_done(pass_name, rows_processed, md):
+    """(units waiting, units done) for one run, or None when this pass's
+    metadata says nothing about a backlog."""
+    if pass_name in ("fanout", "resummarize"):
+        if "sessions_discovered" not in md:
+            return None
+        return (int(md.get("sessions_discovered") or 0),
+                int(md.get("sessions_processed", rows_processed) or 0))
+    if pass_name == "extract":
+        if not isinstance(md.get("backlog"), list):
+            return None
+        return len(md["backlog"]), int(rows_processed or 0)
+    if pass_name == "edges":
+        if "pairs_judged" not in md:
+            return None  # pre-2026-10 metadata: no backlog figure
+        # Progress = pairs judged, or seeds the watermark moved past
+        # because they had no candidate pair.
+        return (int(md.get("seeds_pending") or 0),
+                int(md.get("pairs_judged") or 0) + int(md.get("seeds_done") or 0))
+    return None
+
+
+def evaluate_cognify_runs(rows, *, now, slow_s, refusal_expected=False):
+    """(status, detail) for the cognify runs of the last 24 h.
+
+    ``rows``: (pass_name, project, started_at, completed_at, rows_processed,
+    metadata) tuples. FAIL on auth-type failures (no_auth / refused /
+    unavailable, per unit or run-level ``blocked``) and on a pass that ran
+    repeatedly with work waiting and nothing done. WARN on runs slower than
+    ``slow_s`` (or started that long ago and never completed).
+    ``refusal_expected``: the deployment allows no hosted backend
+    (cognify.allowed_backends: []), so policy refusals are by design."""
+    auth: dict = {}
+    stall: dict = {}
+    slow: list = []
+    for pass_name, project, started, completed, rows_processed, md in rows:
+        md = md if isinstance(md, dict) else {}
+        if md.get("dry_run"):
+            continue
+        if completed is None:
+            if started is not None and (now - started).total_seconds() > slow_s:
+                slow.append(f"{pass_name} started {started:%H:%MZ} never completed")
+            continue
+        dur = (completed - started).total_seconds() if started else 0
+        if dur > slow_s:
+            slow.append(f"{pass_name} took {dur:.0f}s")
+
+        codes: dict = {}
+        for label, n in (md.get("failure_counts") or {}).items():
+            c = _code(label)
+            if c in AUTH_FAILURES:
+                codes[c] = codes.get(c, 0) + int(n or 0)
+        blocked = md.get("blocked")
+        if blocked and _code(blocked) in AUTH_FAILURES:
+            codes.setdefault(_code(blocked), 0)
+        if md.get("refused") is True:  # extract / entities run-level refusal
+            codes.setdefault("refused", 0)
+        stopped = md.get("stopped")
+        if stopped and _code(stopped) in AUTH_FAILURES:
+            # extract (#237) stops at the first refused unit — no backend
+            # allowed, no credential, or an unsafe codex home.
+            codes.setdefault(_code(stopped), 0)
+        by_policy = "refused" in codes and (
+            refusal_expected or md.get("allowed_backends") == []
+        )
+        if by_policy:
+            # Refused on purpose (no hosted backend allowed): not a fault,
+            # and the work it leaves waiting is not a stall either.
+            codes.pop("refused")
+        if codes:
+            a = auth.setdefault(pass_name, {"runs": 0, "codes": {}})
+            a["runs"] += 1
+            for c, n in codes.items():
+                a["codes"][c] = a["codes"].get(c, 0) + n
+
+        wd = None if by_policy else _waiting_and_done(pass_name, rows_processed, md)
+        if wd is not None:
+            s = stall.setdefault((pass_name, project), {"runs": 0, "stuck": 0, "waiting": 0})
+            s["runs"] += 1
+            if wd[0] > 0 and wd[1] == 0:
+                s["stuck"] += 1
+                s["waiting"] = max(s["waiting"], wd[0])
+
+    fails = []
+    for pass_name, a in sorted(auth.items()):
+        codes = ", ".join(
+            f"{c}" + (f"={n}" if n else "") for c, n in sorted(a["codes"].items())
+        )
+        fails.append(f"{pass_name}: {codes} in {a['runs']} run(s) — no LLM backend reachable")
+    for (pass_name, project), s in sorted(stall.items(), key=lambda kv: (kv[0][0], str(kv[0][1]))):
+        if s["runs"] >= STALL_MIN_RUNS and s["stuck"] == s["runs"]:
+            where = f" [{str(project)[:8]}]" if project else ""
+            fails.append(
+                f"{pass_name}{where}: 0 processed in {s['runs']} runs with "
+                f"{s['waiting']} waiting"
+            )
+    if fails:
+        return "FAIL", "; ".join(fails + slow[:3])
+    if slow:
+        return "WARN", f"slow runs (> {slow_s}s): " + "; ".join(slow[:5])
+    return "PASS", f"{len(rows)} runs in 24h: no backend failures, no stalled backlog"
+
+
+def _hosted_llm_disabled() -> bool:
+    """True when this deployment allows no hosted LLM backend
+    (env DEVBRAIN_COGNIFY_ALLOWED_BACKENDS="" or cognify.allowed_backends: []),
+    so every cognify LLM pass is refused on purpose."""
+    env = os.environ.get("DEVBRAIN_COGNIFY_ALLOWED_BACKENDS")
+    if env is not None:
+        return not [v for v in env.split(",") if v.strip()]
+    try:
+        from config import load_config  # noqa: PLC0415
+
+        cog = load_config().get("cognify") or {}
+    except Exception:  # noqa: BLE001
+        return False
+    return "allowed_backends" in cog and cog["allowed_backends"] == []
+
+
+def check_cognify_output(cur):
+    cur.execute("""SELECT pass_name, project_id::text, started_at, completed_at,
+            rows_processed, metadata
+        FROM devbrain.cognify_run_log
+        WHERE started_at > now() - interval '24 hours'
+        ORDER BY started_at""")
+    return evaluate_cognify_runs(
+        cur.fetchall(),
+        now=datetime.now(timezone.utc),
+        slow_s=int(os.environ.get("DEVBRAIN_COGNIFY_SLOW_WARN_S", "1800")),
+        refusal_expected=_hosted_llm_disabled(),
+    )
+
+
 def check_orphan_backlog(_cur):
     proc = subprocess.run(
         [sys.executable, str(Path(__file__).parent / "close_orphan_sessions.py"),
@@ -216,6 +372,7 @@ CHECKS = [
     ("junk_summaries", check_junk_summaries),
     ("ingest_liveness", check_ingest_liveness),
     ("cognify_liveness", check_cognify_liveness),
+    ("cognify_output", check_cognify_output),
     ("orphan_backlog", check_orphan_backlog),
     ("summary_coverage", check_summary_coverage),
     ("worker_quota", check_worker_quota),
