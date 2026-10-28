@@ -143,8 +143,9 @@ describe('helpers', () => {
     assert.equal(recallEnabled({ DEVBRAIN_RECALL: 'off' }), false)
     assert.equal(recallEnabled({ DEVBRAIN_RECALL: 'on' }), true)
   })
-  test('facts module absent: integration point stays dormant', async () => {
-    assert.equal(await loadRecallFacts(), null)
+  test('facts module present: loadRecallFacts finds recallFacts', async () => {
+    const { recallFacts } = await import('./facts.js')
+    assert.equal(await loadRecallFacts(), recallFacts)
   })
 })
 

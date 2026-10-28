@@ -65,7 +65,7 @@ Desktop"`), which the `codex` adapter parses. Notes:
   failures should be watched after Codex app updates.
 
 ### B. Cognify (knowledge maintenance)
-Seven scheduled launchd passes, orchestrated by `factory/cognify/orchestrator.py`
+Eight scheduled launchd passes, orchestrated by `factory/cognify/orchestrator.py`
 (`PASS_ORDER`), each logged to `cognify_run_log` / `cognify_spend_log`:
 
 | pass | cadence | LLM? | mutates |
@@ -77,6 +77,7 @@ Seven scheduled launchd passes, orchestrated by `factory/cognify/orchestrator.py
 | `strengthen` | daily | no | rule graduate/demote |
 | `fanout` | hourly | 1/session, **no cap** | cross-project `session_summary` rows |
 | `resummarize` | hourly | 1/session Sonnet, **no cap** | upgrades Ollama summaries |
+| `entities` | 2h | 8 memories/call, cap 8 calls / 64 memories | facts graph: `entities`, `entity_relations`, `entity_aliases` |
 
 The **curator** runs at `end_session` (`factory/curator/end_session.py`): applies the
 agent's volunteered judgment (promote / contradict / refine / new-edges) and drains
@@ -225,6 +226,51 @@ labels it:
 
 Pending contradictions:
 `SELECT * FROM devbrain.memory_relation_log WHERE review_status = 'pending';`
+
+### Facts graph (`factory/cognify/entities.py`, migration 050)
+`memory_dependencies` links memories to memories; the facts graph links
+**things in the world**, so "which GitHub account and brain go with
+~/Trifekta?" is a walk over typed edges, not a text search. Design follows
+Glitch Cat Club's graph-memory-starter (MIT).
+
+Closed vocabulary (CHECK constraints; keep it small):
+
+| entity types | predicates (source -> target) |
+|---|---|
+| PROJECT, REPO, HOST, SERVICE, ACCOUNT, DOMAIN, PERSON, ORG, TOOL, PATH | runs_on, deploys_to, owned_by (single-valued); uses_account, part_of, depends_on, serves_domain, member_of, located_at |
+
+PATH (folders such as ~/Trifekta) and located_at were added after reading
+real memories; `hosts` was dropped as the inverse of runs_on (the extractor
+flips it).
+
+- **Write** (`entities` pass): decision / pattern / issue / session_summary
+  rows of one project, oldest first after a watermark kept in
+  `cognify_run_log.metadata`, 8 per LLM call. Same backend order as extract
+  (codex in the isolated CODEX_HOME, then Anthropic; `cognify.backend` /
+  `allowed_backends` respected). Model output is checked in code: types and
+  predicates must be in the vocabulary, an entity name (or one of its
+  aliases) must appear in the memories, and **every edge must carry an exact
+  quote of its source memory or it is dropped**. Entities are
+  content-addressed (`uuid5(TYPE:name_norm)`, shared across projects);
+  relations are per project and carry `source_ref` (memory id), `quote`,
+  `observed_at` (the memory's created_at). Re-runs merge.
+- **Retire, never delete**: a newer statement of a single-valued predicate
+  with the same source retires the older target (`retired_reason =
+  'superseded'`, `retired_by`, `valid_until`); a memory saying a relation
+  ended retires it (`'ended'`); a memory saying a thing was decommissioned
+  sets `entities.archived_at`. Comparisons use memory time, so backfills in
+  any order converge; a newer restatement revives.
+- **Read**: `devbrain.facts_seeds(text)` (names/aliases as whole words, via
+  token GIN indexes) and `devbrain.facts_walk(project, text, hops, top_k)`
+  (level-by-level BFS over live facts, ranked by nearness then recency,
+  stops once top_k is filled). `mcp-server/src/facts.ts` exports
+  `recallFacts(db, projectId|null, text, {hops, topK})` and the `facts` MCP
+  tool (`A --[predicate]--> B (memory <id>, <date>)` + a `where:` block of
+  entity notes, wrapped as untrusted). No model call; ~5 ms on a 20k-entity
+  synthetic graph.
+- **Run**: `devbrain cognify-entities --project=<slug> --dry-run` prints what
+  would be written (calls the model, writes nothing);
+  `--since=<date> --max-llm-calls=N --max-memories=M` backfills.
 
 ### C. Retrieval (read path) — `deep_search`
 `mcp-server/src/index.ts:281`: embed query → ivfflat ANN over `memory` (filtered

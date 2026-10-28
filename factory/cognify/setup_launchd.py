@@ -28,7 +28,7 @@ Placeholders
   (extract + edges + strengthen) should scope to.
 - ``@CREDENTIAL_ENV_BLOCK@`` — XML marker replaced by either an
   ``ANTHROPIC_API_KEY`` or ``CLAUDE_CODE_OAUTH_TOKEN`` env entry in
-  the LLM-cost plists (extract, edges, fanout, resummarize). The non-LLM
+  the LLM-cost plists (extract, edges, fanout, resummarize, entities). The non-LLM
   plists (decay + strengthen + gc) don't carry this marker. When
   ``cognify.backend: openai`` (or env DEVBRAIN_COGNIFY_BACKEND=openai) at
   install time, the OpenAI key source set in the installing shell is
@@ -69,6 +69,7 @@ _CRED_PLISTS = (
     "com.devbrain.cognify-edges.plist",
     "com.devbrain.cognify-fanout.plist",  # Phase 8 cross-project fan-out
     "com.devbrain.cognify-resummarize.plist",  # Sonnet upgrade for orphan-of-end_session
+    "com.devbrain.cognify-entities.plist",  # facts graph (migration 050)
 )
 
 # All cognify plists, in installation order.
