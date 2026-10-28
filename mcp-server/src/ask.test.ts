@@ -23,7 +23,7 @@ writeFileSync(
 process.env.DEVBRAIN_CONFIG = cfgPath
 
 const askMod = await import('./ask.js')
-const { ask, bonus, finalOrder, clipAnswer, PROFILES, askEnabled } = askMod
+const { ask, bonus, finalOrder, clipAnswer, PROFILES, askEnabled, hasScreenColumn } = askMod
 const { SEARCH_DEFAULTS } = await import('./hybrid.js')
 
 after(() => rmSync(dir, { recursive: true, force: true }))
@@ -250,5 +250,22 @@ describe('ask pipeline (fake DB)', () => {
     assert.equal(r.answers[0].relevance, 0.97)
     assert.equal(r.weak_match, false)
     assert.equal(r.retrieval.reranked, true)
+  })
+})
+
+describe('screen_flags column check', () => {
+  test('a failed check rejects (ask fails rather than dropping screening labels)', async () => {
+    const failing = async () => {
+      throw new Error('connection reset')
+    }
+    await assert.rejects(hasScreenColumn(failing))
+    const db = fakeDb([{ id: 'x', kind: 'decision', title: 't', content: 'c', created: '2026-01-01', cos: 0.9 }], [])
+    const broken = async (text: string, params: unknown[] = []) => {
+      if (text.includes('information_schema.columns')) throw new Error('connection reset')
+      return db.query(text, params)
+    }
+    await assert.rejects(
+      ask({ question: 'q', kind: 'decision', projectId: null }, { ...db, query: broken, embed, searchCfg: cfg }),
+    )
   })
 })
