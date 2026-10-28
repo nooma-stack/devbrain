@@ -338,6 +338,9 @@ one). It finds memories that a later memory replaced:
   verdicts, edges_earned (what `on` would write), edges_written,
   below_confidence, capped.
 
+`ingest/brain_doctor.py` `cognify_liveness` expects a completed sweep run
+every 26 h (and an entities run every 6 h; `CADENCE_MAX_GAP_H`).
+
 Before switching to `on`, review shadow verdicts:
 `SELECT verdict, count(*), avg(confidence) FROM devbrain.memory_sweep_log WHERE mode = 'shadow' GROUP BY 1;`
 

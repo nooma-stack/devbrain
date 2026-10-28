@@ -156,10 +156,22 @@ def check_ingest_liveness(_cur):
     return "PASS", f"ingest active {age_h:.1f}h ago"
 
 
+# Longest acceptable gap, in hours, since each scheduled pass last completed:
+# a few missed runs of the launchd cadence (hourly → 4, 2-hourly → 6,
+# 6-hourly / nightly → 26).
+CADENCE_MAX_GAP_H = (
+    ("extract", 4),
+    ("resummarize", 4),
+    ("fanout", 4),
+    ("edges", 26),
+    ("entities", 6),   # StartInterval 7200
+    ("sweep", 26),     # nightly 03:40 (StartCalendarInterval)
+)
+
+
 def check_cognify_liveness(cur):
     problems = []
-    for pass_name, max_gap_h in (("extract", 4), ("resummarize", 4),
-                                 ("fanout", 4), ("edges", 26)):
+    for pass_name, max_gap_h in CADENCE_MAX_GAP_H:
         cur.execute("""SELECT max(started_at) FROM devbrain.cognify_run_log
             WHERE pass_name=%s AND completed_at IS NOT NULL""", (pass_name,))
         last = cur.fetchone()[0]
