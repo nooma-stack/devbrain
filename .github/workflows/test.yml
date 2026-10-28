@@ -131,6 +131,7 @@ jobs:
             tests/test_anthropic_response_text.py \
             tests/test_cognify_entities_unit.py \
             tests/test_cognify_extract_quote.py \
+            tests/test_cognify_resummarize_unit.py \
             -p no:cacheprovider --tb=short -q
 
   mcp-server:

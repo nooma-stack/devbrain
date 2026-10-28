@@ -154,16 +154,22 @@ def test_render_inserts_api_key_credential_block_for_edges():
     assert "@CREDENTIAL_ENV_BLOCK@" not in out
 
 
-def test_render_raises_when_extract_template_has_no_credential():
-    text = _read_template("com.devbrain.cognify-extract.plist")
-    with pytest.raises(ValueError, match="require one of"):
-        render_plist(
+def test_render_without_credential_drops_the_block_codex_only():
+    """No Anthropic credential: the LLM plists run on codex only, so the
+    marker comment is removed and nothing else is emitted."""
+    for name in _CRED_PLISTS:
+        text = _read_template(name)
+        out = render_plist(
             text,
             devbrain_home="/tmp/devbrain",
             user="alice",
             project_slug="brightbot",
             credential=None,
         )
+        assert "@CREDENTIAL_ENV_BLOCK@" not in out, name
+        assert "CLAUDE_CODE_OAUTH_TOKEN here" not in out, name
+        assert "<key>ANTHROPIC_API_KEY</key>" not in out, name
+        assert "<key>PYTHONPATH</key>" in out, name
 
 
 def test_render_no_credential_block_in_non_llm_templates():
@@ -311,13 +317,18 @@ def test_install_resolves_credential_from_env_if_not_passed(tmp_path):
     assert "sk-ant-oat01-FROM-ENV" in body
 
 
-def test_install_errors_if_no_cred_in_env_and_not_passed(tmp_path):
+def test_install_without_cred_in_env_installs_codex_only(tmp_path):
     with patch.dict(os.environ, _isolated_env(), clear=True):
-        with pytest.raises(ValueError, match="require one of"):
-            install_cognify_launchd(
-                project_slug="brightbot",
-                devbrain_home="/tmp/devbrain",
-                user="alice",
-                target_dir=tmp_path,
-                reload=False,
-            )
+        installed = install_cognify_launchd(
+            project_slug="brightbot",
+            devbrain_home="/tmp/devbrain",
+            user="alice",
+            target_dir=tmp_path,
+            reload=False,
+            extra_env={},
+        )
+    assert len(installed) == len(ALL_PLISTS)
+    for path in installed:
+        body = path.read_text()
+        assert "ANTHROPIC_API_KEY" not in body
+        assert "CLAUDE_CODE_OAUTH_TOKEN</key>" not in body

@@ -521,7 +521,8 @@ def setup_cognify_launchd_cmd(project_slug, reload):
     ANTHROPIC_AUTH_TOKEN) is the fallback. With cognify.backend: openai,
     the OpenAI key source in the env (GOOGLE_APPLICATION_CREDENTIALS +
     DEVBRAIN_OPENAI_SECRET_PROJECT for Secret Manager, or OPENAI_API_KEY)
-    is written instead/as well. Errors if no credential is set.
+    is written instead/as well. With no credential in the env the LLM
+    passes run on codex only (see `devbrain cognify-codex-home`).
 
     Idempotent — safe to re-run with the same args.
 
@@ -544,6 +545,13 @@ def setup_cognify_launchd_cmd(project_slug, reload):
         sys.exit(2)
     for path in installed:
         click.echo(f"installed: {path}")
+    from cognify.setup_launchd import resolve_credential_from_env, resolve_openai_env
+    if resolve_credential_from_env() is None and not resolve_openai_env():
+        click.echo(
+            "note: no ANTHROPIC_API_KEY / CLAUDE_CODE_OAUTH_TOKEN in this shell — "
+            "the LLM passes will use codex only (check it with "
+            "`devbrain cognify-codex-home`)"
+        )
     if reload:
         click.echo(f"reloaded {len(installed)} launchd job(s)")
 
