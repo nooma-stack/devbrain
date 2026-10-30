@@ -715,7 +715,12 @@ def call_llm(system: str, user: str) -> LLMResult:
             "cognify_entities: codex failed (%s); falling back to %s",
             (res.detail or "")[:160], _FALLBACK,
         )
-        model = _FALLBACK
+        fallback = _anthropic_call(system, user, _FALLBACK)
+        if fallback.failure == "no_auth" and backends.is_rate_limited(res.detail):
+            # Codex is rate limited and there is no fallback to catch it.
+            # The login is fine: report what actually stopped the call.
+            return res
+        return fallback
     return _anthropic_call(system, user, model)
 
 
@@ -1152,9 +1157,9 @@ def run_entities(
     res.since = start[0]
     res.watermark = start
 
-    if not dry_run and llm is call_llm and not usable_backends():
-        from cognify import backends  # noqa: PLC0415
+    from cognify import backends  # noqa: PLC0415
 
+    if not dry_run and llm is call_llm and not usable_backends():
         for b in backend_chain():
             backends.check(b, PASS_NAME)
         res.refused = True
@@ -1181,7 +1186,7 @@ def run_entities(
         _record_spend(conn, project_id, out)
         if out.failure and out.failure != "json_parse":
             # api failure: keep the watermark before this batch.
-            res.failure_counts[out.failure] += 1
+            res.failure_counts[backends.failure_label(out.failure, out.detail)] += 1
             res.stopped = out.failure
             logger.warning("cognify_entities: %s (%s)", out.failure, (out.detail or "")[:200])
             break

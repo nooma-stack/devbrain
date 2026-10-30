@@ -308,6 +308,28 @@ def usable(backend_chain: list[str], pass_name: str) -> tuple[list[str], dict[st
     return ok, reasons
 
 
+# How a provider says "try again later": a 429, a model at capacity or a
+# spent quota. Matched against the error text, since every cognify path labels
+# these "api" alongside timeouts and per-session errors.
+_RATE_LIMIT_MARKERS = (
+    "too many requests", "rate limit", "at capacity", "usage limit", "quota",
+)
+
+
+def is_rate_limited(detail: str | None) -> bool:
+    """True when a failure detail is a provider rate limit, not an outage."""
+    text = (detail or "").lower()
+    return any(marker in text for marker in _RATE_LIMIT_MARKERS)
+
+
+def failure_label(failure: str, detail: str | None) -> str:
+    """The failure_counts key: "api:rate_limited" for a rate limit, so
+    brain_doctor can tell it from other api errors; otherwise ``failure``."""
+    if failure == "api" and is_rate_limited(detail):
+        return "api:rate_limited"
+    return failure
+
+
 def blocked_label(reasons: dict[str, str]) -> str:
     """Run-level label when no backend is usable: "refused" only when every
     backend was refused by policy; otherwise the first non-policy code."""

@@ -171,3 +171,33 @@ def test_hosted_llm_disabled_reads_env(monkeypatch):
 def test_check_is_registered_after_liveness():
     names = [n for n, _ in bd.CHECKS]
     assert names.index("cognify_output") == names.index("cognify_liveness") + 1
+
+
+
+# Real shape (Studio, 2026-10-30), after the label change.
+FANOUT_RATE_LIMITED = {"pass": "fanout", "failure_counts": {"api:rate_limited": 3},
+                       "sessions_failed": 3, "sessions_skipped": 40,
+                       "sessions_processed": 1, "sessions_discovered": 210,
+                       "stopped": "api:rate_limited"}
+FANOUT_ALL_LIMITED = {**FANOUT_RATE_LIMITED, "sessions_processed": 0}
+
+
+def test_rate_limits_warn_and_are_not_called_a_missing_login():
+    status, detail = ev([run("fanout", FANOUT_RATE_LIMITED, hours_ago=h) for h in (1, 2)])
+    assert status == "WARN"
+    assert "fanout: 6 rate-limited in 2 run(s)" in detail
+    assert "no LLM backend reachable" not in detail
+
+
+def test_rate_limits_that_stall_a_pass_all_day_fail():
+    status, detail = ev([run("fanout", FANOUT_ALL_LIMITED, hours_ago=h) for h in (1, 2)])
+    assert status == "FAIL"
+    assert "fanout: 0 processed in 2 runs with 210 waiting" in detail
+    assert "fanout: 6 rate-limited in 2 run(s)" in detail
+
+
+def test_a_missing_login_still_fails_beside_a_rate_limit():
+    rows = [run("fanout", FANOUT_RATE_LIMITED), run("resummarize", RESUMMARIZE_NO_AUTH)]
+    status, detail = ev(rows)
+    assert status == "FAIL"
+    assert "resummarize: no_auth=859 in 1 run(s)" in detail

@@ -47,6 +47,13 @@ logger = logging.getLogger(__name__)
 DEFAULT_MODEL = os.environ.get("DEVBRAIN_FANOUT_MODEL", "codex")
 _FANOUT_FALLBACK = os.environ.get("DEVBRAIN_FANOUT_FALLBACK", "claude-sonnet-5")
 
+# Stop the run after this many sessions in a row fail on something that hits
+# every session alike (rate limit, no backend): the rest would fail the same
+# way, and calling on through a rate limit only prolongs it. Ordinary api
+# errors do not count: one session can time out while the next is fine.
+MAX_CONSECUTIVE_BLOCKED = 3
+_BLOCKING_FAILURES = ("api:rate_limited", "no_auth", "refused")
+
 # JSON Schema for the classifier's final response. OpenAI strict structured
 # output (codex --output-schema) requires every object to set
 # additionalProperties:false + list ALL props in `required`, and forbids
@@ -432,6 +439,7 @@ def classify_session(
 
     parsed: dict | None = None
     effective_model = model
+    codex_detail: str | None = None
     selected = backends.selected()
     if selected == "openai":
         parsed, o_fail, o_detail, o_usage, used = _openai_classify(
@@ -479,6 +487,7 @@ def classify_session(
                     (c_detail or "")[:160], _FANOUT_FALLBACK,
                 )
                 effective_model = _FANOUT_FALLBACK
+                codex_detail = c_detail
             else:
                 result.failure = c_fail
                 result.failure_detail = c_detail
@@ -492,6 +501,12 @@ def classify_session(
         if a_usage is not None:
             result.usage = a_usage
         if parsed is None:
+            if a_fail == "no_auth" and backends.is_rate_limited(codex_detail):
+                # Codex is rate limited and there is no fallback to catch it.
+                # The login is fine: report what actually stopped the call.
+                result.failure = "api"
+                result.failure_detail = codex_detail
+                return result
             result.failure = a_fail
             result.failure_detail = a_detail
             return result
@@ -545,6 +560,7 @@ class FanoutResult:
     rows_emitted: int = 0           # fan-out memory rows written
     llm_calls: int = 0
     failure_counts: dict = field(default_factory=dict)
+    stopped: str | None = None      # failure label that ended the run early
     dry_run: bool = False
 
 
@@ -562,8 +578,9 @@ def discover_sessions_needing_fanout(
         content for the classifier to read),
       * AND no active memory row exists with
         `fanout_source_session_id = rs.id`. The classifier has not yet
-        been run, or it ran and produced zero targets (in which case
-        we skip rather than re-classify — see §12.7 calibration note).
+        been run,
+      * AND it is not in `devbrain.fanout_no_targets`: the classifier found
+        no target for it and it has not grown since (§12.7 calibration note).
 
     Optional filters:
       * `project_id` scopes to sessions whose canonical project_id matches.
@@ -588,6 +605,17 @@ def discover_sessions_needing_fanout(
         "   AND m.archived_at IS NULL "
         ")"
     )
+    # Anti-join: skip sessions already judged to have no target, unless more
+    # of the session has been ingested since that judgment.
+    where.append(
+        "NOT EXISTS ("
+        " SELECT 1 FROM devbrain.fanout_no_targets n "
+        " WHERE n.session_id = rs.id "
+        "   AND n.chunk_count >= ("
+        "     SELECT count(*) FROM devbrain.chunks c WHERE c.source_id = rs.id"
+        "   )"
+        ")"
+    )
 
     sql = (
         "SELECT rs.id::text "
@@ -601,6 +629,20 @@ def discover_sessions_needing_fanout(
     with conn.cursor() as cur:
         cur.execute(sql, params)
         return [r[0] for r in cur.fetchall()]
+
+
+def _record_no_targets(conn: Any, session_id: str) -> None:
+    """Remember that the classifier found no target for this session, so
+    discovery does not send it to the LLM again on every run."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO devbrain.fanout_no_targets (session_id, chunk_count) "
+            "SELECT %s, count(*) FROM devbrain.chunks WHERE source_id = %s "
+            "ON CONFLICT (session_id) DO UPDATE "
+            "SET chunk_count = EXCLUDED.chunk_count, classified_at = now()",
+            (session_id, session_id),
+        )
+    conn.commit()
 
 
 def apply_shard(sessions: list[str], shard: tuple[int, int] | None) -> list[str]:
@@ -753,6 +795,7 @@ def run_fanout(
     from observability.pricing import (  # noqa: PLC0415
         get_pricing, compute_cost_usd, SONNET_4_6,
     )
+    from cognify import backends  # noqa: PLC0415
 
     result = FanoutResult(dry_run=dry_run)
 
@@ -766,8 +809,17 @@ def run_fanout(
         return result
 
     pricing = get_pricing(model) or SONNET_4_6
+    blocked_streak = 0
+    blocked_by: str | None = None
 
     for idx, session_id in enumerate(sessions, start=1):
+        if blocked_streak >= MAX_CONSECUTIVE_BLOCKED:
+            result.stopped = blocked_by
+            logger.warning(
+                "cognify_fanout: %d sessions in a row failed (%s); "
+                "stopping this run", blocked_streak, blocked_by,
+            )
+            break
         try:
             classification = classify_session(session_id, conn, model=model)
         except Exception as exc:  # noqa: BLE001
@@ -820,10 +872,19 @@ def run_fanout(
                 # Count as skipped, not failed (no rework needed; the
                 # session legitimately doesn't fan out).
                 result.sessions_skipped += 1
+                blocked_streak = 0
+                _record_no_targets(conn, session_id)
             else:
                 result.sessions_failed += 1
-                key = classification.failure
+                key = backends.failure_label(
+                    classification.failure, classification.failure_detail,
+                )
                 result.failure_counts[key] = result.failure_counts.get(key, 0) + 1
+                if key in _BLOCKING_FAILURES:
+                    blocked_streak += 1
+                    blocked_by = key
+                else:
+                    blocked_streak = 0
             if progress_callback:
                 progress_callback(idx, len(sessions), {
                     "session_id": session_id,
@@ -833,6 +894,7 @@ def run_fanout(
             continue
 
         # Happy path: write fan-out rows.
+        blocked_streak = 0
         rows_for_session = 0
         for pc in classification.per_project:
             target_pid = _resolve_project_id_by_slug(conn, pc.project_slug)
@@ -899,6 +961,7 @@ def _register_fanout_pass() -> None:
                     "sessions_failed": res.sessions_failed,
                     "sessions_skipped": res.sessions_skipped,
                     "failure_counts": res.failure_counts,
+                    **({"stopped": res.stopped} if res.stopped else {}),
                 },
                 dry_run=dry_run,
             )
@@ -915,6 +978,7 @@ __all__ = [
     "SESSION_RELEVANCE_THRESHOLD",
     "WITHIN_SECTION_THRESHOLD",
     "DEFAULT_MODEL",
+    "MAX_CONSECUTIVE_BLOCKED",
     "ProjectClassification",
     "ClassificationResult",
     "FanoutResult",

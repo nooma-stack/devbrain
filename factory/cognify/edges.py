@@ -855,7 +855,7 @@ def _llm_judge_contradiction(
 
 def _codex_judge_contradiction(content_a: str, content_b: str) -> tuple[bool, dict, str | None]:
     """The judgment via codex exec on the isolated CODEX_HOME."""
-    from cognify import codex_exec  # noqa: PLC0415
+    from cognify import backends, codex_exec  # noqa: PLC0415
     from cognify.extract import _routes_to_codex  # noqa: PLC0415
 
     prompt = (
@@ -872,7 +872,7 @@ def _codex_judge_contradiction(content_a: str, content_b: str) -> tuple[bool, di
     if failure:
         if failure not in _DEAD_FAILURES:
             logger.warning("cognify_edges(codex): contradiction check failed: %s", detail)
-        return False, dict(_EMPTY_USAGE), failure
+        return False, dict(_EMPTY_USAGE), backends.failure_label(failure, detail)
     return bool((parsed or {}).get("contradicts") is True), dict(_EMPTY_USAGE), None
 
 

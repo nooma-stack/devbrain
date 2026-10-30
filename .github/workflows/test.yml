@@ -130,6 +130,7 @@ jobs:
             tests/test_cognify_openai_backend.py \
             tests/test_anthropic_response_text.py \
             tests/test_cognify_entities_unit.py \
+            tests/test_cognify_fanout_limits.py \
             tests/test_cognify_extract_quote.py \
             tests/test_cognify_resummarize_unit.py \
             tests/test_cognify_edges_unit.py \

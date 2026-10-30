@@ -322,6 +322,40 @@ def test_run_fanout_propagates_classifier_failure(live_db, synth_session):
         assert cur.fetchone()[0] == 0
 
 
+def _stub_empty(sess_id, conn, **kw):
+    from cognify.fanout import ClassificationResult
+
+    return ClassificationResult(session_id=sess_id, failure="empty")
+
+
+def test_empty_session_is_not_classified_again(live_db, synth_session):
+    """The no-target judgment sticks: the next run does not pay for it twice."""
+    from cognify import fanout as fanout_mod
+
+    sess_id = synth_session["session_id"]
+    with patch.object(fanout_mod, "classify_session", _stub_empty):
+        fanout_mod.run_fanout(live_db, max_sessions=10)
+    assert sess_id not in fanout_mod.discover_sessions_needing_fanout(live_db)
+
+
+def test_session_that_grew_is_classified_again(live_db, synth_session):
+    from cognify import fanout as fanout_mod
+
+    sess_id = synth_session["session_id"]
+    with patch.object(fanout_mod, "classify_session", _stub_empty):
+        fanout_mod.run_fanout(live_db, max_sessions=10)
+    with live_db.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO devbrain.chunks (project_id, source_type, source_id, content)
+            VALUES (%s, 'session_summary', %s, 'More of the same session')
+            """,
+            (synth_session["canonical_project_id"], sess_id),
+        )
+    live_db.commit()
+    assert sess_id in fanout_mod.discover_sessions_needing_fanout(live_db)
+
+
 # ─── Orchestrator registration ──────────────────────────────────────────────
 
 

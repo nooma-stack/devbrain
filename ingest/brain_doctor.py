@@ -19,7 +19,7 @@ originally caught by ACCIDENT (2026-08-24 → 09-01):
   cognify_output    — passes that "succeed" while failing every unit: no
                       LLM backend reachable (resummarize/fanout logged [ok]
                       with 859 no_auth a run for six weeks), or work waiting
-                      and nothing done; WARN on slow runs
+                      and nothing done; WARN on rate limits and slow runs
   orphan_backlog    — unclosed sessions accumulating again
   summary_coverage  — sessions ingested but never summarized
   worker_quota      — closure worker hitting rate limits / exhausted credits
@@ -197,6 +197,11 @@ def check_cognify_liveness(cur):
 # Failure codes that mean "could not reach a backend at all".
 AUTH_FAILURES = ("no_auth", "refused", "unavailable")
 
+# failure_counts label for a provider rate limit (backends.failure_label):
+# the backend answered "later", so it warns, and only fails if it stalls a
+# pass for the whole window.
+RATE_LIMIT_LABEL = "api:rate_limited"
+
 # A (pass, project) needs at least this many runs in 24 h, ALL with work
 # waiting and nothing done, to count as stalled (one empty run is noise).
 STALL_MIN_RUNS = 2
@@ -234,12 +239,14 @@ def evaluate_cognify_runs(rows, *, now, slow_s, refusal_expected=False):
     ``rows``: (pass_name, project, started_at, completed_at, rows_processed,
     metadata) tuples. FAIL on auth-type failures (no_auth / refused /
     unavailable, per unit or run-level ``blocked``) and on a pass that ran
-    repeatedly with work waiting and nothing done. WARN on runs slower than
-    ``slow_s`` (or started that long ago and never completed).
+    repeatedly with work waiting and nothing done. WARN on provider rate
+    limits and on runs slower than ``slow_s`` (or started that long ago and
+    never completed).
     ``refusal_expected``: the deployment allows no hosted backend
     (cognify.allowed_backends: []), so policy refusals are by design."""
     auth: dict = {}
     stall: dict = {}
+    limited: dict = {}
     slow: list = []
     for pass_name, project, started, completed, rows_processed, md in rows:
         md = md if isinstance(md, dict) else {}
@@ -258,6 +265,10 @@ def evaluate_cognify_runs(rows, *, now, slow_s, refusal_expected=False):
             c = _code(label)
             if c in AUTH_FAILURES:
                 codes[c] = codes.get(c, 0) + int(n or 0)
+            elif label == RATE_LIMIT_LABEL:
+                lim = limited.setdefault(pass_name, {"runs": 0, "units": 0})
+                lim["runs"] += 1
+                lim["units"] += int(n or 0)
         blocked = md.get("blocked")
         if blocked and _code(blocked) in AUTH_FAILURES:
             codes.setdefault(_code(blocked), 0)
@@ -302,10 +313,18 @@ def evaluate_cognify_runs(rows, *, now, slow_s, refusal_expected=False):
                 f"{pass_name}{where}: 0 processed in {s['runs']} runs with "
                 f"{s['waiting']} waiting"
             )
+    limits = [
+        f"{pass_name}: {lim['units']} rate-limited in {lim['runs']} run(s) "
+        "(429 or capacity from the provider)"
+        for pass_name, lim in sorted(limited.items())
+    ]
     if fails:
-        return "FAIL", "; ".join(fails + slow[:3])
-    if slow:
-        return "WARN", f"slow runs (> {slow_s}s): " + "; ".join(slow[:5])
+        return "FAIL", "; ".join(fails + limits + slow[:3])
+    if limits or slow:
+        warnings = list(limits)
+        if slow:
+            warnings.append(f"slow runs (> {slow_s}s): " + "; ".join(slow[:5]))
+        return "WARN", "; ".join(warnings)
     return "PASS", f"{len(rows)} runs in 24h: no backend failures, no stalled backlog"
 
 
