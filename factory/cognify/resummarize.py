@@ -317,7 +317,7 @@ def _call_codex(
     """The summary via `codex exec` on the isolated CODEX_HOME (no token
     spend). Same return contract as _call_sonnet. ``model`` is used only
     when it is a codex/OpenAI id; otherwise cognify.codex_model."""
-    from cognify import codex_exec  # noqa: PLC0415
+    from cognify import backends, codex_exec  # noqa: PLC0415
     from cognify.extract import _routes_to_codex  # noqa: PLC0415
 
     sys_text, user_text = _build_summarize_prompt(raw_content)
@@ -336,7 +336,7 @@ def _call_codex(
     if failure:
         if failure not in _DEAD_BACKEND_FAILURES:
             logger.warning("resummarize(codex): %s: %s", failure, (detail or "")[:200])
-        return None, _empty_usage(), failure
+        return None, _empty_usage(), backends.failure_label(failure, detail)
     text = str((parsed or {}).get("summary") or "").strip()
     if not text:
         return None, _empty_usage(), "empty"

@@ -416,6 +416,7 @@ class ExtractResult:
     llm_calls: int = 0
     memory_ids: list[str] = field(default_factory=list)
     failure: str | None = None  # None | "api" | "json_parse" | "empty" | "refused"
+    failure_detail: str | None = None
     # Items the model returned (lessons + decisions), before any check.
     items_returned: int = 0
     # Per-item outcomes: no_quote / quote_not_found / empty_item (dropped
@@ -589,7 +590,8 @@ class ExtractPass(CognifyPass):
                 # A refused unit made no call: carry it (tries unchanged).
                 done.add(session_id)
             if result.failure:
-                failure_counts[result.failure] = failure_counts.get(result.failure, 0) + 1
+                label = backends.failure_label(result.failure, result.failure_detail)
+                failure_counts[label] = failure_counts.get(label, 0) + 1
             if result.failure == "api":
                 retry.append(session_id)
             _tally(items, result.item_outcomes)
@@ -891,6 +893,7 @@ def extract_from_session(
         llm_calls=llm_calls,
         memory_ids=memory_ids,
         failure=extracted.get("_failure"),
+        failure_detail=extracted.get("_failure_detail"),
         items_returned=returned,
         item_outcomes=outcomes,
         fallback=fallback_outcome,

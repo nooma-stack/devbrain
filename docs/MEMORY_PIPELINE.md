@@ -75,7 +75,7 @@ Nine scheduled launchd passes, orchestrated by `factory/cognify/orchestrator.py`
 | `extract` | hourly | 1/session, cap 20 | lessons→`pattern`, decisions→`decision` |
 | `edges` | 6h, all active projects | contradicts cap 15/run (codex → Anthropic); cites zero-LLM | `memory_dependencies` (cites/contradicts) |
 | `strengthen` | daily | no | rule graduate/demote |
-| `fanout` | hourly | 1/session, **no cap** | cross-project `session_summary` rows |
+| `fanout` | hourly | 1/session, **no cap**; stops after 3 rate-limited or no-backend sessions in a row | cross-project `session_summary` rows; `fanout_no_targets` for sessions with no target, so they are judged once |
 | `resummarize` | hourly | 1/session, codex → Anthropic, cap 20/run | upgrades Ollama summaries |
 | `entities` | 2h | 8 memories/call, cap 8 calls / 64 memories | facts graph: `entities`, `entity_relations`, `entity_aliases` |
 | `sweep` | nightly 03:40 | local Ollama, cap 60 pairs | `memory_sweep_log`; mode `on`: `supersedes` / `contradicts` edges |
