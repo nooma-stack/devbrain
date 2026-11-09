@@ -154,15 +154,15 @@ INGEST_STUCK_GRACE_S = 30 * 60
 
 def _watched_files() -> list[Path]:
     """Files the ingest watcher would act on (its suffix/size/skip rules)."""
-    from main import _SKIP_DIRS, WATCH_DIRS  # ingest/main.py
+    from watch_paths import SKIP_DIRS, resolve_watch_dirs
 
     files: list[Path] = []
-    for root in WATCH_DIRS:
+    for root in resolve_watch_dirs():
         if not root.exists():
             continue
         for pattern in ("*.jsonl", "*.jsonl.zst", "session-*.json", "*.md"):
             for path in root.rglob(pattern):
-                if _SKIP_DIRS & set(path.parts):
+                if SKIP_DIRS & set(path.parts):
                     continue
                 files.append(path)
     return files
@@ -197,7 +197,11 @@ def check_ingest_liveness(_cur):
     log = Path(DEVBRAIN_HOME) / "logs" / "ingest.log"
     log_mtime = log.stat().st_mtime if log.exists() else None
     files = []
-    for path in _watched_files():
+    try:
+        watched = _watched_files()
+    except Exception as e:  # never let this check take the doctor down
+        return "WARN", f"could not list watched transcripts: {type(e).__name__}: {e}"
+    for path in watched:
         try:
             st = path.stat()
         except OSError:
