@@ -1,4 +1,4 @@
-"""Tests for ingest/main.py:_resolve_watch_dirs.
+"""Tests for ingest/watch_paths.py:resolve_watch_dirs.
 
 Covers two historical bugs:
 
@@ -18,14 +18,14 @@ from unittest.mock import patch
 
 import pytest
 
-# Add ingest/ to sys.path so we can import main.
+# Add ingest/ to sys.path so we can import watch_paths.
 sys.path.insert(
     0, str(Path(__file__).resolve().parent.parent.parent / "ingest")
 )
 
 
 def _call_resolve_with_config(cfg: dict, monkeypatch) -> list[Path]:
-    """Helper: import _resolve_watch_dirs with ADAPTER_CONFIG monkey-patched.
+    """Helper: import resolve_watch_dirs with ADAPTER_CONFIG monkey-patched.
 
     Re-imports the module so the closure picks up the patched config.
     """
@@ -34,11 +34,11 @@ def _call_resolve_with_config(cfg: dict, monkeypatch) -> list[Path]:
     import config as ingest_config  # noqa: PLC0415
 
     monkeypatch.setattr(ingest_config, "ADAPTER_CONFIG", cfg)
-    # Re-import main to pick up the patched ADAPTER_CONFIG at import time.
-    if "main" in sys.modules:
-        del sys.modules["main"]
-    main = importlib.import_module("main")
-    return main._resolve_watch_dirs()
+    # Re-import to pick up the patched ADAPTER_CONFIG at import time.
+    if "watch_paths" in sys.modules:
+        del sys.modules["watch_paths"]
+    watch_paths = importlib.import_module("watch_paths")
+    return watch_paths.resolve_watch_dirs()
 
 
 def test_resolve_watch_dirs_expands_tilde(monkeypatch, tmp_path):
