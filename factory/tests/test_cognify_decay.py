@@ -2,8 +2,9 @@
 
 Covers:
   - Decay is applied only to idle rows (>= 30 days idle)
-  - 30-day tier: strength * 0.5
-  - 90-day tier: strength * 0.12
+  - 30-day tier: strength capped at 0.5
+  - 90-day tier: strength capped at 0.12
+  - Decay is idempotent: repeated hourly runs don't compound
   - Decay is monotonic (never increases strength)
   - Archived rows are not decayed
   - Dry-run returns count without mutating
@@ -15,7 +16,7 @@ import uuid
 
 import pytest
 
-from cognify.decay import DecayPass, DECAY_30D_MULTIPLIER, DECAY_90D_MULTIPLIER, MIN_STRENGTH
+from cognify.decay import DECAY_30D_CAP, DECAY_90D_CAP, DecayPass
 
 
 def _seed_strength(conn, memory_id, strength):
@@ -68,7 +69,7 @@ def test_decay_leaves_fresh_rows_untouched(conn, project_factory, memory_factory
 
 @pytest.mark.db
 def test_decay_applies_30d_tier(conn, project_factory, memory_factory):
-    """Rows idle >= 30 days (but < 90 days) get 50% decay."""
+    """Rows idle >= 30 days (but < 90 days) are capped at 0.5."""
     project = project_factory("decay_30d")
     m = memory_factory(project["id"])
     _seed_strength(conn, m["id"], 1.0)
@@ -78,13 +79,13 @@ def test_decay_applies_30d_tier(conn, project_factory, memory_factory):
     result = pass_.run(conn, project["id"])
 
     new_strength = _read_strength(conn, m["id"])
-    assert new_strength == pytest.approx(DECAY_30D_MULTIPLIER, abs=0.01)
+    assert new_strength == pytest.approx(DECAY_30D_CAP, abs=0.001)
     assert result.rows_processed == 1
 
 
 @pytest.mark.db
 def test_decay_applies_90d_tier(conn, project_factory, memory_factory):
-    """Rows idle >= 90 days get 12% decay (not 50%)."""
+    """Rows idle >= 90 days are capped at 0.12 (not 0.06)."""
     project = project_factory("decay_90d")
     m = memory_factory(project["id"])
     _seed_strength(conn, m["id"], 1.0)
@@ -94,7 +95,7 @@ def test_decay_applies_90d_tier(conn, project_factory, memory_factory):
     result = pass_.run(conn, project["id"])
 
     new_strength = _read_strength(conn, m["id"])
-    assert new_strength == pytest.approx(DECAY_90D_MULTIPLIER, abs=0.01)
+    assert new_strength == pytest.approx(DECAY_90D_CAP, abs=0.001)
     assert result.rows_processed == 1
 
 
@@ -114,7 +115,43 @@ def test_decay_monotonic_never_increases(conn, project_factory, memory_factory):
     after_second = _read_strength(conn, m["id"])
 
     assert after_second <= after_first
-    assert after_second >= MIN_STRENGTH
+    assert after_second == pytest.approx(DECAY_30D_CAP, abs=0.001)
+
+
+@pytest.mark.db
+def test_decay_is_idempotent_across_hourly_runs(conn, project_factory, memory_factory):
+    """Regression (2026-11): the hourly job used to multiply on every run,
+    driving a 31-day-idle row to the 0.001 floor within hours."""
+    project = project_factory("decay_idem")
+    m30 = memory_factory(project["id"])
+    m90 = memory_factory(project["id"])
+    for mid, days in ((m30["id"], 31), (m90["id"], 91)):
+        _seed_strength(conn, mid, 1.0)
+        _set_idle(conn, mid, days)
+
+    pass_ = DecayPass()
+    first = pass_.run(conn, project["id"])
+    for _ in range(24):
+        later = pass_.run(conn, project["id"])
+
+    assert first.rows_processed == 2
+    assert later.rows_processed == 0
+    assert _read_strength(conn, m30["id"]) == pytest.approx(DECAY_30D_CAP, abs=0.001)
+    assert _read_strength(conn, m90["id"]) == pytest.approx(DECAY_90D_CAP, abs=0.001)
+
+
+@pytest.mark.db
+def test_decay_leaves_weaker_rows_alone(conn, project_factory, memory_factory):
+    """A row already below its tier's ceiling keeps its own strength."""
+    project = project_factory("decay_weak")
+    m = memory_factory(project["id"])
+    _seed_strength(conn, m["id"], 0.3)
+    _set_idle(conn, m["id"], 45)
+
+    result = DecayPass().run(conn, project["id"])
+
+    assert result.rows_processed == 0
+    assert _read_strength(conn, m["id"]) == pytest.approx(0.3, abs=0.001)
 
 
 @pytest.mark.db

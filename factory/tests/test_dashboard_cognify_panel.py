@@ -112,13 +112,13 @@ def _build_data_with_canned(results: list):
 
 
 def test_state_never_run_when_no_log_rows():
-    """All 5 passes return rows even when cognify_run_log is empty."""
-    data = _build_data_with_canned([None] * 5)
+    """All 4 passes return rows even when cognify_run_log is empty."""
+    data = _build_data_with_canned([None] * 4)
     rows = data.get_cognify_pass_status()
-    assert len(rows) == 5
+    assert len(rows) == 4
     assert all(r["state"] == "never_run" for r in rows)
     assert {r["pass_name"] for r in rows} == {
-        "extract", "edges", "decay", "strengthen", "gc"
+        "extract", "edges", "decay", "strengthen"
     }
 
 
@@ -240,7 +240,7 @@ def test_widget_renders_all_states(monkeypatch):
         {"pass_name": "strengthen", "state": "down",      "last_completed": now - timedelta(days=5),
          "last_rows_processed": 0,  "last_llm_calls": 0, "last_error": None,
          "expected_interval_s": 86_400},
-        {"pass_name": "gc",         "state": "never_run", "last_completed": None,
+        {"pass_name": "sweep",      "state": "never_run", "last_completed": None,
          "last_rows_processed": 0,  "last_llm_calls": 0, "last_error": None,
          "expected_interval_s": 604_800},
     ])

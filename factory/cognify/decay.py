@@ -1,21 +1,25 @@
-"""cognify_decay — time-based exponential strength decay.
+"""cognify_decay — idle-time strength ceiling.
 
-Applies decay to memory rows whose strength has not been reinforced recently.
-SQL-only pass: zero LLM cost, runs hourly.
+Strength records how recently a memory was used. A row nobody has touched
+for a while is capped at a lower ceiling:
 
-Decay schedule (applied to rows not hit for the given interval):
-  >= 30 days idle: strength *= 0.50
-  >= 90 days idle: strength *= 0.12  (approximately e^(-2.12))
+  idle >= 30 days: strength <= 0.50
+  idle >= 90 days: strength <= 0.12
 
-"Idle" is measured by max(last_cascade_at, hit_count_updated_at, last_hit).
-Rows with strength already at 0.0 or archived rows are skipped.
+"Idle" is measured by GREATEST(last_cascade_at, last_hit, created_at).
 
-Strength values are clamped to [0.001, 1.0] after decay so rows never
-hit exactly 0 (they're handled by cognify_gc instead).
+The pass sets ``strength = LEAST(strength, ceiling)``, so it is idempotent:
+running it every hour leaves a row exactly where the first run put it.
+(Until 2026-11 it multiplied by 0.5 / 0.12 on every hourly run, which
+drove any row idle 30+ days to the 0.001 floor within hours.)
 
-All writes go through the normal memory UPDATE path, which fires the AFTER
-trigger from migration 015 (memory_ledger write). So every decay is audited.
+Decay never archives or hides anything. Strength is not used to rank
+search results, and no pass archives a memory because its strength is low.
+
+SQL-only pass: zero LLM cost, runs hourly. Every UPDATE fires the
+memory_ledger trigger (migration 015), so each change is audited.
 """
+
 from __future__ import annotations
 
 import logging
@@ -25,17 +29,18 @@ from cognify.orchestrator import CognifyPass, PassResult, register_pass
 
 logger = logging.getLogger(__name__)
 
-# Decay multipliers per idle tier.
-DECAY_30D_MULTIPLIER = 0.50   # >= 30 days idle: 50% strength retained
-DECAY_90D_MULTIPLIER = 0.12   # >= 90 days idle: 12% strength retained
+# (idle days, strength ceiling), longest idle first. A row gets the ceiling
+# of the longest tier it qualifies for.
+DECAY_TIERS: tuple[tuple[int, float], ...] = ((90, 0.12), (30, 0.50))
+DECAY_30D_CAP = 0.50
+DECAY_90D_CAP = 0.12
 
-# Minimum post-decay strength (prevents exact zero; GC handles the bottom).
-MIN_STRENGTH = 0.001
+IDLE_EXPR = "GREATEST(last_cascade_at, last_hit, created_at)"
 
 
 @register_pass
 class DecayPass(CognifyPass):
-    """cognify_decay: apply time-based exponential strength decay.
+    """cognify_decay: cap the strength of idle rows. Idempotent.
 
     SQL-only. No LLM calls. Runs hourly via launchd.
     """
@@ -43,14 +48,19 @@ class DecayPass(CognifyPass):
     pass_name = "decay"
 
     def run(self, conn: Any, project_id: Any, *, dry_run: bool = False) -> PassResult:
-        """Decay strength for idle memory rows.
+        """Cap strength for idle rows.
 
-        If project_id is given, only rows in that project are decayed.
+        If project_id is given, only rows in that project are touched.
         If project_id is None, all projects are swept (cross-project; safe
         because decay is a mathematical operation with no data leakage).
         """
         if dry_run:
-            return self._dry_run(conn, project_id)
+            count = _count_decay_candidates(conn, project_id)
+            return PassResult(
+                rows_processed=0,
+                llm_calls=0,
+                metadata={"pass": "decay", "dry_run_would_process": count},
+            )
 
         rows_decayed = _apply_decay(conn, project_id)
         return PassResult(
@@ -59,148 +69,54 @@ class DecayPass(CognifyPass):
             metadata={"pass": "decay"},
         )
 
-    def _dry_run(self, conn: Any, project_id: Any) -> PassResult:
-        """Return a count of rows that would be decayed, without mutating."""
-        sql, params = _build_decay_count_sql(project_id)
-        with conn.cursor() as cur:
-            cur.execute(sql, params)
-            count = cur.fetchone()[0]
-        return PassResult(
-            rows_processed=0,
-            llm_calls=0,
-            metadata={"pass": "decay", "dry_run_would_process": count},
-        )
 
-
-def _idle_expr() -> str:
-    """SQL expression for the most-recent activity timestamp of a memory row."""
-    return (
-        "GREATEST("
-        "  last_cascade_at, "
-        "  last_hit, "
-        "  created_at"        # fallback: creation date for never-hit rows
-        ")"
+def _tier_where(days: int, project_id: Any) -> tuple[str, dict]:
+    """WHERE clause for active rows idle >= ``days`` and above the ceiling."""
+    where = (
+        "archived_at IS NULL "
+        "AND strength > %(cap)s "
+        "AND " + IDLE_EXPR + " < NOW() - make_interval(days => %(days)s)"
     )
-
-
-def _build_decay_count_sql(project_id: Any) -> tuple[str, dict]:
-    """Return (sql, params) for counting rows that would be decayed."""
-    idle_expr = _idle_expr()
-    min_s = str(MIN_STRENGTH)
+    params: dict[str, Any] = {"days": days}
     if project_id is not None:
-        sql = (
-            "SELECT COUNT(*) FROM devbrain.memory "
-            "WHERE archived_at IS NULL "
-            "  AND strength > " + min_s + " "
-            "  AND project_id = %(project_id)s "
-            "  AND ("
-            "      " + idle_expr + " < NOW() - INTERVAL '30 days' "
-            "      OR " + idle_expr + " IS NULL"
-            "  )"
-        )
-        params = {"project_id": project_id}
-    else:
-        sql = (
-            "SELECT COUNT(*) FROM devbrain.memory "
-            "WHERE archived_at IS NULL "
-            "  AND strength > " + min_s + " "
-            "  AND ("
-            "      " + idle_expr + " < NOW() - INTERVAL '30 days' "
-            "      OR " + idle_expr + " IS NULL"
-            "  )"
-        )
-        params = {}
-    return sql, params
+        where += " AND project_id = %(project_id)s"
+        params["project_id"] = project_id
+    return where, params
+
+
+def _count_decay_candidates(conn: Any, project_id: Any) -> int:
+    """Rows the next run would change (each counted once, at its deepest tier)."""
+    total = 0
+    seen_days = None
+    with conn.cursor() as cur:
+        for days, cap in DECAY_TIERS:
+            where, params = _tier_where(days, project_id)
+            if seen_days is not None:
+                where += " AND " + IDLE_EXPR + " >= NOW() - make_interval(days => %(upper)s)"
+                params["upper"] = seen_days
+            params["cap"] = cap
+            cur.execute("SELECT COUNT(*) FROM devbrain.memory WHERE " + where, params)
+            total += cur.fetchone()[0]
+            seen_days = days
+    return total
 
 
 def _apply_decay(conn: Any, project_id: Any) -> int:
-    """Apply decay in two passes (90d tier first, then 30d tier).
+    """Apply each tier's ceiling, deepest tier first. Returns rows changed.
 
-    Two-pass avoids double-applying: a row that qualifies for the 90d tier
-    gets the 90d multiplier (not 90d * 30d). The 90d UPDATE runs first;
-    the 30d UPDATE then only matches rows NOT yet in the 90d tier (i.e.
-    30d <= idle < 90d).
-
-    NOTE: SQL is built with string concatenation for non-user-controlled
-    constants (MIN_STRENGTH, idle_expr, intervals) and psycopg2 %s
-    parameters only for user-supplied values (project_id, multipliers).
-    We avoid mixing f-string %s with psycopg2 %s to prevent
-    "not all arguments converted" errors.
+    Running the 90-day tier first means a 100-day-idle row ends at 0.12;
+    the 30-day UPDATE then leaves it alone because 0.12 < 0.50.
     """
-    idle_expr = _idle_expr()
-    min_s = str(MIN_STRENGTH)
-
     total = 0
-
-    # ── 90-day tier ───────────────────────────────────────────────────────────
-    if project_id is not None:
-        sql_90 = (
-            "UPDATE devbrain.memory "
-            "SET strength = GREATEST(" + str(DECAY_90D_MULTIPLIER) + "::float * strength, " + min_s + ") "
-            "WHERE archived_at IS NULL "
-            "  AND strength > " + min_s + " "
-            "  AND project_id = %(project_id)s "
-            "  AND ("
-            "      " + idle_expr + " < NOW() - INTERVAL '90 days' "
-            "      OR (" + idle_expr + " IS NULL AND created_at < NOW() - INTERVAL '90 days')"
-            "  )"
-        )
-        params = {"project_id": project_id}
-    else:
-        sql_90 = (
-            "UPDATE devbrain.memory "
-            "SET strength = GREATEST(" + str(DECAY_90D_MULTIPLIER) + "::float * strength, " + min_s + ") "
-            "WHERE archived_at IS NULL "
-            "  AND strength > " + min_s + " "
-            "  AND ("
-            "      " + idle_expr + " < NOW() - INTERVAL '90 days' "
-            "      OR (" + idle_expr + " IS NULL AND created_at < NOW() - INTERVAL '90 days')"
-            "  )"
-        )
-        params = {}
-
     with conn.cursor() as cur:
-        cur.execute(sql_90, params)
-        total += cur.rowcount
+        for days, cap in DECAY_TIERS:
+            where, params = _tier_where(days, project_id)
+            params["cap"] = cap
+            cur.execute(
+                "UPDATE devbrain.memory SET strength = %(cap)s WHERE " + where,
+                params,
+            )
+            total += cur.rowcount
     conn.commit()
-
-    # ── 30-day tier ───────────────────────────────────────────────────────────
-    if project_id is not None:
-        sql_30 = (
-            "UPDATE devbrain.memory "
-            "SET strength = GREATEST(" + str(DECAY_30D_MULTIPLIER) + "::float * strength, " + min_s + ") "
-            "WHERE archived_at IS NULL "
-            "  AND strength > " + min_s + " "
-            "  AND project_id = %(project_id)s "
-            "  AND ("
-            "      " + idle_expr + " >= NOW() - INTERVAL '90 days' "
-            "      OR (" + idle_expr + " IS NULL AND created_at >= NOW() - INTERVAL '90 days')"
-            "  ) "
-            "  AND ("
-            "      " + idle_expr + " < NOW() - INTERVAL '30 days' "
-            "      OR (" + idle_expr + " IS NULL AND created_at < NOW() - INTERVAL '30 days')"
-            "  )"
-        )
-    else:
-        sql_30 = (
-            "UPDATE devbrain.memory "
-            "SET strength = GREATEST(" + str(DECAY_30D_MULTIPLIER) + "::float * strength, " + min_s + ") "
-            "WHERE archived_at IS NULL "
-            "  AND strength > " + min_s + " "
-            "  AND ("
-            "      " + idle_expr + " >= NOW() - INTERVAL '90 days' "
-            "      OR (" + idle_expr + " IS NULL AND created_at >= NOW() - INTERVAL '90 days')"
-            "  ) "
-            "  AND ("
-            "      " + idle_expr + " < NOW() - INTERVAL '30 days' "
-            "      OR (" + idle_expr + " IS NULL AND created_at < NOW() - INTERVAL '30 days')"
-            "  )"
-        )
-
-    with conn.cursor() as cur:
-        cur.execute(sql_30, params)
-        total += cur.rowcount
-    conn.commit()
-
-    logger.info("cognify_decay: decayed %d rows (project=%s)", total, project_id)
+    logger.info("cognify_decay: capped %d rows (project=%s)", total, project_id)
     return total

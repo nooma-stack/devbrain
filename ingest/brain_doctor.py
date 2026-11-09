@@ -146,14 +146,64 @@ def check_junk_summaries(cur):
     return "PASS", f"junk rate {junk}/{total or 0} in 7d"
 
 
+# A transcript that changed this long after ingest.log's last write is one
+# the watcher missed. The watcher logs "[watch] Detected" for every file it
+# picks up, and a large session can take several minutes to re-embed.
+INGEST_STUCK_GRACE_S = 30 * 60
+
+
+def _watched_files() -> list[Path]:
+    """Files the ingest watcher would act on (its suffix/size/skip rules)."""
+    from main import _SKIP_DIRS, WATCH_DIRS  # ingest/main.py
+
+    files: list[Path] = []
+    for root in WATCH_DIRS:
+        if not root.exists():
+            continue
+        for pattern in ("*.jsonl", "*.jsonl.zst", "session-*.json", "*.md"):
+            for path in root.rglob(pattern):
+                if _SKIP_DIRS & set(path.parts):
+                    continue
+                files.append(path)
+    return files
+
+
+def evaluate_ingest_liveness(log_mtime, files, *, now, grace_s=INGEST_STUCK_GRACE_S):
+    """Verdict from ingest.log's mtime and (path, mtime, size) of watched files.
+
+    FAIL only when a transcript changed more than ``grace_s`` after ingest
+    last wrote its log. A quiet night with no new transcripts is a PASS.
+    """
+    if log_mtime is None:
+        return "WARN", "ingest.log missing"
+    waiting = [
+        mtime
+        for _path, mtime, size in files
+        if mtime - log_mtime > grace_s
+        and size >= (256 if str(_path).endswith(".jsonl.zst") else 1024)
+    ]
+    log_age_h = (now - log_mtime) / 3600
+    if waiting:
+        oldest_h = (now - min(waiting)) / 3600
+        return "FAIL", (
+            f"{len(waiting)} transcript(s) changed after ingest last ran "
+            f"({log_age_h:.1f}h ago); oldest waiting {oldest_h:.1f}h — "
+            "new sessions are not becoming memory"
+        )
+    return "PASS", f"ingest last ran {log_age_h:.1f}h ago; nothing waiting"
+
+
 def check_ingest_liveness(_cur):
     log = Path(DEVBRAIN_HOME) / "logs" / "ingest.log"
-    if not log.exists():
-        return "WARN", "ingest.log missing"
-    age_h = (time.time() - log.stat().st_mtime) / 3600
-    if age_h > 3:
-        return "FAIL", f"ingest watcher silent for {age_h:.1f}h — new sessions are not becoming memory"
-    return "PASS", f"ingest active {age_h:.1f}h ago"
+    log_mtime = log.stat().st_mtime if log.exists() else None
+    files = []
+    for path in _watched_files():
+        try:
+            st = path.stat()
+        except OSError:
+            continue  # vanished between rglob and stat
+        files.append((path, st.st_mtime, st.st_size))
+    return evaluate_ingest_liveness(log_mtime, files, now=time.time())
 
 
 # Longest acceptable gap, in hours, since each scheduled pass last completed:

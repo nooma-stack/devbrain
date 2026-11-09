@@ -30,7 +30,7 @@ Placeholders
 - ``@CREDENTIAL_ENV_BLOCK@`` — XML marker replaced by either an
   ``ANTHROPIC_API_KEY`` or ``CLAUDE_CODE_OAUTH_TOKEN`` env entry in
   the LLM-cost plists (extract, edges, fanout, resummarize, entities). The non-LLM
-  plists (decay + strengthen + gc) and sweep (local Ollama only) don't
+  plists (decay + strengthen) and sweep (local Ollama only) don't
   carry this marker. When
   ``cognify.backend: openai`` (or env DEVBRAIN_COGNIFY_BACKEND=openai) at
   install time, the OpenAI key source set in the installing shell is
@@ -62,7 +62,6 @@ _TEMPLATE_DIR = Path(__file__).resolve().parent / "launchd"
 _NO_CRED_PLISTS = (
     "com.devbrain.cognify-decay.plist",
     "com.devbrain.cognify-strengthen.plist",
-    "com.devbrain.cognify-gc.plist",
     "com.devbrain.cognify-sweep.plist",  # local Ollama only
 )
 
@@ -77,6 +76,13 @@ _CRED_PLISTS = (
 
 # All cognify plists, in installation order.
 ALL_PLISTS = _NO_CRED_PLISTS + _CRED_PLISTS
+
+# Jobs that no longer exist. install_cognify_launchd unloads and removes any
+# installed copy so a re-install can't leave one running.
+#   cognify-gc: archived (hid from every search) memories that were idle 90
+#   days with no outgoing links. Retired 2026-11: memories are never hidden
+#   for age or low strength.
+RETIRED_PLISTS = ("com.devbrain.cognify-gc.plist",)
 
 # OpenAI key-source env (cognify/openai_api.py) copied into the LLM-cost
 # plists when the openai backend is selected at install time.
@@ -276,7 +282,7 @@ def install_cognify_launchd(
     runner: callable = subprocess.run,  # injection point for tests
     extra_env: dict[str, str] | None = None,
 ) -> list[Path]:
-    """Render and install all five cognify launchd plists.
+    """Render and install every cognify launchd plist; remove retired ones.
 
     Defaults:
       * ``credential`` ← ``resolve_credential_from_env()``
@@ -329,6 +335,12 @@ def install_cognify_launchd(
             extra_env=extra_env,
         )
         installed.append(out_path)
+
+    for name in RETIRED_PLISTS:
+        stale = target_dir / name
+        if stale.exists():
+            runner(["launchctl", "unload", str(stale)], check=False, capture_output=True)
+            stale.unlink()
 
     if reload:
         for path in installed:
