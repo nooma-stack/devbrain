@@ -10,6 +10,7 @@ import pytest
 
 from cognify.setup_launchd import (
     ALL_PLISTS,
+    RETIRED_PLISTS,
     CredentialChoice,
     _CRED_PLISTS,
     _NO_CRED_PLISTS,
@@ -173,7 +174,7 @@ def test_render_without_credential_drops_the_block_codex_only():
 
 
 def test_render_no_credential_block_in_non_llm_templates():
-    """decay, strengthen, gc don't have the marker — credential=None must be OK."""
+    """decay, strengthen, sweep don't have the marker — credential=None must be OK."""
     for name in _NO_CRED_PLISTS:
         text = _read_template(name)
         out = render_plist(
@@ -194,12 +195,11 @@ def test_render_no_credential_block_in_non_llm_templates():
 
 
 def test_render_does_not_carry_placeholder_for_project_in_no_project_plists():
-    """decay, gc and the all-project passes (edges, fanout, resummarize)
+    """decay and the all-project passes (edges, fanout, resummarize)
     don't take --project, so ${PROJECT_SLUG} shouldn't appear in their
     templates at all (sanity check the templates themselves)."""
     for name in (
         "com.devbrain.cognify-decay.plist",
-        "com.devbrain.cognify-gc.plist",
         "com.devbrain.cognify-edges.plist",
         "com.devbrain.cognify-fanout.plist",
         "com.devbrain.cognify-resummarize.plist",
@@ -223,8 +223,7 @@ def test_install_writes_all_plists(tmp_path):
         target_dir=tmp_path,
         reload=False,
     )
-    # 6 plists post-Phase-8: 3 SQL-only (decay/strengthen/gc) +
-    # 3 LLM-cost (extract/edges/fanout).
+    # Every template in ALL_PLISTS, and nothing else.
     assert len(installed) == len(ALL_PLISTS)
     assert {p.name for p in installed} == set(ALL_PLISTS)
     for p in installed:
@@ -302,6 +301,42 @@ def test_install_with_reload_invokes_launchctl(tmp_path):
         assert unload_call[0:2] == ("launchctl", "unload")
         assert load_call[0:2] == ("launchctl", "load")
         assert unload_call[2] == load_call[2]  # same plist
+
+
+def test_no_template_or_install_for_retired_jobs():
+    """cognify-gc hid memories from search; it must never be installed again."""
+    assert "com.devbrain.cognify-gc.plist" in RETIRED_PLISTS
+    for name in RETIRED_PLISTS:
+        assert name not in ALL_PLISTS
+        assert not (_TEMPLATE_DIR / name).exists()
+
+
+def test_install_unloads_and_removes_retired_plist(tmp_path):
+    stale = tmp_path / "com.devbrain.cognify-gc.plist"
+    stale.write_text("<plist/>")
+    calls: list[tuple[str, ...]] = []
+
+    def fake_run(args, **kw):
+        calls.append(tuple(args))
+
+        class Result:
+            returncode = 0
+            stdout = b""
+            stderr = b""
+
+        return Result()
+
+    install_cognify_launchd(
+        project_slug="brightbot",
+        credential=CredentialChoice("ANTHROPIC_API_KEY", "sk-ant-api03-FAKE"),
+        devbrain_home="/tmp/devbrain",
+        user="alice",
+        target_dir=tmp_path,
+        reload=False,
+        runner=fake_run,
+    )
+    assert not stale.exists()
+    assert calls == [("launchctl", "unload", str(stale))]
 
 
 def test_install_resolves_credential_from_env_if_not_passed(tmp_path):

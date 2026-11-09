@@ -70,8 +70,7 @@ Nine scheduled launchd passes, orchestrated by `factory/cognify/orchestrator.py`
 
 | pass | cadence | LLM? | mutates |
 |------|---------|------|---------|
-| `decay` | hourly | no | `memory.strength` (two-pass 90d/30d) |
-| `gc` | weekly | no | `memory.archived_at` (**never deletes** — HIPAA) |
+| `decay` | hourly | no | `memory.strength` capped by idle time (≥30d → 0.5, ≥90d → 0.12); idempotent, never archives |
 | `extract` | hourly | 1/session, cap 20 | lessons→`pattern`, decisions→`decision` |
 | `edges` | 6h, all active projects | contradicts cap 15/run (codex → Anthropic); cites zero-LLM | `memory_dependencies` (cites/contradicts) |
 | `strengthen` | daily | no | rule graduate/demote |
@@ -384,8 +383,12 @@ Each encodes a past incident or invariant:
   `memory.ts`) — legacy tables are source of truth; a memory failure must never
   roll back the legacy write. (TS side needs no savepoint — `pg.Pool` is
   connection-per-query.)
-- **`gc` archives, never deletes; `decay` clamps strength to 0.001; `created_at`
-  preserved on backfill** — HIPAA audit trail.
+- **Nothing archives a memory for being old, idle or weak.** `cognify-gc` did
+  (idle 90d + no outgoing links → `archived_at`, which every search filters out)
+  and hid 63k memories before it was retired in 2026-11; `setup_launchd` removes
+  any installed copy. Archiving is only for supersession, re-extraction and
+  project archive. `decay` sets a ceiling (`LEAST`), never multiplies, so the
+  hourly job can't compound. `created_at` preserved on backfill — HIPAA audit trail.
 - **`memory_ledger` has no FK; `provenance_id` is a loose pointer;
   `curator_re_eval_queue.cascade_source_id` is RESTRICT** — ledger outlives
   deleted rows; cascade source is the audit anchor.
@@ -404,7 +407,7 @@ Each encodes a past incident or invariant:
   an `end_session_log` row and a cascade-queue drain. Cross-project payloads are
   **wholesale-rejected** (P_end_session_isolation).
 - **Subtractive (not multiplicative) cascade penalty; 24h half-life; decay
-  two-pass order** — tuned so multi-hop cascades don't zero memories by depth.
+  ceilings applied deepest tier first** — tuned so multi-hop cascades don't zero memories by depth.
 - **import's post-commit conditional `REINDEX`; recency 5×/50× overfetch** — load-bearing.
 
 ## Known seams that have bitten us

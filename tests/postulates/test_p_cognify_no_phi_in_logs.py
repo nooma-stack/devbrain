@@ -17,7 +17,6 @@ import uuid
 import pytest
 
 from cognify.decay import DecayPass
-from cognify.gc import GCPass
 
 
 PHI_SENTINEL = "PATIENT_NAME=John_Doe_SSN_123-45-6789"
@@ -78,22 +77,6 @@ def test_p_cognify_no_phi_in_decay_log(conn, project_factory):
     run_pass(conn, "decay", project["id"])
 
     meta_str = _latest_run_log_metadata(conn, "decay", project["id"])
-    assert PHI_SENTINEL not in meta_str, (
-        "cognify_run_log metadata contains raw PHI from memory.content"
-    )
-
-
-@pytest.mark.db
-def test_p_cognify_no_phi_in_gc_log(conn, project_factory):
-    """cognify_gc run log metadata must not contain PHI from memory.content."""
-    project = project_factory("p_nophi_gc")
-    mid = _setup_row(conn, project["id"])
-    _set_idle_and_low_strength(conn, mid, days=100)
-
-    from cognify.orchestrator import run_pass
-    run_pass(conn, "gc", project["id"])
-
-    meta_str = _latest_run_log_metadata(conn, "gc", project["id"])
     assert PHI_SENTINEL not in meta_str, (
         "cognify_run_log metadata contains raw PHI from memory.content"
     )

@@ -7,10 +7,10 @@ The orchestrator provides:
   - `run_pass(conn, pass_name, project_id, dry_run)` — the CLI-facing
     entrypoint. Dispatches to the registered pass class.
   - `run_all(conn, project_id, dry_run)` — runs all 5 passes in
-    dependency order: decay → gc → extract → edges → strengthen.
+    dependency order: decay → extract → edges → strengthen.
 
 Design invariant: cognify_run_log rows are project-scoped. If project_id
-is None (applies to decay + gc which can sweep all projects), a row per
+is None (applies to decay, which can sweep all projects), a row per
 project is NOT created — a single project_id=NULL row is created instead
 (the pass itself is cross-project). All per-project LLM passes (extract,
 edges, strengthen) must pass an explicit project_id.
@@ -95,9 +95,8 @@ def _ensure_registry() -> None:
     """Import all pass modules so they self-register."""
     if _PASS_REGISTRY:
         return
-    # Import in dependency order (decay and gc first; extract before edges).
+    # Import in dependency order (decay first; extract before edges).
     from cognify import decay as _  # noqa: F401
-    from cognify import gc as _  # noqa: F401
     from cognify import extract as _  # noqa: F401
     from cognify import edges as _  # noqa: F401
     from cognify import strengthen as _  # noqa: F401
@@ -117,7 +116,7 @@ def register_pass(cls: type[CognifyPass]) -> type[CognifyPass]:
 # ── Dependency order ──────────────────────────────────────────────────────
 
 PASS_ORDER = [
-    "decay", "gc", "extract", "edges", "strengthen", "fanout", "resummarize",
+    "decay", "extract", "edges", "strengthen", "fanout", "resummarize",
     "sweep", "entities",
 ]
 
@@ -139,7 +138,7 @@ def run_pass(
 
     Args:
         conn: psycopg2 connection.
-        pass_name: one of 'decay', 'gc', 'extract', 'edges', 'strengthen'.
+        pass_name: one of 'decay', 'extract', 'edges', 'strengthen'.
         project_id: UUID or None.
         dry_run: if True, compute only; no DB mutations.
         cross_project: only honored by passes that opt in (currently
@@ -147,7 +146,7 @@ def run_pass(
             passes ignore the flag.
         max_llm_calls: per-pass override for the LLM-call ceiling. Only
             honored by LLM-cost passes (extract + edges). Zero-LLM passes
-            (decay, gc, strengthen) ignore it. When None (default), each
+            (decay, strengthen) ignore it. When None (default), each
             pass uses its own built-in MAX_LLM_CALLS_PER_PASS constant.
         pass_kwargs: extra pass-specific keyword arguments (e.g. the
             entities pass's ``since`` / ``max_memories`` for a backfill).

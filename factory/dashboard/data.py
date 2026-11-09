@@ -262,7 +262,6 @@ class DashboardData:
         "edges":      21_600,  # every 6h
         "decay":      3_600,   # hourly
         "strengthen": 86_400,  # daily
-        "gc":         604_800, # weekly
     }
     _DOWN_FACTOR = 3  # >3× expected interval since last run = consider down
 
@@ -286,7 +285,7 @@ class DashboardData:
         (truncated), project (slug or None for global passes).
 
         `project` filter scopes to a specific project_id. Global passes
-        (decay, gc — project_id IS NULL) are always included.
+        (decay — project_id IS NULL) are always included.
         """
         from datetime import datetime, timedelta, timezone
 
@@ -309,7 +308,7 @@ class DashboardData:
             for pass_name in self._COGNIFY_PASS_SCHEDULE:
                 if project_id is not None:
                     # Project-scoped passes (extract, edges, strengthen)
-                    # filter to project_id; global passes (decay, gc)
+                    # filter to project_id; global passes (decay)
                     # have project_id IS NULL.
                     cur.execute(
                         """
