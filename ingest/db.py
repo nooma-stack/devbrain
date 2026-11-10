@@ -279,6 +279,29 @@ def insert_chunk(
         return chunk_id
 
 
+def get_session_chunk_vectors(session_id: str) -> dict[str, list[float]]:
+    """md5(content) -> stored embedding for a session's transcript chunks.
+
+    Lets an update reuse the vectors of chunks whose text is unchanged
+    (chunking runs from the start of the transcript, so a grown session
+    keeps every chunk but the tail). Zero vectors (failed embeds) are
+    left out so they get re-embedded.
+    """
+    out: dict[str, list[float]] = {}
+    with get_connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT md5(content), embedding::text FROM devbrain.chunks "
+            "WHERE source_id = %s AND source_type = 'session' "
+            "AND embedding IS NOT NULL",
+            (session_id,),
+        )
+        for digest, text in cur.fetchall():
+            vec = [float(x) for x in text.strip("[]").split(",")]
+            if any(vec):
+                out[digest] = vec
+    return out
+
+
 def delete_chunks_for_session(session_id: str, cur=None) -> int:
     """Delete all chunks for a session (before re-embedding on update).
     Runs on the caller's cursor (no commit) when `cur` is given."""

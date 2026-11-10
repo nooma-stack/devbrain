@@ -16,7 +16,7 @@ from adapters.markdown_memory import MarkdownMemoryAdapter
 from adapters.openclaw import OpenClawAdapter
 from chunker import chunk_text
 from config import INGEST_EXCLUDE_PATH_PARTS
-from db import delete_chunks_for_session, get_connection, get_or_create_project_id, get_existing_session_id, get_session_by_hash, insert_chunk, insert_raw_session, session_exists, update_session_summary
+from db import delete_chunks_for_session, get_connection, get_session_chunk_vectors, get_or_create_project_id, get_existing_session_id, get_session_by_hash, insert_chunk, insert_raw_session, session_exists, update_session_summary
 from embeddings import embed, embed_batch
 from screening_runtime import session_chunk_flags, session_text_for_model
 
@@ -79,13 +79,14 @@ def ingest_file(path: Path, *, force: bool = False) -> bool:
 
     # Check if this is an update to an existing session (same session_id, different hash)
     is_update = False
+    existing = None
     if session.session_id:
         existing = get_existing_session_id(adapter.app_name, session.session_id)
         if existing:
             is_update = True
             print(f"  Updating existing session (content grew)")
 
-    return _process_session(session, path, fhash, is_update=is_update)
+    return _process_session(session, path, fhash, is_update=is_update, existing_id=existing)
 
 
 def _attach_project(adapter, path: Path, raw_id: str) -> bool:
@@ -103,28 +104,49 @@ def _attach_project(adapter, path: Path, raw_id: str) -> bool:
     return True
 
 
-def _embed_chunks(chunks) -> list[list[float]]:
-    """Embed all chunk texts (batched, with per-text fallback) BEFORE the write
+def _content_digest(text: str) -> str:
+    """Same digest as Postgres md5(content) on a UTF-8 database."""
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
+
+
+def _embed_chunks(chunks, reuse: dict[str, list[float]] | None = None) -> tuple[list[list[float]], int]:
+    """Embed chunk texts (batched, with per-text fallback) BEFORE the write
     transaction, so the slow Ollama calls hold no DB locks. A failed embed
     falls back to a zero vector so one bad chunk doesn't abort the whole
-    session (a reembed pass backfills it)."""
-    embeddings: list[list[float]] = []
+    session (a reembed pass backfills it).
+
+    ``reuse`` maps md5(content) to an already-stored vector; chunks found
+    there are not sent to the model. Returns (embeddings, reused_count)."""
+    reuse = reuse or {}
+    embeddings: list[list[float] | None] = [reuse.get(_content_digest(c.content)) for c in chunks]
+    todo = [i for i, e in enumerate(embeddings) if e is None]
     batch_size = 10
-    for i in range(0, len(chunks), batch_size):
-        texts = [c.content for c in chunks[i : i + batch_size]]
+    for start in range(0, len(todo), batch_size):
+        idx = todo[start : start + batch_size]
+        texts = [chunks[i].content for i in idx]
         try:
-            embeddings.extend(embed_batch(texts))
+            vecs = embed_batch(texts)
         except Exception as e:  # noqa: BLE001
             print(f"  Embedding batch failed, falling back to individual: {e}")
+            vecs = []
             for text in texts:
                 try:
-                    embeddings.append(embed(text))
+                    vecs.append(embed(text))
                 except Exception:  # noqa: BLE001
-                    embeddings.append([0.0] * 1024)
-    return embeddings
+                    vecs.append([0.0] * 1024)
+        for i, vec in zip(idx, vecs):
+            embeddings[i] = vec
+    return embeddings, len(chunks) - len(todo)
 
 
-def _process_session(session: UniversalSession, source_path: Path, source_hash: str, *, is_update: bool = False) -> bool:
+def _process_session(
+    session: UniversalSession,
+    source_path: Path,
+    source_hash: str,
+    *,
+    is_update: bool = False,
+    existing_id: str | None = None,
+) -> bool:
     """Store raw session, chunk, embed, and store chunks."""
     # Resolve project — adapters only emit slugs from explicit mappings or
     # the auto-project-roots convention, so an unknown slug means a new
@@ -151,8 +173,9 @@ def _process_session(session: UniversalSession, source_path: Path, source_hash: 
     # Chunk + embed BEFORE opening the write transaction so the (slow) Ollama
     # calls hold no DB locks.
     chunks = chunk_text(raw_text)
-    print(f"  Chunking: {len(chunks)} chunks")
-    embeddings = _embed_chunks(chunks)
+    reuse = get_session_chunk_vectors(existing_id) if is_update and existing_id else {}
+    embeddings, reused = _embed_chunks(chunks, reuse)
+    print(f"  Chunking: {len(chunks)} chunks ({reused} unchanged, {len(chunks) - reused} embedded)")
 
     # One transaction per session: raw_session + chunks + their memory
     # dual-writes commit together. A crash mid-ingest then leaves the session
@@ -180,10 +203,10 @@ def _process_session(session: UniversalSession, source_path: Path, source_hash: 
         if not session_db_id:
             print(f"  Already exists (hash collision), skipping.")
             return False
-        # If updating, delete old chunks so we re-embed the full session.
+        # If updating, replace the old chunk rows (unchanged chunks reuse
+        # their stored vectors, so only new text was sent to the model).
         if is_update:
             delete_chunks_for_session(session_db_id, cur=cur)
-            print(f"  Cleared old chunks for re-embedding")
         # Injection screening on the structured messages: mark each chunk
         # (memory.screen_flags) so extraction withholds it and deep_search
         # can label it.

@@ -396,6 +396,11 @@ Each encodes a past incident or invariant:
   deliberately non-unique** — identical text from *different* sessions is kept.
   Semantic dedup across sessions is the relation check's job (above), which is
   opt-in and archives rather than deletes.
+  `ingest/merge_duplicates.py` merges reworded copies (same project + kind, ≥0.95
+  cosine, same session or same title): keeps one, archives the rest behind a
+  `supersedes` edge (`created_by = merge_duplicates`); `--undo --apply` reverses it.
+- **A grown session re-embeds only new chunks** — `pipeline._embed_chunks` reuses
+  stored vectors keyed by `md5(content)`; zero (failed) vectors are re-embedded.
 - **Never reinstate migration 011's `(provenance_id, kind)` unique index** — an
   operator did and hard-deleted 76k rows (2026-05-28). `backfill_memory._ensure_schema`
   asserts the 037 index *specifically* to prevent this.

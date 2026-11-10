@@ -459,7 +459,7 @@ def test_pipeline_stores_chunk_flags_and_summarizes_withheld_text(
 
     monkeypatch.setattr(pipeline, "get_connection", lambda: _Conn())
     monkeypatch.setattr(pipeline, "insert_raw_session", lambda **kw: "raw-1")
-    monkeypatch.setattr(pipeline, "_embed_chunks", lambda chunks: [[0.0]] * len(chunks))
+    monkeypatch.setattr(pipeline, "_embed_chunks", lambda chunks, reuse=None: ([[0.0]] * len(chunks), 0))
     monkeypatch.setattr(pipeline, "insert_chunk", lambda **kw: stored.append(kw))
     monkeypatch.setattr(
         pipeline, "_summarize_session", lambda sid, text, pid: summarized.append(text)
