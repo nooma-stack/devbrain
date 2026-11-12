@@ -444,6 +444,7 @@ def run_search(
     keyword_sql: str | None = None,
     timings: dict[str, list[float]] | None = None,
     return_pool: bool = False,
+    keyword_evidence: dict[str, tuple[int, int, int]] | None = None,
 ) -> list[str]:
     """One deep_search-equivalent query in its own read-only transaction.
 
@@ -451,6 +452,8 @@ def run_search(
     (as deep_search does), runs the keyword SQL, and RRF-fuses both lists.
     ``return_pool`` returns the whole fused candidate pool instead of the
     top ``depth`` (the near-duplicate collapse walks the pool).
+    ``keyword_evidence`` is filled per keyword row with (keyword_units,
+    keyword_units_kept, query_tokens): the weak-match lookup rule's input.
     """
     if mode == "exact":
         cur.execute("SET LOCAL enable_indexscan = off")
@@ -498,7 +501,11 @@ def run_search(
     )
     cols = [d[0] for d in cur.description]
     i_id, i_score = cols.index("memory_id"), cols.index("score")
-    kw_rows = [(str(r[i_id]), float(r[i_score])) for r in cur.fetchall()]
+    i_ev = [cols.index(c) for c in ("keyword_units", "keyword_units_kept", "query_tokens")]
+    fetched = cur.fetchall()
+    kw_rows = [(str(r[i_id]), float(r[i_score])) for r in fetched]
+    if keyword_evidence is not None:
+        keyword_evidence.update({str(r[i_id]): tuple(int(r[i]) for i in i_ev) for r in fetched})
     if timings is not None:
         timings.setdefault("keyword", []).append((time.monotonic() - t1) * 1000)
     cur.connection.rollback()

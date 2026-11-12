@@ -80,6 +80,10 @@ embedding:
 #   weak_match: true
 #   weak_match_rerank_threshold: 0.88   # reranker score (0..1)
 #   weak_match_cosine_threshold: 0.41   # fallback when the reranker did not score
+#   # An identifier lookup (commit hash, file name, error code) is never weak when a
+#   # result holds every identifier searched for; such results carry exact_match: true.
+#   # A query is a lookup when its identifiers are at least this fraction of its words.
+#   weak_match_lookup_ident_ratio: 0.33
 #   # Retrieved memory is untrusted (env DEVBRAIN_UNTRUSTED_WRAP on/off):
 #   # deep_search, get_project_context and get_source_context wrap memory
 #   # text in <memory>…</memory> under a one-line notice.

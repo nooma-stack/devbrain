@@ -256,3 +256,39 @@ def test_weak_thresholds_match_the_mcp():
     assert len(negs) >= 50
     gold_projects = {g.project for g in load_gold(DEFAULT_GOLD)}
     assert {n.project for n in negs} <= gold_projects
+
+
+def test_exact_lookup_hit_mirrors_the_mcp():
+    from recall_audit.weak import WEAK_LOOKUP_IDENT_RATIO, is_exact_lookup_hit
+
+    ts = HYBRID_TS.read_text()
+    block = ts[ts.index("export const SEARCH_DEFAULTS") :]
+    block = block[: block.index("\n}")]
+    assert float(re.search(r"weakMatchLookupIdentRatio:\s*([\d.]+)", block).group(1)) == WEAK_LOOKUP_IDENT_RATIO
+    # Same cases as mcp-server/src/rerank.test.ts.
+    assert is_exact_lookup_hit((1, 1, 1))
+    assert is_exact_lookup_hit((1, 1, 3))
+    assert not is_exact_lookup_hit((1, 2, 2))
+    assert not is_exact_lookup_hit((1, 1, 11))
+    assert not is_exact_lookup_hit((0, 0, 4))
+    assert not is_exact_lookup_hit(None)
+
+
+def test_weak_flag_skips_exact_lookup_hits():
+    from recall_audit.weak import Observation, flag_stats
+
+    obs = [
+        Observation("l1", "project", True, 0.12, 0.2, 1, exact=True),  # bare identifier, found
+        Observation("n1", "project", False, 0.80, 0.3, None),
+    ]
+    for basis, threshold in (("rerank", 0.88), ("cosine", 0.41)):
+        st = flag_stats(obs, basis, threshold)
+        assert st["flagged"] == 1 and st["false_flags_found"] == 0 and st["precision"] == 1.0
+
+
+def test_run_search_reports_keyword_evidence():
+    import inspect
+
+    from recall_audit.audit import run_search
+
+    assert "keyword_evidence" in inspect.signature(run_search).parameters

@@ -143,6 +143,50 @@ describe('deep_search wiring', () => {
 })
 
 describe('weak-match flag', () => {
+  test('an exact lookup hit holds every kept identifier of an identifier-style query', async () => {
+    const { isExactLookupHit } = await import('./hybrid.js')
+    const cfg = resolveSearchConfig({}, {})
+    // "7b927b7": one token, one kept identifier, the row has it.
+    assert.equal(isExactLookupHit({ units: 1, unitsKept: 1, queryTokens: 1 }, cfg), true)
+    // "where is pool.is_owner": the identifier is a third of the query.
+    assert.equal(isExactLookupHit({ units: 1, unitsKept: 1, queryTokens: 3 }, cfg), true)
+    // Two identifiers asked for, the row has one.
+    assert.equal(isExactLookupHit({ units: 1, unitsKept: 2, queryTokens: 2 }, cfg), false)
+    // A long question that happens to carry one identifier: the reranker judges it.
+    assert.equal(isExactLookupHit({ units: 1, unitsKept: 1, queryTokens: 11 }, cfg), false)
+    // No identifier was searched for, or the keyword channel did not return the row.
+    assert.equal(isExactLookupHit({ units: 0, unitsKept: 0, queryTokens: 4 }, cfg), false)
+    assert.equal(isExactLookupHit(undefined, cfg), false)
+  })
+
+  test('an exact lookup hit is never weak, whatever the reranker scored', async () => {
+    const { isWeak } = await import('./hybrid.js')
+    const cfg = resolveSearchConfig({}, {})
+    assert.equal(isWeak({ score: 0.12, basis: 'rerank' }, cfg, true), false)
+    assert.equal(isWeak({ score: 0.12, basis: 'cosine' }, cfg, true), false)
+    assert.equal(isWeak({ score: 0.12, basis: 'rerank' }, cfg, false), true)
+  })
+
+  test('lookup ratio: default, yaml override, invalid falls back', () => {
+    assert.equal(resolveSearchConfig({}, {}).weakMatchLookupIdentRatio, 0.33)
+    assert.equal(resolveSearchConfig({ weak_match_lookup_ident_ratio: 0.5 }, {}).weakMatchLookupIdentRatio, 0.5)
+    assert.equal(resolveSearchConfig({ weak_match_lookup_ident_ratio: 7 }, {}).weakMatchLookupIdentRatio, 0.33)
+  })
+
+  test('keyword SQL reports what each row matched and what the query asked for', () => {
+    const kw = readFileSync(resolve(import.meta.dirname, '../sql/keyword_search.sql'), 'utf-8')
+    assert.match(kw, /count\(\*\) AS keyword_units\b/)
+    assert.match(kw, /\(SELECT count\(\*\) FROM kept\) AS keyword_units_kept/)
+    assert.match(kw, /\(SELECT count\(\*\) FROM tokens\) AS query_tokens/)
+  })
+
+  test('deep_search exempts exact lookup hits from the weak flag and labels them', () => {
+    const src = readFileSync(resolve(import.meta.dirname, 'index.ts'), 'utf-8')
+    assert.match(src, /isExactLookupHit\(c\.keyword, searchCfg\)/)
+    assert.match(src, /isWeak\(responseStrength\(\[\.\.\.strengthByKey\.values\(\)\]\), searchCfg, exactShown\)/)
+    assert.match(src, /if \(exact\) r\.exact_match = true/)
+  })
+
   test('group strength prefers reranker scores, falls back to cosine', async () => {
     const { groupStrength } = await import('./hybrid.js')
     const rr = new Map([['b', 0.9]])
@@ -189,6 +233,6 @@ describe('weak-match flag', () => {
     const w = src.indexOf('responseBody.weak_match = responseWeak')
     const r = src.indexOf('responseBody.results = results')
     assert.ok(w > 0 && r > w)
-    assert.match(src, /if \(searchCfg\.weakMatch && isWeak\(strength, searchCfg\)\) r\.weak_match = true/)
+    assert.match(src, /if \(searchCfg\.weakMatch && isWeak\(strength, searchCfg, exact\)\) r\.weak_match = true/)
   })
 })

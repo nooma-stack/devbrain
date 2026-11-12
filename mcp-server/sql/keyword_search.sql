@@ -34,6 +34,13 @@
 --   among the top 4 x $4 rows.
 --   MATERIALIZED CTEs keep each expensive step from being re-evaluated.
 --
+-- Lookup evidence (deep_search's weak-match flag, hybrid.ts isExactLookupHit)
+--   keyword_units       kept units this row matches
+--   keyword_units_kept  units kept for the query (same on every row)
+--   query_tokens        whitespace tokens in the query (same on every row)
+--   A row with keyword_units = keyword_units_kept holds every identifier
+--   the channel searched for.
+--
 -- The whole statement is gated on idx_memory_fts_simple existing and being
 -- valid (migration 047), so an install without the index returns no rows
 -- instead of a sequential to_tsvector scan.
@@ -107,7 +114,7 @@ kept AS MATERIALIZED (
   WHERE r.df <= $2::float8 * c.n AND r.cum_df <= $3::float8 AND r.rn <= $9::int
 ),
 hits AS MATERIALIZED (
-  SELECT h.id, sum(k.idf) AS keyword_score
+  SELECT h.id, sum(k.idf) AS keyword_score, count(*) AS keyword_units
   FROM kept k
   CROSS JOIN LATERAL (
     SELECT m.id FROM devbrain.memory m
@@ -133,7 +140,8 @@ pre AS (
     c.source_line_start AS chunk_line_start,
     c.source_line_end AS chunk_line_end,
     p.slug AS project,
-    hits.keyword_score
+    hits.keyword_score,
+    hits.keyword_units
   FROM hits
   JOIN devbrain.memory m ON m.id = hits.id
   JOIN devbrain.projects p ON m.project_id = p.id
@@ -151,7 +159,10 @@ SELECT
   memory_id, memory_kind, title, content,
   1 - (embedding <=> $5::vector) AS score,
   legacy_chunk_id, chunk_source_type, chunk_source_id, chunk_line_start,
-  chunk_line_end, project, keyword_score
+  chunk_line_end, project, keyword_score,
+  keyword_units,
+  (SELECT count(*) FROM kept) AS keyword_units_kept,
+  (SELECT count(*) FROM tokens) AS query_tokens
 FROM pre
 ORDER BY keyword_score DESC, score DESC
 LIMIT $4::int

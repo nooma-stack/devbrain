@@ -16,7 +16,11 @@ cross-project), and the audit records the response's best score:
 * ``cosine``: highest cosine similarity among them (the fallback when the
   reranker is down or off).
 
-A response is flagged when its best score is below the threshold. The flag
+A response is flagged when its best score is below the threshold, unless it
+holds an exact lookup hit: the query is mostly identifiers (commit hash,
+file name, error code) and a returned row contains every one the keyword
+channel searched for. The reranker has no question to judge there and
+scores the right row low. The flag
 predicts "not in the DB": precision = flagged negatives / flagged, recall =
 flagged negatives / negatives. ``false flags`` counts positives flagged,
 split by whether the answer was actually in the returned top 10.
@@ -56,6 +60,18 @@ DEFAULT_NEGATIVES = Path(__file__).resolve().parent / "negatives.jsonl"
 # Shipped thresholds (mirror SEARCH_DEFAULTS.weakMatch* in mcp-server/src/hybrid.ts).
 WEAK_RERANK_THRESHOLD = 0.88
 WEAK_COSINE_THRESHOLD = 0.41
+WEAK_LOOKUP_IDENT_RATIO = 0.33
+
+
+def is_exact_lookup_hit(ev: tuple[int, int, int] | None, ratio: float = WEAK_LOOKUP_IDENT_RATIO) -> bool:
+    """Mirror of isExactLookupHit in mcp-server/src/hybrid.ts.
+
+    ``ev`` is a keyword row's (keyword_units, keyword_units_kept, query_tokens).
+    """
+    if ev is None:
+        return False
+    units, kept, tokens = ev
+    return units >= kept >= 1 and kept >= ratio * tokens
 
 COSINE_SQL = """
 SELECT id::text, 1 - (embedding <=> %(vec)s::vector)
@@ -72,6 +88,7 @@ class Observation:
     rerank: float | None
     cosine: float | None
     hit_rank: int | None  # positives only: rank of the first group holding the answer
+    exact: bool = False  # a returned row is an exact lookup hit: never flagged
 
 
 @dataclass
@@ -96,7 +113,7 @@ def flag_stats(obs: list[Observation], basis: str, threshold: float) -> dict[str
         return o.rerank if basis == "rerank" else o.cosine
 
     usable = [o for o in obs if score(o) is not None]
-    flagged = [o for o in usable if score(o) < threshold]  # type: ignore[operator]
+    flagged = [o for o in usable if not o.exact and score(o) < threshold]  # type: ignore[operator]
     negs = [o for o in usable if not o.positive]
     tp = sum(1 for o in flagged if not o.positive)
     fp_found = sum(1 for o in flagged if o.positive and o.hit_rank is not None and o.hit_rank <= 10)
@@ -162,9 +179,11 @@ def main(argv: list[str] | None = None) -> int:
         for qid, text, project, positive, expected in queries:
             vec = _to_vec(embed_query(text))
             pid = slug_to_id.get(project) if scope == "project" else None
+            evidence: dict[str, tuple[int, int, int]] = {}
             pool = run_search(
                 cur, vec, pid, "index", 10, 400, True, "relaxed_order",
                 pipeline="hybrid", query_text=text, hybrid=hp, keyword_sql=ksql, return_pool=True,
+                keyword_evidence=evidence,
             )
             scores: dict[str, float] = {}
             pool = run_rerank(cur, text, pool, rp, None, scores)
@@ -183,6 +202,7 @@ def main(argv: list[str] | None = None) -> int:
                     rerank=max(rr) if rr else None,
                     cosine=max(cc) if cc else None,
                     hit_rank=first_hit_rank_groups(groups, expected) if positive else None,
+                    exact=any(is_exact_lookup_hit(evidence.get(m)) for m in members),
                 )
             )
             if args.show_negatives and not positive:
@@ -198,6 +218,10 @@ def main(argv: list[str] | None = None) -> int:
 
     lines = [
         f"Positives (gold): {len(gold)}; negatives: {len(negs)}; scopes: {args.scopes}; observations: {len(obs)}",
+        (
+            f"Exact lookup hits (never flagged): {sum(o.exact for o in obs if o.positive)} positives, "
+            f"{sum(o.exact for o in obs if not o.positive)} negatives"
+        ),
         "",
         "Best-score distribution (median / p10 / p90):",
     ]
