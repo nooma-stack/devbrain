@@ -62,6 +62,12 @@ export interface SearchConfig {
   weakMatchRerankThreshold: number
   /** Weak below this cosine similarity when no reranker score is available. */
   weakMatchCosineThreshold: number
+  /**
+   * A query counts as an identifier lookup when the identifiers the keyword
+   * channel searched for are at least this fraction of its tokens; a result
+   * holding all of them is then never weak (isExactLookupHit).
+   */
+  weakMatchLookupIdentRatio: number
   /** Wrap retrieved memory text in <memory>…</memory> with a notice (untrusted.ts). */
   untrustedWrap: boolean
 }
@@ -97,6 +103,11 @@ export const SEARCH_DEFAULTS: SearchConfig = {
   weakMatch: true,
   weakMatchRerankThreshold: 0.88,
   weakMatchCosineThreshold: 0.41,
+  // 2026-11-12, 86 identifier lookups x 2 scopes (bare, or with one or two
+  // plain words) whose memory was in the top 10: the reranker flagged 47 of
+  // 172 weak; with this rule 0. The 76 gold + 50 absent-topic queries are
+  // unchanged (their identifiers are at most 0.22 of the query).
+  weakMatchLookupIdentRatio: 0.33,
   untrustedWrap: true,
 }
 
@@ -139,7 +150,8 @@ function parseTerms(v: unknown): boolean | undefined {
  * dedup, dedup_threshold, dedup_representative, dedup_timeout_ms,
  * recency_strategy, recency_max_scan_tuples, recency_timeout_ms, rerank,
  * rerank_url, rerank_candidates, rerank_blend, rerank_timeout_ms, weak_match,
- * weak_match_rerank_threshold, weak_match_cosine_threshold, untrusted_wrap}.
+ * weak_match_rerank_threshold, weak_match_cosine_threshold,
+ * weak_match_lookup_ident_ratio, untrusted_wrap}.
  */
 export function resolveSearchConfig(yaml: unknown, env: Env = process.env): SearchConfig {
   const y = (yaml && typeof yaml === 'object' ? yaml : {}) as Record<string, unknown>
@@ -194,6 +206,10 @@ export function resolveSearchConfig(yaml: unknown, env: Env = process.env): Sear
     weakMatchCosineThreshold: pick(
       parseNum(y.weak_match_cosine_threshold, (n) => n >= -1 && n <= 1),
       d.weakMatchCosineThreshold,
+    ),
+    weakMatchLookupIdentRatio: pick(
+      parseNum(y.weak_match_lookup_ident_ratio, (n) => n > 0 && n <= 1),
+      d.weakMatchLookupIdentRatio,
     ),
     untrustedWrap: pick(parseBool(env.DEVBRAIN_UNTRUSTED_WRAP), parseBool(y.untrusted_wrap), d.untrustedWrap),
   }
@@ -460,8 +476,34 @@ export function responseStrength(groups: Array<MatchStrength | undefined>): Matc
   return { score: Math.max(...pool.map((g) => g.score)), basis: pool[0].basis }
 }
 
-/** True when the strength is below its basis' threshold (no strength = weak). */
-export function isWeak(strength: MatchStrength | undefined, cfg: SearchConfig): boolean {
+/** What the keyword channel reported for one row (keyword_search.sql). */
+export interface KeywordEvidence {
+  /** Kept query identifiers this row contains. */
+  units: number
+  /** Identifiers the channel searched for (too-common and absent ones are dropped). */
+  unitsKept: number
+  /** Whitespace tokens in the query. */
+  queryTokens: number
+}
+
+/**
+ * An exact lookup hit: the query is mostly identifiers (a commit hash, a
+ * file name, an error code) and this row contains every one the keyword
+ * channel searched for. The cross-encoder has no question to judge in such
+ * a query and scores the right row low, so its score must not flag it.
+ * Mirror of is_exact_lookup_hit in ingest/recall_audit/weak.py.
+ */
+export function isExactLookupHit(e: KeywordEvidence | undefined, cfg: SearchConfig): boolean {
+  if (!e || e.unitsKept < 1 || e.units < e.unitsKept) return false
+  return e.unitsKept >= cfg.weakMatchLookupIdentRatio * e.queryTokens
+}
+
+/**
+ * True when the strength is below its basis' threshold (no strength = weak).
+ * An exact lookup hit is never weak.
+ */
+export function isWeak(strength: MatchStrength | undefined, cfg: SearchConfig, exactLookupHit = false): boolean {
+  if (exactLookupHit) return false
   if (!strength) return true
   const t = strength.basis === 'rerank' ? cfg.weakMatchRerankThreshold : cfg.weakMatchCosineThreshold
   return strength.score < t

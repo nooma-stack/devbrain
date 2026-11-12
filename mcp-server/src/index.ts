@@ -15,6 +15,7 @@ import {
   applyRerank,
   collapseNearDuplicates,
   groupStrength,
+  isExactLookupHit,
   isWeak,
   keywordParams,
   keywordSql,
@@ -23,6 +24,7 @@ import {
   rerankDocText,
   responseStrength,
   rrfFuse,
+  type KeywordEvidence,
   type MatchStrength,
 } from './hybrid.js'
 import { rerankScores } from './rerank.js'
@@ -492,6 +494,8 @@ server.tool(
       memory_id: string
       memory_kind: string
       title: string | null
+      /** Keyword-channel rows only: what the row matched (keyword_search.sql). */
+      keyword?: KeywordEvidence
     }
 
     const candidates: Candidate[] = []
@@ -513,6 +517,15 @@ server.tool(
         memory_id: String(row.memory_id),
         memory_kind: String(row.memory_kind),
         title: row.title != null ? String(row.title) : null,
+        ...(row.keyword_units != null
+          ? {
+              keyword: {
+                units: Number(row.keyword_units),
+                unitsKept: Number(row.keyword_units_kept),
+                queryTokens: Number(row.query_tokens),
+              },
+            }
+          : {}),
       }
     }
 
@@ -698,6 +711,11 @@ server.tool(
       pool = rrfFuse([pool, keywordKeys], [1, searchCfg.keywordWeight], searchCfg.rrfK, byKey.size, cosine)
       matchedByKey = new Map(pool.map((key) => [key, matchedBy(key, vSet, kSet)]))
     }
+    // Exact lookup hits: the query is mostly identifiers and the row holds
+    // every one the keyword channel searched for. Never flagged weak.
+    const exactKeys = new Set(
+      (keywordHits ?? []).filter((c) => isExactLookupHit(c.keyword, searchCfg)).map(keyOf),
+    )
 
     // Local cross-encoder rerank of the pool head (rerank/ service on
     // loopback). Runs before the collapse so each group is anchored by the
@@ -762,7 +780,13 @@ server.tool(
     const strengthByKey = new Map<string, MatchStrength | undefined>(
       topKeys.map((k) => [k, groupStrength([k, ...(similarByKey?.get(k) ?? [])], rerankByKey, cosineByKey)]),
     )
-    const responseWeak = searchCfg.weakMatch && isWeak(responseStrength([...strengthByKey.values()]), searchCfg)
+    // A group is an exact lookup hit when any of its members is.
+    const exactByKey = new Map(
+      topKeys.map((k) => [k, [k, ...(similarByKey?.get(k) ?? [])].some((m) => exactKeys.has(m))]),
+    )
+    const exactShown = [...exactByKey.values()].some(Boolean)
+    const responseWeak =
+      searchCfg.weakMatch && isWeak(responseStrength([...strengthByKey.values()]), searchCfg, exactShown)
 
     // memory.screen_flags (prompt-injection screening, migration 049) for the
     // shown rows. Skipped on installs without the column.
@@ -806,7 +830,10 @@ server.tool(
           // Local cross-encoder relevance (0..1): best among this result and its similar_ids.
           r.rerank_score = Number(strength.score.toFixed(4))
         }
-        if (searchCfg.weakMatch && isWeak(strength, searchCfg)) r.weak_match = true
+        // Holds every identifier of an identifier-style query (commit hash, file name, error code).
+        const exact = exactByKey.get(keyOf(cand)) ?? false
+        if (exact) r.exact_match = true
+        if (searchCfg.weakMatch && isWeak(strength, searchCfg, exact)) r.weak_match = true
         if (similar) {
           // Near-duplicates collapsed into this slot (same fact, other copies).
           r.similar_count = similar.length
